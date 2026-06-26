@@ -935,6 +935,10 @@ class Gefen(torch.optim.Optimizer):
         return state_dict
 
     def load_state_dict(self, state_dict):
+        # Shallow-copy so the pop()s below don't mutate the caller's checkpoint
+        # dict (torch.optim.Optimizer.load_state_dict leaves its input intact);
+        # otherwise a second load of the same dict loses the gefen_* keys.
+        state_dict = dict(state_dict)
         gefen_global_step = state_dict.pop("gefen_global_step", 0)
         gefen_codebook = state_dict.pop("gefen_codebook", None)
 
@@ -956,8 +960,11 @@ class Gefen(torch.optim.Optimizer):
         # Restoring the frozen codebook keeps _maybe_refresh_gefen_codebook a
         # no-op on the first resume step, so the restored automatic_period values
         # stay consistent with the restored vmean/m_codebook block geometry.
-        if gefen_codebook is not None:
-            self._gefen_codebook = gefen_codebook
+        # Assign unconditionally: when FSDP strips the codebook (gefen_codebook is
+        # None) any stale codebook from a prior train/load must be cleared, else
+        # _maybe_refresh_gefen_codebook returns early and skips the restored-period
+        # fallback.
+        self._gefen_codebook = gefen_codebook
 
         # Map saved param ids -> live param objects exactly as the base class
         # does, then restore each aux tensor from its pristine saved copy.
