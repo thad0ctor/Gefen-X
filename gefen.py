@@ -653,9 +653,35 @@ class Gefen(torch.optim.Optimizer):
         if codebook is not None:
             self._gefen_codebook = codebook
 
+    def _resuming_from_checkpoint(self) -> bool:
+        # On resume every param's state has a restored automatic_period; on a
+        # fresh run the state is still empty when the first step starts.
+        return any(
+            "automatic_period" in self.state.get(p, {})
+            for group in self.param_groups
+            for p in group["params"]
+        )
+
     def _maybe_refresh_gefen_codebook(self) -> None:
-        if self._gefen_codebook is None:
-            self._ensure_gefen_codebook()
+        if self._gefen_codebook is not None:
+            # A codebook restored from a checkpoint may land on CPU (depending on
+            # the load map_location); move it onto the gradient device once.
+            device = self._gefen_codebook_device()
+            if self._gefen_codebook.device != device:
+                self._gefen_codebook = self._gefen_codebook.to(device)
+            return
+
+        # No codebook yet. On a fresh run this learns it and predicts periods.
+        # On resume the persisted codebook is normally restored in
+        # load_state_dict, but FSDP optim-state consolidation strips custom
+        # top-level keys, so the codebook can be missing even though the
+        # per-param state (incl. automatic_period) was restored. In that case we
+        # must reuse the restored periods rather than re-predict them, otherwise
+        # the refreshed periods desync from the restored vmean/m_codebook block
+        # geometry and the vmean kernel aborts on a block-count mismatch.
+        self._ensure_gefen_codebook(
+            reuse_existing_periods=self._resuming_from_checkpoint()
+        )
 
     def _maybe_save_gefen_grad_histogram(self) -> None:
         if not hasattr(quantization_module, "LIST_STEPS_SAVE_HIST_GRAD"):
@@ -891,10 +917,20 @@ class Gefen(torch.optim.Optimizer):
     def state_dict(self):
         state_dict = super().state_dict()
         state_dict["gefen_global_step"] = self._gefen_global_step
+        # The exact-DP codebook is learned once on the first step and then frozen
+        # for the rest of the run. It is not per-param state, so persist it
+        # explicitly; without it resume re-learns the codebook (see
+        # _maybe_refresh_gefen_codebook) which re-predicts and overwrites every
+        # restored automatic_period, desyncing them from the saved
+        # vmean/m_codebook. (Note: under FSDP optim-state consolidation strips
+        # these custom top-level keys; _maybe_refresh_gefen_codebook handles that
+        # fallback by reusing the restored periods.)
+        state_dict["gefen_codebook"] = self._gefen_codebook
         return state_dict
 
     def load_state_dict(self, state_dict):
         gefen_global_step = state_dict.pop("gefen_global_step", 0)
+        gefen_codebook = state_dict.pop("gefen_codebook", None)
 
         # torch.optim.Optimizer.load_state_dict casts *every* per-param state
         # tensor to the owning parameter's dtype whenever that parameter is
@@ -910,6 +946,12 @@ class Gefen(torch.optim.Optimizer):
 
         super().load_state_dict(state_dict)
         self._gefen_global_step = gefen_global_step
+
+        # Restoring the frozen codebook keeps _maybe_refresh_gefen_codebook a
+        # no-op on the first resume step, so the restored automatic_period values
+        # stay consistent with the restored vmean/m_codebook block geometry.
+        if gefen_codebook is not None:
+            self._gefen_codebook = gefen_codebook
 
         # Map saved param ids -> live param objects exactly as the base class
         # does, then restore each aux tensor from its pristine saved copy.
