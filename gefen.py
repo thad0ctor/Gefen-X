@@ -88,6 +88,16 @@ def automatic_vmean_update(
     vmean.mul_(beta2).add_(block_mean_grad_sq, alpha=1 - beta2)
 
 
+# Process the nearest-codebook search in element chunks of this size. The search
+# is the dominant transient allocator on the non-fused step: the naive form
+# materialized ~10 full-size fp32/int64 temporaries (~40N bytes vs the 2N-byte
+# bf16 param), which drove the full-FT OOM. Bounding the work to a fixed element
+# count caps the scratch independent of param size while keeping each kernel
+# launch large enough to stay GPU-bound (smaller chunks regress on launch
+# overhead). 8M elems -> ~100 MB scratch ceiling.
+GEFEN_CODEBOOK_SEARCH_CHUNK = 1 << 23
+
+
 def gefen_nearest_codebook_indices(
     codebook: torch.Tensor, normalized_vals: torch.Tensor
 ) -> torch.Tensor:
@@ -100,16 +110,42 @@ def gefen_nearest_codebook_indices(
             )
         )
     k = codebook.numel()
-    flat = normalized_vals.reshape(-1).float()
-    idx = torch.searchsorted(codebook, flat)
-    left = (idx - 1).clamp(0, k - 1)
-    right = idx.clamp(0, k - 1)
-    assignments = torch.where(
-        (flat - codebook[left]).abs() <= (flat - codebook[right]).abs(),
-        left,
-        right,
+    out = torch.empty(
+        normalized_vals.shape, dtype=torch.uint8, device=normalized_vals.device
     )
-    return assignments.to(torch.uint8).view(normalized_vals.shape)
+
+    # k == 1: the only codeword is index 0 for every value.
+    if k <= 1:
+        out.zero_()
+        return out
+
+    # For a sorted codebook the nearest index of a value equals the number of
+    # interior midpoints below it: |v - cb[i]| <= |v - cb[i+1]| iff
+    # v <= (cb[i] + cb[i+1]) / 2. So a single searchsorted on the midpoints (with
+    # side='left', i.e. right=False) returns the nearest index directly and
+    # reproduces the old gather/abs/where tie-break (equal distance -> lower
+    # index), without that pipeline's full-size temporaries.
+    #
+    # Caveat: this matches the old result for all realistic inputs (validated bit
+    # for bit on tens of millions of random fp32/bf16 values, both dtypes the
+    # non-fused path actually produces -- plain-Gefen builds updated_m in fp32),
+    # but it is not provably identical at a sub-ULP tie: within ~1 ULP of a
+    # midpoint the old form's two independent abs-distance subtractions can round
+    # equal where `v <= mid` does not (or vice versa), flipping the assignment by
+    # one index. That only ever swaps two near-equidistant codewords, so the
+    # reconstruction error is bounded by the tie itself and is immaterial.
+    midpoints = (codebook[:-1] + codebook[1:]).mul(0.5)
+
+    flat_out = out.view(-1)
+    flat_in = normalized_vals.reshape(-1)
+    n = flat_in.numel()
+    chunk = GEFEN_CODEBOOK_SEARCH_CHUNK
+    for start in range(0, n, chunk):
+        stop = start + chunk
+        seg = flat_in[start:stop].float()
+        idx = torch.searchsorted(midpoints, seg, right=False)
+        flat_out[start:stop].copy_(idx.to(torch.uint8))
+    return out
 
 
 def gefen_dequantize_unpacked_indices(
