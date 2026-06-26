@@ -102,20 +102,57 @@ Gefen is fully compatible with standard distributed training setups, including P
 
 ### Extension: Gefen-Muon
 
-Based on the Gefen paradigm, a simple extension is to add a pseudo-orthogonalization step on the first moment, as Muon does, while skipping the second moment. This version, which is based on the PyTorch Muon implementation, immediately reduces Muon's optimizer-state footprint by 4x: the first moments are quantized to 8-bit using Gefen's Hessian-block-diagonal-inspired partitioning exact quantization, while performance remains similar to Muon.
+`GefenMuon` adds a Muon-style pseudo-orthogonalization step on the first moment (skipping the second moment), then quantizes those first moments to 8-bit with Gefen's partitioning quantization.
 
-You can use it exactly as you use Muon, with a simple constructor name replacement:
+> **Scope — read this first.** Like Muon, `GefenMuon` optimizes **2D hidden weight matrices only**. It has *no* code path for embeddings, the LM head, or 1D parameters (norms, biases) — feeding it those will fail or misbehave. For a full model, use [`GefenMuonHybrid`](#full-models-gefenmuonhybrid) below, which routes the non-Muon parameters to `Gefen` for you.
+>
+> **Pass `(name, param)` pairs, not bare tensors.** `GefenMuon` keys its 8-bit codebook cache on each parameter's name. If you strip the names (e.g. `[p for _, p in pairs]`) every parameter collapses to the name `"none"` and the cache is corrupted. Always pass the named pairs through:
 
 ```python
 from gefen import GefenMuon
 
-optimizer = GefenMuon(
-    [muon_parameter for _, muon_parameter in muon_parameter_pairs],
+# muon_named_params: list of (name, param) for your 2D hidden weight matrices.
+optimizer = GefenMuon(muon_named_params, lr=lr)
+```
+
+#### Full models: `GefenMuonHybrid`
+
+`GefenMuonHybrid` is the drop-in for training a **whole model** with Muon. It routes 2D hidden weight matrices to `GefenMuon` and everything else (embeddings, LM head, norms, biases) to `Gefen`, behind a single `torch.optim.Optimizer` interface. Both sub-optimizers are 8-bit, so the whole optimizer-state footprint stays small — unlike a stock Muon+AdamW setup where the AdamW half is full precision. Scope: single-GPU / DDP (FSDP2 sharded params are out of scope).
+
+```python
+from gefen import GefenMuonHybrid
+
+def split_params_for_muon(model):
+    """Muon -> 2D hidden weight matrices; Gefen backup -> everything else."""
+    muon, backup = [], []
+    for name, p in model.named_parameters():
+        if not p.requires_grad:
+            continue
+        is_hidden_matrix = (
+            p.ndim == 2
+            and not any(k in name.lower() for k in ("embed", "wte", "lm_head"))
+        )
+        (muon if is_hidden_matrix else backup).append((name, p))
+    return muon, backup
+
+muon_named_params, backup_named_params = split_params_for_muon(model)
+
+optimizer = GefenMuonHybrid(
+    muon_named_params,
+    backup_named_params,
     lr=lr,
+    weight_decay=0.0,
+    fused=True,
 )
 ```
 
-Our experiments show similar performance to Muon, with x4 less optimizer memory.
+It supports `step()`, `zero_grad()`, `state_dict()`/`load_state_dict()`, and LR schedulers (e.g. `torch.optim.lr_scheduler.StepLR(optimizer, ...)`) like any optimizer. Because its constructor takes two parameter lists rather than a single iterable, build it yourself and hand it to the Hugging Face `Trainer` via `optimizers=` (not `optimizer_cls_and_kwargs`):
+
+```python
+optimizer = GefenMuonHybrid(*split_params_for_muon(model), lr=training_args.learning_rate)
+trainer = Trainer(model=model, args=training_args, train_dataset=train_dataset,
+                  optimizers=(optimizer, None))  # (optimizer, lr_scheduler)
+```
 
 ## Testimonials
 

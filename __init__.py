@@ -1,4 +1,4 @@
-__all__ = ["Gefen", "GefenMuon", "kernels"]
+__all__ = ["Gefen", "GefenMuon", "GefenMuonHybrid", "kernels"]
 
 
 def __getattr__(name):
@@ -10,4 +10,8 @@ def __getattr__(name):
         from .gefen_muon import GefenMuon
 
         return GefenMuon
+    if name == "GefenMuonHybrid":
+        from .hybrid import GefenMuonHybrid
+
+        return GefenMuonHybrid
     raise AttributeError("module {!r} has no attribute {!r}".format(__name__, name))
