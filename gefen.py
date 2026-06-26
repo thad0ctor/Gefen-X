@@ -12,10 +12,37 @@ FIND_PERIOD_BACKEND = None
 FUSE_AUTOMATIC_VMEAN_UPDATE = True
 FUSE_GEFEN_AUTOMATIC_STEP = True
 FUSE_HISTOGRAM_FOR_EXACT = True
+
 # Occupancy-flexible two-phase fused update kernel. Bit-identical to the legacy
 # single-kernel path; decouples the CUDA grid from num_blocks so large-period
-# (few-block) and period==1 params are no longer serial.
-FUSE_GEFEN_UPDATE_V2 = os.environ.get("GEFEN_UPDATE_V2", "1") not in {"0", "false", "no"}
+# (few-block) and period==1 params are no longer serial. Verified a large win on
+# Ampere (sm_86, ~2.3x). Default it on only for arches where it is unambiguously
+# verified faster; everything else falls back to the safe single-pass v1 kernel.
+# (Blackwell sm_120 is left off by default pending reconciliation: one cross-arch
+# report saw v2 regress on an RTX PRO 6000, but a controlled idle re-measurement
+# saw v2 ~2x faster there — see fused_bench/PERF.md. Override with the env var.)
+#
+# The decision is lazy (first kernel use, per device) so importing this module
+# never forces CUDA initialization and we read the capability of the device the
+# params actually live on. Env GEFEN_UPDATE_V2 overrides the arch gate entirely.
+_V2_VERIFIED_CAPABILITIES = frozenset({(8, 6)})  # sm_86: RTX 3090/A10/etc.
+_GEFEN_UPDATE_V2_ENV = os.environ.get("GEFEN_UPDATE_V2")
+_gefen_update_v2_by_device: dict = {}
+
+
+def _use_gefen_update_v2(device: Optional[torch.device]) -> bool:
+    if _GEFEN_UPDATE_V2_ENV is not None:
+        return _GEFEN_UPDATE_V2_ENV.lower() not in {"0", "false", "no", "off"}
+    if device is None or getattr(device, "type", None) != "cuda":
+        return False
+    index = device.index
+    if index is None:
+        index = torch.cuda.current_device()
+    cached = _gefen_update_v2_by_device.get(index)
+    if cached is None:
+        cached = torch.cuda.get_device_capability(index) in _V2_VERIFIED_CAPABILITIES
+        _gefen_update_v2_by_device[index] = cached
+    return cached
 
 
 def automatic_partition_view(flat_tensor: torch.Tensor, period: int) -> torch.Tensor:
@@ -168,7 +195,7 @@ def gefen_automatic_fused_update(
         packed_indices,
         beta1,
         lr,
-        use_v2=FUSE_GEFEN_UPDATE_V2,
+        use_v2=_use_gefen_update_v2(grad_view.device),
     )
 
 
