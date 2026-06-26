@@ -71,7 +71,10 @@ def automatic_vmean_update(
         automatic_vmean_update_cuda(vmean, grad_view, beta2)
         return
 
-    block_mean_grad_sq = torch.mean(grad_view * grad_view, dim=1, keepdim=True)
+    # Accumulate in float32 to match the fused kernel and the float32 vmean
+    # buffer; grad_view is the model dtype (e.g. bf16) under non-fused training.
+    grad_view_f32 = grad_view.float()
+    block_mean_grad_sq = torch.mean(grad_view_f32 * grad_view_f32, dim=1, keepdim=True)
     vmean.mul_(beta2).add_(block_mean_grad_sq, alpha=1 - beta2)
 
 
@@ -788,7 +791,10 @@ class Gefen(torch.optim.Optimizer):
             self._gefen_dequantize_m_coefficients(state, grad_view)
             * state["m_magnitude"]
         )
-        updated_m = current_m.lerp(grad_view, 1 - beta1)
+        # current_m is float32 (m_magnitude is float32); grad_view is the model
+        # dtype. lerp() requires both operands to share a dtype, so promote the
+        # gradient. This is the non-fused / FSDP2-meta-tensor path.
+        updated_m = current_m.lerp(grad_view.to(current_m.dtype), 1 - beta1)
 
         state["m_magnitude"].copy_(
             self._automatic_reduce(updated_m.abs().reshape(-1), period, reduce_op="max")
