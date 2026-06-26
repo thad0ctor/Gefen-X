@@ -1,4 +1,5 @@
 import math
+import os
 from itertools import chain
 from typing import Iterable, Optional, Tuple, Union
 
@@ -12,6 +13,10 @@ FIND_PERIOD_BACKEND = None
 FUSE_AUTOMATIC_VMEAN_UPDATE = True
 FUSE_GEFEN_AUTOMATIC_STEP = True
 FUSE_HISTOGRAM_FOR_EXACT = True
+# Occupancy-flexible two-phase fused update kernel. Bit-identical to the legacy
+# single-kernel path; decouples the CUDA grid from num_blocks so large-period
+# (few-block) and period==1 params are no longer serial.
+FUSE_GEFEN_UPDATE_V2 = os.environ.get("GEFEN_UPDATE_V2", "1") not in {"0", "false", "no"}
 
 
 def automatic_partition_view(flat_tensor: torch.Tensor, period: int) -> torch.Tensor:
@@ -167,6 +172,7 @@ def gefen_automatic_fused_update(
         packed_indices,
         beta1,
         lr,
+        use_v2=FUSE_GEFEN_UPDATE_V2,
     )
 
 

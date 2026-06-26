@@ -61,6 +61,26 @@ int choose_threads(int64_t period) {
     return threads;
 }
 
+// period == 1: vmean per block is just (1-beta2)*grad^2 + beta2*vmean, no
+// reduction. v1 launches one 32-thread block per element here (millions of
+// near-empty blocks); a flat grid-stride kernel is bit-identical and well
+// occupied.
+template <typename scalar_t>
+__global__ void automatic_vmean_update_period1_kernel(
+    float* __restrict__ vmean,
+    const scalar_t* __restrict__ grad_view,
+    int64_t num_blocks,
+    float beta2
+) {
+    const int64_t stride = static_cast<int64_t>(gridDim.x) * blockDim.x;
+    for (int64_t idx = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+         idx < num_blocks; idx += stride) {
+        const float grad_value = static_cast<float>(grad_view[idx]);
+        const float mean_square = grad_value * grad_value;
+        vmean[idx] = beta2 * vmean[idx] + (1.0f - beta2) * mean_square;
+    }
+}
+
 }  // namespace
 
 void automatic_vmean_update_cuda(
@@ -96,6 +116,31 @@ void automatic_vmean_update_cuda(
     }
     if (period <= 0) {
         throw std::invalid_argument("Expected grad_view to have a positive period.");
+    }
+
+    if (period == 1) {
+        const int threads = 256;
+        int device_id = 0;
+        cudaGetDevice(&device_id);
+        int sm_count = 0;
+        cudaDeviceGetAttribute(&sm_count, cudaDevAttrMultiProcessorCount, device_id);
+        if (sm_count < 1) sm_count = 1;
+        int64_t nblocks = (num_blocks + threads - 1) / threads;
+        const int64_t cap = static_cast<int64_t>(sm_count) * 32;
+        if (nblocks > cap) nblocks = cap;
+        if (nblocks < 1) nblocks = 1;
+        AT_DISPATCH_FLOATING_TYPES_AND2(
+            at::kHalf, at::kBFloat16, grad_view.scalar_type(),
+            "automatic_vmean_update_period1", [&] {
+                automatic_vmean_update_period1_kernel<scalar_t>
+                    <<<static_cast<unsigned int>(nblocks), threads>>>(
+                        vmean.data_ptr<float>(),
+                        grad_view.data_ptr<scalar_t>(),
+                        num_blocks,
+                        static_cast<float>(beta2));
+            });
+        C10_CUDA_KERNEL_LAUNCH_CHECK();
+        return;
     }
 
     const int threads = choose_threads(period);

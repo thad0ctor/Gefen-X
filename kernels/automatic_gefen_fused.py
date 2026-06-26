@@ -30,6 +30,8 @@ def automatic_gefen_fused_update_cuda(
     packed_indices: bool,
     beta1: float,
     lr: float,
+    *,
+    use_v2: bool = True,
 ) -> None:
     tensors = {
         "p": p,
@@ -101,6 +103,19 @@ def automatic_gefen_fused_update_cuda(
         )
 
     module = _load_extension()
+    if use_v2 and not packed_indices:
+        module.automatic_gefen_fused_update_v2_cuda(
+            p,
+            grad_view.contiguous(),
+            m_sign,
+            m_magnitude,
+            stepsize.contiguous(),
+            codebook.contiguous(),
+            packed_indices,
+            beta1,
+            lr,
+        )
+        return
     module.automatic_gefen_fused_update_cuda(
         p,
         grad_view.contiguous(),
