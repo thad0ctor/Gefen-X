@@ -64,6 +64,51 @@ optimizer.zero_grad(set_to_none=True)
 print('Finished successfully.')
 ```
 
+### Learning rate (when porting an AdamW config)
+
+Gefen matches AdamW's *interface*, but it needs a **lower learning rate** —
+about **0.6× AdamW's** on the architectures we tested (Qwen3, i.e. SwiGLU MLP +
+grouped-query attention). This factor is **model-specific**, not a universal
+constant — it is set by the model's RMSNorm/block structure (see below), so treat
+0.6× as a starting point for Qwen3-family decoders and measure it for anything
+else. **At its own optimal LR, Gefen matches AdamW's loss and run-to-run
+reproducibility**, while keeping its optimizer-memory advantage; reused at AdamW's
+LR unchanged, it over-steps.
+
+Why: Gefen's second moment is a *block-shared* RMS of the gradient rather than
+AdamW's per-element `√v`. Globally the two take similar-magnitude steps, but on a
+few high-leverage tensors — most sharply the RMSNorm weights (`q_norm`/`k_norm`,
+whose length equals the head dim, so the whole tensor is a *single shared block*) —
+Gefen over-steps by ~1.5×. Those tensors set the stability ceiling, so the usable
+LR is ~0.6× AdamW's. This is most pronounced on modern decoder architectures
+(SwiGLU MLP + grouped-query attention, e.g. Qwen3).
+
+Measured on Qwen3-4B full fine-tune (each optimizer at its own optimum, then the
+naive drop-in):
+
+| Learning rate | Gefen vs AdamW | run-to-run spread |
+|---|---|---|
+| ~0.6× AdamW's (Gefen's optimum) | **matches AdamW** (ties at 300 and 800 steps) | tight (≈ AdamW) |
+| 1.0× AdamW's, but AdamW-LR too hot* | ~0.3–0.4 higher | ~5× AdamW |
+
+\* Both optimizers preferred a much lower LR than a typical AdamW default in this
+regime, so "1.0× AdamW's LR" above means an LR that is itself near AdamW's edge;
+the gap is the *extra* over-step Gefen incurs there.
+
+When porting an AdamW recipe, **scale the learning rate to ~0.6× and tune from
+there.** An LR comfortable for AdamW can sit past Gefen's stability edge, and Gefen
+does *not* tolerate raising the LR back up. The exact factor is set by the
+architecture's RMSNorm/block structure, so confirm on your own model — the simplest
+check is to compute, on a warmed AdamW state, `‖m̂/(√v̂+ε)‖ / ‖m̂/(√blockmean(v̂)+ε)‖`
+for the norm-weight tensors; that ratio is the LR scale factor.
+
+**If your recipe uses a nonzero `weight_decay`:** AdamW (and Gefen) apply
+*decoupled* weight decay, so the per-step regularization is `lr × weight_decay`.
+Scaling `lr` down to ~0.6× therefore weakens decay by the same factor. To hold
+regularization constant, scale `weight_decay` up correspondingly (≈ `1 / 0.6`), or
+retune it. (Our measurements used `weight_decay = 0`, so this follows from the
+decoupled-decay definition rather than direct testing.)
+
 ## Hugging Face Trainer
 
 Until native `optim="gefen"` support is released in Transformers, pass Gefen to
