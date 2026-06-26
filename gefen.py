@@ -12,6 +12,39 @@ FUSE_AUTOMATIC_VMEAN_UPDATE = True
 FUSE_GEFEN_AUTOMATIC_STEP = True
 FUSE_HISTOGRAM_FOR_EXACT = True
 
+# --- DIAGNOSTIC / PROTOTYPE FLAGS (default off; uncommitted research only) ---
+# Decomposition ablations: route the param through a non-fused reference step so
+# the two Gefen approximations can be toggled independently.
+#   ABLATE_FULL_V: per-element fp32 2nd moment (kills shared-vmean approximation)
+#   ABLATE_FULL_M: per-element unquantized fp32 1st moment (kills codebook quant)
+# Both False -> non-fused stock (quant m + shared v), used to validate the path.
+ABLATE_FULL_V = False
+ABLATE_FULL_M = False
+# Force the non-fused reference path (with both ablations off) to validate that
+# it reproduces the fused stock step.
+_GEFEN_FORCE_NONFUSED = False
+# Prototype: keep full AdamW-style fp32 m+v (no quant, per-element) ONLY for
+# parameters whose ndim <= this threshold (1 -> RMSNorm weights / biases), and
+# additionally any param with numel <= SELECTIVE_FP32_MAX_NUMEL. Everything else
+# uses stock Gefen. This is the bnb-style "don't quantize the small tensors".
+SELECTIVE_FP32 = False
+SELECTIVE_FP32_MAX_NDIM = 1
+SELECTIVE_FP32_MAX_NUMEL = 0
+# Prototype: always use the coarse shape-aligned fallback period for 2D weights
+# instead of the noisy variance-drop search, so the period stops flipping between
+# runs (variance control). Independent of partitioning.MEMORY_SAFE_FALLBACK.
+FORCE_ROW_PERIOD = False
+
+
+def _selective_fp32_param(param: torch.Tensor) -> bool:
+    if not SELECTIVE_FP32:
+        return False
+    if param.dim() <= SELECTIVE_FP32_MAX_NDIM:
+        return True
+    if SELECTIVE_FP32_MAX_NUMEL > 0 and param.numel() <= SELECTIVE_FP32_MAX_NUMEL:
+        return True
+    return False
+
 # Dispatch between the two bit-identical fused update kernels (v1 single-pass,
 # v2 two-phase) is decided per call inside automatic_gefen_fused_update_cuda from
 # the param's num_blocks / period vs the device SM count -- the real driver of
@@ -499,6 +532,12 @@ class Gefen(torch.optim.Optimizer):
     def _predict_period_from_grad_sq(
         self, param_name: str, param: torch.Tensor, grad: torch.Tensor
     ) -> int:
+        if FORCE_ROW_PERIOD and param.dim() >= 2:
+            from gefen.partitioning import memory_safe_fallback_period
+
+            forced = memory_safe_fallback_period(param.numel(), tuple(param.shape))
+            if forced >= 8:
+                return forced
         backend = _resolve_find_period_backend(grad)
         if backend == "cuda_kernel":
             grad_work = grad.to_local() if hasattr(grad, "to_local") else grad
@@ -796,9 +835,125 @@ class Gefen(torch.optim.Optimizer):
         quantized_m = codebook[indices.long()].to(dtype=grad_view.dtype)
         return quantized_m * state["m_magnitude"]
 
+    def _step_full_adamw(
+        self, group, p: torch.Tensor, grad: torch.Tensor
+    ) -> None:
+        # Per-element fp32 m+v AdamW reference for the selective-precision
+        # prototype (no quantization, no period). Used for tiny/1D params.
+        if hasattr(grad, "to_local"):
+            grad = grad.to_local()
+        if hasattr(grad, "wait"):
+            grad = grad.wait()
+        state = self.state[p]
+        beta1 = group["beta1"]
+        beta2 = group["beta2"]
+        lr = group["lr"]
+        eps = group["eps"]
+        p_local = (
+            p.to_local()
+            if (hasattr(p, "to_local") and hasattr(p, "placements"))
+            else p
+        )
+        if "step" not in state:
+            state["step"] = 0
+            state["m_full"] = torch.zeros_like(p_local, dtype=torch.float32)
+            state["v_full"] = torch.zeros_like(p_local, dtype=torch.float32)
+        if group["weight_decay"] > 0.0:
+            p_local.mul_(1 - lr * group["weight_decay"])
+        state["step"] += 1
+        m = state["m_full"]
+        v = state["v_full"]
+        m.lerp_(grad, 1 - beta1)
+        v.mul_(beta2).addcmul_(grad, grad, value=1 - beta2)
+        bc1 = 1 - beta1 ** state["step"]
+        bc2 = 1 - beta2 ** state["step"]
+        h = (v / bc2).sqrt_().add_(eps)
+        p_local.addcdiv_(m, h, value=-lr / bc1)
+
+    def _step_automatic_ablation(
+        self, group, param_name: str, p: torch.Tensor, grad: torch.Tensor
+    ) -> None:
+        # Non-fused reference step used only for the decomposition ablations.
+        # ABLATE_FULL_V -> per-element fp32 second moment; ABLATE_FULL_M ->
+        # per-element unquantized first moment. With both False this is the
+        # non-fused stock path (quant m + shared v) and must match the fused step.
+        if hasattr(grad, "to_local"):
+            grad = grad.to_local()
+        if hasattr(grad, "wait"):
+            grad = grad.wait()
+        state = self.state[p]
+        beta1 = group["beta1"]
+        beta2 = group["beta2"]
+        lr = group["lr"]
+        eps = group["eps"]
+        flat_grad = grad.reshape(-1)
+
+        if "step" not in state:
+            if "automatic_period" in state:
+                automatic_period = state["automatic_period"]
+            elif p.numel() == 1:
+                automatic_period = 1
+            else:
+                automatic_period = self._predict_period_from_grad_sq(
+                    param_name, p, grad
+                )
+            state["automatic_period"] = automatic_period
+            state["step"] = 0
+            grad_view0 = self._automatic_view(flat_grad, automatic_period)
+            self._init_gefen_state(state, grad_view0)
+            state["vmean"] = torch.zeros_like(
+                grad_view0[:, 0:1], dtype=torch.float32
+            )
+            if ABLATE_FULL_V:
+                state["v_full"] = torch.zeros_like(grad_view0, dtype=torch.float32)
+            if ABLATE_FULL_M:
+                state["m_full"] = torch.zeros_like(grad_view0, dtype=torch.float32)
+
+        automatic_period = state["automatic_period"]
+        grad_view = self._automatic_view(flat_grad, automatic_period)
+
+        self._automatic_vmean_update(state["vmean"], grad_view, beta2)
+        if ABLATE_FULL_V:
+            state["v_full"].mul_(beta2).addcmul_(
+                grad_view, grad_view, value=1 - beta2
+            )
+
+        state["step"] += 1
+        p_local = (
+            p.to_local()
+            if (hasattr(p, "to_local") and hasattr(p, "placements"))
+            else p
+        )
+        if group["weight_decay"] > 0.0:
+            p_local.mul_(1 - lr * group["weight_decay"])
+
+        bc1 = 1 - beta1 ** state["step"]
+        bc2 = 1 - beta2 ** state["step"]
+        if ABLATE_FULL_V:
+            h = (state["v_full"] / bc2).sqrt().add_(eps)
+        else:
+            h = (state["vmean"] / bc2).sqrt().add_(eps)
+        stepsize = (1.0 / bc1) / h
+
+        if ABLATE_FULL_M:
+            state["m_full"].lerp_(grad_view, 1 - beta1)
+            shared_m = state["m_full"]
+        else:
+            shared_m = self._automatic_momentum_update(state, grad_view, beta1)
+
+        update = (shared_m * stepsize).reshape(grad.size())
+        update.mul_(lr)
+        p_local.add_(-update)
+
     def _step_automatic(
         self, group, param_name: str, p: torch.Tensor, grad: torch.Tensor
     ) -> None:
+        if SELECTIVE_FP32 and _selective_fp32_param(p):
+            self._step_full_adamw(group, p, grad)
+            return
+        if ABLATE_FULL_V or ABLATE_FULL_M or _GEFEN_FORCE_NONFUSED:
+            self._step_automatic_ablation(group, param_name, p, grad)
+            return
         # Unwrap the gradient to its local shard for both the fused and
         # non-fused paths. Under FSDP2 the gradient arrives as a sharded DTensor;
         # the raw CUDA kernels (vmean + fused Gefen update) need a materialized,
