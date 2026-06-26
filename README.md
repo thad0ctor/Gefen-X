@@ -97,7 +97,7 @@ trainer = Trainer(
 
 ### Distributed Training
 
-Gefen is fully compatible with standard distributed training setups, including PyTorch DDP, PyTorch FSDP, and all flavors of DeepSpeed ZeRO. In the usual DDP, FSDP, and DeepSpeed ZeRO workflows, Gefen can be used like any other PyTorch optimizer. For sharded-initialization workflows where the model is constructed on `meta` tensors or otherwise not fully materialized before sharding, such as TorchTitan-style FSDP2 initialization with `fully_shard(...)` followed by `to_empty(...)`, pass `fused=False` to the Gefen optimizer. 
+Gefen is fully compatible with standard distributed training setups, including PyTorch DDP, PyTorch FSDP (including FSDP2 with `fully_shard`), and all flavors of DeepSpeed ZeRO. Gefen can be used like any other PyTorch optimizer in these workflows, with either `fused=True` or `fused=False`.
 
 
 ### Extension: Gefen-Muon

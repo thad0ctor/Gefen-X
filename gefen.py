@@ -826,11 +826,15 @@ class Gefen(torch.optim.Optimizer):
     def _step_automatic(
         self, group, param_name: str, p: torch.Tensor, grad: torch.Tensor
     ) -> None:
-        if not self.fused:
-            if hasattr(grad, "to_local"):
-                grad = grad.to_local()
-            if hasattr(grad, "wait"):
-                grad = grad.wait()
+        # Unwrap the gradient to its local shard for both the fused and
+        # non-fused paths. Under FSDP2 the gradient arrives as a sharded DTensor;
+        # the raw CUDA kernels (vmean + fused Gefen update) need a materialized,
+        # contiguous local tensor, otherwise they hit "data is not allocated
+        # yet". The non-fused path already relied on this unwrap.
+        if hasattr(grad, "to_local"):
+            grad = grad.to_local()
+        if hasattr(grad, "wait"):
+            grad = grad.wait()
 
         state = self.state[p]
         beta1 = group["beta1"]
@@ -840,12 +844,29 @@ class Gefen(torch.optim.Optimizer):
 
         flat_grad = grad.reshape(-1)
 
+        # Empty local shard (e.g. a tiny or uneven DTensor/FSDP2 rank that owns
+        # zero elements): there is nothing to update and no period to predict.
+        # _iter_gefen_grad_periods already skips these during codebook learning,
+        # so state["automatic_period"] is never set for them; mirror that here
+        # and no-op instead of raising in the state-init branch below. The guard
+        # precedes every state access, so empty shards also no-op on later steps
+        # rather than KeyError-ing on the missing vmean.
+        if flat_grad.numel() == 0:
+            return
+
         if "step" not in state:
+            # grad (hence flat_grad) is already unwrapped to the local shard, and
+            # _predict_period_from_grad_sq derives the period from that local
+            # tensor. Size the first-step branch and divisibility check off the
+            # local shard too (flat_grad.numel()), matching
+            # _iter_gefen_grad_periods; mixing in the global DTensor p.numel()
+            # breaks on uneven or tiny shards.
+            local_numel = flat_grad.numel()
             if "automatic_period" in state:
                 automatic_period = state["automatic_period"]
-            elif p.numel() == 1:
+            elif local_numel == 1:
                 automatic_period = 1
-            elif p.numel() > 1:
+            elif local_numel > 1:
                 automatic_period = self._predict_period_from_grad_sq(
                     param_name, p, grad
                 )
@@ -856,12 +877,12 @@ class Gefen(torch.optim.Optimizer):
                     )
                 )
 
-            if p.numel() % automatic_period != 0:
+            if local_numel % automatic_period != 0:
                 raise ValueError(
                     "Automatic partition period {} does not divide parameter {} with numel {}".format(
                         automatic_period,
                         param_name,
-                        p.numel(),
+                        local_numel,
                     )
                 )
 
@@ -884,8 +905,18 @@ class Gefen(torch.optim.Optimizer):
 
         state["step"] += 1
 
+        # Under FSDP2 the parameter is a sharded DTensor; every in-place write
+        # below (weight decay, fused kernel, non-fused add_) must land on the
+        # local shard's storage. DTensor.to_local() returns a view of that
+        # storage, so in-place ops propagate back to the param.
+        p_local = (
+            p.to_local()
+            if (hasattr(p, "to_local") and hasattr(p, "placements"))
+            else p
+        )
+
         if group["weight_decay"] > 0.0:
-            p.mul_(1 - lr * group["weight_decay"])
+            p_local.mul_(1 - lr * group["weight_decay"])
 
         bias_correction_1 = 1 - beta1 ** state["step"]
         bias_correction_2 = 1 - beta2 ** state["step"]
@@ -893,24 +924,37 @@ class Gefen(torch.optim.Optimizer):
         stepsize = (1 / bias_correction_1) / h
 
         if self._use_fused_gefen_automatic_step():
-            self._automatic_gefen_fused_update(
-                p,
-                state,
-                grad_view,
-                beta1,
-                stepsize,
-                lr,
-            )
+            # The fused kernel flat-indexes p and requires it contiguous. A
+            # contiguous DTensor shard is written in place directly; a
+            # non-contiguous shard is updated on a contiguous copy that is then
+            # copied back so the in-place semantics are preserved.
+            if p_local.is_contiguous():
+                self._automatic_gefen_fused_update(
+                    p_local,
+                    state,
+                    grad_view,
+                    beta1,
+                    stepsize,
+                    lr,
+                )
+            else:
+                p_contig = p_local.contiguous()
+                self._automatic_gefen_fused_update(
+                    p_contig,
+                    state,
+                    grad_view,
+                    beta1,
+                    stepsize,
+                    lr,
+                )
+                p_local.copy_(p_contig)
 
             return
 
         shared_m = self._automatic_momentum_update(state, grad_view, beta1)
         update = (shared_m * stepsize).view(grad.size())
         update.mul_(lr)
-        if not self.fused and hasattr(p, "to_local") and hasattr(p, "placements"):
-            p.to_local().add_(-update)
-        else:
-            p.add_(-update)
+        p_local.add_(-update)
 
     def _optimizer_state_memory_bytes(self) -> int:
         total = 0
