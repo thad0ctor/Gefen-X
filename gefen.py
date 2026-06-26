@@ -88,6 +88,32 @@ def automatic_vmean_update(
     vmean.mul_(beta2).add_(block_mean_grad_sq, alpha=1 - beta2)
 
 
+# Process the nearest-codebook search in element chunks of this size. The search
+# is the dominant transient allocator on the non-fused step: the naive form
+# materialized ~10 full-size fp32/int64 temporaries (~40N bytes vs the 2N-byte
+# bf16 param), which drove the full-FT OOM. Bounding the work to a fixed element
+# count caps the scratch independent of param size while keeping each kernel
+# launch large enough to stay GPU-bound (smaller chunks regress on launch
+# overhead). The exact gather/abs/where keeps several int64/fp32 temporaries live
+# per chunk (~40 bytes/elem), so 8M elems -> ~320 MB scratch ceiling (vs the
+# param-proportional ~40N of the old whole-tensor form -- multiple GiB on a large
+# embedding). The search runs ~10% slower than that whole-tensor form at this
+# chunk size; it is not the step bottleneck (Newton-Schulz dominates), and the
+# bounded scratch is what turns the full-FT OOM into a fit.
+GEFEN_CODEBOOK_SEARCH_CHUNK = 1 << 23
+
+
+# Dequantize the stored uint8 indices into codebook coefficients in element
+# chunks of this size. The naive `codebook[stored.long()]` makes a full-size
+# int64 copy of the indices (8N bytes) on top of the full-size fp32 gather
+# (4N bytes), so the transient peaks at ~12N before the final cast even though
+# only the 2N/4N output is kept -- and this runs every step on both the fused and
+# non-fused paths. Chunked index_select keeps the int64 index temporary and the
+# fp32 gather bounded to one chunk while writing straight into the preallocated
+# output. Same constant as the search chunk for the same launch-overhead reason.
+GEFEN_DEQUANT_GATHER_CHUNK = 1 << 23
+
+
 def gefen_nearest_codebook_indices(
     codebook: torch.Tensor, normalized_vals: torch.Tensor
 ) -> torch.Tensor:
@@ -100,16 +126,41 @@ def gefen_nearest_codebook_indices(
             )
         )
     k = codebook.numel()
-    flat = normalized_vals.reshape(-1).float()
-    idx = torch.searchsorted(codebook, flat)
-    left = (idx - 1).clamp(0, k - 1)
-    right = idx.clamp(0, k - 1)
-    assignments = torch.where(
-        (flat - codebook[left]).abs() <= (flat - codebook[right]).abs(),
-        left,
-        right,
+    out = torch.empty(
+        normalized_vals.shape, dtype=torch.uint8, device=normalized_vals.device
     )
-    return assignments.to(torch.uint8).view(normalized_vals.shape)
+
+    # k == 1: the only codeword is index 0 for every value.
+    if k <= 1:
+        out.zero_()
+        return out
+
+    # The original assignment -- searchsorted into the sorted codebook, then a
+    # gather/abs/where tie-break (nearest codeword; equal distance resolves to the
+    # lower index via `<=`) -- materialized ~10 full-size fp32/int64 temporaries
+    # (~40N bytes vs the 2N-byte bf16 param), which drove the full-FT OOM. We run
+    # that *exact* arithmetic one element-chunk at a time, so the result is
+    # bit-for-bit identical to the old whole-tensor form for every input dtype
+    # (including the plain-Gefen fp32 momentum path, whose quantized indices feed
+    # the next optimizer step -- so the trajectory is unchanged), while the
+    # int64/fp32 scratch is bounded to a single chunk instead of the whole tensor.
+    flat_out = out.view(-1)
+    flat_in = normalized_vals.reshape(-1)
+    n = flat_in.numel()
+    chunk = GEFEN_CODEBOOK_SEARCH_CHUNK
+    for start in range(0, n, chunk):
+        stop = start + chunk
+        seg = flat_in[start:stop].float()
+        idx = torch.searchsorted(codebook, seg)
+        left = (idx - 1).clamp_(0, k - 1)
+        right = idx.clamp_(0, k - 1)
+        assign = torch.where(
+            (seg - codebook[left]).abs() <= (seg - codebook[right]).abs(),
+            left,
+            right,
+        )
+        flat_out[start:stop].copy_(assign.to(torch.uint8))
+    return out
 
 
 def gefen_dequantize_unpacked_indices(
@@ -125,9 +176,23 @@ def gefen_dequantize_unpacked_indices(
             )
         )
 
-    coeff = codebook[stored_indices.long()].to(
-        device=like_tensor.device, dtype=like_tensor.dtype
+    # Equivalent to `codebook[stored_indices.long()].to(device, dtype)` but
+    # without the full-size int64 index copy + full-size fp32 gather: chunked
+    # index_select gathers one bounded slice at a time and copy_ writes it into
+    # the preallocated output, casting fp32 -> output dtype (and crossing devices
+    # if needed) per chunk. The gathered values and the fp32->dtype rounding are
+    # identical to advanced indexing, so the result is bit-for-bit the same.
+    coeff = torch.empty(
+        stored_indices.shape, dtype=like_tensor.dtype, device=like_tensor.device
     )
+    coeff_flat = coeff.view(-1)
+    idx_flat = stored_indices.reshape(-1)
+    n = idx_flat.numel()
+    chunk = GEFEN_DEQUANT_GATHER_CHUNK
+    for start in range(0, n, chunk):
+        stop = start + chunk
+        seg = idx_flat[start:stop].long()
+        coeff_flat[start:stop].copy_(codebook.index_select(0, seg))
     if hasattr(like_tensor, "device_mesh") and hasattr(like_tensor, "placements"):
         coeff_cls = type(like_tensor)
         if hasattr(coeff_cls, "from_local"):
