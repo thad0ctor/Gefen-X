@@ -1,3 +1,5 @@
+# Gefen hybrid: the wrapper auto-dispatches the v1/v2 update kernel per param by
+# occupancy (the default). Leave GEFEN_UPDATE_V2 unset in the environment.
 base_model: Qwen/Qwen3-4B            # HF hub id or a local model path
 model_type: AutoModelForCausalLM
 tokenizer_type: AutoTokenizer

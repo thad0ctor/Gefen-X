@@ -196,6 +196,13 @@ __device__ __forceinline__ void atomic_max_nonneg(float* addr, float val) {
     // Valid only for val >= 0 and *addr >= 0 (positive-float bit patterns are
     // monotonic in their unsigned-int reinterpretation). magnitude is an
     // absolute value initialised to 0, so both hold.
+    // Skip NaN and negatives: `!(val >= 0)` is true for NaN (all NaN compares
+    // false) and for val < 0, so a NaN magnitude can never win the CAS and
+    // corrupt the running max -- matching the v1 single-kernel path, which
+    // leaves the max unchanged for NaN.
+    if (!(val >= 0.0f)) {
+        return;
+    }
     unsigned int* uaddr = reinterpret_cast<unsigned int*>(addr);
     unsigned int old = *uaddr;
     unsigned int assumed;
@@ -471,6 +478,20 @@ void automatic_gefen_fused_update_v2_cuda(
     }
     if (m_magnitude.size(0) != num_blocks || stepsize.size(0) != num_blocks) {
         throw std::invalid_argument("Expected m_magnitude and stepsize to match num_blocks.");
+    }
+    // Raw-pointer dtype guards: grad_view is read as scalar_t (the dispatch type
+    // from p), and m_magnitude/stepsize are read as float*; a mismatch would
+    // reinterpret memory at the wrong width.
+    if (grad_view.scalar_type() != p.scalar_type()) {
+        throw std::invalid_argument("Expected grad_view dtype to match p.");
+    }
+    if (m_magnitude.scalar_type() != at::kFloat || stepsize.scalar_type() != at::kFloat) {
+        throw std::invalid_argument("Expected m_magnitude and stepsize to have dtype float32.");
+    }
+    // nearest_codebook_index() returns uint8_t, so a codebook larger than 256
+    // entries would wrap the stored indices; also reject an empty table.
+    if (codebook.numel() < 1 || codebook.numel() > 256) {
+        throw std::invalid_argument("Expected codebook size in [1, 256].");
     }
 
     auto new_magnitude = at::zeros_like(m_magnitude);

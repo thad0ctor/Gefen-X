@@ -28,7 +28,7 @@ def make(numel, period):
     g = torch.Generator(device=DEV).manual_seed(7)
     p = (torch.randn(numel, device=DEV, dtype=torch.bfloat16, generator=g) * 0.02).contiguous()
     gv = (torch.randn(nb, period, device=DEV, dtype=torch.bfloat16, generator=g) * 1e-3).contiguous()
-    ms = torch.randint(0, 256, (numel,), device=DEV, dtype=torch.uint8)
+    ms = torch.randint(0, 256, (numel,), device=DEV, dtype=torch.uint8, generator=g)
     mm = (torch.rand(nb, 1, device=DEV, dtype=torch.float32, generator=g) * 1e-3).contiguous()
     ss = (torch.rand(nb, 1, device=DEV, dtype=torch.float32, generator=g) + 0.5).contiguous()
     return p, gv, ms, mm, ss
