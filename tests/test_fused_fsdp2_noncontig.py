@@ -20,6 +20,13 @@ import torch
 
 from gefen import Gefen
 
+# Optional so the `python tests/...py` script path still runs without pytest
+# installed; when pytest IS present it discovers the test_* wrappers below.
+try:
+    import pytest
+except ImportError:  # pragma: no cover
+    pytest = None
+
 DEV = "cuda"
 LR = 5e-5
 
@@ -77,42 +84,66 @@ def case_B():
     os.environ.setdefault("WORLD_SIZE", "1")
     if not dist.is_initialized():
         dist.init_process_group(backend="nccl", rank=0, world_size=1)
-    mesh = init_device_mesh("cuda", (1,))
+    # Always tear the default process group back down, even if step() or the
+    # oracle comparison raises, so a later distributed test doesn't inherit a
+    # live default group.
+    try:
+        mesh = init_device_mesh("cuda", (1,))
 
-    torch.manual_seed(1)
-    M, N = 48, 64  # numel 3072
-    init = torch.randn(M, N, device=DEV, dtype=torch.bfloat16)
-    grad = torch.randn(M, N, device=DEV, dtype=torch.bfloat16) * 0.01
+        torch.manual_seed(1)
+        M, N = 48, 64  # numel 3072
+        init = torch.randn(M, N, device=DEV, dtype=torch.bfloat16)
+        grad = torch.randn(M, N, device=DEV, dtype=torch.bfloat16) * 0.01
 
-    # --- DTensor param with a NON-contiguous local shard ---
-    local_nc = make_noncontig(init.clone())
-    p = torch.nn.Parameter(
-        DTensor.from_local(local_nc, mesh, [Shard(0)], run_check=False)
+        # --- DTensor param with a NON-contiguous local shard ---
+        local_nc = make_noncontig(init.clone())
+        p = torch.nn.Parameter(
+            DTensor.from_local(local_nc, mesh, [Shard(0)], run_check=False)
+        )
+        grad_dt = DTensor.from_local(grad.clone(), mesh, [Shard(0)], run_check=False)
+        p.grad = grad_dt
+
+        opt = Gefen([p], lr=LR, fused=True)
+        opt.step()
+
+        updated_local = p.to_local()
+
+        # --- plain-tensor oracle: same single fused step on a contiguous param ---
+        p_ref = torch.nn.Parameter(init.clone())
+        opt_ref = Gefen([p_ref], lr=LR, fused=True)
+        p_ref.grad = grad.clone()
+        opt_ref.step()
+
+        changed = not torch.equal(updated_local.float(), init.float())
+        local_was_noncontig = not local_nc.is_contiguous()
+        max_abs = (updated_local.float() - p_ref.detach().float()).abs().max().item()
+        ok = changed and (max_abs == 0.0)
+        print(f"[B] local shard non-contiguous on entry={local_was_noncontig}")
+        print(f"[B] DTensor param changed={changed}  max|dtensor-oracle|={max_abs:.3e}")
+        print(f"[B] {'PASS' if ok else 'FAIL'}")
+
+        return ok and local_was_noncontig
+    finally:
+        if dist.is_initialized():
+            dist.destroy_process_group()
+
+
+# pytest entry points so `pytest tests/` collects this module (the case_* are
+# plain helpers pytest would otherwise ignore). Skipped without CUDA since the
+# fused path is GPU-only.
+if pytest is not None:
+    requires_cuda = pytest.mark.skipif(
+        not torch.cuda.is_available(),
+        reason="fused FSDP2 path requires a CUDA device",
     )
-    grad_dt = DTensor.from_local(grad.clone(), mesh, [Shard(0)], run_check=False)
-    p.grad = grad_dt
 
-    opt = Gefen([p], lr=LR, fused=True)
-    opt.step()
+    @requires_cuda
+    def test_noncontig_plain_param_copyback():
+        assert case_A()
 
-    updated_local = p.to_local()
-
-    # --- plain-tensor oracle: same single fused step on a contiguous param ---
-    p_ref = torch.nn.Parameter(init.clone())
-    opt_ref = Gefen([p_ref], lr=LR, fused=True)
-    p_ref.grad = grad.clone()
-    opt_ref.step()
-
-    changed = not torch.equal(updated_local.float(), init.float())
-    local_was_noncontig = not local_nc.is_contiguous()
-    max_abs = (updated_local.float() - p_ref.detach().float()).abs().max().item()
-    ok = changed and (max_abs == 0.0)
-    print(f"[B] local shard non-contiguous on entry={local_was_noncontig}")
-    print(f"[B] DTensor param changed={changed}  max|dtensor-oracle|={max_abs:.3e}")
-    print(f"[B] {'PASS' if ok else 'FAIL'}")
-
-    dist.destroy_process_group()
-    return ok and local_was_noncontig
+    @requires_cuda
+    def test_noncontig_dtensor_local_shard():
+        assert case_B()
 
 
 if __name__ == "__main__":

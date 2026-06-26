@@ -812,11 +812,18 @@ class Gefen(torch.optim.Optimizer):
         flat_grad = grad.reshape(-1)
 
         if "step" not in state:
+            # grad (hence flat_grad) is already unwrapped to the local shard, and
+            # _predict_period_from_grad_sq derives the period from that local
+            # tensor. Size the first-step branch and divisibility check off the
+            # local shard too (flat_grad.numel()), matching
+            # _iter_gefen_grad_periods; mixing in the global DTensor p.numel()
+            # breaks on uneven or tiny shards.
+            local_numel = flat_grad.numel()
             if "automatic_period" in state:
                 automatic_period = state["automatic_period"]
-            elif p.numel() == 1:
+            elif local_numel == 1:
                 automatic_period = 1
-            elif p.numel() > 1:
+            elif local_numel > 1:
                 automatic_period = self._predict_period_from_grad_sq(
                     param_name, p, grad
                 )
@@ -827,12 +834,12 @@ class Gefen(torch.optim.Optimizer):
                     )
                 )
 
-            if p.numel() % automatic_period != 0:
+            if local_numel % automatic_period != 0:
                 raise ValueError(
                     "Automatic partition period {} does not divide parameter {} with numel {}".format(
                         automatic_period,
                         param_name,
-                        p.numel(),
+                        local_numel,
                     )
                 )
 
