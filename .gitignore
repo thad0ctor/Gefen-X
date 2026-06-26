@@ -2,3 +2,6 @@
 __pycache__/
 kernels/__pycache__/
 gefen.egg-info/
+
+# benchmark outputs / research notes — kept OUTSIDE the repo
+benchmarks/
