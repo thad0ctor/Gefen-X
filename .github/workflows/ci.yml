@@ -1,0 +1,82 @@
+name: CI
+
+# CPU job runs automatically on every push / PR. The GPU test job is opt-in
+# (manual workflow_dispatch) because the kernel parity tests require a CUDA
+# device + nvcc, which GitHub-hosted runners do not provide. Trigger it from
+# the Actions tab if you have a self-hosted GPU runner labelled [self-hosted, gpu].
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      run_gpu_tests:
+        description: "Run CUDA kernel parity tests on a self-hosted GPU runner"
+        type: boolean
+        default: false
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  cpu:
+    name: CPU smoke (py${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.9", "3.10", "3.11"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+
+      - name: Install CPU PyTorch + package
+        run: |
+          python -m pip install --upgrade pip
+          # CPU-only torch wheel: the CUDA wheel is ~2GB and pointless here.
+          pip install torch --index-url https://download.pytorch.org/whl/cpu
+          # torch is already satisfied, so this only pulls numba/numpy/ninja + gefen.
+          pip install .
+
+      - name: Byte-compile all sources
+        run: python -m compileall -q gefen.py gefen_muon.py hybrid.py partitioning.py quantization.py kernels
+
+      - name: Import smoke (no CUDA required)
+        # Run from a clean dir so the installed package is imported, not the source tree.
+        working-directory: ${{ runner.temp }}
+        run: |
+          python - <<'PY'
+          import gefen
+          # Derive the public optimizers from __all__ so this adapts per branch
+          # (e.g. main has no GefenMuonHybrid). "kernels" is a submodule, not an
+          # optimizer, so skip it here.
+          names = [n for n in gefen.__all__ if n != "kernels"]
+          loaded = {n: getattr(gefen, n).__name__ for n in names}
+          assert "Gefen" in loaded, "Gefen must always be importable"
+          print("import OK ->", loaded)
+          PY
+
+  gpu-tests:
+    name: GPU kernel parity tests
+    # Only when explicitly requested via the Actions tab. Skipped on push/PR so the
+    # job never sits pending forever when no GPU runner is connected.
+    if: github.event_name == 'workflow_dispatch' && inputs.run_gpu_tests
+    runs-on: [self-hosted, gpu]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install package (CUDA torch expected on the runner)
+        run: |
+          python -m pip install --upgrade pip
+          pip install .
+
+      - name: Run CUDA parity tests
+        run: |
+          python tests/test_fused_update_v2_parity.py
+          python tests/test_fused_fsdp2_noncontig.py
