@@ -13,6 +13,12 @@ FUSE_AUTOMATIC_VMEAN_UPDATE = True
 FUSE_GEFEN_AUTOMATIC_STEP = True
 FUSE_HISTOGRAM_FOR_EXACT = True
 
+# Dispatch between the two bit-identical fused update kernels (v1 single-pass,
+# v2 two-phase) is decided per call inside automatic_gefen_fused_update_cuda from
+# the param's num_blocks / period vs the device SM count -- the real driver of
+# which kernel is faster (the old arch allowlist was a proxy for this). Env
+# GEFEN_UPDATE_V2 still hard-forces the choice. See fused_bench/PERF.md.
+
 
 def automatic_partition_view(flat_tensor: torch.Tensor, period: int) -> torch.Tensor:
     if flat_tensor.dim() != 1:
@@ -71,10 +77,14 @@ def automatic_vmean_update(
         automatic_vmean_update_cuda(vmean, grad_view, beta2)
         return
 
-    # Accumulate in float32 to match the fused kernel and the float32 vmean
-    # buffer; grad_view is the model dtype (e.g. bf16) under non-fused training.
-    grad_view_f32 = grad_view.float()
-    block_mean_grad_sq = torch.mean(grad_view_f32 * grad_view_f32, dim=1, keepdim=True)
+    # Square in the model dtype (e.g. bf16) rather than promoting to float32
+    # first: this avoids a full-size float32 temporary (~3-4% faster on the
+    # non-fused step for large params) at the cost of ~1e-3 relative error in
+    # the second moment, which is below the bf16 training noise floor. The
+    # float32 vmean buffer still keeps the running estimate stable; add_ upcasts
+    # the bf16 increment. (Diverges ~1e-3 from the fused kernel, which squares in
+    # float32 — there is no cross-path parity requirement.)
+    block_mean_grad_sq = torch.mean(grad_view * grad_view, dim=1, keepdim=True)
     vmean.mul_(beta2).add_(block_mean_grad_sq, alpha=1 - beta2)
 
 

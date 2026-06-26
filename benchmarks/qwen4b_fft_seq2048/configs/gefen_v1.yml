@@ -1,0 +1,33 @@
+# Gefen "v1" kernel. The v1/v2 update kernel is chosen at runtime (per-param
+# occupancy, with an env override), so `optimizer: gefen` alone does NOT pin v1.
+# To force the v1 path for this benchmark, launch with GEFEN_UPDATE_V2=0 set in
+# the environment.
+base_model: Qwen/Qwen3-4B            # HF hub id or a local model path
+model_type: AutoModelForCausalLM
+tokenizer_type: AutoTokenizer
+load_in_8bit: false
+load_in_4bit: false
+datasets:
+  - path: tatsu-lab/alpaca
+    type: alpaca
+dataset_prepared_path: ./prepared/qwen4b_fft_s2048   # local cache dir
+val_set_size: 0.0
+output_dir: ./out/qwen4b_fft_s2048/gefen_v1
+sequence_len: 2048
+sample_packing: false
+pad_to_sequence_len: true
+micro_batch_size: 1
+gradient_accumulation_steps: 1
+learning_rate: 5e-5
+lr_scheduler: constant
+warmup_steps: 5
+optimizer: gefen
+bf16: true
+flash_attention: true
+gradient_checkpointing: false
+seed: 42
+data_seed: 42
+logging_steps: 1
+max_steps: 40
+save_strategy: "no"
+special_tokens:
