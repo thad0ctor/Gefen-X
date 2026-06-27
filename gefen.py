@@ -1,4 +1,5 @@
 import math
+import os
 from itertools import chain
 from typing import Iterable, Optional, Tuple, Union
 
@@ -95,8 +96,30 @@ def automatic_vmean_update(
     # float32 vmean buffer still keeps the running estimate stable; add_ upcasts
     # the bf16 increment. (Diverges ~1e-3 from the fused kernel, which squares in
     # float32 — there is no cross-path parity requirement.)
-    block_mean_grad_sq = torch.mean(grad_view * grad_view, dim=1, keepdim=True)
-    vmean.mul_(beta2).add_(block_mean_grad_sq, alpha=1 - beta2)
+    #
+    # Stream the per-block mean-square reduction in row chunks so the full-size
+    # `grad_view * grad_view` temporary (the last param-proportional transient on
+    # the non-fused step -- ~594 MiB of bf16 on the 311M-element tied embedding) is
+    # never materialized whole. Each block's mean is a row-local reduction over
+    # dim=1, so chunking whole rows is bit-for-bit identical to the whole-tensor
+    # form. vmean.mul_(beta2) is applied once up front (it is the tiny [blocks,1]
+    # state, not param-proportional); the scaled increment is then added per chunk.
+    num_blocks = grad_view.shape[0]
+    period = grad_view.shape[1]
+    rows_per_chunk = max(1, GEFEN_MOMENTUM_UPDATE_CHUNK // period)
+    if rows_per_chunk >= num_blocks:
+        # Whole tensor fits one chunk (every param except the largest, e.g. the
+        # tied embedding): run the original two-op form directly. Avoids the
+        # per-param Python loop / slice overhead while staying the exact same math.
+        block_mean_grad_sq = torch.mean(grad_view * grad_view, dim=1, keepdim=True)
+        vmean.mul_(beta2).add_(block_mean_grad_sq, alpha=1 - beta2)
+        return
+    vmean.mul_(beta2)
+    for r0 in range(0, num_blocks, rows_per_chunk):
+        r1 = min(r0 + rows_per_chunk, num_blocks)
+        g = grad_view[r0:r1]
+        block_mean_grad_sq = torch.mean(g * g, dim=1, keepdim=True)
+        vmean[r0:r1].add_(block_mean_grad_sq, alpha=1 - beta2)
 
 
 # Process the nearest-codebook search in element chunks of this size. The search
@@ -123,6 +146,50 @@ GEFEN_CODEBOOK_SEARCH_CHUNK = 1 << 23
 # fp32 gather bounded to one chunk while writing straight into the preallocated
 # output. Same constant as the search chunk for the same launch-overhead reason.
 GEFEN_DEQUANT_GATHER_CHUNK = 1 << 23
+
+
+# Stream the whole non-fused momentum update + parameter apply (dequant -> lerp ->
+# per-block magnitude -> normalize -> re-quantize -> reconstruct -> scale -> p.add_)
+# in row (block) chunks of about this many elements. The stock non-fused path ran
+# every stage on the full tensor, so up to ~5 full-size fp32 temporaries
+# (dequantized current_m, the promoted fp32 grad, the lerp output updated_m, its
+# abs() reduction temp, the reconstructed shared_m) plus the fp32 update/-update
+# were simultaneously live -- on the 311M-element tied embedding that is multiple
+# GiB of transient fp32 scratch. Each block's update depends only on that block's
+# own row (the per-block max magnitude, normalize, and codebook round-trip are all
+# row-local), so processing whole rows one chunk at a time is bit-for-bit identical
+# to the whole-tensor form while capping every fp32 temporary to one chunk. Rows
+# are kept whole (never split mid-block) so the per-block max sees the full block.
+# Same element budget as the gather/search chunks for the same launch-overhead
+# reason; an exact multiple keeps each kernel launch GPU-bound.
+#
+# This constant also defines the "large param" routing threshold for the combined
+# non-fused step: a param whose local numel exceeds it actually triggers the
+# row-chunk loop (numel <= it runs whole-tensor in one iteration), so such params
+# stay on the per-param streaming path instead of the foreach-merged path -- i.e.
+# when a param is both "large" and would otherwise batch, streaming wins.
+GEFEN_MOMENTUM_UPDATE_CHUNK = 1 << 23
+
+
+# Non-fused step batching budget (in elements). The non-fused step runs a Python
+# loop over every parameter, each issuing ~48 small elementwise CUDA ops, so the
+# step is dominated by kernel-launch / CPU-dispatch overhead (~15k launches/step
+# on Qwen3-1.7B, ~half pure dispatch on the 113 tiny RMSNorm params that move
+# ~zero data). To cut that overhead we group parameters that share block geometry
+# -- identical (local numel, automatic_period) and identical hyperparameters --
+# and process each group as ONE merged (K*nblocks, period) tensor: the codebook
+# search, dequant, vmean update, normalization and param update then run as a
+# single set of ops over K params instead of K separate loop iterations. Because
+# every op in the non-fused path is per-block or per-element independent, merging
+# K params (a concatenation of their blocks) is bit-for-bit identical to looping
+# over them one at a time. The merged tensors are bounded to this many elements so
+# the extra transient stays small (the codebook-search scratch is independently
+# chunk-bounded); K = max(1, budget // numel), so tiny params batch wide (the big
+# launch win) while large params batch only a few at a time (their launch cost is
+# already amortized by real GPU work). Env-overridable for tuning / OOM headroom.
+GEFEN_NONFUSED_FOREACH_BUDGET = int(
+    os.environ.get("GEFEN_NONFUSED_FOREACH_BUDGET", str(1 << 25))
+)
 
 
 def gefen_nearest_codebook_indices(
@@ -945,8 +1012,31 @@ class Gefen(torch.optim.Optimizer):
         )
 
     def _automatic_momentum_update(
-        self, state, grad_view: torch.Tensor, beta1: float
-    ) -> torch.Tensor:
+        self,
+        state,
+        grad_view: torch.Tensor,
+        beta1: float,
+        stepsize: torch.Tensor,
+        lr: float,
+        p_local: torch.Tensor,
+    ) -> None:
+        # Streamed (row-chunked) momentum update *and* parameter apply. This is a
+        # numerics-preserving, low-transient-memory rewrite of the old
+        #     shared_m = <whole-tensor momentum update returning fp32 [blocks,period]>
+        #     update  = (shared_m * stepsize).view(grad.size()); update.mul_(lr)
+        #     p_local.add_(-update)
+        # sequence. The old form kept up to ~5 full-size fp32 temporaries live at
+        # once (current_m, the promoted fp32 grad, updated_m, its abs() temp, the
+        # reconstructed shared_m) plus the fp32 update/-update -- multiple GiB on
+        # the tied embedding. Every block's update is row-local (per-block max,
+        # normalize, codebook round-trip, and the elementwise scale/add all stay
+        # within one row), so we run the exact same arithmetic one whole-row chunk
+        # at a time, capping every fp32 temporary to one chunk while writing the
+        # result straight into p. Bit-for-bit identical to the whole-tensor form.
+        #
+        # Used by the per-param (incl. the large/streamed) non-fused path. The
+        # foreach-merged path uses the sibling _automatic_momentum_update_merged
+        # (bounded merged transient, scatter-back instead of in-place apply).
         if grad_view.dim() != 2:
             raise ValueError(
                 "Automatic shared momentum expects a 2D tensor, got dim={}".format(
@@ -954,41 +1044,130 @@ class Gefen(torch.optim.Optimizer):
                 )
             )
 
+        codebook = self._gefen_codebook
+        if codebook is None:
+            raise ValueError(
+                "Expected Gefen codebook to be initialized before the momentum update."
+            )
+        if codebook.device != grad_view.device:
+            raise ValueError(
+                "Gefen codebook device {} does not match grad_view device {}.".format(
+                    codebook.device,
+                    grad_view.device,
+                )
+            )
+
         period = state["automatic_period"]
-        current_m = (
-            self._gefen_dequantize_m_coefficients(state, grad_view)
-            * state["m_magnitude"]
-        )
-        # current_m is float32 (m_magnitude is float32); grad_view is the model
-        # dtype. lerp() requires both operands to share a dtype, so promote the
-        # gradient. This is the non-fused / FSDP2-meta-tensor path.
-        updated_m = current_m.lerp(grad_view.to(current_m.dtype), 1 - beta1)
+        m_codebook = state["m_codebook"]
+        m_magnitude = state["m_magnitude"]
+        num_blocks = grad_view.shape[0]
 
-        state["m_magnitude"].copy_(
-            self._automatic_reduce(updated_m.abs().reshape(-1), period, reduce_op="max")
-        )
+        # The apply writes p through a flat view so each row chunk maps to a
+        # contiguous element range. A contiguous shard is written in place; a
+        # non-contiguous shard is updated on a contiguous copy and copied back so
+        # the in-place semantics match the stock p_local.add_(-update).
+        p_contig = p_local.is_contiguous()
+        p_work = p_local if p_contig else p_local.contiguous()
+        p_flat = p_work.view(-1)
 
-        nonzero_mask = state["m_magnitude"] > 0
-        updated_m.div_(state["m_magnitude"])
-        updated_m.masked_fill_(~nonzero_mask, 0.0)
+        rows_per_chunk = max(1, GEFEN_MOMENTUM_UPDATE_CHUNK // period)
+        for r0 in range(0, num_blocks, rows_per_chunk):
+            r1 = min(r0 + rows_per_chunk, num_blocks)
 
-        indices = self._gefen_nearest_indices(updated_m)
-        self._gefen_set_indices(state, indices)
+            # Dequantize the stored (old) momentum coefficients for these rows and
+            # rescale by their old magnitude. Dequant returns grad_view.dtype
+            # (e.g. bf16); the * fp32 magnitude promotes current_m to fp32 -- same
+            # as the stock dequant(...) * m_magnitude.
+            current_m = (
+                gefen_dequantize_unpacked_indices(
+                    codebook, m_codebook[r0:r1], grad_view
+                )
+                * m_magnitude[r0:r1]
+            )
+            # lerp() needs matching dtypes, so promote the (bf16) grad rows to fp32.
+            updated_m = current_m.lerp(
+                grad_view[r0:r1].to(current_m.dtype), 1 - beta1
+            )
+
+            # New per-block magnitude = max |updated_m| over each row, written back
+            # into the persistent fp32 m_magnitude state in place.
+            mag_slot = m_magnitude[r0:r1]
+            mag_slot.copy_(
+                automatic_partition_reduce(
+                    updated_m.abs().reshape(-1), period, reduce_op="max"
+                )
+            )
+
+            nonzero_mask = mag_slot > 0
+            updated_m.div_(mag_slot)
+            updated_m.masked_fill_(~nonzero_mask, 0.0)
+
+            # Re-quantize the normalized coefficients and store the fresh indices.
+            indices = gefen_nearest_codebook_indices(codebook, updated_m)
+            gefen_set_unpacked_indices(m_codebook[r0:r1], indices)
+
+            # Reconstruct the quantized momentum, scale by the new magnitude, the
+            # per-block stepsize, and lr, then apply to p in place. Folding the
+            # scale/negate into this loop avoids the full-size fp32 shared_m and
+            # update/-update temporaries entirely.
+            shared_m = gefen_dequantize_unpacked_indices(codebook, indices, grad_view)
+            update = shared_m * mag_slot
+            update.mul_(stepsize[r0:r1]).mul_(lr)
+            # p_flat slice (bf16) += -update (fp32); alpha=-1 negates exactly
+            # (sign flip), so this matches the stock p_local.add_(-update).
+            p_flat[r0 * period : r1 * period].add_(update.reshape(-1), alpha=-1)
+
+        if not p_contig:
+            p_local.copy_(p_work)
+
+    def _automatic_momentum_update_merged(
+        self, state, grad_view: torch.Tensor, beta1: float
+    ) -> torch.Tensor:
+        # Whole-tensor (non-streamed) momentum reconstruct for the foreach-merged
+        # batch. `state` here is the synthetic merged dict assembled in
+        # _step_automatic_merged (automatic_period + the stacked merged m_magnitude
+        # / m_codebook buffers), and grad_view is the merged (K*nblocks, period)
+        # grid. The merged tensor is bounded by GEFEN_NONFUSED_FOREACH_BUDGET, so
+        # its fp32 temporaries are already small -- streaming it would only add
+        # kernel launches back and defeat the batching. This is the original
+        # whole-tensor momentum update with the chunked-gather fix (identical math
+        # to the per-param streamed sibling above), returning the reconstructed
+        # shared momentum (fp32 [K*nblocks, period]); the caller scatters it back
+        # to the K params via torch._foreach_add_.
+        if grad_view.dim() != 2:
+            raise ValueError(
+                "Automatic shared momentum expects a 2D tensor, got dim={}".format(
+                    grad_view.dim()
+                )
+            )
 
         codebook = self._gefen_codebook
         if codebook is None:
             raise ValueError(
                 "Expected Gefen codebook to be initialized before reconstructing quantized m."
             )
-        if codebook.device != indices.device:
-            raise ValueError(
-                "Gefen codebook device {} does not match index device {}.".format(
-                    codebook.device,
-                    indices.device,
-                )
-            )
 
-        quantized_m = codebook[indices.long()].to(dtype=grad_view.dtype)
+        period = state["automatic_period"]
+        current_m = (
+            gefen_dequantize_unpacked_indices(codebook, state["m_codebook"], grad_view)
+            * state["m_magnitude"]
+        )
+        updated_m = current_m.lerp(grad_view.to(current_m.dtype), 1 - beta1)
+
+        state["m_magnitude"].copy_(
+            automatic_partition_reduce(
+                updated_m.abs().reshape(-1), period, reduce_op="max"
+            )
+        )
+
+        nonzero_mask = state["m_magnitude"] > 0
+        updated_m.div_(state["m_magnitude"])
+        updated_m.masked_fill_(~nonzero_mask, 0.0)
+
+        indices = gefen_nearest_codebook_indices(codebook, updated_m)
+        gefen_set_unpacked_indices(state["m_codebook"], indices)
+
+        quantized_m = gefen_dequantize_unpacked_indices(codebook, indices, grad_view)
         return quantized_m * state["m_magnitude"]
 
     def _step_automatic(
@@ -1236,10 +1415,190 @@ class Gefen(torch.optim.Optimizer):
 
             return
 
-        shared_m = self._automatic_momentum_update(state, grad_view, beta1)
-        update = (shared_m * stepsize).view(grad.size())
+        # Streamed momentum update + parameter apply: row-chunked, bit-for-bit
+        # identical to the old whole-tensor form, but it never materializes the
+        # full-size fp32 shared_m / update / -update temporaries. This per-param
+        # path carries the memory win (it is where the few LARGE params -- esp. the
+        # tied embedding -- land; the many small same-shape params are routed to the
+        # foreach-merged path in step()).
+        self._automatic_momentum_update(state, grad_view, beta1, stepsize, lr, p_local)
+
+    # ------------------------------------------------------------------
+    # Batched (foreach / merged-tensor) non-fused step
+    #
+    # The per-param non-fused path above is correct but launch-bound. The methods
+    # below batch parameters that share block geometry into a single merged
+    # tensor and run the *same* arithmetic once over all of them, collapsing the
+    # per-param kernel launches. They are only used when fused=False, and only for
+    # params that are NOT "large" (numel <= GEFEN_MOMENTUM_UPDATE_CHUNK): a large
+    # param actually triggers the per-param streaming loop, so it stays on the
+    # per-param path (streaming wins over batching for memory/correctness).
+    # ------------------------------------------------------------------
+
+    def _nonfused_batch_eligible(self, p: torch.Tensor, grad: torch.Tensor) -> bool:
+        # Only the plain (non-DTensor / non-FSDP2), contiguous, CUDA path is
+        # batched. DTensor / async-collective gradients and non-contiguous shards
+        # keep the per-param path, which already handles their unwrap/copy-back.
+        if hasattr(grad, "to_local") or hasattr(grad, "wait"):
+            return False
+        if hasattr(p, "to_local") and hasattr(p, "placements"):
+            return False
+        if not grad.is_cuda:
+            return False
+        if not p.is_contiguous():
+            return False
+        # Large params (those that would actually stream in the per-param momentum
+        # update) stay per-param so they get the transient-VRAM win; only the
+        # smaller, launch-bound params are batched. This is the routing rule:
+        # large -> chunked-streaming path; small/batchable -> merged foreach path.
+        if grad.reshape(-1).numel() > GEFEN_MOMENTUM_UPDATE_CHUNK:
+            return False
+        return True
+
+    def _nonfused_batch_key(self, group, p: torch.Tensor):
+        # Params batch together only if every per-block op lines up bit-for-bit:
+        # identical local numel + automatic_period (=> identical (nblocks,period)
+        # block grid) and identical hyperparameters. lr may be a Tensor (LR
+        # schedule); that is unhashable and also implies per-step-varying scalars,
+        # so fall back to per-param for it.
+        lr = group["lr"]
+        if isinstance(lr, torch.Tensor):
+            return None
+        state = self.state[p]
+        period = state.get("automatic_period")
+        if period is None:
+            return None
+        grad = p.grad
+        local_numel = grad.reshape(-1).numel()
+        # Every merge invariant must be in the key. step: _step_automatic_merged
+        # uses one state's bias correction for the whole batch, so params at
+        # different step counts (e.g. one whose grad was None on a prior step)
+        # must not group. device/dtype: merged buffers only combine compatible
+        # tensors.
+        return (
+            p.device,
+            p.dtype,
+            grad.device,
+            grad.dtype,
+            local_numel,
+            period,
+            state["step"],
+            group["beta1"],
+            group["beta2"],
+            float(lr),
+            group["eps"],
+            group["weight_decay"],
+        )
+
+    def _nonfused_state_ready(self, p: torch.Tensor) -> bool:
+        state = self.state.get(p)
+        if state is None:
+            return False
+        return (
+            "step" in state
+            and "vmean" in state
+            and "m_magnitude" in state
+            and "m_codebook" in state
+            and "automatic_period" in state
+        )
+
+    def _dispatch_nonfused_batch(self, items) -> None:
+        # items: list of (group, name, p, grad) sharing block geometry + hypers.
+        # Sub-batch by an element budget so the merged transient stays bounded:
+        # K wide for tiny params (big launch win), narrow for larger params.
+        local_numel = items[0][2].grad.reshape(-1).numel()
+        budget = GEFEN_NONFUSED_FOREACH_BUDGET
+        k = max(1, budget // max(local_numel, 1))
+        for start in range(0, len(items), k):
+            chunk = items[start : start + k]
+            if len(chunk) == 1:
+                group, name, p, grad = chunk[0]
+                self._step_automatic(group, name, p, grad)
+            else:
+                self._step_automatic_merged(chunk)
+
+    def _step_automatic_merged(self, items) -> None:
+        # All items share (local numel, automatic_period, beta1, beta2, lr, eps,
+        # weight_decay). Stack their per-block tensors into one merged
+        # (K*nblocks, period) problem and run the existing non-fused arithmetic on
+        # it. Each op in that arithmetic is per-block (vmean/magnitude reductions,
+        # stepsize, weight decay) or per-element (lerp, codebook search, dequant,
+        # the final update), so the merged result is bit-for-bit identical to
+        # looping over the params one at a time. The stepsize op sequence here is
+        # the algebraic equal of the per-param cached-buffer form in
+        # _step_automatic (scalar/tensor == reciprocal(tensor)*scalar), verified
+        # bit-identical by the K-series scratch-buffer change.
+        group0 = items[0][0]
+        beta1 = group0["beta1"]
+        beta2 = group0["beta2"]
+        lr = group0["lr"]
+        eps = group0["eps"]
+        weight_decay = group0["weight_decay"]
+
+        first_state = self.state[items[0][2]]
+        period = first_state["automatic_period"]
+        k = len(items)
+
+        grad_views = []
+        vmeans = []
+        mags = []
+        codebooks = []
+        params = []
+        for _, _, p, grad in items:
+            flat = grad.detach().reshape(-1)
+            grad_views.append(flat.view(-1, period))
+            state = self.state[p]
+            vmeans.append(state["vmean"])
+            mags.append(state["m_magnitude"])
+            codebooks.append(state["m_codebook"])
+            params.append(p)
+        nblocks = grad_views[0].shape[0]
+
+        # Merged views. torch.stack copies into fresh contiguous buffers, so the
+        # per-param state tensors are untouched until we scatter the results back.
+        merged_grad = torch.stack(grad_views).reshape(k * nblocks, period)
+        merged_vmean = torch.stack(vmeans).reshape(k * nblocks, 1)
+        merged_mag = torch.stack(mags).reshape(k * nblocks, 1)
+        merged_codebook = torch.stack(codebooks).reshape(k * nblocks, period)
+
+        # vmean update (same non-fused arithmetic, on the merged block grid).
+        automatic_vmean_update(merged_vmean, merged_grad, beta2, use_fused=False)
+
+        for _, _, p, _ in items:
+            self.state[p]["step"] += 1
+        step_count = first_state["step"]
+
+        if weight_decay > 0.0:
+            torch._foreach_mul_(params, 1 - lr * weight_decay)
+
+        bias_correction_1 = 1 - beta1 ** step_count
+        bias_correction_2 = 1 - beta2 ** step_count
+        h = (merged_vmean.sqrt() / math.sqrt(bias_correction_2)).add_(eps)
+        stepsize = (1 / bias_correction_1) / h
+
+        merged_state = {
+            "automatic_period": period,
+            "m_magnitude": merged_mag,
+            "m_codebook": merged_codebook,
+        }
+        shared_m = self._automatic_momentum_update_merged(
+            merged_state, merged_grad, beta1
+        )
+        update = shared_m * stepsize
         update.mul_(lr)
-        p_local.add_(-update)
+
+        # Scatter results back. The momentum update wrote the new magnitude and
+        # codebook indices into the merged buffers in place; copy them, the new
+        # vmean, and the parameter delta into each param/state with one foreach
+        # call apiece.
+        update_views = update.reshape(k, nblocks, period)
+        param_updates = [update_views[i].reshape(params[i].shape) for i in range(k)]
+        torch._foreach_add_(params, param_updates, alpha=-1.0)
+        torch._foreach_copy_(vmeans, list(merged_vmean.reshape(k, nblocks, 1).unbind(0)))
+        torch._foreach_copy_(mags, list(merged_mag.reshape(k, nblocks, 1).unbind(0)))
+        torch._foreach_copy_(
+            codebooks, list(merged_codebook.reshape(k, nblocks, period).unbind(0))
+        )
 
     def _optimizer_state_memory_bytes(self) -> int:
         total = 0
@@ -1363,13 +1722,48 @@ class Gefen(torch.optim.Optimizer):
             with torch.enable_grad():
                 loss = closure()
 
+        # The fused path has its own batched CUDA kernel per param; only the
+        # non-fused Python-loop path benefits from foreach/merged batching.
+        # Gate on BOTH fused flags: the merged path hard-codes use_fused=False for
+        # the vmean update, so it must not engage while fused vmean is still on
+        # (e.g. FUSE_GEFEN_AUTOMATIC_STEP off but FUSE_AUTOMATIC_VMEAN_UPDATE on),
+        # which would otherwise change the vmean math vs the per-param path.
+        batch_nonfused = (
+            not self._use_fused_gefen_automatic_step()
+            and not self._use_fused_automatic_vmean()
+        )
+
+        # Collect parameters that share block geometry + hyperparameters so they
+        # can be processed as one merged tensor (see _step_automatic_merged).
+        # Anything not eligible (fused path, first step before state exists,
+        # DTensor/FSDP2 shards, LR-Tensor schedules, or LARGE params that should
+        # stream) keeps the per-param path.
+        nonfused_groups = {}
         for group in self.param_groups:
             name = group["name"]
             for p in group["params"]:
                 grad = p.grad
                 if grad is None:
                     continue
+                if (
+                    batch_nonfused
+                    and self._nonfused_state_ready(p)
+                    and self._nonfused_batch_eligible(p, grad)
+                ):
+                    key = self._nonfused_batch_key(group, p)
+                    if key is not None:
+                        nonfused_groups.setdefault(key, []).append(
+                            (group, name, p, grad)
+                        )
+                        continue
                 self._step_automatic(group, name, p, grad)
+
+        for items in nonfused_groups.values():
+            if len(items) == 1:
+                group, name, p, grad = items[0]
+                self._step_automatic(group, name, p, grad)
+            else:
+                self._dispatch_nonfused_batch(items)
 
         self._gefen_global_step += 1
         return loss
