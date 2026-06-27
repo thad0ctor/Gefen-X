@@ -564,6 +564,217 @@ __global__ void gefen_update_flat_kernel(
     }
 }
 
+// ---------------------------------------------------------------------------
+// v2 fully-fused (Tier-1 K1/K2/K3 on the two-phase path).
+//
+// Phase 1 already streams every grad element to form the per-block magnitude;
+// these variants additionally accumulate Sum(grad^2) per block in the SAME read
+// (K1), so the separate automatic_vmean kernel + its redundant grad pass are
+// eliminated for v2-routed params. A tiny finalize over num_blocks forms the
+// vmean EMA and the per-block stepsize in-kernel (K2), removing the host
+// sqrt/div/reciprocal/mul launches. Phase 2 folds weight decay into the write
+// (K3).
+//
+// Bit-exactness contract (vs the decomposed v2 reference it replaces):
+//   * magnitude is an order-free absmax -> bit-identical to the plain v2
+//     magnitude kernels (the Sum(grad^2) accumulator is independent of it).
+//   * given the kernel's own vmean, the finalize stepsize uses the identical
+//     IEEE primitives as gefen.py's host math (and the v1 fully-fused kernel,
+//     which is gated bit-exact vs that host math), and phase 2's write copies
+//     the v2 update kernel op-for-op (+ the v1-style weight-decay fold), so p,
+//     m_sign and m_magnitude are BIT-IDENTICAL to the reference pipeline run on
+//     that same vmean.
+//   * vmean itself is NOT bit-identical to the standalone tree reduction: the
+//     per-block Sum(grad^2) is formed by atomic accumulation, whose summation
+//     order is non-deterministic. The deviation is a sub-ULP-scale perturbation
+//     of a 2nd-moment EMA (convergence-neutral); the parity suite asserts it
+//     stays within a tight rtol of the standalone kernel. period==1 has a single
+//     term and no atomic contention across distinct blocks, so it stays
+//     bit-identical there.
+// ---------------------------------------------------------------------------
+
+// Small/medium period: flat grid-stride, one atomicMax + one atomicAdd per
+// element. Magnitude path is op-identical to gefen_magnitude_flat_kernel.
+template <typename scalar_t>
+__global__ void gefen_magnitude_sumsq_flat_kernel(
+    const scalar_t* __restrict__ grad_view,
+    const uint8_t* __restrict__ m_sign,
+    const float* __restrict__ old_magnitude,
+    const float* __restrict__ codebook,
+    float* __restrict__ new_magnitude,
+    float* __restrict__ sumsq,
+    int codebook_size,
+    int64_t period,
+    int64_t total_numel,
+    float beta1
+) {
+    extern __shared__ float s_codebook[];
+    for (int i = threadIdx.x; i < codebook_size; i += blockDim.x) {
+        s_codebook[i] = codebook[i];
+    }
+    __syncthreads();
+    const int64_t stride = static_cast<int64_t>(gridDim.x) * blockDim.x;
+    for (int64_t idx = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+         idx < total_numel; idx += stride) {
+        const int64_t block_idx = idx / period;
+        // Use the shared updated_momentum() helper for the magnitude so nvcc's
+        // FMA-contraction of `beta1*m + (1-beta1)*g` is byte-identical to the
+        // plain v2 magnitude kernel (an inlined copy contracts differently and
+        // perturbs the absmax). The extra grad read for the square is L2-hot.
+        const float updated = updated_momentum(
+            grad_view, m_sign, s_codebook, old_magnitude[block_idx], idx, beta1);
+        atomic_max_nonneg(&new_magnitude[block_idx], fabsf(updated));
+        const float grad_value = static_cast<float>(grad_view[idx]);
+        atomicAdd(&sumsq[block_idx], grad_value * grad_value);
+    }
+}
+
+// Large period: split each row across blocks_per_row CUDA blocks; block-local
+// max + sum trees, then one atomicMax and one atomicAdd per CUDA block.
+template <typename scalar_t>
+__global__ void gefen_magnitude_sumsq_split_kernel(
+    const scalar_t* __restrict__ grad_view,
+    const uint8_t* __restrict__ m_sign,
+    const float* __restrict__ old_magnitude,
+    const float* __restrict__ codebook,
+    float* __restrict__ new_magnitude,
+    float* __restrict__ sumsq,
+    int codebook_size,
+    int64_t period,
+    int64_t num_blocks,
+    int blocks_per_row,
+    float beta1
+) {
+    // Shared: [blockDim.x max][blockDim.x sum][codebook_size codebook].
+    extern __shared__ float smem[];
+    float* shared_max = smem;
+    float* shared_sum = smem + blockDim.x;
+    float* s_codebook = shared_sum + blockDim.x;
+    for (int i = threadIdx.x; i < codebook_size; i += blockDim.x) {
+        s_codebook[i] = codebook[i];
+    }
+    __syncthreads();
+    const int64_t row = static_cast<int64_t>(blockIdx.x) / blocks_per_row;
+    const int sub = static_cast<int>(static_cast<int64_t>(blockIdx.x) % blocks_per_row);
+    if (row >= num_blocks) {
+        return;
+    }
+    const float old_mag = old_magnitude[row];
+    const int64_t row_start = row * period;
+    float local_absmax = 0.0f;
+    float local_sumsq = 0.0f;
+    for (int64_t offset = static_cast<int64_t>(sub) * blockDim.x + threadIdx.x;
+         offset < period; offset += static_cast<int64_t>(blocks_per_row) * blockDim.x) {
+        const int64_t idx = row_start + offset;
+        // Helper for the magnitude (FMA-identical to the plain split kernel);
+        // separate grad read for the square.
+        const float updated = updated_momentum(
+            grad_view, m_sign, s_codebook, old_mag, idx, beta1);
+        const float a = fabsf(updated);
+        if (a > local_absmax) {
+            local_absmax = a;
+        }
+        const float grad_value = static_cast<float>(grad_view[idx]);
+        local_sumsq += grad_value * grad_value;
+    }
+    shared_max[threadIdx.x] = local_absmax;
+    shared_sum[threadIdx.x] = local_sumsq;
+    __syncthreads();
+    for (unsigned int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (threadIdx.x < s) {
+            if (shared_max[threadIdx.x + s] > shared_max[threadIdx.x]) {
+                shared_max[threadIdx.x] = shared_max[threadIdx.x + s];
+            }
+            shared_sum[threadIdx.x] += shared_sum[threadIdx.x + s];
+        }
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) {
+        atomic_max_nonneg(&new_magnitude[row], shared_max[0]);
+        atomicAdd(&sumsq[row], shared_sum[0]);
+    }
+}
+
+// K2 finalize over num_blocks: form the vmean EMA from the per-block Sum(grad^2)
+// and the per-block stepsize, op-identical to automatic_vmean_update_kernel's
+// EMA and gefen.py's host stepsize math. stepsize is written back into the
+// sumsq buffer (its input is consumed first).
+__global__ void gefen_finalize_vmean_stepsize_kernel(
+    float* __restrict__ vmean,
+    float* __restrict__ sumsq_to_stepsize,
+    int64_t num_blocks,
+    int64_t period,
+    float beta2,
+    float eps,
+    float inv_sqrt_bias_correction_2,
+    float inv_bias_correction_1
+) {
+    const int64_t stride = static_cast<int64_t>(gridDim.x) * blockDim.x;
+    for (int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+         i < num_blocks; i += stride) {
+        const float mean_square = sumsq_to_stepsize[i] / static_cast<float>(period);
+        const float previous_vmean = vmean[i];
+        const float updated_vmean = beta2 * previous_vmean + (1.0f - beta2) * mean_square;
+        vmean[i] = updated_vmean;
+        float h = __fsqrt_rn(updated_vmean);
+        h = __fmul_rn(h, inv_sqrt_bias_correction_2);
+        h = __fadd_rn(h, eps);
+        sumsq_to_stepsize[i] = __fmul_rn(__frcp_rn(h), inv_bias_correction_1);
+    }
+}
+
+// Phase 2: quantize + parameter update, with weight decay folded into the write
+// (K3). Magnitude/quantize/momentum ops are op-identical to
+// gefen_update_flat_kernel; the wd==0 (factor==1) branch is bit-identical to it.
+template <typename scalar_t>
+__global__ void gefen_update_flat_full_kernel(
+    scalar_t* __restrict__ p,
+    const scalar_t* __restrict__ grad_view,
+    uint8_t* __restrict__ m_sign,
+    const float* __restrict__ old_magnitude,
+    const float* __restrict__ new_magnitude,
+    const float* __restrict__ stepsize,
+    const float* __restrict__ codebook,
+    int codebook_size,
+    int64_t period,
+    int64_t total_numel,
+    float beta1,
+    float lr,
+    float weight_decay_factor
+) {
+    extern __shared__ float s_codebook[];
+    for (int i = threadIdx.x; i < codebook_size; i += blockDim.x) {
+        s_codebook[i] = codebook[i];
+    }
+    __syncthreads();
+    const int64_t stride = static_cast<int64_t>(gridDim.x) * blockDim.x;
+    for (int64_t idx = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+         idx < total_numel; idx += stride) {
+        const int64_t block_idx = idx / period;
+        const float new_mag = new_magnitude[block_idx];
+        const float updated = updated_momentum(
+            grad_view, m_sign, s_codebook, old_magnitude[block_idx], idx, beta1);
+        float normalized_value = 0.0f;
+        if (new_mag > 0.0f) {
+            normalized_value = updated / new_mag;
+        }
+        const uint8_t quantized_index =
+            nearest_codebook_index(normalized_value, s_codebook, codebook_size);
+        m_sign[idx] = quantized_index;
+        if (lr != 0.0f) {
+            const float quantized_value = s_codebook[static_cast<int>(quantized_index)] * new_mag;
+            const float update_value = __fmul_rn(__fmul_rn(quantized_value, stepsize[block_idx]), lr);
+            if (weight_decay_factor == 1.0f) {
+                p[idx] = static_cast<scalar_t>(__fsub_rn(static_cast<float>(p[idx]), update_value));
+            } else {
+                const float decayed = static_cast<float>(
+                    static_cast<scalar_t>(__fmul_rn(static_cast<float>(p[idx]), weight_decay_factor)));
+                p[idx] = static_cast<scalar_t>(__fsub_rn(decayed, update_value));
+            }
+        }
+    }
+}
+
 }  // namespace
 
 void automatic_gefen_fused_update_cuda(
@@ -906,6 +1117,146 @@ void automatic_gefen_fused_update_v2_cuda(
                 m_magnitude.data_ptr<float>(), new_magnitude.data_ptr<float>(),
                 stepsize.data_ptr<float>(), codebook.data_ptr<float>(), codebook_size,
                 period, total_numel, static_cast<float>(beta1), static_cast<float>(lr));
+        });
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+
+    m_magnitude.copy_(new_magnitude);
+}
+
+void automatic_gefen_fused_update_v2_full_cuda(
+    at::Tensor p,
+    at::Tensor grad_view,
+    at::Tensor m_sign,
+    at::Tensor m_magnitude,
+    at::Tensor vmean,
+    at::Tensor codebook,
+    bool packed_indices,
+    double beta1,
+    double beta2,
+    double lr,
+    double eps,
+    double inv_sqrt_bias_correction_2,
+    double inv_bias_correction_1,
+    double weight_decay_factor
+) {
+    if (packed_indices) {
+        throw std::invalid_argument("v2 fused update does not support packed indices.");
+    }
+    if (!p.is_cuda() || !grad_view.is_cuda() || !m_sign.is_cuda() || !m_magnitude.is_cuda() || !vmean.is_cuda() || !codebook.is_cuda()) {
+        throw std::invalid_argument("Expected all tensors to be on CUDA.");
+    }
+    if (!p.is_contiguous() || !grad_view.is_contiguous() || !m_sign.is_contiguous() ||
+        !m_magnitude.is_contiguous() || !vmean.is_contiguous() || !codebook.is_contiguous()) {
+        throw std::invalid_argument("Expected all tensors to be contiguous.");
+    }
+    if (grad_view.dim() != 2) {
+        throw std::invalid_argument("Expected grad_view to be 2D.");
+    }
+    if (m_magnitude.dim() != 2 || m_magnitude.size(1) != 1) {
+        throw std::invalid_argument("Expected m_magnitude to have shape [num_blocks, 1].");
+    }
+    if (vmean.dim() != 2 || vmean.size(1) != 1) {
+        throw std::invalid_argument("Expected vmean to have shape [num_blocks, 1].");
+    }
+    if (m_sign.scalar_type() != at::kByte) {
+        throw std::invalid_argument("Expected m_sign to have dtype uint8.");
+    }
+    if (codebook.scalar_type() != at::kFloat) {
+        throw std::invalid_argument("Expected codebook to have dtype float32.");
+    }
+
+    c10::cuda::CUDAGuard device_guard(p.device());
+
+    const int64_t num_blocks = grad_view.size(0);
+    const int64_t period = grad_view.size(1);
+    const int64_t total_numel = num_blocks * period;
+    if (p.numel() != total_numel || m_sign.numel() != total_numel) {
+        throw std::invalid_argument("Expected p and m_sign numel to match grad_view.");
+    }
+    if (m_magnitude.size(0) != num_blocks || vmean.size(0) != num_blocks) {
+        throw std::invalid_argument("Expected m_magnitude and vmean to match num_blocks.");
+    }
+    if (grad_view.scalar_type() != p.scalar_type()) {
+        throw std::invalid_argument("Expected grad_view dtype to match p.");
+    }
+    if (m_magnitude.scalar_type() != at::kFloat || vmean.scalar_type() != at::kFloat) {
+        throw std::invalid_argument("Expected m_magnitude and vmean to have dtype float32.");
+    }
+    if (codebook.numel() < 1 || codebook.numel() > 256) {
+        throw std::invalid_argument("Expected codebook size in [1, 256].");
+    }
+    if (period <= 0) {
+        throw std::invalid_argument("Expected grad_view to have a positive period.");
+    }
+
+    auto new_magnitude = at::zeros_like(m_magnitude);
+    // K1 accumulator; reused as the stepsize buffer by the finalize (K2).
+    auto sumsq = at::zeros_like(m_magnitude);
+
+    const int codebook_size = static_cast<int>(codebook.numel());
+    const int threads = 256;
+    const int sm_count = cached_sm_count(p.get_device());
+    const int64_t flat_blocks_cap = static_cast<int64_t>(sm_count) * 32;
+    const size_t codebook_bytes = static_cast<size_t>(codebook_size) * sizeof(float);
+
+    // Phase 1: per-block magnitude (absmax) + Sum(grad^2) in one grad read.
+    AT_DISPATCH_FLOATING_TYPES_AND2(
+        at::kHalf, at::kBFloat16, p.scalar_type(),
+        "gefen_v2_full_magnitude", [&] {
+            if (period <= 2048) {
+                int64_t nblocks = (total_numel + threads - 1) / threads;
+                if (nblocks > flat_blocks_cap) nblocks = flat_blocks_cap;
+                if (nblocks < 1) nblocks = 1;
+                gefen_magnitude_sumsq_flat_kernel<scalar_t><<<static_cast<unsigned int>(nblocks), threads, codebook_bytes>>>(
+                    grad_view.data_ptr<scalar_t>(), m_sign.data_ptr<uint8_t>(),
+                    m_magnitude.data_ptr<float>(), codebook.data_ptr<float>(),
+                    new_magnitude.data_ptr<float>(), sumsq.data_ptr<float>(),
+                    codebook_size, period, total_numel, static_cast<float>(beta1));
+            } else {
+                int blocks_per_row = static_cast<int>((period + threads * 64 - 1) / (threads * 64));
+                if (blocks_per_row < 1) blocks_per_row = 1;
+                const int max_bpr = static_cast<int>((flat_blocks_cap + num_blocks - 1) / num_blocks);
+                if (blocks_per_row > max_bpr && max_bpr >= 1) blocks_per_row = max_bpr;
+                if (blocks_per_row < 1) blocks_per_row = 1;
+                const int64_t grid = num_blocks * blocks_per_row;
+                // Two per-thread reduction buffers (max, sum) plus the codebook.
+                const size_t shmem = 2 * static_cast<size_t>(threads) * sizeof(float) + codebook_bytes;
+                gefen_magnitude_sumsq_split_kernel<scalar_t><<<static_cast<unsigned int>(grid), threads, shmem>>>(
+                    grad_view.data_ptr<scalar_t>(), m_sign.data_ptr<uint8_t>(),
+                    m_magnitude.data_ptr<float>(), codebook.data_ptr<float>(),
+                    new_magnitude.data_ptr<float>(), sumsq.data_ptr<float>(),
+                    codebook_size, period, num_blocks, blocks_per_row, static_cast<float>(beta1));
+            }
+        });
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+
+    // K2: vmean EMA + per-block stepsize (writes stepsize into sumsq).
+    {
+        const int fthreads = 256;
+        int64_t fblocks = (num_blocks + fthreads - 1) / fthreads;
+        if (fblocks > flat_blocks_cap) fblocks = flat_blocks_cap;
+        if (fblocks < 1) fblocks = 1;
+        gefen_finalize_vmean_stepsize_kernel<<<static_cast<unsigned int>(fblocks), fthreads>>>(
+            vmean.data_ptr<float>(), sumsq.data_ptr<float>(), num_blocks, period,
+            static_cast<float>(beta2), static_cast<float>(eps),
+            static_cast<float>(inv_sqrt_bias_correction_2),
+            static_cast<float>(inv_bias_correction_1));
+        C10_CUDA_KERNEL_LAUNCH_CHECK();
+    }
+
+    // Phase 2: quantize + parameter update with weight decay folded in (K3).
+    AT_DISPATCH_FLOATING_TYPES_AND2(
+        at::kHalf, at::kBFloat16, p.scalar_type(),
+        "gefen_v2_full_update", [&] {
+            int64_t nblocks = (total_numel + threads - 1) / threads;
+            if (nblocks > flat_blocks_cap) nblocks = flat_blocks_cap;
+            if (nblocks < 1) nblocks = 1;
+            gefen_update_flat_full_kernel<scalar_t><<<static_cast<unsigned int>(nblocks), threads, codebook_bytes>>>(
+                p.data_ptr<scalar_t>(), grad_view.data_ptr<scalar_t>(), m_sign.data_ptr<uint8_t>(),
+                m_magnitude.data_ptr<float>(), new_magnitude.data_ptr<float>(),
+                sumsq.data_ptr<float>(), codebook.data_ptr<float>(), codebook_size,
+                period, total_numel, static_cast<float>(beta1), static_cast<float>(lr),
+                static_cast<float>(weight_decay_factor));
         });
     C10_CUDA_KERNEL_LAUNCH_CHECK();
 

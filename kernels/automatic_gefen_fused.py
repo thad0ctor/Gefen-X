@@ -165,3 +165,46 @@ def automatic_gefen_fused_full_update_cuda(
         inv_bias_correction_1,
         weight_decay_factor,
     )
+
+
+def automatic_gefen_fused_update_v2_full_cuda(
+    p: torch.Tensor,
+    grad_view: torch.Tensor,
+    m_sign: torch.Tensor,
+    m_magnitude: torch.Tensor,
+    vmean: torch.Tensor,
+    codebook: torch.Tensor,
+    packed_indices: bool,
+    beta1: float,
+    beta2: float,
+    lr: float,
+    eps: float,
+    inv_sqrt_bias_correction_2: float,
+    inv_bias_correction_1: float,
+    weight_decay_factor: float,
+) -> None:
+    """Two-phase (v2) fully-fused update for occupancy-flexible (few-block /
+    tiny-period) params: folds the vmean (2nd-moment) EMA, the per-block stepsize
+    and weight decay into the two-phase magnitude/update kernels, eliminating the
+    separate vmean kernel + host stepsize/weight-decay passes. The C++ guards
+    enforce dtype/shape/contiguity; only normalize contiguity when needed."""
+    grad_c = grad_view if grad_view.is_contiguous() else grad_view.contiguous()
+    cb_c = codebook if codebook.is_contiguous() else codebook.contiguous()
+
+    module = _load_extension()
+    module.automatic_gefen_fused_update_v2_full_cuda(
+        p,
+        grad_c,
+        m_sign,
+        m_magnitude,
+        vmean,
+        cb_c,
+        packed_indices,
+        beta1,
+        beta2,
+        lr,
+        eps,
+        inv_sqrt_bias_correction_2,
+        inv_bias_correction_1,
+        weight_decay_factor,
+    )
