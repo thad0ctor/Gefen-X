@@ -1203,9 +1203,14 @@ void automatic_gefen_fused_update_v2_full_cuda(
         return;
     }
 
-    auto new_magnitude = at::zeros_like(m_magnitude);
-    // K1 accumulator; reused as the stepsize buffer by the finalize (K2).
-    auto sumsq = at::zeros_like(m_magnitude);
+    // One zeroed scratch instead of two separate zeros_like fills (one fill
+    // launch, not two): row 0 is the new per-block magnitude (atomicMax target),
+    // row 1 is the K1 Sum(grad^2) accumulator (atomicAdd target, later reused as
+    // the stepsize buffer by the finalize K2). Both rows are contiguous
+    // [num_blocks, 1] views, so the kernels index them exactly as before.
+    auto scratch = at::zeros({2, num_blocks, 1}, m_magnitude.options());
+    auto new_magnitude = scratch[0];
+    auto sumsq = scratch[1];
 
     const int codebook_size = static_cast<int>(codebook.numel());
     const int threads = 256;
@@ -1274,5 +1279,13 @@ void automatic_gefen_fused_update_v2_full_cuda(
         });
     C10_CUDA_KERNEL_LAUNCH_CHECK();
 
-    m_magnitude.copy_(new_magnitude);
+    // Repoint m_magnitude at the just-computed magnitudes instead of copying them
+    // back. copy_ was a full-size D2D memcpy + its own launch every step per
+    // param; set_ is a metadata-only storage rebind (no kernel launch, no copy)
+    // and the values m_magnitude ends up holding are identical. m_magnitude now
+    // shares `scratch`'s storage; the tiny row-1 (sumsq) half stays alive until
+    // the next step rebinds m_magnitude (bounded by num_blocks floats per param).
+    // phase 2 above has already consumed the old m_magnitude (old_magnitude), so
+    // the rebind is safe to do after it.
+    m_magnitude.set_(new_magnitude);
 }
