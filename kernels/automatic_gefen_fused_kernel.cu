@@ -10,6 +10,17 @@
 #include <cstdint>
 #include <stdexcept>
 
+// Param-dtype dispatch over Float/Half/BFloat16 *without* Double: every Gefen
+// update kernel does its arithmetic in float and writes static_cast<scalar_t>,
+// so a double param would be silently computed at single precision. Reject it at
+// dispatch (clear "not implemented for 'Double'") instead of downcasting.
+#define GEFEN_DISPATCH_FLOAT_HALF_BF16(TYPE, NAME, ...)        \
+    AT_DISPATCH_SWITCH(                                        \
+        TYPE, NAME,                                            \
+        AT_DISPATCH_CASE(at::kFloat, __VA_ARGS__)              \
+        AT_DISPATCH_CASE(at::kHalf, __VA_ARGS__)               \
+        AT_DISPATCH_CASE(at::kBFloat16, __VA_ARGS__))
+
 namespace {
 
 // Cache the per-device SM count: cudaDeviceGetAttribute is a driver round-trip
@@ -758,9 +769,7 @@ void automatic_gefen_fused_full_update_cuda(
     const size_t shared_bytes =
         (static_cast<size_t>(codebook.numel()) + 2 * static_cast<size_t>(threads)) * sizeof(float);
 
-    AT_DISPATCH_FLOATING_TYPES_AND2(
-        at::kHalf,
-        at::kBFloat16,
+    GEFEN_DISPATCH_FLOAT_HALF_BF16(
         p.scalar_type(),
         "automatic_gefen_fused_full_update_cuda",
         [&] {

@@ -112,7 +112,12 @@ def parity(device, wd=0.0):
     ok = True
     fails = 0
     n = 0
-    for dt_name, dt in DTYPES.items():
+    # bf16 isn't supported on every GPU (e.g. pre-Ampere); skip it there so the
+    # parity run doesn't fail on an unsupported dtype rather than a real drift.
+    dtypes = dict(DTYPES)
+    if not torch.cuda.is_bf16_supported():
+        dtypes.pop("bf16", None)
+    for dt_name, dt in dtypes.items():
         for numel, period in CASES:
             for step in STEPS:
                 p, gv, ms, mm, vm = _make(numel, period, dt, device, 100 + step + (numel % 91))
