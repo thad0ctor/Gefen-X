@@ -868,6 +868,7 @@ class Gefen(torch.optim.Optimizer):
         eps,
         bias_correction_1,
         bias_correction_2,
+        weight_decay_factor,
     ) -> None:
         # Tier-1 fully-fused v1 path: the kernel computes the vmean EMA and the
         # per-block stepsize in-kernel, so the separate vmean kernel and the host
@@ -895,6 +896,7 @@ class Gefen(torch.optim.Optimizer):
             eps,
             1.0 / math.sqrt(bias_correction_2),
             1.0 / bias_correction_1,
+            weight_decay_factor,
         )
 
     def _automatic_momentum_update(
@@ -1052,13 +1054,13 @@ class Gefen(torch.optim.Optimizer):
         bias_correction_2 = 1 - beta2 ** state["step"]
 
         if use_full_fused:
-            # K1+K2: vmean EMA + stepsize are computed inside the fused kernel.
-            # Weight decay is still a separate host pass here (folded into the
-            # kernel write in K3). The kernel flat-indexes p and requires it
-            # contiguous; a non-contiguous shard is updated on a contiguous copy
-            # that is copied back to preserve the in-place semantics.
-            if group["weight_decay"] > 0.0:
-                p_local.mul_(1 - lr * group["weight_decay"])
+            # K1+K2+K3: vmean EMA, per-block stepsize, and weight decay are all
+            # computed inside the fused kernel. weight_decay_factor == 1 - lr*wd
+            # mirrors the host p.mul_(1 - lr*wd) pass (an exact identity when
+            # wd == 0). The kernel flat-indexes p and requires it contiguous; a
+            # non-contiguous shard is updated on a contiguous copy that is copied
+            # back to preserve the in-place semantics.
+            weight_decay_factor = 1.0 - lr * group["weight_decay"]
             if p_local.is_contiguous():
                 self._automatic_gefen_fused_full_update(
                     p_local,
@@ -1070,6 +1072,7 @@ class Gefen(torch.optim.Optimizer):
                     eps,
                     bias_correction_1,
                     bias_correction_2,
+                    weight_decay_factor,
                 )
             else:
                 p_contig = p_local.contiguous()
@@ -1083,6 +1086,7 @@ class Gefen(torch.optim.Optimizer):
                     eps,
                     bias_correction_1,
                     bias_correction_2,
+                    weight_decay_factor,
                 )
                 p_local.copy_(p_contig)
             return

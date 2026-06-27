@@ -139,6 +139,7 @@ def automatic_gefen_fused_full_update_cuda(
     eps: float,
     inv_sqrt_bias_correction_2: float,
     inv_bias_correction_1: float,
+    weight_decay_factor: float,
 ) -> None:
     """Single-kernel v1 update that folds the vmean (2nd-moment) EMA and the
     per-block stepsize/bias-correction math into the fused update (Tier-1 K1+K2).
@@ -162,4 +163,5 @@ def automatic_gefen_fused_full_update_cuda(
         eps,
         inv_sqrt_bias_correction_2,
         inv_bias_correction_1,
+        weight_decay_factor,
     )

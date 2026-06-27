@@ -97,11 +97,12 @@ def _fused(mod, p, gv, ms, mm, vm, cb, step, wd):
     p, ms, mm, vm = p.clone(), ms.clone(), mm.clone(), vm.clone()
     bc1 = 1 - BETA1 ** step
     bc2 = 1 - BETA2 ** step
-    if wd > 0.0:  # K3 not yet folded -> host pass mirrors the reference
-        p.mul_(1 - LR * wd)
+    # K3: weight decay is folded into the kernel write via weight_decay_factor;
+    # no host pre-decay pass here (the reference applies p.mul_ instead).
+    weight_decay_factor = 1.0 - LR * wd
     mod.automatic_gefen_fused_full_update_cuda(
         p, gv, ms, mm, vm, cb, False, BETA1, BETA2, LR, EPS,
-        1.0 / math.sqrt(bc2), 1.0 / bc1)
+        1.0 / math.sqrt(bc2), 1.0 / bc1, weight_decay_factor)
     return p, ms, mm, vm
 
 

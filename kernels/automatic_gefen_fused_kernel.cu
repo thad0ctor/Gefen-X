@@ -195,8 +195,15 @@ __global__ void automatic_gefen_fused_update_kernel(
         store_packed_codebook_index(m_sign, idx, quantized_index, packed_indices);
         if (lr != 0.0f) {
             const float quantized_value = s_codebook[static_cast<int>(quantized_index)] * new_magnitude;
-            const float update_value = quantized_value * step * lr;
-            p[idx] = static_cast<scalar_t>(static_cast<float>(p[idx]) - update_value);
+            // Explicit round-to-nearest mul/sub: the parameter write does not
+            // depend on nvcc's per-kernel FMA-contraction choice for
+            // `p - q*step*lr`. v1, v2 and the fully-fused kernel all use this exact
+            // form so their writes are bit-identical to each other and reproducible
+            // run-to-run -- separately-compiled kernels otherwise contract `p -
+            // q*step*lr` differently and disagree on fp32 params at rounding
+            // boundaries.
+            const float update_value = __fmul_rn(__fmul_rn(quantized_value, step), lr);
+            p[idx] = static_cast<scalar_t>(__fsub_rn(static_cast<float>(p[idx]), update_value));
         }
     }
 }
@@ -251,7 +258,8 @@ __global__ void automatic_gefen_fused_full_update_kernel(
     float lr,
     float eps,
     float inv_sqrt_bias_correction_2,
-    float inv_bias_correction_1
+    float inv_bias_correction_1,
+    float weight_decay_factor
 ) {
     // Shared layout: [codebook_size codebook][blockDim.x max][blockDim.x sumsq].
     extern __shared__ float smem[];
@@ -343,8 +351,22 @@ __global__ void automatic_gefen_fused_full_update_kernel(
         store_packed_codebook_index(m_sign, idx, quantized_index, packed_indices);
         if (lr != 0.0f) {
             const float quantized_value = s_codebook[static_cast<int>(quantized_index)] * new_magnitude;
-            const float update_value = quantized_value * stepsize_val * lr;
-            p[idx] = static_cast<scalar_t>(static_cast<float>(p[idx]) - update_value);
+            const float update_value = __fmul_rn(__fmul_rn(quantized_value, stepsize_val), lr);
+            // K3: fold weight decay into the write. weight_decay_factor is a
+            // kernel-wide scalar, so this branch is uniform (no warp divergence).
+            // When it is 1.0f (wd == 0 -- the common case) take the exact same
+            // write the K1+K2 path used, which is bit-identical to the v1 kernel;
+            // restructuring it would change nvcc's FMA-contraction of `p - update`
+            // and perturb fp32 params at rounding boundaries. Otherwise reproduce
+            // the host p.mul_(1 - lr*wd) pass, which rounds back to scalar_t before
+            // the update reads it (the inner scalar_t cast mirrors that round).
+            if (weight_decay_factor == 1.0f) {
+                p[idx] = static_cast<scalar_t>(__fsub_rn(static_cast<float>(p[idx]), update_value));
+            } else {
+                const float decayed = static_cast<float>(
+                    static_cast<scalar_t>(__fmul_rn(static_cast<float>(p[idx]), weight_decay_factor)));
+                p[idx] = static_cast<scalar_t>(__fsub_rn(decayed, update_value));
+            }
         }
     }
 }
@@ -523,8 +545,10 @@ __global__ void gefen_update_flat_kernel(
         m_sign[idx] = quantized_index;
         if (lr != 0.0f) {
             const float quantized_value = s_codebook[static_cast<int>(quantized_index)] * new_mag;
-            const float update_value = quantized_value * stepsize[block_idx] * lr;
-            p[idx] = static_cast<scalar_t>(static_cast<float>(p[idx]) - update_value);
+            // Explicit round-to-nearest mul/sub: FMA-independent, bit-identical to
+            // the v1 and fully-fused parameter writes (see the v1 kernel comment).
+            const float update_value = __fmul_rn(__fmul_rn(quantized_value, stepsize[block_idx]), lr);
+            p[idx] = static_cast<scalar_t>(__fsub_rn(static_cast<float>(p[idx]), update_value));
         }
     }
 }
@@ -653,7 +677,8 @@ void automatic_gefen_fused_full_update_cuda(
     double lr,
     double eps,
     double inv_sqrt_bias_correction_2,
-    double inv_bias_correction_1
+    double inv_bias_correction_1,
+    double weight_decay_factor
 ) {
     if (!p.is_cuda() || !grad_view.is_cuda() || !m_sign.is_cuda() || !m_magnitude.is_cuda() || !vmean.is_cuda() || !codebook.is_cuda()) {
         throw std::invalid_argument("Expected all tensors to be on CUDA.");
@@ -733,7 +758,8 @@ void automatic_gefen_fused_full_update_cuda(
                 static_cast<float>(lr),
                 static_cast<float>(eps),
                 static_cast<float>(inv_sqrt_bias_correction_2),
-                static_cast<float>(inv_bias_correction_1)
+                static_cast<float>(inv_bias_correction_1),
+                static_cast<float>(weight_decay_factor)
             );
         }
     );

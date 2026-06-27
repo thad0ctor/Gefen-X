@@ -40,7 +40,8 @@ void automatic_gefen_fused_full_update_cuda(
     double lr,
     double eps,
     double inv_sqrt_bias_correction_2,
-    double inv_bias_correction_1
+    double inv_bias_correction_1,
+    double weight_decay_factor
 );
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
@@ -89,6 +90,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         py::arg("lr"),
         py::arg("eps"),
         py::arg("inv_sqrt_bias_correction_2"),
-        py::arg("inv_bias_correction_1")
+        py::arg("inv_bias_correction_1"),
+        py::arg("weight_decay_factor")
     );
 }
