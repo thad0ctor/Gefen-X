@@ -457,6 +457,16 @@ void automatic_gefen_fused_update_cuda(
     if (m_magnitude.size(0) != num_blocks || stepsize.size(0) != num_blocks) {
         throw std::invalid_argument("Expected m_magnitude and stepsize to match the number of blocks.");
     }
+    // nearest_codebook_index() returns uint8_t, so >256 entries would wrap the
+    // stored indices; an empty table would size shared memory at 0. Packed
+    // indices store 2 entries per byte (4-bit), so cap at 16 in that mode.
+    const int64_t codebook_numel = codebook.numel();
+    if (codebook_numel < 1 || codebook_numel > 256) {
+        throw std::invalid_argument("Expected codebook size in [1, 256].");
+    }
+    if (packed_indices && codebook_numel > 16) {
+        throw std::invalid_argument("Expected packed codebook size in [1, 16].");
+    }
     // these two may create additional memory footprint.
     const int threads = choose_threads(period);
     const dim3 grid(static_cast<unsigned int>(num_blocks));

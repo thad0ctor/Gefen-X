@@ -83,6 +83,32 @@ def automatic_gefen_fused_update_cuda(
             grad_view.shape[0], grad_view.shape[1], grad_view.device
         )
 
+    # Load-bearing guards for the raw-pointer launch: the C++ path reads grad_view
+    # as p.scalar_type() and m_magnitude/stepsize/codebook as float*, all on p's
+    # device. A dtype/device mismatch would reinterpret memory or read across
+    # devices. (Shape/contiguity invariants are still enforced in C++.)
+    if grad_view.dtype != p.dtype:
+        raise ValueError(
+            f"grad_view dtype {grad_view.dtype} must match p dtype {p.dtype}."
+        )
+    for name, t in (
+        ("grad_view", grad_view),
+        ("m_magnitude", m_magnitude),
+        ("stepsize", stepsize),
+        ("codebook", codebook),
+    ):
+        if t.device != p.device:
+            raise ValueError(
+                f"{name} device {t.device} must match p device {p.device}."
+            )
+    for name, t in (
+        ("m_magnitude", m_magnitude),
+        ("stepsize", stepsize),
+        ("codebook", codebook),
+    ):
+        if t.dtype != torch.float32:
+            raise ValueError(f"{name} must be float32, got {t.dtype}.")
+
     grad_c = grad_view if grad_view.is_contiguous() else grad_view.contiguous()
     step_c = stepsize if stepsize.is_contiguous() else stepsize.contiguous()
     cb_c = codebook if codebook.is_contiguous() else codebook.contiguous()

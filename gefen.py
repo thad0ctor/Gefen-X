@@ -1068,6 +1068,19 @@ class Gefen(torch.optim.Optimizer):
 
     def state_dict(self):
         state_dict = super().state_dict()
+        # stepsize/_h_buf are per-step scratch buffers (recomputed from vmean every
+        # step); they live in self.state only to be reused across steps, so strip
+        # them from the serialized dict instead of bloating every checkpoint. Build
+        # fresh per-param dicts so live self.state is left untouched.
+        scratch_keys = ("stepsize", "_h_buf")
+        state_dict["state"] = {
+            pid: (
+                {k: v for k, v in pstate.items() if k not in scratch_keys}
+                if isinstance(pstate, dict)
+                else pstate
+            )
+            for pid, pstate in state_dict["state"].items()
+        }
         state_dict["gefen_global_step"] = self._gefen_global_step
         # The exact-DP codebook is learned once on the first step and then frozen
         # for the rest of the run. It is not per-param state, so persist it
