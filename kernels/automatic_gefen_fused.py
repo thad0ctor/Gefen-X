@@ -73,103 +73,26 @@ def automatic_gefen_fused_update_cuda(
     *,
     use_v2: Optional[bool] = None,
 ) -> None:
-    tensors = {
-        "p": p,
-        "grad_view": grad_view,
-        "m_sign": m_sign,
-        "m_magnitude": m_magnitude,
-        "stepsize": stepsize,
-        "codebook": codebook,
-    }
-    for name, tensor in tensors.items():
-        if not isinstance(tensor, torch.Tensor):
-            raise TypeError("Expected {} to be a torch.Tensor.".format(name))
-        elif tensor.device.type != "cuda":
-            raise ValueError(
-                "Expected {} to be on CUDA, got device {}.".format(name, tensor.device)
-            )
-
-    if grad_view.dim() != 2:
-        raise ValueError(
-            "Expected grad_view to be 2D, got dim={}".format(grad_view.dim())
-        )
-    elif m_magnitude.dim() != 2 or m_magnitude.shape[1] != 1:
-        raise ValueError(
-            "Expected m_magnitude to have shape [num_blocks, 1], got {}".format(
-                tuple(m_magnitude.shape)
-            )
-        )
-    elif stepsize.dim() != 2 or stepsize.shape[1] != 1:
-        raise ValueError(
-            "Expected stepsize to have shape [num_blocks, 1], got {}".format(
-                tuple(stepsize.shape)
-            )
-        )
-    elif grad_view.shape[0] != m_magnitude.shape[0]:
-        raise ValueError(
-            "Expected grad_view and m_magnitude to have the same number of blocks."
-        )
-    elif grad_view.shape[0] != stepsize.shape[0]:
-        raise ValueError(
-            "Expected grad_view and stepsize to have the same number of blocks."
-        )
-    elif m_sign.dtype != torch.uint8:
-        raise ValueError("Expected m_sign to be uint8, got {}".format(m_sign.dtype))
-    elif codebook.dtype != torch.float32:
-        raise ValueError(
-            "Expected codebook to be float32, got {}".format(codebook.dtype)
-        )
-    elif codebook.numel() > 256:
-        raise ValueError(
-            "Expected codebook to have at most 256 entries, got {}".format(
-                codebook.numel()
-            )
-        )
-    elif packed_indices and m_sign.numel() != (grad_view.numel() + 1) // 2:
-        raise ValueError(
-            "Expected packed m_sign.numel()={} for grad_view.numel()={}, got {}.".format(
-                (grad_view.numel() + 1) // 2,
-                grad_view.numel(),
-                m_sign.numel(),
-            )
-        )
-    elif not packed_indices and m_sign.numel() != grad_view.numel():
-        raise ValueError(
-            "Expected unpacked m_sign.numel()={} for grad_view.numel()={}, got {}.".format(
-                grad_view.numel(),
-                grad_view.numel(),
-                m_sign.numel(),
-            )
-        )
-
-    # v2 has no packed-index path; for unpacked, decide per call from occupancy.
+    # Steady-state hot path: the dtype/shape/device/contiguity invariants are
+    # enforced by the CUDA extension's C++ guards (which throw clear errors), so
+    # the former full Python re-validation ran every step per param for no added
+    # safety. Only normalize contiguity here, and only when actually needed --
+    # an already-contiguous tensor skips the dispatch.
     if use_v2 is None:
         use_v2 = not packed_indices and _should_use_v2(
             grad_view.shape[0], grad_view.shape[1], grad_view.device
         )
 
+    grad_c = grad_view if grad_view.is_contiguous() else grad_view.contiguous()
+    step_c = stepsize if stepsize.is_contiguous() else stepsize.contiguous()
+    cb_c = codebook if codebook.is_contiguous() else codebook.contiguous()
+
     module = _load_extension()
     if use_v2 and not packed_indices:
         module.automatic_gefen_fused_update_v2_cuda(
-            p,
-            grad_view.contiguous(),
-            m_sign,
-            m_magnitude,
-            stepsize.contiguous(),
-            codebook.contiguous(),
-            packed_indices,
-            beta1,
-            lr,
+            p, grad_c, m_sign, m_magnitude, step_c, cb_c, packed_indices, beta1, lr
         )
         return
     module.automatic_gefen_fused_update_cuda(
-        p,
-        grad_view.contiguous(),
-        m_sign,
-        m_magnitude,
-        stepsize.contiguous(),
-        codebook.contiguous(),
-        packed_indices,
-        beta1,
-        lr,
+        p, grad_c, m_sign, m_magnitude, step_c, cb_c, packed_indices, beta1, lr
     )

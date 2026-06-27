@@ -7,6 +7,12 @@ import torch.nn as nn
 
 from gefen.partitioning import find_period_by_block_variance
 import gefen.quantization as quantization_module
+from gefen.kernels.automatic_vmean import (
+    automatic_vmean_update_cuda as _automatic_vmean_update_cuda,
+)
+from gefen.kernels.automatic_gefen_fused import (
+    automatic_gefen_fused_update_cuda as _automatic_gefen_fused_update_cuda,
+)
 
 FIND_PERIOD_BACKEND = None
 FUSE_AUTOMATIC_VMEAN_UPDATE = True
@@ -72,9 +78,7 @@ def automatic_vmean_update(
                     vmean.device
                 )
             )
-        from gefen.kernels.automatic_vmean import automatic_vmean_update_cuda
-
-        automatic_vmean_update_cuda(vmean, grad_view, beta2)
+        _automatic_vmean_update_cuda(vmean, grad_view, beta2)
         return
 
     # Square in the model dtype (e.g. bf16) rather than promoting to float32
@@ -230,9 +234,7 @@ def gefen_automatic_fused_update(
             )
         )
 
-    from gefen.kernels.automatic_gefen_fused import automatic_gefen_fused_update_cuda
-
-    automatic_gefen_fused_update_cuda(
+    _automatic_gefen_fused_update_cuda(
         p,
         grad_view,
         m_codebook,
@@ -995,8 +997,33 @@ class Gefen(torch.optim.Optimizer):
 
         bias_correction_1 = 1 - beta1 ** state["step"]
         bias_correction_2 = 1 - beta2 ** state["step"]
-        h = (state["vmean"].sqrt() / math.sqrt(bias_correction_2)).add_(eps)
-        stepsize = (1 / bias_correction_1) / h
+        # Reuse two cached [num_blocks, 1] scratch buffers instead of allocating
+        # three fresh tensors (sqrt, /scale, final stepsize) every step per param.
+        # The arithmetic is preserved bit-for-bit:
+        #   h        = sqrt(vmean) / sqrt(bc2) + eps   (sqrt out=, in-place div/add)
+        #   stepsize = (1/bc1) / h
+        # `scalar / tensor` is implemented by PyTorch as reciprocal(tensor) * scalar
+        # (NOT div(scalar, tensor) -- they round differently), so reproduce that
+        # exact pair of ops in place; verified bit-identical over random inputs.
+        vmean = state["vmean"]
+        stepsize = state.get("stepsize")
+        h = state.get("_h_buf")
+        if (
+            stepsize is None
+            or stepsize.shape != vmean.shape
+            or stepsize.dtype != torch.float32
+            or h is None
+            or h.shape != vmean.shape
+            or h.dtype != torch.float32
+        ):
+            stepsize = torch.empty_like(vmean)
+            h = torch.empty_like(vmean)
+            state["stepsize"] = stepsize
+            state["_h_buf"] = h
+        torch.sqrt(vmean, out=h)
+        h.div_(math.sqrt(bias_correction_2)).add_(eps)
+        torch.reciprocal(h, out=stepsize)
+        stepsize.mul_(1.0 / bias_correction_1)
 
         if self._use_fused_gefen_automatic_step():
             # The fused kernel flat-indexes p and requires it contiguous. A
