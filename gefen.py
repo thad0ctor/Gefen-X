@@ -16,6 +16,9 @@ from gefen.kernels.automatic_gefen_fused import (
 from gefen.kernels.automatic_gefen_fused import (
     automatic_gefen_fused_full_update_cuda as _automatic_gefen_fused_full_update_cuda,
 )
+from gefen.kernels.automatic_gefen_fused import (
+    automatic_gefen_fused_update_v2_full_cuda as _automatic_gefen_fused_update_v2_full_cuda,
+)
 from gefen.kernels.automatic_gefen_fused import _should_use_v2
 
 FIND_PERIOD_BACKEND = None
@@ -899,6 +902,48 @@ class Gefen(torch.optim.Optimizer):
             weight_decay_factor,
         )
 
+    def _automatic_gefen_fused_update_v2_full(
+        self,
+        p,
+        state,
+        grad_view,
+        beta1,
+        beta2,
+        lr,
+        eps,
+        bias_correction_1,
+        bias_correction_2,
+        weight_decay_factor,
+    ) -> None:
+        # Tier-1 fully-fused v2 (two-phase) path for occupancy-flexible params:
+        # the magnitude phase also accumulates Sum(grad^2), a tiny finalize forms
+        # the vmean EMA + per-block stepsize, and weight decay is folded into the
+        # update write -- so the separate vmean kernel and the host
+        # stepsize/weight-decay passes are skipped. The scalar reciprocals are
+        # precomputed as Python doubles and cast in-kernel exactly as PyTorch
+        # casts the operands of the host div_/mul_ (see the v1-full path).
+        codebook = self._gefen_codebook
+        if codebook is None:
+            raise ValueError(
+                "Expected Gefen codebook to be initialized before fused update."
+            )
+        _automatic_gefen_fused_update_v2_full_cuda(
+            p,
+            grad_view,
+            state["m_codebook"],
+            state["m_magnitude"],
+            state["vmean"],
+            codebook,
+            False,
+            beta1,
+            beta2,
+            lr,
+            eps,
+            1.0 / math.sqrt(bias_correction_2),
+            1.0 / bias_correction_1,
+            weight_decay_factor,
+        )
+
     def _automatic_momentum_update(
         self, state, grad_view: torch.Tensor, beta1: float
     ) -> torch.Tensor:
@@ -1031,11 +1076,16 @@ class Gefen(torch.optim.Optimizer):
         # / few-block params stay on the decomposed v2 path, and the non-fused
         # path stays decomposed. The routing predicate is the same one the v1/v2
         # update dispatch uses, so the choice is consistent.
-        use_full_fused = self._use_fused_gefen_automatic_step() and not _should_use_v2(
+        fused_step = self._use_fused_gefen_automatic_step()
+        route_v2 = _should_use_v2(
             grad_view.shape[0], automatic_period, grad_view.device
         )
+        use_full_fused = fused_step and not route_v2
+        use_v2_full = fused_step and route_v2
 
-        if not use_full_fused:
+        # Only the non-fused fallback still needs the standalone vmean kernel; the
+        # v1-full and v2-full fused paths both compute the vmean EMA in-kernel.
+        if not (use_full_fused or use_v2_full):
             self._automatic_vmean_update(state["vmean"], grad_view, beta2)
 
         state["step"] += 1
@@ -1077,6 +1127,42 @@ class Gefen(torch.optim.Optimizer):
             else:
                 p_contig = p_local.contiguous()
                 self._automatic_gefen_fused_full_update(
+                    p_contig,
+                    state,
+                    grad_view,
+                    beta1,
+                    beta2,
+                    lr,
+                    eps,
+                    bias_correction_1,
+                    bias_correction_2,
+                    weight_decay_factor,
+                )
+                p_local.copy_(p_contig)
+            return
+
+        if use_v2_full:
+            # K1+K2+K3 on the occupancy-flexible two-phase path: vmean EMA,
+            # per-block stepsize and weight decay are folded into the v2 kernels
+            # (see _automatic_gefen_fused_update_v2_full). Same contiguity
+            # handling as the v1-full branch.
+            weight_decay_factor = 1.0 - lr * group["weight_decay"]
+            if p_local.is_contiguous():
+                self._automatic_gefen_fused_update_v2_full(
+                    p_local,
+                    state,
+                    grad_view,
+                    beta1,
+                    beta2,
+                    lr,
+                    eps,
+                    bias_correction_1,
+                    bias_correction_2,
+                    weight_decay_factor,
+                )
+            else:
+                p_contig = p_local.contiguous()
+                self._automatic_gefen_fused_update_v2_full(
                     p_contig,
                     state,
                     grad_view,
