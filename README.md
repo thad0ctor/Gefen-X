@@ -94,7 +94,7 @@ print('Finished successfully.')
 ### Learning rate (when porting an AdamW config)
 
 Gefen matches AdamW's *interface*, but it needs a **lower learning rate** —
-about **0.6× AdamW's** on the architectures we tested (Qwen3, i.e. SwiGLU MLP +
+about **0.6× AdamW's** on the architectures tested (Qwen3, i.e. SwiGLU MLP +
 grouped-query attention). This factor is set by the model's `head_dim`/RMSNorm
 block structure (see below), **not its parameter count** — it holds (~0.6×) across
 Qwen3-0.6B → 8B (all `head_dim = 128`), so re-measure only for a different
@@ -153,10 +153,9 @@ decoupled-decay definition rather than direct testing.)
 Optimizer comparison on a full fine-tune, **with each optimizer at its own
 fair learning-rate optimum** (from a per-optimizer LR sweep), 2000 steps.
 
-> Measured as of commit `ebb7d40` — the head of the fused-kernel performance
-> series (`perf/tier0-quickwins` → `perf/tier1-kernel-fusion` → `perf/v2-fusion`
-> → `perf/k4-batching`, PRs #8–#11). Update this SHA to the merge commit when the
-> series lands in `main`.
+> Measured on the fused-kernel performance series (`perf/tier0-quickwins` →
+> `perf/tier1-kernel-fusion` → `perf/v2-fusion` → `perf/k4-batching`, PRs #8–#11),
+> merged into `main` as `191817d`; benchmark code state `ebb7d40`.
 
 **Testing environment**
 - **Hardware:** NVIDIA RTX 3090 (Ampere, sm_86), single GPU per run.
@@ -179,6 +178,24 @@ fair learning-rate optimum** (from a per-optimizer LR sweep), 2000 steps.
 
 ![Qwen3-1.7B optimizer comparison](docs/benchmarks/quad_qwen3_1p7b.png)
 ![Qwen3-0.6B optimizer comparison](docs/benchmarks/quad_qwen3_0p6b.png)
+
+**Loss curves** — loss over the 2000 steps. For each optimizer (distinguished by
+**color**), there are two lines: **solid = held-out eval loss** (the 32-example
+validation set, logged every 50 steps — this is the comparison metric in the
+table above) and **dashed = train-loss EMA** (exponential moving average of the
+training loss). Lower is better. Gefen converges stably and its eval curve tracks
+just above the AdamW cluster (the ~0.1–0.2 loss gap), with no instability at its
+fair LR.
+
+![Qwen3-1.7B loss curves](docs/benchmarks/loss_curve_qwen3_1p7b.png)
+![Qwen3-0.6B loss curves](docs/benchmarks/loss_curve_qwen3_0p6b.png)
+
+**Throughput vs peak VRAM** — the speed/memory frontier (upper-left = faster *and*
+lighter is better). Gefen sits alone in the best corner; AdamW-4-bit is worst on
+*both* axes despite its small optimizer state (torchao transient buffers).
+
+![Qwen3-1.7B throughput vs VRAM](docs/benchmarks/tput_vram_qwen3_1p7b.png)
+![Qwen3-0.6B throughput vs VRAM](docs/benchmarks/tput_vram_qwen3_0p6b.png)
 
 **Takeaways.** At its fair LR, **Gefen-fused has the lowest peak VRAM and the
 lowest optimizer-state footprint, with competitive-to-best throughput** (fastest
