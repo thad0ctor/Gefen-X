@@ -145,7 +145,13 @@ def parity(device, wd=0.0):
                 svm = _standalone_vmean(vm, gv)
                 bitwise = (_bit_equal(rp, fp) and _bit_equal(rms, fms)
                            and _bit_equal(rmm, fmm))
-                vm_ok = torch.allclose(fvm, svm, rtol=VMEAN_RTOL, atol=VMEAN_ATOL)
+                # period==1 has a single grad^2 term per block, so the atomic
+                # accumulation degenerates to one add and must match the
+                # standalone tree reduction bit-for-bit -- no tolerance there.
+                if period == 1:
+                    vm_ok = _bit_equal(fvm, svm)
+                else:
+                    vm_ok = torch.allclose(fvm, svm, rtol=VMEAN_RTOL, atol=VMEAN_ATOL)
                 rel = ((fvm - svm).abs() / (svm.abs() + 1e-12)).max().item()
                 worst_vm = max(worst_vm, rel)
                 good = bitwise and vm_ok

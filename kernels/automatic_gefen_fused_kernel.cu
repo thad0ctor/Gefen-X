@@ -1145,6 +1145,14 @@ void automatic_gefen_fused_update_v2_full_cuda(
     if (!p.is_cuda() || !grad_view.is_cuda() || !m_sign.is_cuda() || !m_magnitude.is_cuda() || !vmean.is_cuda() || !codebook.is_cuda()) {
         throw std::invalid_argument("Expected all tensors to be on CUDA.");
     }
+    // All tensors are dereferenced on p's device; reject cross-device inputs that
+    // the is_cuda() checks above would otherwise let through (CUDAGuard only
+    // selects the launch device, it does not relocate the operands).
+    if (grad_view.device() != p.device() || m_sign.device() != p.device() ||
+        m_magnitude.device() != p.device() || vmean.device() != p.device() ||
+        codebook.device() != p.device()) {
+        throw std::invalid_argument("Expected all tensors on the same device as p.");
+    }
     if (!p.is_contiguous() || !grad_view.is_contiguous() || !m_sign.is_contiguous() ||
         !m_magnitude.is_contiguous() || !vmean.is_contiguous() || !codebook.is_contiguous()) {
         throw std::invalid_argument("Expected all tensors to be contiguous.");
@@ -1187,6 +1195,12 @@ void automatic_gefen_fused_update_v2_full_cuda(
     }
     if (period <= 0) {
         throw std::invalid_argument("Expected grad_view to have a positive period.");
+    }
+    // Empty param (num_blocks == 0 -> total_numel == 0): nothing to update, and
+    // the split-path block-per-row math below divides by num_blocks. Bail before
+    // any launch / divide-by-zero.
+    if (total_numel == 0) {
+        return;
     }
 
     auto new_magnitude = at::zeros_like(m_magnitude);
