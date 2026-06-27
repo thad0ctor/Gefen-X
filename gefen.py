@@ -13,6 +13,10 @@ from gefen.kernels.automatic_vmean import (
 from gefen.kernels.automatic_gefen_fused import (
     automatic_gefen_fused_update_cuda as _automatic_gefen_fused_update_cuda,
 )
+from gefen.kernels.automatic_gefen_fused import (
+    automatic_gefen_fused_full_update_cuda as _automatic_gefen_fused_full_update_cuda,
+)
+from gefen.kernels.automatic_gefen_fused import _should_use_v2
 
 FIND_PERIOD_BACKEND = None
 FUSE_AUTOMATIC_VMEAN_UPDATE = True
@@ -853,6 +857,46 @@ class Gefen(torch.optim.Optimizer):
             lr=lr,
         )
 
+    def _automatic_gefen_fused_full_update(
+        self,
+        p,
+        state,
+        grad_view,
+        beta1,
+        beta2,
+        lr,
+        eps,
+        bias_correction_1,
+        bias_correction_2,
+    ) -> None:
+        # Tier-1 fully-fused v1 path: the kernel computes the vmean EMA and the
+        # per-block stepsize in-kernel, so the separate vmean kernel and the host
+        # sqrt/div/reciprocal/mul launches are skipped. The scalar reciprocals are
+        # precomputed here as Python doubles and cast to float32 in the kernel
+        # exactly as PyTorch casts the scalar operands of the host div_/mul_.
+        # PyTorch lowers `h.div_(sqrt(bc2))` to a multiply by float32(1/sqrt(bc2))
+        # (a true divide differs by up to ~2 ULP), so pass the reciprocal directly.
+        codebook = self._gefen_codebook
+        if codebook is None:
+            raise ValueError(
+                "Expected Gefen codebook to be initialized before fused update."
+            )
+        _automatic_gefen_fused_full_update_cuda(
+            p,
+            grad_view,
+            state["m_codebook"],
+            state["m_magnitude"],
+            state["vmean"],
+            codebook,
+            False,
+            beta1,
+            beta2,
+            lr,
+            eps,
+            1.0 / math.sqrt(bias_correction_2),
+            1.0 / bias_correction_1,
+        )
+
     def _automatic_momentum_update(
         self, state, grad_view: torch.Tensor, beta1: float
     ) -> torch.Tensor:
@@ -978,7 +1022,19 @@ class Gefen(torch.optim.Optimizer):
         automatic_period = state["automatic_period"]
         grad_view = self._automatic_view(flat_grad, automatic_period)
 
-        self._automatic_vmean_update(state["vmean"], grad_view, beta2)
+        # Tier-1: well-occupied (v1-regime) params take the fully-fused kernel,
+        # which folds the vmean EMA + per-block stepsize math (and, after K3,
+        # weight decay) into the single update kernel -- skipping the separate
+        # vmean kernel and the host sqrt/div/reciprocal/mul launches. Tiny-period
+        # / few-block params stay on the decomposed v2 path, and the non-fused
+        # path stays decomposed. The routing predicate is the same one the v1/v2
+        # update dispatch uses, so the choice is consistent.
+        use_full_fused = self._use_fused_gefen_automatic_step() and not _should_use_v2(
+            grad_view.shape[0], automatic_period, grad_view.device
+        )
+
+        if not use_full_fused:
+            self._automatic_vmean_update(state["vmean"], grad_view, beta2)
 
         state["step"] += 1
 
@@ -992,11 +1048,48 @@ class Gefen(torch.optim.Optimizer):
             else p
         )
 
+        bias_correction_1 = 1 - beta1 ** state["step"]
+        bias_correction_2 = 1 - beta2 ** state["step"]
+
+        if use_full_fused:
+            # K1+K2: vmean EMA + stepsize are computed inside the fused kernel.
+            # Weight decay is still a separate host pass here (folded into the
+            # kernel write in K3). The kernel flat-indexes p and requires it
+            # contiguous; a non-contiguous shard is updated on a contiguous copy
+            # that is copied back to preserve the in-place semantics.
+            if group["weight_decay"] > 0.0:
+                p_local.mul_(1 - lr * group["weight_decay"])
+            if p_local.is_contiguous():
+                self._automatic_gefen_fused_full_update(
+                    p_local,
+                    state,
+                    grad_view,
+                    beta1,
+                    beta2,
+                    lr,
+                    eps,
+                    bias_correction_1,
+                    bias_correction_2,
+                )
+            else:
+                p_contig = p_local.contiguous()
+                self._automatic_gefen_fused_full_update(
+                    p_contig,
+                    state,
+                    grad_view,
+                    beta1,
+                    beta2,
+                    lr,
+                    eps,
+                    bias_correction_1,
+                    bias_correction_2,
+                )
+                p_local.copy_(p_contig)
+            return
+
         if group["weight_decay"] > 0.0:
             p_local.mul_(1 - lr * group["weight_decay"])
 
-        bias_correction_1 = 1 - beta1 ** state["step"]
-        bias_correction_2 = 1 - beta2 ** state["step"]
         # Reuse two cached [num_blocks, 1] scratch buffers instead of allocating
         # three fresh tensors (sqrt, /scale, final stepsize) every step per param.
         # The arithmetic is preserved bit-for-bit:

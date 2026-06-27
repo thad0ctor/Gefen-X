@@ -123,3 +123,43 @@ def automatic_gefen_fused_update_cuda(
     module.automatic_gefen_fused_update_cuda(
         p, grad_c, m_sign, m_magnitude, step_c, cb_c, packed_indices, beta1, lr
     )
+
+
+def automatic_gefen_fused_full_update_cuda(
+    p: torch.Tensor,
+    grad_view: torch.Tensor,
+    m_sign: torch.Tensor,
+    m_magnitude: torch.Tensor,
+    vmean: torch.Tensor,
+    codebook: torch.Tensor,
+    packed_indices: bool,
+    beta1: float,
+    beta2: float,
+    lr: float,
+    eps: float,
+    inv_sqrt_bias_correction_2: float,
+    inv_bias_correction_1: float,
+) -> None:
+    """Single-kernel v1 update that folds the vmean (2nd-moment) EMA and the
+    per-block stepsize/bias-correction math into the fused update (Tier-1 K1+K2).
+    The C++ guards enforce dtype/shape/contiguity; only normalize contiguity
+    here, and only when actually needed."""
+    grad_c = grad_view if grad_view.is_contiguous() else grad_view.contiguous()
+    cb_c = codebook if codebook.is_contiguous() else codebook.contiguous()
+
+    module = _load_extension()
+    module.automatic_gefen_fused_full_update_cuda(
+        p,
+        grad_c,
+        m_sign,
+        m_magnitude,
+        vmean,
+        cb_c,
+        packed_indices,
+        beta1,
+        beta2,
+        lr,
+        eps,
+        inv_sqrt_bias_correction_2,
+        inv_bias_correction_1,
+    )
