@@ -94,11 +94,11 @@ print('Finished successfully.')
 ### Learning rate (when porting an AdamW config)
 
 Gefen matches AdamW's *interface*, but it needs a **lower learning rate** —
-about **0.6× AdamW's** on the architectures tested (Qwen3, i.e. SwiGLU MLP +
-grouped-query attention). This factor is **model-specific**, not a universal
-constant — it is set by the model's RMSNorm/block structure (see below), so treat
-0.6× as a starting point for Qwen3-family decoders and measure it for anything
-else. **At its own optimal LR, Gefen matches AdamW's loss and run-to-run
+about **0.6× AdamW's** on the architectures we tested (Qwen3, i.e. SwiGLU MLP +
+grouped-query attention). This factor is set by the model's `head_dim`/RMSNorm
+block structure (see below), **not its parameter count** — it holds (~0.6×) across
+Qwen3-0.6B → 8B (all `head_dim = 128`), so re-measure only for a different
+architecture or `head_dim`. **At its own optimal LR, Gefen matches AdamW's loss and run-to-run
 reproducibility**, while keeping its optimizer-memory advantage; reused at AdamW's
 LR unchanged, it over-steps.
 
@@ -121,6 +121,18 @@ naive drop-in):
 \* Both optimizers preferred a much lower LR than a typical AdamW default in this
 regime, so "1.0× AdamW's LR" above means an LR that is itself near AdamW's edge;
 the gap is the *extra* over-step Gefen incurs there.
+
+The diagnostic ratio, run across the Qwen3 family, confirms the factor is
+size-independent — the binder is always the `head_dim`-length `q_norm`/`k_norm`:
+
+| Model | `head_dim` | norm-binder ratio | usable LR factor |
+|---|---|---|---|
+| Qwen3-0.6B | 128 | 1.29 | ~0.77 |
+| Qwen3-1.7B | 128 | 1.75 | ~0.57 |
+| Qwen3-4B | 128 | 1.43 | ~0.70 |
+| Qwen3-8B | 128 | 1.28 | ~0.78 |
+
+(8B measured with a bf16 optimizer state, which deflates its ratio → lower bound.)
 
 When porting an AdamW recipe, **scale the learning rate to ~0.6× and tune from
 there.** An LR comfortable for AdamW can sit past Gefen's stability edge, and Gefen
