@@ -11,8 +11,13 @@ Both sub-optimizers key their per-parameter codebook cache on ``group["name"]``,
 so parameters MUST be supplied as ``(name, param)`` pairs with unique names --
 passing bare tensors collapses every name to ``"none"`` and corrupts the cache.
 
-Scope: single-GPU / DDP. FSDP2 sharded parameters would need the distributed
-Newton-Schulz path and are intentionally out of scope here.
+Scope: single-GPU / DDP and FSDP2 (fully_shard / DTensor). Under FSDP2 each rank
+holds only a shard of every parameter, so the backup (plain Gefen) params update
+per-shard directly, while the Muon 2D matrices all-gather their gradient to the
+full matrix per step (GefenMuon._step_automatic), run the quantized-momentum +
+Newton-Schulz pipeline on the full matrix so the numerics match the single-GPU
+reference, then slice the orthogonalized update back to the local shard. Tensor
+parallelism / multi-dim (HSDP x TP) meshes are not validated.
 """
 from collections import OrderedDict
 
