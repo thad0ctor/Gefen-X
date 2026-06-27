@@ -129,6 +129,59 @@ class GefenMuon(Gefen):
     def _init_gefen_muon_state(self, state, grad_view: torch.Tensor) -> None:
         self._init_gefen_state(state, grad_view)
 
+    def _iter_gefen_grad_periods(self, reuse_existing_periods: bool = False):
+        # Same as Gefen._iter_gefen_grad_periods, but for sharded (DTensor)
+        # gradients gather the FULL matrix (full_tensor) instead of taking the
+        # local shard. The exact-DP codebook and the per-param block period are
+        # therefore learned from the full matrix on every rank -- identical to
+        # the single-GPU reference, and identical across ranks (so quantization
+        # matches). With full grads, flat.numel() is the global numel and is
+        # never 0, so every rank iterates every parameter in the same order and
+        # the full_tensor() collective is matched across ranks.
+        for group in self.param_groups:
+            for p in group["params"]:
+                if p.grad is None:
+                    continue
+                grad = p.grad
+                if hasattr(grad, "full_tensor"):
+                    grad = grad.full_tensor()
+                elif hasattr(grad, "to_local"):
+                    grad = grad.to_local()
+                if hasattr(grad, "wait"):
+                    grad = grad.wait()
+                grad = grad.detach()
+                flat = grad.reshape(-1)
+                if flat.numel() == 0:
+                    continue
+
+                if reuse_existing_periods:
+                    state = self.state[p]
+                    if "automatic_period" not in state:
+                        raise ValueError(
+                            "Expected automatic_period to exist for {} before refreshing Gefen codebook at optimizer step {}".format(
+                                group["name"],
+                                self._gefen_global_step,
+                            )
+                        )
+                    period = state["automatic_period"]
+                elif flat.numel() == 1:
+                    period = 1
+                else:
+                    period = self._predict_period_from_grad_sq(group["name"], p, grad)
+
+                self.state[p]["automatic_period"] = period
+
+                if flat.numel() % period != 0:
+                    raise ValueError(
+                        "Automatic partition period {} does not divide parameter {} with numel {} while learning Gefen codebook".format(
+                            period,
+                            group["name"],
+                            flat.numel(),
+                        )
+                    )
+
+                yield group["name"], flat, period, grad
+
     def _quantize_momentum_(self, state, momentum_view: torch.Tensor) -> None:
         period = state["automatic_period"]
         state["m_magnitude"].copy_(
@@ -182,10 +235,57 @@ class GefenMuon(Gefen):
         quantized_momentum.mul_(state["m_magnitude"])
         return quantized_momentum
 
+    @staticmethod
+    def _is_sharded(p: torch.Tensor) -> bool:
+        # An FSDP2 / DTensor parameter carries a device mesh + placements. Plain
+        # tensors (single-GPU / DDP) do not, and take the original code paths
+        # verbatim so their behaviour is byte-for-byte unchanged.
+        return (
+            hasattr(p, "to_local")
+            and hasattr(p, "placements")
+            and hasattr(p, "device_mesh")
+        )
+
+    @staticmethod
+    def _shard_like(
+        full_tensor: torch.Tensor, dtensor_param: torch.Tensor
+    ) -> torch.Tensor:
+        # Slice an already-replicated full tensor (the Newton-Schulz update,
+        # which is identical on every rank) down to this rank's shard, matching
+        # the parameter's own placements exactly -- including uneven and empty
+        # shards. Replicate -> Shard is a local narrow (no collective), so this
+        # adds no communication and cannot deadlock.
+        from torch.distributed.tensor import DTensor, Replicate
+
+        mesh = dtensor_param.device_mesh
+        replicated = DTensor.from_local(
+            full_tensor.contiguous(),
+            mesh,
+            [Replicate()] * mesh.ndim,
+            run_check=False,
+        )
+        return replicated.redistribute(
+            placements=dtensor_param.placements
+        ).to_local()
+
     def _step_automatic(
         self, group, param_name: str, p: torch.Tensor, grad: torch.Tensor
     ) -> None:
-        if not self.fused:
+        is_sharded = self._is_sharded(p)
+
+        if is_sharded:
+            # FSDP2: reconstruct the FULL gradient matrix on every rank so the
+            # period prediction, quantized momentum, and Newton-Schulz all run on
+            # the full matrix exactly as on a single GPU. full_tensor() is a
+            # collective (all-gather); every rank -- including a rank that owns an
+            # empty shard -- must reach it, so it precedes any early return.
+            if hasattr(grad, "full_tensor"):
+                grad = grad.full_tensor()
+            elif hasattr(grad, "to_local"):
+                grad = grad.to_local()
+            if hasattr(grad, "wait"):
+                grad = grad.wait()
+        elif not self.fused:
             if hasattr(grad, "to_local"):
                 grad = grad.to_local()
             if hasattr(grad, "wait"):
@@ -240,8 +340,15 @@ class GefenMuon(Gefen):
         grad_view = self._automatic_view(flat_grad, automatic_period)
 
         if self._use_fused_gefen_automatic_step():
+            # The fused kernel flat-indexes its `p` argument but only writes
+            # p -= lr*update with lr=0 (see _fused_quantized_momentum_update), so
+            # p is left untouched and never feeds the momentum math -- it only has
+            # to be a contiguous tensor whose numel matches the (full) grad_view.
+            # Under sharding the real param's local shard is smaller than the full
+            # grad, so pass a full-matrix scratch instead of the DTensor param.
+            fused_p = grad.new_empty(grad.shape) if is_sharded else p
             momentum_update = self._fused_quantized_momentum_update(
-                p,
+                fused_p,
                 state,
                 grad_view,
                 momentum,
@@ -267,13 +374,23 @@ class GefenMuon(Gefen):
             group["eps"],
         )
 
+        # p.shape is the GLOBAL shape for a DTensor, which is exactly what the
+        # rows/cols LR ratio wants -- keep it unchanged under sharding.
         adjusted_lr = _adjust_lr(lr, group["adjust_lr_fn"], p.shape)
-        if group["weight_decay"] > 0.0:
-            p.mul_(1 - lr * group["weight_decay"])
 
-        if not self.fused and hasattr(p, "to_local") and hasattr(p, "placements"):
-            p.to_local().add_(update, alpha=-adjusted_lr)
+        if is_sharded:
+            # `update` is the full-matrix Newton-Schulz result, identical on every
+            # rank. Apply weight decay and the sliced update to the local shard
+            # storage (to_local() is a view, so in-place ops propagate back).
+            p_local = p.to_local()
+            if group["weight_decay"] > 0.0:
+                p_local.mul_(1 - lr * group["weight_decay"])
+            if p_local.numel() > 0:
+                local_update = self._shard_like(update, p)
+                p_local.add_(local_update, alpha=-adjusted_lr)
         else:
+            if group["weight_decay"] > 0.0:
+                p.mul_(1 - lr * group["weight_decay"])
             p.add_(update, alpha=-adjusted_lr)
 
     @torch.no_grad()
