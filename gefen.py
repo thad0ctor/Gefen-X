@@ -1256,9 +1256,26 @@ class Gefen(torch.optim.Optimizer):
         # them from the serialized dict instead of bloating every checkpoint. Build
         # fresh per-param dicts so live self.state is left untouched.
         scratch_keys = ("stepsize", "_h_buf")
+
+        def _compact(value):
+            # K4 rebinds m_magnitude onto a [2, num_blocks, 1] scratch buffer via
+            # set_() (it shares storage with the transient sumsq/stepsize row).
+            # Serializing such a non-owning view would persist the whole oversized
+            # storage -- the scratch tail included -- into every checkpoint. Clone
+            # any state tensor that doesn't own a tight storage so only its own
+            # values are saved. Operates on the serialized copy only; live
+            # self.state keeps the aliased fast-path buffer.
+            if torch.is_tensor(value) and (
+                value.storage_offset() != 0
+                or value.untyped_storage().nbytes()
+                != value.numel() * value.element_size()
+            ):
+                return value.detach().clone()
+            return value
+
         state_dict["state"] = {
             pid: (
-                {k: v for k, v in pstate.items() if k not in scratch_keys}
+                {k: _compact(v) for k, v in pstate.items() if k not in scratch_keys}
                 if isinstance(pstate, dict)
                 else pstate
             )
