@@ -29,6 +29,13 @@ def automatic_vmean_update_cuda(
     # CUDA extension's C++ guards, so the former Python re-validation ran every
     # step per param for no added safety. Only normalize contiguity, and only when
     # the input is actually non-contiguous.
+    # CUDAGuard only selects the launch device; a mismatched-device input would
+    # still read across devices, so reject that here.
+    if grad_view.device != vmean.device:
+        raise ValueError(
+            f"grad_view device {grad_view.device} must match vmean device "
+            f"{vmean.device}."
+        )
     grad_c = grad_view if grad_view.is_contiguous() else grad_view.contiguous()
     module = _load_extension()
     module.automatic_vmean_update_cuda(vmean, grad_c, beta2)

@@ -93,6 +93,7 @@ def automatic_gefen_fused_update_cuda(
         )
     for name, t in (
         ("grad_view", grad_view),
+        ("m_sign", m_sign),
         ("m_magnitude", m_magnitude),
         ("stepsize", stepsize),
         ("codebook", codebook),

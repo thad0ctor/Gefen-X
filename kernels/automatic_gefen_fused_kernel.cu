@@ -5,6 +5,7 @@
 #include <ATen/ATen.h>
 #include <ATen/Dispatch.h>
 
+#include <atomic>
 #include <cmath>
 #include <cstdint>
 #include <stdexcept>
@@ -13,14 +14,17 @@ namespace {
 
 // Cache the per-device SM count: cudaDeviceGetAttribute is a driver round-trip
 // that the v2 launch path otherwise pays on every step per param, and the value
-// is constant for the life of the process. Writes are idempotent so the lazy
-// fill needs no lock.
+// is constant for the life of the process. The cache is an atomic array (0 ==
+// unfilled, real SM counts are >= 1) so concurrent fills are a benign race on
+// the same constant rather than UB on a plain shared array.
 int cached_sm_count(int device_id) {
     constexpr int kMaxDevices = 64;
-    static int cache[kMaxDevices] = {0};
-    static bool valid[kMaxDevices] = {false};
-    if (device_id >= 0 && device_id < kMaxDevices && valid[device_id]) {
-        return cache[device_id];
+    static std::atomic<int> cache[kMaxDevices];  // static storage zero-inits
+    if (device_id >= 0 && device_id < kMaxDevices) {
+        const int cached = cache[device_id].load(std::memory_order_relaxed);
+        if (cached > 0) {
+            return cached;
+        }
     }
     int sm = 0;
     cudaDeviceGetAttribute(&sm, cudaDevAttrMultiProcessorCount, device_id);
@@ -28,8 +32,7 @@ int cached_sm_count(int device_id) {
         sm = 1;
     }
     if (device_id >= 0 && device_id < kMaxDevices) {
-        cache[device_id] = sm;
-        valid[device_id] = true;
+        cache[device_id].store(sm, std::memory_order_relaxed);
     }
     return sm;
 }
