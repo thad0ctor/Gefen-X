@@ -705,6 +705,18 @@ void automatic_gefen_fused_full_update_cuda(
     if (m_magnitude.scalar_type() != at::kFloat || vmean.scalar_type() != at::kFloat) {
         throw std::invalid_argument("Expected m_magnitude and vmean to have dtype float32.");
     }
+    // Raw-pointer launch reads grad_view as scalar_t (p's dispatch dtype); a
+    // mismatch would reinterpret memory at the wrong width.
+    if (grad_view.scalar_type() != p.scalar_type()) {
+        throw std::invalid_argument("Expected grad_view dtype to match p.");
+    }
+    // All tensors are dereferenced on p's device; reject cross-device inputs that
+    // the is_cuda() checks above would otherwise let through.
+    if (grad_view.device() != p.device() || m_sign.device() != p.device() ||
+        m_magnitude.device() != p.device() || vmean.device() != p.device() ||
+        codebook.device() != p.device()) {
+        throw std::invalid_argument("Expected all tensors on the same device as p.");
+    }
 
     c10::cuda::CUDAGuard device_guard(p.device());
 
@@ -726,6 +738,16 @@ void automatic_gefen_fused_full_update_cuda(
     }
     if (period <= 0) {
         throw std::invalid_argument("Expected grad_view to have a positive period.");
+    }
+    // nearest_codebook_index() returns uint8_t, so >256 entries would wrap the
+    // stored indices; an empty table would size shared memory at 0. Packed
+    // indices store 2 entries per byte (4-bit), so cap at 16 in that mode.
+    const int64_t codebook_numel = codebook.numel();
+    if (codebook_numel < 1 || codebook_numel > 256) {
+        throw std::invalid_argument("Expected codebook size in [1, 256].");
+    }
+    if (packed_indices && codebook_numel > 16) {
+        throw std::invalid_argument("Expected packed codebook size in [1, 16].");
     }
 
     const int threads = choose_threads(period);
