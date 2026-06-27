@@ -109,6 +109,51 @@ regularization constant, scale `weight_decay` up correspondingly (≈ `1 / 0.6`)
 retune it. (Our measurements used `weight_decay = 0`, so this follows from the
 decoupled-decay definition rather than direct testing.)
 
+## Benchmarks
+
+Optimizer comparison on a full fine-tune, **with each optimizer at its own
+fair learning-rate optimum** (from a per-optimizer LR sweep), 2000 steps.
+
+> Measured as of commit `ebb7d40` — the head of the fused-kernel performance
+> series (`perf/tier0-quickwins` → `perf/tier1-kernel-fusion` → `perf/v2-fusion`
+> → `perf/k4-batching`, PRs #8–#11). Update this SHA to the merge commit when the
+> series lands in `main`.
+
+**Testing environment**
+- **Hardware:** NVIDIA RTX 3090 (Ampere, sm_86), single GPU per run.
+- **Software:** PyTorch 2.12.0 (cu133), Python 3.12; Gefen fused CUDA kernels JIT-built for sm_86.
+- **Models:** Qwen3-0.6B and Qwen3-1.7B — full fine-tune (all weights trained, no adapters).
+- **Regime:** bf16 master weights, gradient checkpointing, sequence length 2048, micro-batch 1, Alpaca greedy-packed to 2048-token blocks, 2000 steps, single seed, identical data order across optimizers; 32-example held-out eval.
+- **Learning rate (each at its own fair optimum):** AdamW (bf16 / 8-bit / 4-bit) = `5e-5`; Gefen (fused) = `2e-5`.
+- **Optimizers:** `adamw_bf16` = torch fused AdamW · `adamw8bit` = bitsandbytes · `adamw4bit` = torchao · `gefen_fused` = `Gefen(fused=True)`.
+
+| Model | Optimizer | LR | Eval loss | tok/s | Peak VRAM (GiB) | Opt-state B/param |
+|---|---|---|---|---|---|---|
+| Qwen3-0.6B | adamw_bf16 | 5e-5 | **1.437** | 4933 | 6.95 | 4.00 |
+| Qwen3-0.6B | adamw8bit | 5e-5 | 1.439 | 4690 | 5.86 | 2.03 |
+| Qwen3-0.6B | adamw4bit | 5e-5 | 1.444 | 4005 | 6.32 | 1.06 |
+| Qwen3-0.6B | **gefen_fused** | 2e-5 | 1.635 | 4815 | **5.31** | **1.03** |
+| Qwen3-1.7B | adamw_bf16 | 5e-5 | **1.221** | 2650 | 14.00 | 4.00 |
+| Qwen3-1.7B | adamw8bit | 5e-5 | 1.251 | 2466 | 10.84 | 2.03 |
+| Qwen3-1.7B | adamw4bit | 5e-5 | 1.242 | 2195 | 15.11 | 1.06 |
+| Qwen3-1.7B | **gefen_fused** | 2e-5 | 1.331 | **2676** | **9.21** | **1.02** |
+
+![Qwen3-1.7B optimizer comparison](docs/benchmarks/quad_qwen3_1p7b.png)
+![Qwen3-0.6B optimizer comparison](docs/benchmarks/quad_qwen3_0p6b.png)
+
+**Takeaways.** At its fair LR, **Gefen-fused has the lowest peak VRAM and the
+lowest optimizer-state footprint, with competitive-to-best throughput** (fastest
+at 1.7B on sm_86) — at a **modest loss cost** (~0.1 at 1.7B, ~0.2 at 0.6B) vs the
+best-tuned AdamW. Note that AdamW-4-bit's optimizer state is also small
+(~1.06 B/param) but its **peak VRAM is the highest** (torchao compiled-step
+transient buffers), so Gefen, not 4-bit, is the real peak-memory winner. Gefen's
+clear optimizer-state edge is over 8-bit (2.03) and bf16 (4.00).
+
+*Caveats:* single seed; the `5e-5`/`2e-5` LRs are 175-step optima (the 2000-step
+optimum is likely lower for every optimizer); `adamw4bit` was run at the
+AdamW-family `5e-5` (its own 4-bit optimum was not separately swept). Raw data:
+`docs/benchmarks/optimizer_comparison_2000steps.csv`.
+
 ## Hugging Face Trainer
 
 Until native `optim="gefen"` support is released in Transformers, pass Gefen to
