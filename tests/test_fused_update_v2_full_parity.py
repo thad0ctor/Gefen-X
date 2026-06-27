@@ -176,11 +176,16 @@ def determinism(device, runs=4):
         for _ in range(runs - 1):
             fp, _, _, fvm = _fused(mod, p, gv, ms, mm, vm, cb, 7, 0.0)
             vm_ok = torch.allclose(fvm, fvm0, rtol=VMEAN_RTOL, atol=VMEAN_ATOL)
+            # p only inherits perturbation through vmean, so it must stay within
+            # the same documented tolerance run-to-run (period>1), not just be
+            # bit-identical at period==1. Assert it explicitly.
+            p_ok = torch.allclose(fp, fp0, rtol=VMEAN_RTOL, atol=VMEAN_ATOL)
             if period == 1:
                 vm_ok = vm_ok and _bit_equal(fvm, fvm0) and _bit_equal(fp, fp0)
-            ok = ok and vm_ok
-            if not vm_ok:
-                print(f"  [determinism FAIL] numel={numel} period={period}")
+            ok = ok and vm_ok and p_ok
+            if not (vm_ok and p_ok):
+                print(f"  [determinism FAIL] numel={numel} period={period} "
+                      f"vm_ok={vm_ok} p_ok={p_ok}")
                 break
     print(f"[fused-v2-full determinism ({runs}x): vmean within rtol, period==1 bit-exact] "
           f"-> {'PASS' if ok else 'FAIL'}")
