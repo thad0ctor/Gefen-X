@@ -321,6 +321,58 @@ trainer = Trainer(model=model, args=training_args, train_dataset=train_dataset,
                   optimizers=(optimizer, None))  # (optimizer, lr_scheduler)
 ```
 
+## Using Gefen with Axolotl
+
+[Axolotl](https://github.com/axolotl-ai-cloud/axolotl) can train with Gefen via its
+`optimizer: gefen` integration — see the (draft) PR
+[axolotl-ai-cloud/axolotl#3755](https://github.com/axolotl-ai-cloud/axolotl/pull/3755).
+
+> ⚠️ **Install this fork from source, not the PyPI package.** PR #3755 documents
+> `pip install gefen`, which pulls **upstream** Gefen — *without* this fork's fixes
+> (the modern-arch `period==1` memory fallback, the ~2× fused kernels, the
+> robustness guards). Install this fork from source (see [Installation](#installation));
+> axolotl's `optimizer: gefen` then imports whichever `gefen` is on the path, i.e.
+> the fork.
+
+**Basic** (memory-efficient AdamW drop-in):
+
+```yaml
+optimizer: gefen
+learning_rate: 6.0e-6    # ≈ 0.6× the AdamW LR you'd use — Gefen needs a lower LR
+weight_decay: 0.0
+```
+
+**Fused kernels** (recommended — ~2× faster `opt.step`, bit-exact):
+
+```yaml
+optimizer: gefen
+learning_rate: 6.0e-6
+optim_args:
+  fused: true
+```
+
+`learning_rate`, `weight_decay`, `adam_beta1`/`adam_beta2`, `adam_epsilon` are
+forwarded straight to the `Gefen` constructor; anything under `optim_args` (e.g.
+`fused`) is passed through as extra constructor kwargs.
+
+**The levers, and where each lives:**
+
+| Lever | How (axolotl) | Notes |
+|---|---|---|
+| Select Gefen | `optimizer: gefen` | added by PR #3755 |
+| Fused kernels | `optim_args: { fused: true }` | ~2× faster `opt.step`; bit-exact |
+| Learning rate | `learning_rate: <≈0.6× AdamW>` | Gefen over-steps at AdamW's LR on SwiGLU/GQA (Qwen3) — see [Learning rate](#learning-rate-when-porting-an-adamw-config) |
+| Betas / eps / weight decay | standard `adam_beta1/2`, `adam_epsilon`, `weight_decay` | forwarded to Gefen |
+| `period==1` memory fallback | *on by default in this fork* | restores ~1 B/param on modern decoders; it's the module flag `MEMORY_SAFE_FALLBACK`, not a YAML key |
+
+**Not (yet) exposed via axolotl config:** the **Muon hybrid** (`GefenMuonHybrid` +
+`adjust_lr_fn`) is **not** in PR #3755 (the PR notes Muon is "more involved") — use
+it directly in Python per [Gefen-Muon](#extension-gefen-muon) above. `MEMORY_SAFE_FALLBACK`
+is a module default (on in this fork), toggled in code rather than YAML.
+
+> PR #3755 is an early draft and marked *untested* upstream; the config keys above
+> may change — check the PR for the current state.
+
 ## Citation
 
 If you found this library useful, please consider citing our work:
