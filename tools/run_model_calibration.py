@@ -187,6 +187,8 @@ def run_one(path, device, dtype, steps, warmup, seq, reference):
         print(f"    {'type':<14}{'kind':<7}{'n':>4}{'ratio med':>11}{'k_eff med':>11}")
         for t in sorted(by_type_ratio):
             s = _summ(by_type_ratio[t])
+            if s is None:  # every ratio for this type was non-finite -> nothing to show
+                continue
             ks = _summ(by_type_k[t]) if by_type_k[t] else None
             kind = "muon" if by_type_k[t] else "backup"
             kcol = f"{ks[0]:.3f}" if ks else "-"
