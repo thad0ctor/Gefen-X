@@ -42,7 +42,10 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--csv", required=True)
     ap.add_argument("--out-dir", required=True)
+    ap.add_argument("--subtitle", default="",
+                    help="optional extra footer line (e.g. hardware / date / LRs)")
     args = ap.parse_args()
+    config_text = CONFIG + ("\n" + args.subtitle if args.subtitle else "")
 
     rows = list(csv.DictReader(open(args.csv)))
     for r in rows:
@@ -93,7 +96,7 @@ def main():
                    for o in opts]
         fig.legend(handles=handles, loc="lower center", ncol=len(opts), fontsize=9.5,
                    frameon=False, bbox_to_anchor=(0.5, 0.04))
-        fig.text(0.5, 0.005, CONFIG, ha="center", va="bottom", fontsize=8.0, color="#333333")
+        fig.text(0.5, 0.005, config_text, ha="center", va="bottom", fontsize=8.0, color="#333333")
 
         fig.tight_layout(rect=[0, 0.11, 1, 0.965])
         slug = model.lower().replace("-", "_").replace(".", "p").replace("/", "_")

@@ -49,7 +49,10 @@ def main():
     ap.add_argument("--csv", required=True)
     ap.add_argument("--logs", required=True, help="dir with <tag>_<opt>.log files")
     ap.add_argument("--out-dir", required=True)
+    ap.add_argument("--subtitle", default="",
+                    help="optional extra footer line (e.g. hardware / date / LRs)")
     args = ap.parse_args()
+    config_text = CONFIG + ("\n" + args.subtitle if args.subtitle else "")
 
     rows = list(csv.DictReader(open(args.csv)))
     by_model_opt = {(r["model"], r["optimizer"]): r for r in rows}
@@ -100,7 +103,7 @@ def main():
             ]
             ax.legend(handles=style_handles, fontsize=8.5, title="line style",
                       title_fontsize=8.5, loc="upper right", bbox_to_anchor=(1.0, 0.66))
-        fig.text(0.5, 0.012, CONFIG, ha="center", fontsize=7.6, color="#333")
+        fig.text(0.5, 0.012, config_text, ha="center", fontsize=7.6, color="#333")
         fig.tight_layout(rect=[0, 0.06, 1, 1])
         out = os.path.join(args.out_dir, f"loss_curve_{slug}.png")
         fig.savefig(out, dpi=140)
@@ -138,7 +141,7 @@ def main():
             ax.set_xlim(min(fxs) - 1.2, max(fxs) + 2.8)
         if fys:
             ax.set_ylim(min(fys) * 0.94, max(fys) * 1.06)
-        fig.text(0.5, 0.012, CONFIG, ha="center", fontsize=7.6, color="#333")
+        fig.text(0.5, 0.012, config_text, ha="center", fontsize=7.6, color="#333")
         fig.tight_layout(rect=[0, 0.06, 1, 1])
         out = os.path.join(args.out_dir, f"tput_vram_{slug}.png")
         fig.savefig(out, dpi=140)

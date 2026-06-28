@@ -182,19 +182,21 @@ fair learning-rate optimum** (from a per-optimizer LR sweep), 2000 steps.
 - **Software:** PyTorch 2.12.0 (cu133), Python 3.12; Gefen fused CUDA kernels JIT-built for sm_86.
 - **Models:** Qwen3-0.6B and Qwen3-1.7B — full fine-tune (all weights trained, no adapters).
 - **Regime:** bf16 master weights, gradient checkpointing, sequence length 2048, micro-batch 1, Alpaca greedy-packed to 2048-token blocks, 2000 steps, single seed, identical data order across optimizers; 32-example held-out eval.
-- **Learning rate (each at its own fair optimum):** AdamW (bf16 / 8-bit / 4-bit) = `5e-5`; Gefen (fused) = `2e-5`.
-- **Optimizers:** `adamw_bf16` = torch fused AdamW · `adamw8bit` = bitsandbytes · `adamw4bit` = torchao · `gefen_fused` = `Gefen(fused=True)`.
+- **Learning rate (each at its own fair optimum):** AdamW (bf16 / 8-bit / 4-bit) = `5e-5`; Gefen (fused) = `2e-5`; Gefen-Muon = `5e-5` (with `adjust_lr_fn="match_rms_adamw"`).
+- **Optimizers:** `adamw_bf16` = torch fused AdamW · `adamw8bit` = bitsandbytes · `adamw4bit` = torchao · `gefen_fused` = `Gefen(fused=True)` · `gefen_muon` = `GefenMuonHybrid` (Muon on 2D hidden matrices, Gefen on everything else).
 
 | Model | Optimizer | LR | Eval loss | tok/s | Peak VRAM (GiB) | Opt-state B/param |
 |---|---|---|---|---|---|---|
 | Qwen3-0.6B | adamw_bf16 | 5e-5 | **1.437** | 4933 | 6.95 | 4.00 |
 | Qwen3-0.6B | adamw8bit | 5e-5 | 1.439 | 4690 | 5.86 | 2.03 |
 | Qwen3-0.6B | adamw4bit | 5e-5 | 1.444 | 4005 | 6.32 | 1.06 |
-| Qwen3-0.6B | **gefen_fused** | 2e-5 | 1.635 | 4815 | **5.31** | **1.03** |
+| Qwen3-0.6B | **gefen_fused** | 2e-5 | 1.635 | 4815 | 5.31 | 1.03 |
+| Qwen3-0.6B | **gefen_muon** | 5e-5 | 1.501 | 2770 | **5.30** | **1.01** |
 | Qwen3-1.7B | adamw_bf16 | 5e-5 | **1.221** | 2650 | 14.00 | 4.00 |
 | Qwen3-1.7B | adamw8bit | 5e-5 | 1.251 | 2466 | 10.84 | 2.03 |
 | Qwen3-1.7B | adamw4bit | 5e-5 | 1.242 | 2195 | 15.11 | 1.06 |
-| Qwen3-1.7B | **gefen_fused** | 2e-5 | 1.331 | **2676** | **9.21** | **1.02** |
+| Qwen3-1.7B | **gefen_fused** | 2e-5 | 1.331 | **2676** | 9.21 | 1.02 |
+| Qwen3-1.7B | **gefen_muon** | 5e-5 | 1.326 | 924 | **9.20** | **1.01** |
 
 ![Qwen3-1.7B optimizer comparison](docs/benchmarks/quad_qwen3_1p7b.png)
 ![Qwen3-0.6B optimizer comparison](docs/benchmarks/quad_qwen3_0p6b.png)
@@ -203,16 +205,20 @@ fair learning-rate optimum** (from a per-optimizer LR sweep), 2000 steps.
 **color**), there are two lines: **solid = held-out eval loss** (the 32-example
 validation set, logged every 50 steps — this is the comparison metric in the
 table above) and **dashed = train-loss EMA** (exponential moving average of the
-training loss). Lower is better. Gefen converges stably and its eval curve tracks
-just above the AdamW cluster (the ~0.1–0.2 loss gap), with no instability at its
-fair LR.
+training loss). Lower is better. Gefen-fused converges stably and its eval curve
+tracks just above the AdamW cluster (the ~0.1–0.2 loss gap), with no instability
+at its fair LR. **Gefen-Muon recovers most of that gap** — its curve sits between
+Gefen-fused and the AdamW cluster, most visibly at 0.6B where it closes the gap to
+the best AdamW from +0.198 to +0.064.
 
 ![Qwen3-1.7B loss curves](docs/benchmarks/loss_curve_qwen3_1p7b.png)
 ![Qwen3-0.6B loss curves](docs/benchmarks/loss_curve_qwen3_0p6b.png)
 
 **Throughput vs peak VRAM** — the speed/memory frontier (upper-left = faster *and*
-lighter is better). Gefen sits alone in the best corner; AdamW-4-bit is worst on
-*both* axes despite its small optimizer state (torchao transient buffers).
+lighter is better). Gefen-fused sits alone in the best corner; AdamW-4-bit is worst
+on *both* axes despite its small optimizer state (torchao transient buffers).
+Gefen-Muon shares Gefen-fused's lowest-VRAM column but sits far lower on
+throughput — the Newton-Schulz orthogonalization makes it the slowest optimizer.
 
 ![Qwen3-1.7B throughput vs VRAM](docs/benchmarks/tput_vram_qwen3_1p7b.png)
 ![Qwen3-0.6B throughput vs VRAM](docs/benchmarks/tput_vram_qwen3_0p6b.png)
@@ -225,9 +231,19 @@ best-tuned AdamW. Note that AdamW-4-bit's optimizer state is also small
 transient buffers), so Gefen, not 4-bit, is the real peak-memory winner. Gefen's
 clear optimizer-state edge is over 8-bit (2.03) and bf16 (4.00).
 
+**Gefen-Muon** (`GefenMuonHybrid`, Muon on 2D hidden matrices + Gefen elsewhere,
+`match_rms_adamw` LR) is the **best Gefen variant on loss** at both scales — 1.501
+@0.6B (vs Gefen-fused 1.635) and 1.326 @1.7B (~tied with Gefen-fused, +0.105 vs the
+best AdamW) — while tying Gefen-fused for the lowest peak VRAM and lowest
+optimizer state (~1.01 B/param). The cost is throughput: Newton-Schulz makes it the
+slowest optimizer (~0.58× Gefen-fused at 0.6B, ~0.35× at 1.7B). So **Gefen-fused is
+the speed+memory sweet spot; Gefen-Muon is the loss-recovery option** when you can
+afford the slowdown.
+
 *Caveats:* single seed; the `5e-5`/`2e-5` LRs are 175-step optima (the 2000-step
 optimum is likely lower for every optimizer); `adamw4bit` was run at the
-AdamW-family `5e-5` (its own 4-bit optimum was not separately swept).
+AdamW-family `5e-5` (its own 4-bit optimum was not separately swept); Gefen-Muon and
+Gefen-fused are within ~0.01 GiB / ~0.01 B/param on VRAM and optimizer state (a tie).
 
 **Review the raw runs:** per-cell training logs (step-by-step loss, throughput,
 VRAM) in [`docs/benchmarks/logs/`](docs/benchmarks/logs/) · aggregated metrics as
