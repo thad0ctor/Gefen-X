@@ -388,7 +388,8 @@ def find_lr_parallel_sweep(
         bs=bs, seed=seed,
     )
 
-    _prewarm_kernels()
+    if optimizer != "adamw":  # AdamW needs no Gefen CUDA kernels -> don't import them
+        _prewarm_kernels()
     ctx = mp.get_context("spawn")
     q = ctx.Queue()
     procs = []
@@ -596,7 +597,8 @@ def find_lr_sharded_sweep(
         eval_blocks=eval_blocks, sweep_steps=sweep_steps, warmup=warmup,
         bs=bs, seed=seed,
     )
-    _prewarm_kernels()
+    if optimizer != "adamw":  # AdamW needs no Gefen CUDA kernels -> don't import them
+        _prewarm_kernels()
     ctx = mp.get_context("spawn")
     results: Dict[float, float] = {}
 
@@ -692,7 +694,11 @@ def _load_texts(dataset, split, max_rows):
             texts = [_row_text(r) for r in rows]
         elif dataset.endswith(".json"):
             with open(dataset) as fh:
-                texts = [_row_text(r) for r in json.load(fh)]
+                loaded = json.load(fh)
+            # A single-object .json loads as a dict; wrap it as one row so we don't
+            # iterate its field names. A list is already multiple rows.
+            rows = loaded if isinstance(loaded, list) else [loaded]
+            texts = [_row_text(r) for r in rows]
         else:  # plain text file
             with open(dataset) as fh:
                 texts = [fh.read()]
