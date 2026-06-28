@@ -42,6 +42,7 @@ class GefenMuonHybrid(torch.optim.Optimizer):
         nesterov=True,
         ns_steps=5,
         adjust_lr_fn="match_rms_adamw",
+        sharded_mode="exact",
         verbose=False,
     ):
         muon_named_params = list(muon_named_params)
@@ -59,6 +60,7 @@ class GefenMuonHybrid(torch.optim.Optimizer):
                 ns_steps=ns_steps,
                 adjust_lr_fn=adjust_lr_fn,
                 fused=fused,
+                sharded_mode=sharded_mode,
                 verbose=verbose,
             )
             if muon_named_params

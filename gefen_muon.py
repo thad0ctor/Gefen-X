@@ -82,6 +82,7 @@ class GefenMuon(Gefen):
         adjust_lr_fn: Optional[str] = None,
         *,
         fused: bool = True,
+        sharded_mode: str = "exact",
         verbose: bool = False,
     ) -> None:
         if isinstance(lr, torch.Tensor) and lr.numel() != 1:
@@ -101,6 +102,19 @@ class GefenMuon(Gefen):
             raise ValueError(
                 "Adjust learning rate function {} is not supported".format(adjust_lr_fn)
             )
+        if sharded_mode not in ("exact", "approx"):
+            raise ValueError(
+                "sharded_mode must be 'exact' or 'approx' but is: {}".format(
+                    sharded_mode
+                )
+            )
+        # "exact" (default): under FSDP2 every rank gathers the full gradient and
+        # runs Newton-Schulz on the full matrix -> bit-for-bit single-GPU parity.
+        # "approx": each rank runs the whole pipeline on its LOCAL shard only --
+        # no all-gather and NS on a smaller (row-sharded) matrix, so it is
+        # cheaper, but Newton-Schulz of a row block is NOT the orthogonalization
+        # of the full matrix: this mode is explicitly NON-PARITY. Opt-in only.
+        self._sharded_mode = sharded_mode
 
         super().__init__(
             params,
@@ -118,6 +132,7 @@ class GefenMuon(Gefen):
             group["ns_coefficients"] = ns_coefficients
             group["ns_steps"] = ns_steps
             group["adjust_lr_fn"] = adjust_lr_fn
+            group["sharded_mode"] = sharded_mode
             for p in group["params"]:
                 if p.ndim != 2:
                     raise ValueError(
@@ -143,7 +158,12 @@ class GefenMuon(Gefen):
                 if p.grad is None:
                     continue
                 grad = p.grad
-                if hasattr(grad, "full_tensor"):
+                # approx mode learns the codebook/period from the LOCAL shard
+                # (no all-gather) so periods divide the local numel that the
+                # approximate step operates on; exact mode gathers the full matrix.
+                if self._sharded_mode == "approx" and hasattr(grad, "to_local"):
+                    grad = grad.to_local()
+                elif hasattr(grad, "full_tensor"):
                     grad = grad.full_tensor()
                 elif hasattr(grad, "to_local"):
                     grad = grad.to_local()
@@ -253,27 +273,54 @@ class GefenMuon(Gefen):
         # Slice an already-replicated full tensor (the Newton-Schulz update,
         # which is identical on every rank) down to this rank's shard, matching
         # the parameter's own placements exactly -- including uneven and empty
-        # shards. Replicate -> Shard is a local narrow (no collective), so this
-        # adds no communication and cannot deadlock.
-        from torch.distributed.tensor import DTensor, Replicate
+        # shards. Replicate -> Shard is a pure local narrow (no collective), so
+        # rather than build a Replicated DTensor and call
+        # .redistribute(...).to_local() (a DTensor object + redistribute dispatch
+        # per matrix, every step) we narrow the full tensor directly, reproducing
+        # DTensor's torch.chunk split arithmetic exactly. This is numerically
+        # identical to the redistribute path, adds no communication, and cannot
+        # deadlock.
+        from torch.distributed.tensor.placement_types import Shard
 
         mesh = dtensor_param.device_mesh
-        replicated = DTensor.from_local(
-            full_tensor.contiguous(),
-            mesh,
-            [Replicate()] * mesh.ndim,
-            run_check=False,
-        )
-        return replicated.redistribute(
-            placements=dtensor_param.placements
-        ).to_local()
+        coords = mesh.get_coordinate()
+        if coords is None:
+            # This rank is not part of the mesh; redistribute would yield an
+            # empty local shard, so mirror that.
+            return full_tensor.narrow(0, 0, 0).contiguous()
+
+        local = full_tensor
+        for mesh_dim, placement in enumerate(dtensor_param.placements):
+            if isinstance(placement, Shard):
+                dim = placement.dim
+                size = local.size(dim)
+                num_chunks = mesh.size(mesh_dim)
+                rank = coords[mesh_dim]
+                # ceil split == torch.chunk == DTensor Replicate->Shard
+                full_chunk = (size + num_chunks - 1) // num_chunks
+                start = full_chunk * rank
+                length = max(0, min(size, start + full_chunk) - start)
+                local = local.narrow(dim, min(start, size), length)
+        return local.contiguous()
 
     def _step_automatic(
         self, group, param_name: str, p: torch.Tensor, grad: torch.Tensor
     ) -> None:
         is_sharded = self._is_sharded(p)
+        approx = is_sharded and group["sharded_mode"] == "approx"
 
-        if is_sharded:
+        if approx:
+            # NON-PARITY opt-in mode: operate on this rank's LOCAL shard only --
+            # no all-gather, and Newton-Schulz runs on the smaller row-sharded
+            # matrix. There are no collectives here, so an empty-shard rank may
+            # return early without risking a deadlock.
+            if hasattr(grad, "to_local"):
+                grad = grad.to_local()
+            if hasattr(grad, "wait"):
+                grad = grad.wait()
+            if grad.numel() == 0:
+                return
+        elif is_sharded:
             # FSDP2: reconstruct the FULL gradient matrix on every rank so the
             # period prediction, quantized momentum, and Newton-Schulz all run on
             # the full matrix exactly as on a single GPU. full_tensor() is a
@@ -305,12 +352,15 @@ class GefenMuon(Gefen):
         momentum = group["momentum"]
 
         flat_grad = grad.reshape(-1)
+        # In approx mode the pipeline operates on the local shard, so the period
+        # must divide the LOCAL numel; exact/non-sharded use the (global) numel.
+        eff_numel = flat_grad.numel() if approx else p.numel()
         if "step" not in state:
             if "automatic_period" in state:
                 automatic_period = state["automatic_period"]
-            elif p.numel() == 1:
+            elif eff_numel == 1:
                 automatic_period = 1
-            elif p.numel() > 1:
+            elif eff_numel > 1:
                 automatic_period = self._predict_period_from_grad_sq(
                     param_name, p, grad
                 )
@@ -321,12 +371,12 @@ class GefenMuon(Gefen):
                     )
                 )
 
-            if p.numel() % automatic_period != 0:
+            if eff_numel % automatic_period != 0:
                 raise ValueError(
                     "Automatic partition period {} does not divide parameter {} with numel {}".format(
                         automatic_period,
                         param_name,
-                        p.numel(),
+                        eff_numel,
                     )
                 )
 
@@ -379,14 +429,15 @@ class GefenMuon(Gefen):
         adjusted_lr = _adjust_lr(lr, group["adjust_lr_fn"], p.shape)
 
         if is_sharded:
-            # `update` is the full-matrix Newton-Schulz result, identical on every
-            # rank. Apply weight decay and the sliced update to the local shard
-            # storage (to_local() is a view, so in-place ops propagate back).
+            # Apply to the local shard storage (to_local() is a view, so in-place
+            # ops propagate back). In exact mode `update` is the full-matrix
+            # Newton-Schulz result (identical on every rank) sliced to this shard;
+            # in approx mode `update` is already this shard's own NS result.
             p_local = p.to_local()
             if group["weight_decay"] > 0.0:
                 p_local.mul_(1 - lr * group["weight_decay"])
             if p_local.numel() > 0:
-                local_update = self._shard_like(update, p)
+                local_update = update if approx else self._shard_like(update, p)
                 p_local.add_(local_update, alpha=-adjusted_lr)
         else:
             if group["weight_decay"] > 0.0:
