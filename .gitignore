@@ -2,3 +2,6 @@
 __pycache__/
 kernels/__pycache__/
 gefen.egg-info/
+
+# Local prepared benchmark dataset (load_from_disk; ~68MB, machine-local)
+benchmarks/data/
