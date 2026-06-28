@@ -83,7 +83,10 @@ Options:
   --dry-run, --check     Resolve config + CLI, print effective settings, exit.
   --tag NAME             Result tag / chart label key (default $TAG).
   --world-sizes "2 4"    Shard counts to sweep (default "$WORLD_SIZES").
-  --modes "exact approx" sharded_mode values to sweep (default "$MODES").
+  --modes "exact approx distributed"
+                         sharded_mode values to sweep (default "$MODES").
+                         exact/distributed are bit-exact (same eval loss);
+                         distributed splits NS across ranks for speed/memory.
   --steps N              Steps per cell (default $STEPS).
   --seq N                Sequence / pack-block length (default $SEQ).
   --lr X                 Constant LR (default $LR).
@@ -198,7 +201,7 @@ done
   || die "need >= $MAXW GPUs for world_sizes '$WORLD_SIZES' but pool has ${#GPU_ARR[@]} (${GPUS})"
 
 for mode in $MODES; do
-  case "$mode" in exact|approx) ;; *) die "modes must be exact/approx, got '$mode'";; esac
+  case "$mode" in exact|approx|distributed) ;; *) die "modes must be exact/approx/distributed, got '$mode'";; esac
 done
 
 # Warn (don't fail) if the chosen pool mixes GPU types — step-time comparisons

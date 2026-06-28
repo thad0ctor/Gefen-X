@@ -30,13 +30,20 @@ import matplotlib.pyplot as plt  # noqa: E402
 # Per-world-size colors, assigned in ascending world order. The first two match
 # the colors used for x2 / x4 in the original committed charts.
 PALETTE = ["#3f5e8c", "#c25b1f", "#2e8b57", "#8c3f7a", "#7a6a3f", "#3f7a8c"]
-LS = {"exact": "-", "approx": "--"}
+# Line styles (loss curves) and bar colors (perf) per sharded_mode. exact and
+# distributed are bit-exact (identical eval loss), so distributed is drawn dotted
+# over exact's solid; approx (non-parity) is dashed.
+LS = {"exact": "-", "approx": "--", "distributed": ":"}
+MODES_ORDER = ["exact", "approx", "distributed"]
+MODE_COLOR = {"exact": "#3f5e8c", "approx": "#c25b1f", "distributed": "#2e8b57"}
+MODE_LABEL = {"exact": "exact (parity)", "approx": "approx (non-parity)",
+              "distributed": "distributed (parity)"}
 
 STEP_RE = re.compile(
     r"step\s+(\d+)\s+train_ema\s+[0-9.]+\s+eval\s+([0-9.]+)\s+\(([0-9.]+)s/step\)")
 RESULT_RE = re.compile(r"RESULT\s+(\{.*\})\s*$")
 # Tolerant filename parser: `..._w4_approx.log` or `full_2gpu_exact.log`.
-NAME_RE = re.compile(r"(?:_w|_)(\d+)(?:gpu)?_(exact|approx)\.log$")
+NAME_RE = re.compile(r"(?:_w|_)(\d+)(?:gpu)?_(exact|approx|distributed)\.log$")
 
 
 def parse_log(path):
@@ -165,7 +172,7 @@ def main():
     fig, ax = plt.subplots(figsize=(9.0, 6.0))
     drew = False
     for world in worlds:
-        for mode in ("exact", "approx"):
+        for mode in MODES_ORDER:
             c = curves.get((world, mode))
             if not c or not c["steps"]:
                 continue
@@ -181,14 +188,14 @@ def main():
                           + (f"  -> {fe:.3f}" if fe is not None else ""))
     ax.set_xlabel("training step")
     ax.set_ylabel("held-out eval loss  ->  lower is better")
-    ax.set_title("Gefen-Muon under FSDP2: exact vs approx sharded Newton-Schulz\n"
-                 + regime, fontsize=11.5, fontweight="bold")
+    ax.set_title("Gefen-Muon under FSDP2: exact / distributed / approx sharded "
+                 "Newton-Schulz\n" + regime, fontsize=11.5, fontweight="bold")
     ax.grid(alpha=0.25)
     ax.set_axisbelow(True)
     if drew:
-        ax.legend(title="solid = exact (parity)   dashed = approx (non-parity)"
-                        "   -> final eval",
-                  fontsize=9.5, title_fontsize=9.5, loc="upper right")
+        ax.legend(title="solid = exact   dotted = distributed (both parity)   "
+                        "dashed = approx (non-parity)   -> final eval",
+                  fontsize=9.5, title_fontsize=9.0, loc="upper right")
     fig.tight_layout()
     p1 = os.path.join(args.out_dir, "muon_shard_loss.png")
     fig.savefig(p1, dpi=140)
@@ -196,40 +203,58 @@ def main():
     plt.close(fig)
 
     # ---------- 2) performance (step-time + VRAM bars per world) ----------
-    groups = [w for w in worlds
-              if sstep(w, "exact") is not None and sstep(w, "approx") is not None]
-    if groups:
-        ex = [sstep(w, "exact") for w in groups]
-        ap = [sstep(w, "approx") for w in groups]
-        ex_v = [peak_vram(w, "exact") for w in groups]
-        ap_v = [peak_vram(w, "approx") for w in groups]
+    # Plot every mode present that has a step-time; exact is the baseline both
+    # the approx and distributed speedups are measured against.
+    groups = [w for w in worlds if sstep(w, "exact") is not None]
+    present_modes = [m for m in MODES_ORDER
+                     if any(sstep(w, m) is not None for w in groups)]
+    if groups and len(present_modes) >= 2:
+        n = len(present_modes)
         x = range(len(groups))
-        w = 0.36
-        fig, ax = plt.subplots(figsize=(9.0, 6.0))
-        ax.bar([i - w / 2 for i in x], ex, w, label="exact (parity)",
-               color="#3f5e8c")
-        ax.bar([i + w / 2 for i in x], ap, w, label="approx (non-parity)",
-               color="#c25b1f")
+        bw = 0.8 / n
+        fig, ax = plt.subplots(figsize=(max(9.0, 3.0 * len(groups)), 6.0))
+        all_vals = []
+        for mi, mode in enumerate(present_modes):
+            off = (mi - (n - 1) / 2.0) * bw
+            vals = [sstep(w, mode) for w in groups]
+            vram = [peak_vram(w, mode) for w in groups]
+            xs = [i + off for i in x]
+            ax.bar(xs, [v if v is not None else 0 for v in vals], bw,
+                   label=MODE_LABEL[mode], color=MODE_COLOR[mode])
+            for i, world in enumerate(groups):
+                if vals[i] is None:
+                    continue
+                all_vals.append(vals[i])
+                vlab = f"\n{vram[i]:.2f} GiB" if vram[i] is not None else ""
+                ax.text(xs[i], vals[i] + 0.01, f"{vals[i]:.2f}s{vlab}",
+                        ha="center", va="bottom", fontsize=8.5)
+        # per-world annotation: speedup of approx / distributed vs exact
         for i, world in enumerate(groups):
-            ev = f"\n{ex_v[i]:.2f} GiB" if ex_v[i] is not None else ""
-            av = f"\n{ap_v[i]:.2f} GiB" if ap_v[i] is not None else ""
-            ax.text(i - w / 2, ex[i] + 0.02, f"{ex[i]:.2f}s{ev}",
-                    ha="center", va="bottom", fontsize=9)
-            ax.text(i + w / 2, ap[i] + 0.02, f"{ap[i]:.2f}s{av}",
-                    ha="center", va="bottom", fontsize=9)
-            spd = ex[i] / ap[i]
-            fe_ex, fe_ap = final_eval(world, "exact"), final_eval(world, "approx")
-            ann = f"approx: {spd:.2f}x faster"
-            if fe_ex is not None and fe_ap is not None:
-                ann += f"\n{fe_ap - fe_ex:+.3f} eval loss"
-            ax.text(i, max(ex[i], ap[i]) + 0.20, ann, ha="center", va="bottom",
-                    fontsize=9.5, fontweight="bold", color="#444")
+            base = sstep(world, "exact")
+            lines = []
+            for mode in ("distributed", "approx"):
+                v = sstep(world, mode)
+                if v is None or base is None:
+                    continue
+                line = f"{mode}: {base / v:.2f}x"
+                if mode == "approx":
+                    fe_ex, fe_ap = final_eval(world, "exact"), final_eval(world, mode)
+                    if fe_ex is not None and fe_ap is not None:
+                        line += f" ({fe_ap - fe_ex:+.3f} loss)"
+                else:
+                    line += " (bit-exact)"
+                lines.append(line)
+            if lines:
+                ymax = max(v for m in present_modes
+                           if (v := sstep(world, m)) is not None)
+                ax.text(i, ymax + 0.18, "\n".join(lines), ha="center",
+                        va="bottom", fontsize=9, fontweight="bold", color="#444")
         ax.set_xticks(list(x))
         ax.set_xticklabels([f"{g} GPUs" for g in groups])
         ax.set_ylabel("avg training-step time (s)  ->  lower is better")
-        ax.set_ylim(0, max(ex + ap) + 0.5)
-        ax.set_title("Gefen-Muon under FSDP2: the sharded_mode speed / quality trade\n"
-                     + regime, fontsize=11.5, fontweight="bold")
+        ax.set_ylim(0, (max(all_vals) if all_vals else 1) + 0.7)
+        ax.set_title("Gefen-Muon under FSDP2: sharded_mode step-time + optimizer "
+                     "VRAM\n" + regime, fontsize=11.5, fontweight="bold")
         ax.grid(alpha=0.25, axis="y")
         ax.set_axisbelow(True)
         ax.legend(fontsize=10, loc="upper left")
@@ -239,7 +264,7 @@ def main():
         print("wrote", p2)
         plt.close(fig)
     else:
-        print("skip muon_shard_perf.png: need both exact+approx s/step per world")
+        print("skip muon_shard_perf.png: need exact + >=1 other mode s/step")
     print("done")
 
 
