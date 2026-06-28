@@ -69,7 +69,7 @@ Drive everything through `run.sh`. For each `world_size x mode` it launches
 
 Settings come from CLI flags and/or a YAML config, with
 
-```
+```text
 precedence:  CLI flag  >  config.yaml  >  built-in default
 ```
 

@@ -125,6 +125,12 @@ def _run_case(case):
     assert "main" in results, f"[{case}] no result from rank 0 (deadlock?)"
 
     _case, local_rows, changed, finite, diff = results["main"]
+    # Pin the Shard(0) row split so a chunking regression (e.g. the empty case no
+    # longer putting the whole tensor on rank 0) can't silently pass.
+    expected_rows = {"even": (4, 4), "uneven": (3, 2), "empty": (1, 0)}[case]
+    assert (local_rows, rank_rows.get(1)) == expected_rows, (
+        f"[approx {case}] shard rows {(local_rows, rank_rows.get(1))} "
+        f"!= {expected_rows}")
     print(f"[approx {case}] rank0_rows={local_rows} changed={changed} "
           f"finite={finite} |approx-exact|={diff:.3e}")
     # approx must run, stay finite, change the param, and (by construction) NOT

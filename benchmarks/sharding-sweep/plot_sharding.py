@@ -79,6 +79,26 @@ def main():
     args = ap.parse_args()
     os.makedirs(args.out_dir, exist_ok=True)
 
+    # Cells are keyed by (world_size, sharded_mode) only, so a results/logs dir
+    # that mixes tags would collide. If --tag wasn't given and >1 tag is present,
+    # default to one (and warn) so cells never silently overwrite each other.
+    if args.tag is None:
+        tags = set()
+        with open(args.results) as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    tags.add(json.loads(line).get("tag"))
+                except json.JSONDecodeError:
+                    pass
+        tags.discard(None)
+        if len(tags) > 1:
+            args.tag = sorted(tags)[0]
+            print(f"WARN: results mix tags {sorted(tags)}; plotting only "
+                  f"{args.tag!r} (pass --tag to choose another)")
+
     # ---- authoritative per-cell results keyed by (world, mode) ----
     results = {}
     with open(args.results) as f:
@@ -133,6 +153,11 @@ def main():
         return r.get("peak_vram_gib") if r else None
 
     def sstep(world, mode):
+        # Prefer the authoritative steady-state s/step from RESULT; the last eval
+        # log line is only an approximation (and stale when steps % eval_every).
+        r = results.get((world, mode))
+        if r is not None and r.get("s_per_step") is not None:
+            return r["s_per_step"]
         c = curves.get((world, mode))
         return c["sstep"] if c else None
 

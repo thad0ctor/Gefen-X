@@ -23,11 +23,27 @@ Run:
 """
 import argparse
 import inspect
+import os
+import sys
 
 import torch
 
-from gefen import GefenMuon
-from gefen.gefen_muon import _zeropower_via_newtonschulz, DEFAULT_A, DEFAULT_B, DEFAULT_C
+
+def _strip_shadowing_gefen():
+    # A flat `gefen.py` on sys.path shadows the installed `gefen/` package and
+    # breaks `from gefen import ...`; drop any such entry (the real package,
+    # reached via the PYTHONPATH symlink, survives).
+    sys.path[:] = [
+        p for p in sys.path
+        if not os.path.isfile(os.path.join(p or ".", "gefen.py"))
+    ]
+
+
+_strip_shadowing_gefen()
+
+from gefen import GefenMuon  # noqa: E402
+from gefen.gefen_muon import (  # noqa: E402
+    _zeropower_via_newtonschulz, DEFAULT_A, DEFAULT_B, DEFAULT_C)
 
 
 def make_shapes(hidden, inter, n_layers, n_kv_groups=1):
@@ -92,7 +108,7 @@ def main():
         opt = GefenMuon(params, lr=1e-3, ns_steps=ns_steps, fused=bool(args.fused),
                         adjust_lr_fn="match_rms_adamw")
 
-        def full_step():
+        def full_step(opt=opt, params=params, grads=grads):
             for (_, p), g in zip(params, grads):
                 p.grad = g
             opt.step()
@@ -103,10 +119,12 @@ def main():
 
         step_ms = cuda_time(full_step, args.iters, args.warmup)
 
-        # NS-only: run the same NS over all matrices once per "step"
-        ns_inputs = [g.float() for g in grads]
+        # NS-only: run the same NS over all matrices once per "step". Keep the
+        # bf16 param dtype -- NS casts to bf16 internally, so .float() here would
+        # charge the timer an fp32->bf16 cast the real step never pays.
+        ns_inputs = [g.clone() for g in grads]
 
-        def ns_only():
+        def ns_only(ns_inputs=ns_inputs, coeffs=coeffs, ns_steps=ns_steps):
             for x in ns_inputs:
                 _zeropower_via_newtonschulz(x, coeffs, ns_steps, 1e-7)
 
@@ -119,31 +137,39 @@ def main():
         # state (the op isn't idempotent), so the measured cost reflects a steadily
         # evolving state, not a fixed one. That's fine for wall-clock timing (the
         # work per call is identical); don't read correctness into the values.
-        mom_fn = opt._fused_quantized_momentum_update
-        # baseline signature: (p, state, grad_view, momentum); this branch drops p.
-        takes_p = len(inspect.signature(mom_fn).parameters) == 4
-        primed = []  # (p_or_None, state, grad_view, momentum) precomputed once
-        for (_, p), g in zip(params, grads):
-            state = opt.state[p]
-            gv = opt._automatic_view(g.reshape(-1), state["automatic_period"])
-            primed.append((p if takes_p else None, state, gv))
-        momentum = opt.param_groups[0]["momentum"]
+        # Only meaningful for fused runs: full_step() uses the non-fused dequant
+        # path when --fused 0, so _fused_quantized_momentum_update is NOT part of
+        # the measured step there -- skip it to avoid a misleading decomposition.
+        mom_ms = None
+        if args.fused:
+            mom_fn = opt._fused_quantized_momentum_update
+            # baseline signature: (p, state, grad_view, momentum); this branch drops p.
+            takes_p = len(inspect.signature(mom_fn).parameters) == 4
+            primed = []  # (p_or_None, state, grad_view, momentum) precomputed once
+            for (_, p), g in zip(params, grads):
+                state = opt.state[p]
+                gv = opt._automatic_view(g.reshape(-1), state["automatic_period"])
+                primed.append((p if takes_p else None, state, gv))
+            momentum = opt.param_groups[0]["momentum"]
 
-        def momentum_only():
-            for p_arg, state, gv in primed:
-                if takes_p:
-                    mom_fn(p_arg, state, gv, momentum)
-                else:
-                    mom_fn(state, gv, momentum)
+            def momentum_only(primed=primed, takes_p=takes_p, mom_fn=mom_fn,
+                              momentum=momentum):
+                for p_arg, state, gv in primed:
+                    if takes_p:
+                        mom_fn(p_arg, state, gv, momentum)
+                    else:
+                        mom_fn(state, gv, momentum)
 
-        mom_ms = cuda_time(momentum_only, args.iters, args.warmup)
+            mom_ms = cuda_time(momentum_only, args.iters, args.warmup)
 
         frac = 100.0 * ns_ms / step_ms if step_ms else 0.0
-        mom_frac = 100.0 * mom_ms / step_ms if step_ms else 0.0
-        print(f"ns_steps={ns_steps}: step={step_ms:7.3f} ms  "
-              f"NS-only={ns_ms:7.3f} ms  NS≈{frac:4.1f}% of step  "
-              f"(rest≈{step_ms-ns_ms:6.3f} ms)  "
-              f"momentum-only={mom_ms:6.3f} ms ({mom_frac:4.1f}% of step)")
+        line = (f"ns_steps={ns_steps}: step={step_ms:7.3f} ms  "
+                f"NS-only={ns_ms:7.3f} ms  NS≈{frac:4.1f}% of step  "
+                f"(rest≈{step_ms-ns_ms:6.3f} ms)")
+        if mom_ms is not None:
+            mom_frac = 100.0 * mom_ms / step_ms if step_ms else 0.0
+            line += f"  momentum-only={mom_ms:6.3f} ms ({mom_frac:4.1f}% of step)"
+        print(line)
 
 
 if __name__ == "__main__":

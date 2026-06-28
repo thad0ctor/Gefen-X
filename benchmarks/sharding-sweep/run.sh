@@ -180,7 +180,7 @@ fi
 
 # ---- validate ----
 [ -n "$PY" ]    || die "no python given (--venv or config 'venv:')"
-[ -x "$PY" ] || [ -f "$PY" ] || die "venv python not found/executable: $PY"
+[ -x "$PY" ] || die "venv python not found/executable: $PY"
 [ -n "$OUT" ]   || die "no output dir (--out or config 'out:')"
 [ -n "$GPUS" ]  || die "no GPUs (--gpus or config 'gpus:'); see --list-gpus"
 [ -n "$MODEL" ] || die "no model (--model or config 'model:')"

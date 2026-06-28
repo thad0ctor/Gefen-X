@@ -241,15 +241,23 @@ log(f"step 0  eval_loss {eval0:.4f}")
 
 torch.cuda.reset_peak_memory_stats()
 ema = None
+# Steady-state s/step: time each train step (fwd+bwd+opt, eval excluded) and
+# average over the post-warmup steps. Persisted into RESULT so plot_sharding.py
+# need not infer it from the last eval log line (wrong when steps % eval_every).
+warmup_steps = min(10, max(0, args.steps - 1))
+step_times = []
 t_start = time.time()
 for s in range(1, args.steps + 1):
+    t_step = time.time()
     ids, lab = blocks[s - 1]
     ids, lab = ids.to(dev), lab.to(dev)
     loss = m(ids, labels=lab).loss
     loss.backward()
     opt.step()
     opt.zero_grad(set_to_none=True)
-    l = loss.item()
+    l = loss.item()  # also syncs the step before we read the wall clock
+    if s > warmup_steps:
+        step_times.append(time.time() - t_step)
     ema = l if ema is None else 0.95 * ema + 0.05 * l
     if s % args.eval_every == 0:
         log(f"step {s}  train_ema {ema:.4f}  eval {evaluate():.4f}  "
@@ -257,6 +265,12 @@ for s in range(1, args.steps + 1):
 
 final_eval = evaluate()
 peak = torch.cuda.max_memory_allocated() / 1024**3
+# peak is rank-local; the row is treated as cell-wide, so publish the max peak
+# across ranks (collective -- every rank must call before rank 0 writes).
+peak_t = torch.tensor(peak, device=dev)
+dist.all_reduce(peak_t, op=dist.ReduceOp.MAX)
+peak = peak_t.item()
+s_per_step = sum(step_times) / len(step_times) if step_times else None
 
 if rank == 0:
     res = {
@@ -266,6 +280,7 @@ if rank == 0:
         "params_B": round(n_params / 1e9, 4), "gpu": dev_name,
         "final_train_ema": round(ema, 4), "eval0": round(eval0, 4),
         "final_eval": round(final_eval, 4), "peak_vram_gib": round(peak, 2),
+        "s_per_step": round(s_per_step, 4) if s_per_step is not None else None,
     }
     print("RESULT " + json.dumps(res), flush=True)
     with open(args.out, "a") as f:

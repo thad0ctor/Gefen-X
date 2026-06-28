@@ -151,26 +151,33 @@ def main():
     # ---- timing ----
     step_ms = cuda_time(full_step, args.iters, args.warmup)
 
-    # gather-only: pure per-param all-gather (full_tensor) over pre-sharded
-    # grads -- isolates the serial collective cost from distribute/compute.
-    sharded_grads = [distribute_tensor(g.clone(), mesh, [Shard(0)])
-                     for g in full_grads]
+    # The gather-only / NS-only breakdown is EXACT-mode only (approx has no
+    # all-gather and runs NS on local shards), so skip this discarded work in
+    # approx mode rather than paying the exact-mode cost on every approx run.
+    gather_ms = ns_ms = 0.0
+    if not args.approx:
+        # gather-only: pure per-param all-gather (full_tensor) over pre-sharded
+        # grads -- isolates the serial collective cost from distribute/compute.
+        sharded_grads = [distribute_tensor(g.clone(), mesh, [Shard(0)])
+                         for g in full_grads]
 
-    def gather_only():
-        for dg in sharded_grads:
-            fg = dg.full_tensor()
-            if hasattr(fg, "wait"):
-                fg = fg.wait()
-    gather_ms = cuda_time(gather_only, args.iters, args.warmup)
+        def gather_only():
+            for dg in sharded_grads:
+                fg = dg.full_tensor()
+                if hasattr(fg, "wait"):
+                    fg = fg.wait()
+        gather_ms = cuda_time(gather_only, args.iters, args.warmup)
 
-    # NS-only over full matrices (rank-redundant compute)
-    ns_inputs = [g.float() for g in full_grads]
+        # NS-only over full matrices (rank-redundant compute). Keep the param
+        # dtype (bf16) -- NS casts to bf16 internally, so .float() here would
+        # charge the timer an fp32->bf16 cast the real step never pays.
+        ns_inputs = [g.clone() for g in full_grads]
 
-    def ns_only():
-        for x in ns_inputs:
-            _zeropower_via_newtonschulz(
-                x, (DEFAULT_A, DEFAULT_B, DEFAULT_C), args.ns_steps, 1e-7)
-    ns_ms = cuda_time(ns_only, args.iters, args.warmup)
+        def ns_only():
+            for x in ns_inputs:
+                _zeropower_via_newtonschulz(
+                    x, (DEFAULT_A, DEFAULT_B, DEFAULT_C), args.ns_steps, 1e-7)
+        ns_ms = cuda_time(ns_only, args.iters, args.warmup)
 
     if rank == 0:
         if args.approx:
@@ -207,7 +214,12 @@ def main():
         for (_, p), g in zip(named, p_grads):
             p.grad = distribute_tensor(g.clone(), mesh, [Shard(0)])
         opt2.step()
-    gathered = [p.detach().full_tensor() for p in sharded]
+    gathered = []
+    for p in sharded:
+        g = p.detach().full_tensor()
+        if hasattr(g, "wait"):  # mirror gather_only(): resolve any async gather
+            g = g.wait()
+        gathered.append(g)
 
     if rank == 0:
         # Single-GPU oracle: ONE optimizer over ALL full params (Gefen's codebook
