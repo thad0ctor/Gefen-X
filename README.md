@@ -241,8 +241,11 @@ the speed+memory sweet spot; Gefen-Muon is the loss-recovery option** when you c
 afford the slowdown.
 
 *Caveats:* single seed; the `5e-5`/`2e-5` LRs are 175-step optima (the 2000-step
-optimum is likely lower for every optimizer); `adamw4bit` was run at the
-AdamW-family `5e-5` (its own 4-bit optimum was not separately swept).
+optimum is likely lower for every optimizer). The per-optimizer LR sweep covered
+`adamw_bf16`, `adamw8bit`, and `gefen_fused` (both AdamW variants peaked at `5e-5`,
+Gefen at `2e-5`); `adamw4bit` reused the AdamW family's `5e-5` rather than being
+swept on its own — a safe assumption given its eval lands within ~0.01 of the other
+AdamW variants.
 
 **Review the raw runs:** per-cell training logs (step-by-step loss, throughput,
 VRAM) in [`docs/benchmarks/logs/`](docs/benchmarks/logs/) · aggregated metrics as
