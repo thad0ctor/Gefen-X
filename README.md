@@ -1,31 +1,21 @@
-# [Gefen: Optimized Stochastic Optimizer](https://arxiv.org/pdf/2606.13894)
+ ### `Gefen-X` Fork
 
-> ### This fork — `thad0ctor/Gefen-X`
-> A fork of [upstream Gefen](https://github.com/ndvbd/Gefen) that **fixes several
-> critical gaps in the shipped release and adds modern-architecture support.**
-> Top-level highlights:
->
-> - **🏗️ Modern decoders (SwiGLU MLP + grouped-query attention — Qwen3, Llama-3, Mistral, …).**
->   Shipped Gefen's block-period detector collapses to `period==1` on these
->   architectures, falling back to per-element fp32 state (**~9 B/param — *worse*
->   than AdamW's 8**). A memory-safe coarse fallback restores the intended
->   **~1 B/param**, with documented learning-rate guidance (Gefen's block-shared
->   2nd moment needs a lower LR than AdamW — see
->   [Learning rate](#learning-rate-when-porting-an-adamw-config)).
-> - **⚡ ~2× faster `opt.step()`, bit-exact.** A fused-kernel rewrite folds the
->   2nd-moment update, step-size, and weight decay into the update kernel with
->   occupancy-aware v1/v2 dispatch — removing ~half the per-step kernel launches
->   and a full gradient pass.
-> - **💾 Correct checkpoint/resume** (dtype-on-load, block-period persistence) and
->   **FSDP2 `fused=True` support** — broken / absent in the shipped release.
-> - **🛡️ Robustness hardening:** same-device/dtype guards before raw-pointer
->   kernel launches, thread-safe SM-count caches, codebook & empty-tensor bounds checks.
->
-> See **[Benchmarks](#benchmarks)** for a fair optimizer comparison (loss · speed ·
-> memory) with raw logs. The upstream README follows.
+**This fork of [upstream Gefen](https://github.com/ndvbd/Gefen) that fixes several critical gaps in the shipped release and adds modern-architecture support.**
+
+ Gefen is intended to be a drop-in replacement for the AdamW optimizer for memory-efficient training. It keeps the familiar AdamW training recipe while dramatically reducing optimizer-state memory: an 8x reduction in AdamW memory footprint (about 6.5 GiB saved per billion f32 parameters), while maintaining f32 AdamW-level performance. The reduced memory footprint enables training larger models and larger batch sizes for added throughput.
+
+**Fork Highlights:**
+
+ - **Modern decoders (SwiGLU MLP + grouped-query attention — Qwen3, Llama-3, Mistral, …).** Upstream Gefen's block-period detector collapses to `period==1` on these architectures, falling back to per-element fp32 state (**~9 B/param — *worse*  than AdamW's 8**). A memory-safe coarse fallback restores the intended **~1 B/param**, with documented learning-rate guidance (Gefen's block-shared2nd moment needs a lower LR than AdamW — see [Learning rate](#learning-rate-when-porting-an-adamw-config)).
+ - **~2× faster `opt.step()`, bit-exact.** A fused-kernel rewrite folds the 2nd-moment update, step-size, and weight decay into the update kernel with occupancy-aware v1/v2 dispatch — removing ~half the per-step kernel launches and a full gradient pass.
+ - **Corrected checkpoint/resume** (dtype-on-load, block-period persistence) and **FSDP2 `fused=True` support** — broken / absent in the shipped release.
+ - **Robustness hardening:** same-device/dtype guards before raw-pointer kernel launches, thread-safe SM-count caches, codebook & empty-tensor bounds checks.
+ - See detailed listing in collapsible section below
+
+ See **[Benchmarks](#benchmarks)** for a fair optimizer comparison (loss · speed · memory) with raw logs..
 
 <details>
-<summary><b>Fork Improvements</b> (vs upstream)</summary>
+<summary><b>Detailed Fork Improvements</b> (vs upstream)</summary>
 
 | Capability | Upstream v1.1.1 | This fork |
 |---|---|---|
@@ -43,21 +33,10 @@
 Measured numbers (Qwen3 0.6B / 1.7B) and the technical details are in [Benchmarks](#benchmarks) and the sections below.
 
 </details>
-
-Gefen is a drop-in replacement for the AdamW optimizer for memory-efficient
-training. It keeps the familiar AdamW training recipe while dramatically
-reducing optimizer-state memory: an 8x reduction in AdamW memory footprint, or
-about 6.5 GiB saved per billion parameters, while maintaining AdamW-level
-performance. The reduced memory footprint lets you train larger models or use
-larger batch sizes and, as a result, achieve higher training throughput.
-All it takes is changing two lines of code: import Gefen and replace the AdamW
-optimizer constructor.
-
+ 
 ## Installation
 
-> **This fork is not on PyPI.** `pip install gefen` fetches the *upstream*
-> release, which does **not** include the fixes/improvements above — install this
-> fork from source instead.
+> **This fork is not on PyPI.** `pip install gefen` fetches the *upstream* release, which does **not** include the fixes/improvements above — install this fork from source instead.
 
 Build from source (editable install):
 
@@ -67,18 +46,11 @@ cd Gefen-X
 pip install -e .          # imports as `gefen`; the fix series lives on the perf branches
 ```
 
-The package is pure-Python at install time — the fused CUDA kernels are **built
-on first use** via PyTorch JIT (`torch.utils.cpp_extension`) + `nvcc`. The first
-CUDA run takes a few minutes; later runs reuse the cached build keyed on your
-Python / PyTorch / CUDA version and the Gefen source checkout. Force a rebuild
-with `GEFEN_FORCE_REBUILD=1`.
+The package is pure-Python at install time, the fused kernels (CUDA required) are **built on first use** via PyTorch JIT (`torch.utils.cpp_extension`) + `nvcc`. The first CUDA run takes a few minutes; later runs reuse the cached build keyed on your Python / PyTorch / CUDA version and the Gefen source checkout. Force a rebuild with `GEFEN_FORCE_REBUILD=1`.
 
-**Requirements:** a CUDA toolkit and host compiler compatible with your PyTorch
-build (the JIT compiles for your GPU's compute capability — e.g. `sm_86` for
-RTX 3090, `sm_120` for RTX 5090; set `TORCH_CUDA_ARCH_LIST` to target others or a
-multi-arch fat binary). Verified with **PyTorch 2.12 (cu133) / Python 3.12**.
-Optional baselines used in the benchmark: `bitsandbytes` (AdamW-8bit),
-`torchao` (AdamW-4bit).
+**Requirements:** a CUDA toolkit and host compiler compatible with your PyTorch build (the JIT compiles for your GPU's compute capability; set `TORCH_CUDA_ARCH_LIST` to target arch or a multi-arch build). 
+
+Verified with **PyTorch 2.12 (cu133) / Python 3.12**. Optional baselines used in the benchmark: `bitsandbytes` (AdamW-8bit),`torchao` (AdamW-4bit).
 
 ## Quick Start
 
@@ -113,69 +85,39 @@ print('Finished successfully.')
 
 ### Learning rate (when porting an AdamW config)
 
-Gefen matches AdamW's *interface*, but it needs a **lower learning rate** —
-about **0.6× AdamW's** on the architectures tested (Qwen3, i.e. SwiGLU MLP +
-grouped-query attention). This factor is set by the model's `head_dim`/RMSNorm
-block structure (see below), **not its parameter count** — it holds (~0.6×) across
-Qwen3-0.6B → 8B (all `head_dim = 128`), so re-measure only for a different
-architecture or `head_dim`. **At its own optimal LR, Gefen matches AdamW's loss and run-to-run
-reproducibility**, while keeping its optimizer-memory advantage; reused at AdamW's
-LR unchanged, it over-steps.
+Gefen matches AdamW's *interface*, but it needs a **lower learning rate** — about **0.6× AdamW's** on modern architectures tested *(Qwen3, i.e. SwiGLU MLP + grouped-query attention)*. This factor is set by the model's `head_dim`/RMSNorm block structure (see below), not its parameter count, it holds (~0.6×) across Qwen3-0.6B → 8B (all `head_dim = 128`), so re-measure only for a different architecture or `head_dim`. **At its own optimal LR, Gefen closely matches AdamW's loss and run-to-run reproducibility**, while keeping its optimizer-memory advantage.
 
-Why: Gefen's second moment is a *block-shared* RMS of the gradient rather than
-AdamW's per-element `√v`. Globally the two take similar-magnitude steps, but on a
-few high-leverage tensors — most sharply the RMSNorm weights (`q_norm`/`k_norm`,
-whose length equals the head dim, so the whole tensor is a *single shared block*) —
-Gefen over-steps by ~1.5×. Those tensors set the stability ceiling, so the usable
-LR is ~0.6× AdamW's. This is most pronounced on modern decoder architectures
-(SwiGLU MLP + grouped-query attention, e.g. Qwen3).
+**Why:** Gefen's second moment is a *block-shared* RMS of the gradient rather than AdamW's per-element `√v`. Globally the two take similar-magnitude steps, but on a few high-leverage tensors — most sharply the RMSNorm weights (`q_norm`/`k_norm`, whose length equals the head dim, so the whole tensor is a *single shared block*) — Gefen over-steps by ~1.5×. Those tensors set the stability ceiling, so the usable LR is ~0.6× AdamW's on modern decoder architectures *(SwiGLU MLP + grouped-query attention, e.g. Qwen3)*.
 
-Measured on Qwen3-4B full fine-tune (each optimizer at its own optimum, then the
-naive drop-in):
+Measured on Qwen3-4B full fine-tune (each optimizer at its own optimum):
 
 | Learning rate | Gefen vs AdamW | run-to-run spread |
 |---|---|---|
 | ~0.6× AdamW's (Gefen's optimum) | **matches AdamW** (ties at 300 and 800 steps) | tight (≈ AdamW) |
 | 1.0× AdamW's, but AdamW-LR too hot* | ~0.3–0.4 higher | ~5× AdamW |
 
-\* Both optimizers preferred a much lower LR than a typical AdamW default in this
-regime, so "1.0× AdamW's LR" above means an LR that is itself near AdamW's edge;
-the gap is the *extra* over-step Gefen incurs there.
+\* Both optimizers preferred a much lower LR than a typical AdamW default in this regime, so "1.0× AdamW's LR" above means an LR that is itself near AdamW's edge; the gap is the *extra* over-step Gefen incurs there.
 
-The diagnostic ratio, run across the Qwen3 family, confirms the factor is
-size-independent — the binder is always the `head_dim`-length `q_norm`/`k_norm`:
+The diagnostic ratio, run across the Qwen3 family, confirms the factor is size-independent — the binder is always the `head_dim`-length `q_norm`/`k_norm`:
 
 | Model | `head_dim` | norm-binder ratio | usable LR factor |
 |---|---|---|---|
 | Qwen3-0.6B | 128 | 1.29 | ~0.77 |
 | Qwen3-1.7B | 128 | 1.75 | ~0.57 |
 | Qwen3-4B | 128 | 1.43 | ~0.70 |
-| Qwen3-8B | 128 | 1.28 | ~0.78 |
+| Qwen3-8B* | 128 | 1.28 | ~0.78 |
 
-(8B measured with a bf16 optimizer state, which deflates its ratio → lower bound.)
+\* (8B measured with a bf16 optimizer state, which deflates its ratio → lower bound.)
 
-When porting an AdamW recipe, **scale the learning rate to ~0.6× and tune from
-there.** An LR comfortable for AdamW can sit past Gefen's stability edge, and Gefen
-does *not* tolerate raising the LR back up. The exact factor is set by the
-architecture's RMSNorm/block structure, so confirm on your own model — the simplest
-check is to compute, on a warmed AdamW state, `‖m̂/(√v̂+ε)‖ / ‖m̂/(√blockmean(v̂)+ε)‖`
-for the norm-weight tensors; that ratio is the LR scale factor.
+When porting an AdamW recipe, **scale the learning rate to ~0.6× and tune from there.** An LR comfortable for AdamW can sit past Gefen's stability edge, and Gefen does *not* tolerate raising the LR back up. The exact factor is set by the architecture's RMSNorm/block structure, so confirm on your own model — the simplest check is to compute, on a warmed AdamW state, `‖m̂/(√v̂+ε)‖ / ‖m̂/(√blockmean(v̂)+ε)‖` for the norm-weight tensors; that ratio is the LR scale factor.
 
-**If your recipe uses a nonzero `weight_decay`:** AdamW (and Gefen) apply
-*decoupled* weight decay, so the per-step regularization is `lr × weight_decay`.
-Scaling `lr` down to ~0.6× therefore weakens decay by the same factor. To hold
-regularization constant, scale `weight_decay` up correspondingly (≈ `1 / 0.6`), or
-retune it. (Our measurements used `weight_decay = 0`, so this follows from the
-decoupled-decay definition rather than direct testing.)
+**If your recipe uses a nonzero `weight_decay`:** AdamW (and Gefen) apply *decoupled* weight decay, so the per-step regularization is `lr × weight_decay`. Scaling `lr` down to ~0.6× therefore weakens decay by the same factor. To hold regularization constant, scale `weight_decay` up correspondingly (≈ `1 / 0.6`), or retune it. (Our measurements used `weight_decay = 0`, so this follows from the decoupled-decay definition rather than direct testing.)
 
 ## Benchmarks
 
-Optimizer comparison on a full fine-tune, **with each optimizer at its own
-fair learning-rate optimum** (from a per-optimizer LR sweep), 2000 steps.
+Optimizer comparison on a full fine-tune, **with each optimizer at its own fair learning-rate optimum** (from a per-optimizer LR sweep), 2000 steps.
 
-> Measured on the fused-kernel performance series (`perf/tier0-quickwins` →
-> `perf/tier1-kernel-fusion` → `perf/v2-fusion` → `perf/k4-batching`, PRs #8–#11),
-> merged into `main` as `191817d`; benchmark code state `ebb7d40`.
+> Measured on the fused-kernel performance series commits unique to Gefen-X as of `191817d`
 
 **Testing environment**
 - **Hardware:** NVIDIA RTX 3090 (Ampere, sm_86), single GPU per run.
@@ -201,48 +143,23 @@ fair learning-rate optimum** (from a per-optimizer LR sweep), 2000 steps.
 ![Qwen3-1.7B optimizer comparison](docs/benchmarks/quad_qwen3_1p7b.png)
 ![Qwen3-0.6B optimizer comparison](docs/benchmarks/quad_qwen3_0p6b.png)
 
-**Loss curves** — loss over the 2000 steps. For each optimizer (distinguished by
-**color**), there are two lines: **solid = held-out eval loss** (the 32-example
-validation set, logged every 50 steps — this is the comparison metric in the
-table above) and **dashed = train-loss EMA** (exponential moving average of the
-training loss). Lower is better. Gefen-fused converges stably and its eval curve
-tracks just above the AdamW cluster (the ~0.1–0.2 loss gap), with no instability
-at its fair LR. **Gefen-Muon recovers most of that gap** — its curve sits between
-Gefen-fused and the AdamW cluster, most visibly at 0.6B where it closes the gap to
-the best AdamW from +0.198 to +0.064.
+**Loss curves** — loss over the 2000 steps. For each optimizer (distinguished by **color**), there are two lines: **solid = held-out eval loss** (the 32-example validation set, logged every 50 steps — this is the comparison metric in the table above) and **dashed = train-loss EMA** (exponential moving average of the training loss). 
+
+Gefen-fused converges stably and its eval curve tracks just above the AdamW cluster (the ~0.1–0.2 loss gap), with no instability at its fair LR. **Gefen-Muon recovers most of that gap**, its curve sits between Gefen-fused and the AdamW cluster, most visibly at 0.6B where it closes the gap to the best AdamW from +0.198 to +0.064.
 
 ![Qwen3-1.7B loss curves](docs/benchmarks/loss_curve_qwen3_1p7b.png)
 ![Qwen3-0.6B loss curves](docs/benchmarks/loss_curve_qwen3_0p6b.png)
 
-**Throughput vs peak VRAM** — the speed/memory frontier (upper-left = faster *and*
-lighter is better). Gefen-fused sits alone in the best corner; AdamW-4-bit is worst
-on *both* axes despite its small optimizer state (torchao transient buffers).
-Gefen-Muon shares Gefen-fused's lowest-VRAM column but sits far lower on
-throughput — the Newton-Schulz orthogonalization makes it the slowest optimizer.
+**Throughput vs peak VRAM** — the speed/memory frontier (upper-left = faster *and* lighter is better). Gefen-fused sits alone in the best corner; AdamW-4-bit is worst on *both* axes despite its small optimizer state (torchao transient buffers). 
+
+Gefen-Muon shares Gefen-fused's lowest-VRAM column but sits far lower on throughput — the Newton-Schulz orthogonalization makes it the slowest optimizer.
 
 ![Qwen3-1.7B throughput vs VRAM](docs/benchmarks/tput_vram_qwen3_1p7b.png)
 ![Qwen3-0.6B throughput vs VRAM](docs/benchmarks/tput_vram_qwen3_0p6b.png)
 
-**Takeaways.** At its fair LR, **Gefen-fused has the lowest peak VRAM and the
-lowest optimizer-state footprint, with competitive-to-best throughput** (fastest
-at 1.7B on sm_86) — at a **modest loss cost** (~0.1 at 1.7B, ~0.2 at 0.6B) vs the
-best-tuned AdamW. Note that AdamW-4-bit's optimizer state is also small
-(~1.06 B/param) but its **peak VRAM is the highest** (torchao compiled-step
-transient buffers), so Gefen, not 4-bit, is the real peak-memory winner. Gefen's
-clear optimizer-state edge is over 8-bit (2.03) and bf16 (4.00).
+**Gefen Hybrid** At its fair LR, **Gefen-fused has the lowest peak VRAM and the lowest optimizer-state footprint, with competitive-to-best throughput** (fastest at 1.7B on sm_86) — at a **modest loss cost** (~0.1 at 1.7B, ~0.2 at 0.6B) vs the best-tuned AdamW. Note that AdamW-4-bit's optimizer state is also small (~1.06 B/param) but its **peak VRAM is the highest** (torchao compiled-step transient buffers), so Gefen, not 4-bit, is the real peak-memory winner. Gefen's clear optimizer-state edge is over 8-bit (2.03) and bf16 (4.00).
 
-**Gefen-Muon** (`GefenMuonHybrid`, Muon on 2D hidden matrices + Gefen elsewhere,
-`match_rms_adamw` LR) is the **best Gefen variant on loss** at both scales — 1.501
-@0.6B (vs Gefen-fused 1.635) and 1.326 @1.7B (~tied with Gefen-fused, +0.105 vs the
-best AdamW) — while tying Gefen-fused for the lowest peak VRAM and lowest
-optimizer state (~1.01 B/param). The cost is throughput: Newton-Schulz makes it the
-slowest optimizer (~0.58× Gefen-fused at 0.6B, ~0.35× at 1.7B). So **Gefen-fused is
-the speed+memory sweet spot; Gefen-Muon is the loss-recovery option** when you can
-afford the slowdown.
-
-*Caveats:* single seed; the LRs are 175-step sweep optima (the 2000-step optimum is
-likely lower for every optimizer). LRs used: AdamW (bf16 / 8-bit / 4-bit) = `5e-5`,
-Gefen-fused = `2e-5`, Gefen-Muon = `5e-5`.
+**Gefen-Muon** (`GefenMuonHybrid`, Muon on 2D hidden matrices + Gefen elsewhere, `match_rms_adamw` LR) is the **best Gefen variant on loss** at both scales — 1.501 @0.6B (vs Gefen-fused 1.635) and 1.326 @1.7B (~tied with Gefen-fused, +0.105 vs the best AdamW) — while tying Gefen-fused for the lowest peak VRAM and lowest optimizer state (~1.01 B/param). The cost is throughput: Newton-Schulz makes it the slowest optimizer (~0.58× Gefen-fused at 0.6B, ~0.35× at 1.7B). So **Gefen-fused is the speed+memory sweet spot; Gefen-Muon is the loss-recovery option** when you can afford the slowdown.
 
 **Review the raw runs:** per-cell training logs (step-by-step loss, throughput,
 VRAM) in [`docs/benchmarks/logs/`](docs/benchmarks/logs/) · aggregated metrics as
@@ -332,20 +249,17 @@ optimizer = GefenMuonHybrid(
 )
 ```
 
-> **Learning rate — set `adjust_lr_fn="match_rms_adamw"`.** The Hybrid feeds a
-> *single* `lr` to both halves, but Muon (2D matrices) and AdamW/Gefen (everything
-> else) want different LR scales, so the shared `lr` is only meaningful after a
-> per-parameter rescale:
->
-> - **`adjust_lr_fn="match_rms_adamw"`** (recommended) rescales the Muon update to
->   AdamW-equivalent RMS (`0.2·√max(rows, cols)`). Then **one AdamW-scale `lr` is
->   correct for both halves**, and the [Learning rate](#learning-rate-when-porting-an-adamw-config)
->   guidance above (Gefen wants ~0.6× AdamW's on Qwen3) applies to the whole model.
-> - **`adjust_lr_fn=None`** (the *default*, = "original" Muon scaling
->   `√max(1, rows/cols)`) leaves the Muon half on its native scale. Passing an
->   AdamW-sized `lr` here **under-trains the 2D Muon matrices** — and because both
->   halves share one `lr`, there's no single value that suits Muon-native *and*
->   the Gefen backup. **Don't use the default with an AdamW-scale `lr`.**
+**Moun Learning rate — set `adjust_lr_fn="match_rms_adamw"`.** The Hybrid feeds a > *single* `lr` to both halves, but Muon (2D matrices) and AdamW/Gefen (everything > else) want different LR scales, so the shared `lr` is only meaningful after a per-parameter rescale:
+
+ - **`adjust_lr_fn="match_rms_adamw"`** (recommended) rescales the Muon update to
+   AdamW-equivalent RMS (`0.2·√max(rows, cols)`). Then **one AdamW-scale `lr` is
+   correct for both halves**, and the [Learning rate](#learning-rate-when-porting-an-adamw-config)
+   guidance above (Gefen wants ~0.6× AdamW's on Qwen3) applies to the whole model.
+ - **`adjust_lr_fn=None`** (the *default*, = "original" Muon scaling
+   `√max(1, rows/cols)`) leaves the Muon half on its native scale. Passing an
+   AdamW-sized `lr` here **under-trains the 2D Muon matrices** — and because both
+   halves share one `lr`, there's no single value that suits Muon-native *and*
+   the Gefen backup. **Don't use the default with an AdamW-scale `lr`.**
 
 It supports `step()`, `zero_grad()`, `state_dict()`/`load_state_dict()`, and LR schedulers (e.g. `torch.optim.lr_scheduler.StepLR(optimizer, ...)`) like any optimizer. Because its constructor takes two parameter lists rather than a single iterable, build it yourself and hand it to the Hugging Face `Trainer` via `optimizers=` (not `optimizer_cls_and_kwargs`):
 
@@ -358,16 +272,9 @@ trainer = Trainer(model=model, args=training_args, train_dataset=train_dataset,
 
 ## Using Gefen with Axolotl
 
-[Axolotl](https://github.com/axolotl-ai-cloud/axolotl) can train with Gefen via its
-`optimizer: gefen` integration — see the (draft) PR
-[axolotl-ai-cloud/axolotl#3755](https://github.com/axolotl-ai-cloud/axolotl/pull/3755).
+[Axolotl](https://github.com/axolotl-ai-cloud/axolotl) can train with Gefen via its `optimizer: gefen` integration — see the (draft) PR [axolotl-ai-cloud/axolotl#3755](https://github.com/axolotl-ai-cloud/axolotl/pull/3755).
 
-> ⚠️ **Install this fork from source, not the PyPI package.** PR #3755 documents
-> `pip install gefen`, which pulls **upstream** Gefen — *without* this fork's fixes
-> (the modern-arch `period==1` memory fallback, the ~2× fused kernels, the
-> robustness guards). Install this fork from source (see [Installation](#installation));
-> axolotl's `optimizer: gefen` then imports whichever `gefen` is on the path, i.e.
-> the fork.
+> ⚠️ **Install this fork from source, not the PyPI package.** PR #3755 documents  `pip install gefen`, which pulls **upstream** Gefen — *without* this fork's fixes (the modern-arch `period==1` memory fallback, the ~2× fused kernels, the robustness guards). Install this fork from source (see [Installation](#installation)); axolotl's `optimizer: gefen` then imports whichever `gefen` is on the path..
 
 **Basic** (memory-efficient AdamW drop-in):
 
@@ -377,7 +284,7 @@ learning_rate: 6.0e-6    # ≈ 0.6× the AdamW LR you'd use — Gefen needs a lo
 weight_decay: 0.0
 ```
 
-**Fused kernels** (recommended — ~2× faster `opt.step`, bit-exact):
+**Fused kernels** (recommended — ~2× faster `opt.step`, bit-exact, requires CUDA):
 
 ```yaml
 optimizer: gefen
@@ -386,9 +293,7 @@ optim_args:
   fused: true
 ```
 
-`learning_rate`, `weight_decay`, `adam_beta1`/`adam_beta2`, `adam_epsilon` are
-forwarded straight to the `Gefen` constructor; anything under `optim_args` (e.g.
-`fused`) is passed through as extra constructor kwargs.
+`learning_rate`, `weight_decay`, `adam_beta1`/`adam_beta2`, `adam_epsilon` are forwarded straight to the `Gefen` constructor; anything under `optim_args` (e.g. `fused`) is passed through as extra constructor kwargs.
 
 **The levers, and where each lives:**
 
@@ -400,15 +305,11 @@ forwarded straight to the `Gefen` constructor; anything under `optim_args` (e.g.
 | Betas / eps / weight decay | standard `adam_beta1/2`, `adam_epsilon`, `weight_decay` | forwarded to Gefen |
 | `period==1` memory fallback | *on by default in this fork* | restores ~1 B/param on modern decoders; it's the module flag `MEMORY_SAFE_FALLBACK`, not a YAML key |
 
-**Not (yet) exposed via axolotl config:** the **Muon hybrid** (`GefenMuonHybrid` +
-`adjust_lr_fn`) is **not** in PR #3755 (the PR notes Muon is "more involved") — use
-it directly in Python per [Gefen-Muon](#extension-gefen-muon) above. `MEMORY_SAFE_FALLBACK`
-is a module default (on in this fork), toggled in code rather than YAML.
+**Not (yet) exposed via axolotl config:** the **Muon hybrid** (`GefenMuonHybrid` + `adjust_lr_fn`) is **not** in PR #3755 (the PR notes Muon is "more involved") — use it directly in Python per [Gefen-Muon](#extension-gefen-muon) above. `MEMORY_SAFE_FALLBACK` is a module default (on in this fork), toggled in code rather than YAML.
 
-> PR #3755 is an early draft and marked *untested* upstream; the config keys above
-> may change — check the PR for the current state.
+> PR #3755 is an early draft and marked *untested* upstream; the config keys above may change — check the PR for the current state.
 
-## Citation
+## Citation:
 
 If you found this library useful, please consider citing our work:
 
@@ -421,3 +322,6 @@ If you found this library useful, please consider citing our work:
 }
 ```
 
+## Paper:
+
+# [Gefen: Optimized Stochastic Optimizer](https://arxiv.org/pdf/2606.13894)
