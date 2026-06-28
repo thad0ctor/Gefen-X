@@ -38,21 +38,23 @@ Two modes:
 Selecting multiple GPUs does **not** shard by itself — `--devices` alone replicates the whole model per GPU. Add `--shard` to split one model across them.
 
 Worked example (single GPU):
+# --dataset accepts a HF dataset name OR a local .txt/.json/.jsonl path
 ```bash
 python -m gefen.tools.find_lr \
     --model /path/to/Qwen3-1.7B \
     --optimizer gefen --method sweep \
-    --dataset tatsu-lab/alpaca \      # HF dataset name, OR a local .txt/.json/.jsonl
+    --dataset tatsu-lab/alpaca \
     --device cuda:0 --seq 512 --bs 8 \
     --sweep-lrs 1e-5 3e-5 1e-4 3e-4
 # -> RECOMMENDED base LR for gefen: <number>
 ```
 
 **Parallel sweep across GPUs** (`--devices`). Each LR arm is independent, so a sweep fans across GPUs — one (or more) LRs per GPU — for a near-linear speedup, with the **same** lowest-eval selection as the sequential run:
+# --devices spawns one worker per GPU; the LR grid is round-robin'd across them
 ```bash
 python -m gefen.tools.find_lr \
     --model /path/to/Qwen3-1.7B --optimizer gefen --method sweep \
-    --devices cuda:0 cuda:1 cuda:2 \   # one spawn worker per GPU; LRs round-robin'd
+    --devices cuda:0 cuda:1 cuda:2 \
     --sweep-lrs 1e-5 3e-5 1e-4 3e-4 1e-3 --seq 512 --bs 8
 # [find_lr] device cuda:0 <- LRs ['1.0e-05', '3.0e-04']  ... etc
 # -> RECOMMENDED base LR for gefen: <number>   (identical to the sequential pick)

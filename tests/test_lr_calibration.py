@@ -105,7 +105,8 @@ def test_lr_range_test():
     print("\nC. " + res.summary())
     assert len(res.lrs) > 0
     assert math.isfinite(res.suggested_lr) and res.suggested_lr > 0
-    assert res.lrs[0] <= res.suggested_lr <= res.lrs[-1] or res.suggested_lr > 0
+    # The suggestion must lie inside the scanned ramp, not just be positive.
+    assert res.lrs[0] <= res.suggested_lr <= res.lrs[-1]
 
 
 def test_non_invasive():
