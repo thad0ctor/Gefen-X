@@ -240,12 +240,9 @@ slowest optimizer (~0.58× Gefen-fused at 0.6B, ~0.35× at 1.7B). So **Gefen-fus
 the speed+memory sweet spot; Gefen-Muon is the loss-recovery option** when you can
 afford the slowdown.
 
-*Caveats:* single seed; the `5e-5`/`2e-5` LRs are 175-step optima (the 2000-step
-optimum is likely lower for every optimizer). The per-optimizer LR sweep covered
-`adamw_bf16`, `adamw8bit`, and `gefen_fused` (both AdamW variants peaked at `5e-5`,
-Gefen at `2e-5`); `adamw4bit` reused the AdamW family's `5e-5` rather than being
-swept on its own — a safe assumption given its eval lands within ~0.01 of the other
-AdamW variants.
+*Caveats:* single seed; the LRs are 175-step sweep optima (the 2000-step optimum is
+likely lower for every optimizer). LRs used: AdamW (bf16 / 8-bit / 4-bit) = `5e-5`,
+Gefen-fused = `2e-5`, Gefen-Muon = `5e-5`.
 
 **Review the raw runs:** per-cell training logs (step-by-step loss, throughput,
 VRAM) in [`docs/benchmarks/logs/`](docs/benchmarks/logs/) · aggregated metrics as
