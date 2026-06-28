@@ -38,6 +38,9 @@ class GefenMuonHybrid(torch.optim.Optimizer):
         muon_lr=None,
         backup_lr=None,
         weight_decay=0.0,
+        muon_weight_decay=None,
+        backup_weight_decay=None,
+        no_decay_substrings=(),
         betas=(0.9, 0.999),
         eps=1e-8,
         fused=True,
@@ -69,11 +72,20 @@ class GefenMuonHybrid(torch.optim.Optimizer):
         muon_lr = lr if muon_lr is None else muon_lr
         backup_lr = lr if backup_lr is None else backup_lr
 
+        # Per-half weight decay. Decoupled (AdamW-style) decay is `lr*wd` per
+        # step; keeping muon/backup decay separate lets a recipe decay the 2D
+        # matrices while leaving the backup (norms/biases/embeddings/head) on a
+        # different schedule. Both default to the shared weight_decay.
+        muon_weight_decay = weight_decay if muon_weight_decay is None else muon_weight_decay
+        backup_weight_decay = (
+            weight_decay if backup_weight_decay is None else backup_weight_decay
+        )
+
         self.muon = (
             GefenMuon(
                 muon_named_params,
                 lr=muon_lr,
-                weight_decay=weight_decay,
+                weight_decay=muon_weight_decay,
                 momentum=momentum,
                 nesterov=nesterov,
                 ns_steps=ns_steps,
@@ -85,19 +97,61 @@ class GefenMuonHybrid(torch.optim.Optimizer):
             if muon_named_params
             else None
         )
-        self.backup = (
-            Gefen(
-                backup_named_params,
-                lr=backup_lr,
-                betas=betas,
-                eps=eps,
-                weight_decay=weight_decay,
-                fused=fused,
-                verbose=verbose,
+        # AdamW-style group semantics: names matching no_decay_substrings (e.g.
+        # "norm", "bias") form a separate backup group with weight_decay=0, the
+        # rest keep backup_weight_decay. With the default empty no_decay_substrings
+        # the backup is a single flat group at backup_weight_decay -- identical to
+        # the previous single-group construction.
+        no_decay_substrings = tuple(s.lower() for s in no_decay_substrings)
+
+        def _is_no_decay(name):
+            lname = name.lower()
+            return any(sub in lname for sub in no_decay_substrings)
+
+        if backup_named_params and no_decay_substrings:
+            decay_group = [(n, p) for n, p in backup_named_params if not _is_no_decay(n)]
+            no_decay_group = [(n, p) for n, p in backup_named_params if _is_no_decay(n)]
+            backup_groups = [
+                g
+                for g in (
+                    {
+                        "params": decay_group,
+                        "lr": backup_lr,
+                        "betas": betas,
+                        "eps": eps,
+                        "weight_decay": backup_weight_decay,
+                    }
+                    if decay_group
+                    else None,
+                    {
+                        "params": no_decay_group,
+                        "lr": backup_lr,
+                        "betas": betas,
+                        "eps": eps,
+                        "weight_decay": 0.0,
+                    }
+                    if no_decay_group
+                    else None,
+                )
+                if g is not None
+            ]
+            self.backup = Gefen(backup_groups, lr=backup_lr, betas=betas, eps=eps,
+                                 weight_decay=backup_weight_decay, fused=fused,
+                                 verbose=verbose)
+        else:
+            self.backup = (
+                Gefen(
+                    backup_named_params,
+                    lr=backup_lr,
+                    betas=betas,
+                    eps=eps,
+                    weight_decay=backup_weight_decay,
+                    fused=fused,
+                    verbose=verbose,
+                )
+                if backup_named_params
+                else None
             )
-            if backup_named_params
-            else None
-        )
         self._subopts = [o for o in (self.muon, self.backup) if o is not None]
 
         # Deliberately do NOT call super().__init__(): we expose each
