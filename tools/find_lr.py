@@ -31,16 +31,20 @@ CLI: see ``python -m gefen.tools.find_lr --help`` (model + dataset paths via arg
 from __future__ import annotations
 
 import argparse
-import copy
 from dataclasses import dataclass, field
 from typing import Callable, Dict, List, Optional, Union
 
 import torch
 
-# NOTE: gefen-package imports are done lazily inside the functions that use them,
-# so the CLI can re-exec under a target venv (--venv/--python) BEFORE importing
-# gefen -- whose CUDA kernel-build guard runs on first import of the optimizer
-# classes and needs an nvcc matching torch.version.cuda.
+# NOTE: the gefen OPTIMIZER imports (gefen.gefen / the CUDA kernel-build guard,
+# which needs an nvcc matching torch.version.cuda) are deferred to the functions
+# that build optimizers, so the CLI can re-exec under a target venv
+# (--venv/--python) BEFORE that build runs. ``gefen.tools.lr_calibration`` is
+# imported eagerly below ON PURPOSE: it pulls in only ``torch`` (no kernel build),
+# and ``LRRangeResult`` must exist in module globals so the FindLRResult
+# annotation resolves at runtime (e.g. typing.get_type_hints), not just under
+# TYPE_CHECKING.
+from gefen.tools.lr_calibration import LRRangeResult, lr_range_test
 
 
 OPTIMIZERS = ("gefen", "gefen_muon", "hybrid", "adamw")
@@ -84,17 +88,21 @@ def build_optimizer(
 ):
     """Construct the requested optimizer family at ``lr``. ``adjust_lr_fn`` applies
     to the Muon paths only (default ``match_rms_adamw`` -- the magnitude-matching
-    v2/auto path is intentionally NOT used here)."""
-    from gefen import Gefen, GefenMuon, GefenMuonHybrid
-    from gefen.tools.run_model_calibration import split_params_for_muon
+    v2/auto path is intentionally NOT used here).
 
+    The gefen imports live INSIDE each branch so the ``adamw`` path never imports
+    gefen (hence never triggers the CUDA kernel build) -- you can find an AdamW LR
+    on a box without a matching nvcc."""
     if optimizer == "adamw":
         return torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
     named = [(n, p) for n, p in model.named_parameters() if p.requires_grad]
     if optimizer == "gefen":
+        from gefen import Gefen
         return Gefen(named, lr=lr, betas=(0.9, 0.999), eps=1e-8,
                      weight_decay=weight_decay, fused=fused)
     if optimizer == "hybrid":
+        from gefen import GefenMuonHybrid
+        from gefen.tools.run_model_calibration import split_params_for_muon
         muon, backup = split_params_for_muon(model)
         return GefenMuonHybrid(muon, backup, lr=lr, weight_decay=weight_decay,
                                fused=fused, adjust_lr_fn=adjust_lr_fn)
@@ -102,6 +110,8 @@ def build_optimizer(
         # GefenMuon only accepts 2D hidden matrices; the rest of the model is left
         # frozen for the duration of the finder (the Muon path's stability/optimum
         # still drives the curve). Use the hybrid to also train embeddings/norms.
+        from gefen import GefenMuon
+        from gefen.tools.run_model_calibration import split_params_for_muon
         muon, _ = split_params_for_muon(model)
         if not muon:
             raise ValueError("gefen_muon: model has no 2D hidden matrices to optimize")
@@ -134,13 +144,16 @@ def _closure_from_blocks(model, blocks, device, bs, seed):
 
 @torch.no_grad()
 def _eval_loss(model, eval_blocks, device, bs):
+    was_training = model.training
     model.eval()
-    losses = []
-    for i in range(0, eval_blocks.size(0), bs):
-        ids = eval_blocks[i:i + bs].to(device)
-        losses.append(float(model(input_ids=ids, labels=ids).loss))
-    model.train()
-    return sum(losses) / len(losses)
+    try:
+        losses = []
+        for i in range(0, eval_blocks.size(0), bs):
+            ids = eval_blocks[i:i + bs].to(device)
+            losses.append(float(model(input_ids=ids, labels=ids).loss))
+        return sum(losses) / len(losses)
+    finally:
+        model.train(was_training)
 
 
 def _snapshot(model):
@@ -189,10 +202,9 @@ def find_lr(
         raise ValueError("method must be 'range_test' or 'sweep'")
     if device is None:
         device = next(model.parameters()).device
+    was_training = model.training  # restore the caller's mode on exit
     model.train()
     snap = _snapshot(model) if restore else None
-
-    from gefen.tools.lr_calibration import lr_range_test
 
     try:
         if method == "range_test":
@@ -235,6 +247,7 @@ def find_lr(
     finally:
         if restore and snap is not None:
             model.load_state_dict(snap)
+        model.train(was_training)
 
     if verbose:
         print(out.summary())
@@ -288,8 +301,11 @@ def _prewarm_kernels():
     spawn workers load the compiled .so instead of all racing to compile it."""
     try:
         import gefen.gefen  # noqa: F401  -- import builds/loads the fused kernels
-    except Exception:
-        pass  # best-effort; torch's extension lock makes concurrent builds safe too
+    except Exception as exc:  # noqa: BLE001 -- best-effort warm-up, never fatal
+        # torch's extension lock makes concurrent builds safe even if this no-ops;
+        # the workers will (re)build on their own first import.
+        print(f"[find_lr] kernel pre-warm skipped ({type(exc).__name__}: {exc})",
+              flush=True)
 
 
 def _sweep_worker(device: str, lr_list: List[float], cfg: dict, q) -> None:
@@ -384,12 +400,19 @@ def find_lr_parallel_sweep(
             print(f"[find_lr] device {dev} <- LRs {['%.1e' % x for x in lrs]}", flush=True)
 
     import queue as _pyqueue
+    import time as _time
     results: Dict[float, float] = {}
     errors: List = []
     done = 0
+    deadline = _time.monotonic() + worker_timeout  # OVERALL deadline, not per-get
+    timed_out = False
     while done < len(procs):
+        remaining = deadline - _time.monotonic()
+        if remaining <= 0:
+            timed_out = True
+            break  # a worker is alive but silent past the deadline -> give up
         try:
-            tag, a, b = q.get(timeout=worker_timeout)
+            tag, a, b = q.get(timeout=min(5.0, remaining))
         except _pyqueue.Empty:
             if not any(p.is_alive() for p in procs):
                 break  # all workers died without signalling -> stop waiting
@@ -406,6 +429,11 @@ def find_lr_parallel_sweep(
         if p.is_alive():
             p.terminate()
 
+    if timed_out:
+        raise RuntimeError(
+            f"parallel sweep exceeded the {worker_timeout:.0f}s deadline with a "
+            f"worker still alive but silent; terminated workers."
+        )
     if errors:
         dev, tb = errors[0]
         raise RuntimeError(f"parallel sweep worker on {dev} failed:\n{tb}")
@@ -554,6 +582,7 @@ def find_lr_sharded_sweep(
     restrict the physical GPUs with ``CUDA_VISIBLE_DEVICES`` so rank r -> cuda:r.
     """
     import queue as _pyqueue
+    import time as _time
     import torch.multiprocessing as mp
 
     world = len(devices)
@@ -582,9 +611,15 @@ def find_lr_sharded_sweep(
         msgs: List = []
         errors: List = []
         got = 0
+        deadline = _time.monotonic() + worker_timeout  # OVERALL deadline per arm
+        timed_out = False
         while got < world:
+            remaining = deadline - _time.monotonic()
+            if remaining <= 0:
+                timed_out = True
+                break  # a rank is alive but silent past the deadline -> give up
             try:
-                m = q.get(timeout=worker_timeout)
+                m = q.get(timeout=min(5.0, remaining))
             except _pyqueue.Empty:
                 if not any(p.is_alive() for p in procs):
                     break
@@ -598,6 +633,11 @@ def find_lr_sharded_sweep(
                 p.terminate()
                 p.join(timeout=10)
 
+        if timed_out:
+            raise RuntimeError(
+                f"sharded sweep arm lr {lr:.2e} exceeded the {worker_timeout:.0f}s "
+                f"deadline with a rank still alive but silent; terminated ranks."
+            )
         if errors:
             raise RuntimeError(
                 f"sharded sweep worker (rank {errors[0][1]}) failed:\n{errors[0][2]}")
@@ -643,15 +683,19 @@ def _row_text(r):
 def _load_texts(dataset, split, max_rows):
     """Load a list of text strings from a local file (.txt/.json/.jsonl) or, if
     ``dataset`` isn't a path, an installed HuggingFace dataset by name."""
-    import os, json
+    import json
+    import os
     if os.path.exists(dataset):
         if dataset.endswith(".jsonl"):
-            rows = [json.loads(l) for l in open(dataset) if l.strip()]
+            with open(dataset) as fh:
+                rows = [json.loads(line) for line in fh if line.strip()]
             texts = [_row_text(r) for r in rows]
         elif dataset.endswith(".json"):
-            texts = [_row_text(r) for r in json.load(open(dataset))]
+            with open(dataset) as fh:
+                texts = [_row_text(r) for r in json.load(fh)]
         else:  # plain text file
-            texts = [open(dataset).read()]
+            with open(dataset) as fh:
+                texts = [fh.read()]
     else:
         from datasets import load_dataset
         texts = [_row_text(r) for r in load_dataset(dataset, split=split)]
@@ -691,12 +735,17 @@ def _strip_flags(argv, flags):
         a = argv[i]
         hit = False
         for fl in flags:
-            if a == fl:
-                i += 2; hit = True; break          # skip flag and its value
-            if a.startswith(fl + "="):
-                i += 1; hit = True; break
+            if a == fl:                 # "--flag value": skip the flag and its value
+                i += 2
+                hit = True
+                break
+            if a.startswith(fl + "="):  # "--flag=value": skip the single token
+                i += 1
+                hit = True
+                break
         if not hit:
-            out.append(a); i += 1
+            out.append(a)
+            i += 1
     return out
 
 
@@ -730,14 +779,16 @@ def _reexec_command(args, current_exe, argv, environ):
 
 
 def _maybe_reexec(args):
-    import os, sys
+    import os
+    import sys
     plan = _reexec_command(args, sys.executable, sys.argv[1:], os.environ)
     if plan is None:
         return
     target, new_argv, env = plan
     note = f" (CUDA_HOME={env['CUDA_HOME']})" if args.cuda_home else ""
     print(f"[find_lr] re-exec under {target}{note}", flush=True)
-    os.execve(target, [target, *new_argv], env)
+    # Intentional process replacement so the kernel build sees a matching nvcc.
+    os.execve(target, [target, *new_argv], env)  # noqa: S606 -- deliberate re-exec
 
 
 # --------------------------------------------------------------------------- #
