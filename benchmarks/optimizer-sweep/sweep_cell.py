@@ -31,6 +31,20 @@ import random
 import sys
 import time
 
+def positive_int(value):
+    value = int(value)
+    if value <= 0:
+        raise argparse.ArgumentTypeError("must be > 0")
+    return value
+
+
+def nonnegative_int(value):
+    value = int(value)
+    if value < 0:
+        raise argparse.ArgumentTypeError("must be >= 0")
+    return value
+
+
 ap = argparse.ArgumentParser(description=__doc__,
                              formatter_class=argparse.RawDescriptionHelpFormatter)
 ap.add_argument("--opt", required=True,
@@ -38,8 +52,8 @@ ap.add_argument("--opt", required=True,
 ap.add_argument("--model", required=True, help="local path OR HuggingFace model id")
 ap.add_argument("--lr", type=float, required=True)
 ap.add_argument("--seed", type=int, default=0)
-ap.add_argument("--steps", type=int, default=2000)
-ap.add_argument("--seq", type=int, default=2048)
+ap.add_argument("--steps", type=positive_int, default=2000)
+ap.add_argument("--seq", type=positive_int, default=2048)
 ap.add_argument("--gpu", type=int, required=True, help="CUDA device index to pin")
 ap.add_argument("--arch", default="8.6",
                 help="TORCH_CUDA_ARCH_LIST value, e.g. 8.6 (Ampere), 12.0 (Blackwell)")
@@ -48,9 +62,9 @@ ap.add_argument("--out", required=True, help="JSONL file to append the result li
 ap.add_argument("--dataset", default="tatsu-lab/alpaca",
                 help="HuggingFace dataset id (Alpaca-format) OR a local load_from_disk path "
                      "that already has input_ids/labels columns")
-ap.add_argument("--max-eval", type=int, default=32, help="held-out eval examples")
-ap.add_argument("--warmup", type=int, default=15, help="steps excluded from steady-state tok/s")
-ap.add_argument("--eval-every", type=int, default=50,
+ap.add_argument("--max-eval", type=positive_int, default=32, help="held-out eval examples")
+ap.add_argument("--warmup", type=nonnegative_int, default=15, help="steps excluded from steady-state tok/s")
+ap.add_argument("--eval-every", type=positive_int, default=50,
                 help="intermediate eval-logging cadence only; does not affect recorded "
                      "final_eval/EMA/tok_s (raise to cut eval overhead on long runs)")
 ap.add_argument("--muon-adjust", default="match_rms_adamw",
@@ -125,7 +139,10 @@ def load_examples():
         labels = ([-100] * len(p_ids) + r_ids)[:BLOCK]
         return {"input_ids": ids, "labels": labels}
 
-    return [render(ex) for ex in raw]
+    rendered = [render(ex) for ex in raw]
+    # drop examples whose response was fully truncated away: an all -100 labels
+    # row supervises zero tokens and yields a 0/0 NaN if it lands in eval.
+    return [e for e in rendered if any(t != -100 for t in e["labels"])]
 
 
 # ---- deterministic data: identical for every optimizer within a seed ----

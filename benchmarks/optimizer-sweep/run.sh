@@ -219,6 +219,21 @@ fi
 IFS=',' read -r -a GPU_ARR <<< "$GPUS"
 [ "${#GPU_ARR[@]}" -gt 0 ] || die "no GPUs parsed from '$GPUS'"
 
+# Tables/plots compare optimizers within a model side by side, which is only
+# apples-to-apples on one GPU type; round-robin pins by index, not model, so warn
+# (don't fail) if the chosen pool mixes GPU models. Indices match PCI_BUS_ID order.
+if command -v nvidia-smi >/dev/null 2>&1; then
+  declare -A GPU_NAME=()
+  while IFS=',' read -r _idx _name; do
+    GPU_NAME["${_idx// /}"]="${_name# }"
+  done < <(nvidia-smi --query-gpu=index,name --format=csv,noheader)
+  declare -a SEL_NAMES=()
+  for g in "${GPU_ARR[@]}"; do SEL_NAMES+=("${GPU_NAME[$g]:-unknown}"); done
+  if [ "$(printf '%s\n' "${SEL_NAMES[@]}" | sort -u | wc -l)" -gt 1 ]; then
+    echo "WARN: mixed GPU types in pool (${SEL_NAMES[*]}); within-model tok/s comparisons aren't apples-to-apples" >&2
+  fi
+fi
+
 # --no-muon strips gefen_muon whether it came from the default set, config or --opts
 if [ "$NO_MUON" -eq 1 ]; then
   OPTS="$(echo "$OPTS" | tr ' ' '\n' | grep -vx 'gefen_muon' | tr '\n' ' ')"
@@ -238,6 +253,16 @@ RESULTS="$OUT/results.jsonl"
 SWEEP="$OUT/results_lrsweep.jsonl"
 LOGS="$OUT/logs"
 CELL="$HERE/sweep_cell.py"
+# Background cells append a line here on failure; the pool's `wait -n` reaps pids
+# before the phase `wait`, so per-pid status is unrecoverable — collect via file.
+FAILLOG="$OUT/failures.log"
+
+abort_on_failures() { # phase-name
+  [ -s "$FAILLOG" ] || return 0
+  echo "ERROR: $1: $(wc -l < "$FAILLOG") cell(s) failed:" >&2
+  cat "$FAILLOG" >&2
+  exit 1
+}
 
 # --- GPU pool: dispatch jobs round-robin, one per GPU, wait when full ---
 declare -A GPU_BUSY=()
@@ -260,7 +285,10 @@ run_cell() { # gpu tag model opt lr steps out logfile
     --steps "$steps" --seq "$SEQ" --gpu "$gpu" --arch "$ARCH" --tag "$tag" \
     --dataset "$DATASET" --eval-every "$EVAL_EVERY" --muon-adjust "$MUON_ADJUST" \
     --out "$out" > "$log" 2>&1
-  echo "[done  $(date +%T)] $tag $opt rc=$?"
+  local rc=$?
+  echo "[done  $(date +%T)] $tag $opt rc=$rc"
+  [ "$rc" -ne 0 ] && echo "$tag $opt lr=$lr gpu=$gpu rc=$rc (see $log)" >> "$FAILLOG"
+  return "$rc"
 }
 
 dispatch() { # tag model opt lr steps out logfile  -> backgrounds on a free gpu
@@ -274,7 +302,7 @@ dispatch() { # tag model opt lr steps out logfile  -> backgrounds on a free gpu
 declare -A BEST_LR=()
 if [ "$LR_SWEEP" -eq 1 ]; then
   echo "=== LR SWEEP (${SWEEP_STEPS} steps/cell) ==="
-  : > "$SWEEP"
+  : > "$SWEEP"; : > "$FAILLOG"
   for i in "${!TAGS[@]}"; do
     tag="${TAGS[$i]}"; model="${PATHS[$i]}"
     for opt in $OPTS; do
@@ -285,6 +313,7 @@ if [ "$LR_SWEEP" -eq 1 ]; then
     done
   done
   wait
+  abort_on_failures "LR sweep"
   for i in "${!TAGS[@]}"; do
     tag="${TAGS[$i]}"
     for opt in $OPTS; do
@@ -296,7 +325,7 @@ fi
 
 # ---- finals ----
 echo "=== FINALS (${STEPS} steps) ==="
-: > "$RESULTS"
+: > "$RESULTS"; : > "$FAILLOG"
 for i in "${!TAGS[@]}"; do
   tag="${TAGS[$i]}"; model="${PATHS[$i]}"
   for opt in $OPTS; do
@@ -305,6 +334,8 @@ for i in "${!TAGS[@]}"; do
   done
 done
 wait
+abort_on_failures "finals"
+rm -f "$FAILLOG"
 echo "=== ALL FINALS DONE $(date +%T) ==="
 
 # ---- table + charts ----

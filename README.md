@@ -140,22 +140,22 @@ Optimizer comparison on a full fine-tune, **with each optimizer at its own fair 
 | Qwen3-1.7B | **gefen_fused** | 2e-5 | 1.331 | **2676** | 9.21 | 1.02 |
 | Qwen3-1.7B | **gefen_muon** | 5e-5 | 1.326 | 924 | **9.20** | **1.01** |
 
-![Qwen3-1.7B optimizer comparison](docs/benchmarks/quad_qwen3_1p7b.png)
-![Qwen3-0.6B optimizer comparison](docs/benchmarks/quad_qwen3_0p6b.png)
+![Qwen3-1.7B optimizer comparison](docs/benchmarks/quad_qwen1p7b.png)
+![Qwen3-0.6B optimizer comparison](docs/benchmarks/quad_qwen0p6b.png)
 
 **Loss curves** — loss over the 2000 steps. For each optimizer (distinguished by **color**), there are two lines: **solid = held-out eval loss** (the 32-example validation set, logged every 50 steps — this is the comparison metric in the table above) and **dashed = train-loss EMA** (exponential moving average of the training loss). 
 
 Gefen-fused converges stably and its eval curve tracks just above the AdamW cluster (the ~0.1–0.2 loss gap), with no instability at its fair LR. **Gefen-Muon recovers most of that gap**, its curve sits between Gefen-fused and the AdamW cluster, most visibly at 0.6B where it closes the gap to the best AdamW from +0.198 to +0.064.
 
-![Qwen3-1.7B loss curves](docs/benchmarks/loss_curve_qwen3_1p7b.png)
-![Qwen3-0.6B loss curves](docs/benchmarks/loss_curve_qwen3_0p6b.png)
+![Qwen3-1.7B loss curves](docs/benchmarks/loss_curve_qwen1p7b.png)
+![Qwen3-0.6B loss curves](docs/benchmarks/loss_curve_qwen0p6b.png)
 
 **Throughput vs peak VRAM** — the speed/memory frontier (upper-left = faster *and* lighter is better). Gefen-fused sits alone in the best corner; AdamW-4-bit is worst on *both* axes despite its small optimizer state (torchao transient buffers). 
 
 Gefen-Muon shares Gefen-fused's lowest-VRAM column but sits far lower on throughput — the Newton-Schulz orthogonalization makes it the slowest optimizer.
 
-![Qwen3-1.7B throughput vs VRAM](docs/benchmarks/tput_vram_qwen3_1p7b.png)
-![Qwen3-0.6B throughput vs VRAM](docs/benchmarks/tput_vram_qwen3_0p6b.png)
+![Qwen3-1.7B throughput vs VRAM](docs/benchmarks/tput_vram_qwen1p7b.png)
+![Qwen3-0.6B throughput vs VRAM](docs/benchmarks/tput_vram_qwen0p6b.png)
 
 **Gefen Hybrid** At its fair LR, **Gefen-fused has the lowest peak VRAM and the lowest optimizer-state footprint, with competitive-to-best throughput** (fastest at 1.7B on sm_86) — at a **modest loss cost** (~0.1 at 1.7B, ~0.2 at 0.6B) vs the best-tuned AdamW. Note that AdamW-4-bit's optimizer state is also small (~1.06 B/param) but its **peak VRAM is the highest** (torchao compiled-step transient buffers), so Gefen, not 4-bit, is the real peak-memory winner. Gefen's clear optimizer-state edge is over 8-bit (2.03) and bf16 (4.00).
 

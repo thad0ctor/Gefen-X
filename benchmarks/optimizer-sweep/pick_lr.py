@@ -25,7 +25,9 @@ def main():
             r = json.loads(line)
             if r["tag"] != args.tag or r["opt"] != args.opt:
                 continue
-            if best is None or r["final_eval"] < best["final_eval"]:
+            # tie-break on lr (lower wins) so equal rounded final_eval is deterministic
+            key = (r["final_eval"], r["lr"])
+            if best is None or key < (best["final_eval"], best["lr"]):
                 best = r
     if best is None:
         raise SystemExit(f"no sweep results for tag={args.tag} opt={args.opt}")

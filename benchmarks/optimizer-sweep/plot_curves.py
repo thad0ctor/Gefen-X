@@ -55,17 +55,17 @@ def main():
     config_text = CONFIG + ("\n" + args.subtitle if args.subtitle else "")
 
     rows = list(csv.DictReader(open(args.csv)))
-    by_model_opt = {(r["model"], r["optimizer"]): r for r in rows}
-    # model display -> tag (for log filenames)
-    tag_of = {r["model"]: r["tag"] for r in rows}
-    lr_of = {(r["model"], r["optimizer"]): r["LR"] for r in rows}
-    models = list(dict.fromkeys(r["model"] for r in rows))
+    # key off the stable tag, not the display label (labels can collide)
+    by_tag_opt = {(r["tag"], r["optimizer"]): r for r in rows}
+    disp_of = {r["tag"]: r["model"] for r in rows}
+    lr_of = {(r["tag"], r["optimizer"]): r["LR"] for r in rows}
+    tags = list(dict.fromkeys(r["tag"] for r in rows))
     os.makedirs(args.out_dir, exist_ok=True)
 
-    for disp in models:
-        tag = tag_of[disp]
-        opts = [o for o in ORDER if (disp, o) in by_model_opt]
-        slug = disp.lower().replace("-", "_").replace(".", "p").replace("/", "_")
+    for tag in tags:
+        disp = disp_of[tag]
+        opts = [o for o in ORDER if (tag, o) in by_tag_opt]
+        slug = tag.lower().replace("-", "_").replace(".", "p").replace("/", "_")
 
         # ---- 1) loss curves ----
         fig, ax = plt.subplots(figsize=(9.5, 6.2))
@@ -80,7 +80,7 @@ def main():
             drew = True
             lw = 2.6 if o.startswith("gefen") else 1.8
             ax.plot(s, ev, "-o", color=COLOR.get(o, "#888"), lw=lw, ms=3.5,
-                    label=f"{NAME.get(o, o)}  (lr {lr_of[(disp, o)]})  -> {ev[-1]:.3f}")
+                    label=f"{NAME.get(o, o)}  (lr {lr_of[(tag, o)]})  -> {ev[-1]:.3f}")
             xe = [a for a, b in zip(s, ema) if b is not None]
             ye = [b for b in ema if b is not None]
             ax.plot(xe, ye, "--", color=COLOR.get(o, "#888"), lw=1.0, alpha=0.45)
@@ -114,7 +114,7 @@ def main():
         fig, ax = plt.subplots(figsize=(9.0, 6.4))
         xs, ys = [], []
         for o in opts:
-            r = by_model_opt.get((disp, o))
+            r = by_tag_opt.get((tag, o))
             if not r:
                 continue
             x = float(r["peak_vram_gib"])

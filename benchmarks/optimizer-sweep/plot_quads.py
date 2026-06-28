@@ -53,16 +53,19 @@ def main():
                   "peak_vram_gib", "opt_state_bpp"):
             r[k] = float(r[k])
 
-    models = list(dict.fromkeys(r["model"] for r in rows))
+    # group by the stable tag, not the display label (labels can collide)
+    disp_of = {r["tag"]: r["model"] for r in rows}
+    tags = list(dict.fromkeys(r["tag"] for r in rows))
     os.makedirs(args.out_dir, exist_ok=True)
 
-    for model in models:
-        mrows = {r["optimizer"]: r for r in rows if r["model"] == model}
+    for tag in tags:
+        disp = disp_of[tag]
+        mrows = {r["optimizer"]: r for r in rows if r["tag"] == tag}
         opts = [o for o in ORDER if o in mrows]
         lr = {o: mrows[o]["LR"] for o in opts}
 
         fig, axes = plt.subplots(2, 2, figsize=(12.5, 9.5))
-        fig.suptitle(f"{model} - optimizer comparison  (loss . speed . memory)",
+        fig.suptitle(f"{disp} - optimizer comparison  (loss . speed . memory)",
                      fontsize=17, fontweight="bold", y=0.985)
 
         for ax, (key, title, unit, direction) in zip(axes.flat, PANELS):
@@ -99,7 +102,7 @@ def main():
         fig.text(0.5, 0.005, config_text, ha="center", va="bottom", fontsize=8.0, color="#333333")
 
         fig.tight_layout(rect=[0, 0.11, 1, 0.965])
-        slug = model.lower().replace("-", "_").replace(".", "p").replace("/", "_")
+        slug = tag.lower().replace("-", "_").replace(".", "p").replace("/", "_")
         out = os.path.join(args.out_dir, f"quad_{slug}.png")
         fig.savefig(out, dpi=140)
         plt.close(fig)
