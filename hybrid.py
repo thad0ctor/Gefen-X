@@ -61,6 +61,25 @@ class GefenMuonHybrid(torch.optim.Optimizer):
         # split_params_for_muon's callers, not here.
         validate_split(muon_named_params, backup_named_params)
 
+        # adjust_lr_fn guard (idea 5). The default is "match_rms_adamw", which
+        # rescales each Muon update to AdamW-equivalent RMS so a single AdamW-scale
+        # lr is correct for both halves. The legacy None/"original" scaling leaves
+        # the Muon matrices on Muon-native footing; feeding them an AdamW-scale lr
+        # then under-trains them, and no single shared lr suits both halves. Make
+        # that loud rather than silent.
+        if adjust_lr_fn in (None, "original"):
+            import warnings
+
+            warnings.warn(
+                "GefenMuonHybrid: adjust_lr_fn={!r} uses Muon-native LR scaling, so "
+                "an AdamW-scale lr will mis-scale the 2D Muon matrices relative to "
+                "the backup half. Use adjust_lr_fn='match_rms_adamw' (the default) "
+                "to share one AdamW-scale lr, or set muon_lr explicitly.".format(
+                    adjust_lr_fn
+                ),
+                stacklevel=2,
+            )
+
         # Per-half learning rates. The shared ``lr`` keeps the documented
         # single-LR behavior; ``muon_lr`` / ``backup_lr`` override it per half so
         # the Muon matrices (with ``adjust_lr_fn`` rescaling them to AdamW-RMS)
