@@ -142,12 +142,38 @@ def test_distribute_lrs():
     print("E. distribute_lrs round-robin (even, complete, drops empty) PASS")
 
 
+def test_decoder_layers():
+    from gefen.tools.find_lr import _decoder_layers
+
+    class Inner(nn.Module):
+        def __init__(s):
+            super().__init__()
+            s.layers = nn.ModuleList([nn.Linear(4, 4) for _ in range(3)])
+
+    class CausalLM(nn.Module):  # Llama/Qwen-like: model.model.layers
+        def __init__(s):
+            super().__init__()
+            s.model = Inner()
+            s.lm_head = nn.Linear(4, 8)
+
+    class GPT2(nn.Module):  # GPT2-like: model.h
+        def __init__(s):
+            super().__init__()
+            s.h = nn.ModuleList([nn.Linear(4, 4) for _ in range(2)])
+
+    assert len(_decoder_layers(CausalLM())) == 3
+    assert len(_decoder_layers(GPT2())) == 2
+    assert _decoder_layers(nn.Linear(4, 4)) is None  # -> shard whole model only
+    print("F. _decoder_layers discovery (model.layers / .h / none) PASS")
+
+
 def run():
     test_build_optimizer_all_families()
     test_range_test_each_family_and_restore()
     test_restore_false_mutates()
     test_reexec_planner()
     test_distribute_lrs()
+    test_decoder_layers()
     print("\nAll find_lr smoke checks passed.")
 
 

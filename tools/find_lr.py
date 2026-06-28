@@ -421,6 +421,208 @@ def find_lr_parallel_sweep(
 
 
 # --------------------------------------------------------------------------- #
+# Model-SHARDED sweep (FSDP2 / fully_shard): one model split across GPUs per arm
+# --------------------------------------------------------------------------- #
+def _decoder_layers(model):
+    """Return the model's per-layer ModuleList to wrap with FSDP2 (Llama/Qwen ->
+    ``model.model.layers``), or None if not found. Kept tiny + pure so the
+    discovery can be unit-tested without a GPU."""
+    inner = getattr(model, "model", model)
+    for attr in ("layers", "h", "blocks"):
+        cand = getattr(inner, attr, None)
+        if cand is not None and hasattr(cand, "__len__"):
+            return cand
+    return None
+
+
+def _apply_fully_shard(model, mesh, fully_shard):
+    """Standard FSDP2 idiom: shard each decoder block, then the whole model."""
+    layers = _decoder_layers(model)
+    if layers is not None:
+        for blk in layers:
+            fully_shard(blk, mesh=mesh)
+    fully_shard(model, mesh=mesh)
+    return layers is not None
+
+
+def _free_port() -> str:
+    import socket
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind(("127.0.0.1", 0))
+        return str(s.getsockname()[1])
+
+
+def _shard_worker(rank: int, world: int, lr: float, cfg: dict, port: str, q) -> None:
+    """One rank of an FSDP2-sharded fine-tune at a single LR. Each rank holds only
+    a 1/world shard of every parameter; forward/backward/eval are collective, so
+    every rank runs them in lockstep. rank 0 reports (lr, eval); all ranks report
+    their local shard size + peak memory (evidence of true sharding). The process
+    group is torn down in ``finally`` so a failed arm can't leak a group or hang."""
+    import os as _os
+    import sys as _sys
+    import traceback
+
+    # Drop any sys.path entry exposing a flat ``gefen.py`` that would shadow the
+    # ``gefen/`` package (same guard the FSDP2 parity test uses for spawned ranks).
+    _sys.path[:] = [
+        p for p in _sys.path
+        if not _os.path.isfile(_os.path.join(p or ".", "gefen.py"))
+    ]
+    try:
+        import types
+        import torch as _torch
+        import torch.distributed as dist
+        from torch.distributed.device_mesh import init_device_mesh
+        from torch.distributed.fsdp import fully_shard
+
+        _os.environ["MASTER_ADDR"] = "127.0.0.1"
+        _os.environ["MASTER_PORT"] = port
+        _os.environ["RANK"] = str(rank)
+        _os.environ["WORLD_SIZE"] = str(world)
+        _torch.cuda.set_device(rank)
+        dist.init_process_group("nccl", rank=rank, world_size=world)
+        try:
+            mesh = init_device_mesh("cuda", (world,))
+            dev = f"cuda:{rank}"
+            from gefen.tools.run_model_calibration import load_model
+
+            dtype = getattr(_torch, cfg["dtype"])
+            tok, model = load_model(cfg["model_path"], dev, dtype)
+            # FSDP2 + reentrant grad-checkpointing can deadlock; the models we
+            # sweep fit without it once sharded, so disable it for the sweep.
+            if hasattr(model, "gradient_checkpointing_disable"):
+                model.gradient_checkpointing_disable()
+            full_params = sum(p.numel() for p in model.parameters())
+            _apply_fully_shard(model, mesh, fully_shard)
+
+            ds_args = types.SimpleNamespace(
+                seq=cfg["seq"], dataset=cfg["dataset"], split=cfg["split"],
+                max_rows=cfg["max_rows"], eval_blocks=cfg["eval_blocks"],
+            )
+            train_blocks, eval_blocks = build_token_stream(tok, ds_args)
+            opt = build_optimizer(
+                model, cfg["optimizer"], lr, weight_decay=cfg["weight_decay"],
+                fused=cfg["fused"], adjust_lr_fn=cfg["adjust_lr_fn"],
+            )
+            _torch.cuda.reset_peak_memory_stats(rank)
+            _short_finetune(model, train_blocks, opt, dev, steps=cfg["sweep_steps"],
+                            warmup=cfg["warmup"], bs=cfg["bs"], seed=cfg["seed"])
+            ev = _eval_loss(model, eval_blocks, dev, cfg["bs"])
+
+            local_params = 0
+            for p in model.parameters():
+                local_params += p.to_local().numel() if hasattr(p, "to_local") else p.numel()
+            peak_mb = _torch.cuda.max_memory_allocated(rank) / (1024 ** 2)
+            tag = "RESULT" if rank == 0 else "RANK"
+            q.put((tag, rank, lr, float(ev), int(local_params), int(full_params), float(peak_mb)))
+        finally:
+            if dist.is_initialized():
+                dist.destroy_process_group()
+    except Exception:  # noqa: BLE001 -- surface, never hang
+        q.put(("ERROR", rank, traceback.format_exc()))
+
+
+def find_lr_sharded_sweep(
+    model_path: str,
+    devices: List[str],
+    *,
+    optimizer: str = "gefen",
+    sweep_lrs: Optional[List[float]] = None,
+    dtype: str = "bfloat16",
+    dataset: str = "tatsu-lab/alpaca",
+    split: str = "train",
+    seq: int = 512,
+    max_rows: int = 0,
+    eval_blocks: int = 48,
+    weight_decay: float = 0.0,
+    fused: bool = True,
+    adjust_lr_fn: str = "match_rms_adamw",
+    sweep_steps: int = 80,
+    warmup: int = 10,
+    bs: int = 8,
+    seed: int = 0,
+    verbose: bool = True,
+    worker_timeout: float = 3600.0,
+) -> FindLRResult:
+    """Sweep LRs SEQUENTIALLY, each arm running ONE model sharded across
+    ``len(devices)`` GPUs via FSDP2 ``fully_shard``. For each LR a fresh nccl
+    process group is spun up (one spawn process per GPU), the model is sharded,
+    short-fine-tuned + held-out-evaluated, then the group is torn down before the
+    next LR. Selection is identical to the other modes (lowest eval).
+
+    ``devices`` is the per-rank visible-device list (e.g. ``["cuda:0","cuda:1"]``);
+    restrict the physical GPUs with ``CUDA_VISIBLE_DEVICES`` so rank r -> cuda:r.
+    """
+    import queue as _pyqueue
+    import torch.multiprocessing as mp
+
+    world = len(devices)
+    if world < 2:
+        raise ValueError("--shard needs >=2 devices")
+    grid = list(sweep_lrs or [1e-5, 3e-5, 1e-4, 3e-4, 1e-3])
+    cfg = dict(
+        model_path=model_path, dtype=dtype, optimizer=optimizer,
+        weight_decay=weight_decay, fused=fused, adjust_lr_fn=adjust_lr_fn,
+        dataset=dataset, split=split, seq=seq, max_rows=max_rows,
+        eval_blocks=eval_blocks, sweep_steps=sweep_steps, warmup=warmup,
+        bs=bs, seed=seed,
+    )
+    _prewarm_kernels()
+    ctx = mp.get_context("spawn")
+    results: Dict[float, float] = {}
+
+    for lr in grid:
+        q = ctx.Queue()
+        port = _free_port()
+        procs = [ctx.Process(target=_shard_worker, args=(r, world, lr, cfg, port, q))
+                 for r in range(world)]
+        for p in procs:
+            p.start()
+
+        msgs: List = []
+        errors: List = []
+        got = 0
+        while got < world:
+            try:
+                m = q.get(timeout=worker_timeout)
+            except _pyqueue.Empty:
+                if not any(p.is_alive() for p in procs):
+                    break
+                continue
+            got += 1
+            (errors if m[0] == "ERROR" else msgs).append(m)
+        for p in procs:
+            p.join(timeout=30)
+        for p in procs:
+            if p.is_alive():
+                p.terminate()
+                p.join(timeout=10)
+
+        if errors:
+            raise RuntimeError(
+                f"sharded sweep worker (rank {errors[0][1]}) failed:\n{errors[0][2]}")
+        res = [m for m in msgs if m[0] == "RESULT"]
+        if not res:
+            raise RuntimeError(f"sharded sweep produced no rank-0 result for lr {lr:.2e}")
+        _, _, _, ev, lp0, full, peak0 = res[0]
+        results[lr] = ev
+        if verbose:
+            frac = lp0 / full if full else float("nan")
+            print(f"[find_lr][shard] lr {lr:.2e} -> eval {ev:.4f}  "
+                  f"(rank0 shard {lp0:,}/{full:,} params = {frac:.2f}x, peak {peak0:.0f} MiB)",
+                  flush=True)
+            for m in sorted((m for m in msgs if m[0] == "RANK"), key=lambda x: x[1]):
+                print(f"                 rank{m[1]} shard {m[4]:,} params, peak {m[6]:.0f} MiB",
+                      flush=True)
+
+    best = min(results, key=results.get)
+    out = FindLRResult(lr=best, optimizer=optimizer, method="sweep", sweep=results)
+    if verbose:
+        print(out.summary())
+    return out
+
+
+# --------------------------------------------------------------------------- #
 # Dataset -> packed token blocks (self-contained; HF name OR local file)
 # --------------------------------------------------------------------------- #
 def _row_text(r):
@@ -560,6 +762,12 @@ def main():
         help="multiple devices for a PARALLEL sweep (e.g. --devices cuda:0 cuda:1); "
         "each LR arm runs on its own GPU. Only used for --method sweep with >1 device.",
     )
+    ap.add_argument(
+        "--shard", action="store_true",
+        help="SHARDED sweep: each LR arm runs ONE model split across --devices via "
+        "FSDP2 (arms sequential). For models too big for one GPU. Restrict physical "
+        "GPUs with CUDA_VISIBLE_DEVICES so rank r -> cuda:r.",
+    )
     ap.add_argument("--dtype", default="bfloat16")
     ap.add_argument("--seq", type=int, default=512)
     ap.add_argument("--bs", type=int, default=8)
@@ -582,6 +790,21 @@ def main():
     _maybe_reexec(args)
 
     devices = args.devices or [args.device]
+
+    # Sharded sweep: each LR arm runs ONE model sharded across --devices (FSDP2),
+    # arms sequential. For models too big for a single GPU.
+    if args.shard:
+        if len(devices) < 2:
+            raise SystemExit("--shard needs >=2 --devices (e.g. --devices cuda:0 cuda:1)")
+        res = find_lr_sharded_sweep(
+            args.model, devices, optimizer=args.optimizer, sweep_lrs=args.sweep_lrs,
+            dtype=args.dtype, dataset=args.dataset, split=args.split, seq=args.seq,
+            max_rows=args.max_rows, eval_blocks=args.eval_blocks,
+            weight_decay=args.weight_decay, sweep_steps=args.sweep_steps,
+            warmup=args.warmup, bs=args.bs, seed=args.seed,
+        )
+        print(f"\nRECOMMENDED base LR for {args.optimizer} (sharded): {res.lr:.3e}")
+        return
 
     # Parallel sweep: fan the LR grid across GPUs (loads the model per worker from
     # --model, so this is CLI-level, not the in-memory find_lr path).
