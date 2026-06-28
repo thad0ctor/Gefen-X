@@ -1,4 +1,11 @@
-__all__ = ["Gefen", "GefenMuon", "GefenMuonHybrid", "kernels"]
+__all__ = [
+    "Gefen",
+    "GefenMuon",
+    "GefenMuonHybrid",
+    "split_params_for_muon",
+    "validate_split",
+    "kernels",
+]
 
 
 def __getattr__(name):
@@ -14,4 +21,8 @@ def __getattr__(name):
         from .hybrid import GefenMuonHybrid
 
         return GefenMuonHybrid
+    if name in ("split_params_for_muon", "validate_split"):
+        from . import params
+
+        return getattr(params, name)
     raise AttributeError("module {!r} has no attribute {!r}".format(__name__, name))

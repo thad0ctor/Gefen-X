@@ -25,6 +25,7 @@ import torch
 
 from gefen.gefen import Gefen
 from gefen.gefen_muon import GefenMuon
+from gefen.params import split_params_for_muon, validate_split
 
 
 class GefenMuonHybrid(torch.optim.Optimizer):
@@ -49,6 +50,11 @@ class GefenMuonHybrid(torch.optim.Optimizer):
         backup_named_params = list(backup_named_params)
         if not muon_named_params and not backup_named_params:
             raise ValueError("GefenMuonHybrid received no parameters to optimize")
+        # Catch the silent footguns: a param routed to both halves (stepped
+        # twice) or a duplicate name (codebook cache key collision). Completeness
+        # (a trainable param in neither list) needs the model, so it is checked in
+        # split_params_for_muon's callers, not here.
+        validate_split(muon_named_params, backup_named_params)
 
         self.muon = (
             GefenMuon(
@@ -133,6 +139,20 @@ class GefenMuonHybrid(torch.optim.Optimizer):
             self.muon.load_state_dict(state_dict["muon"])
         if self.backup is not None and state_dict.get("backup") is not None:
             self.backup.load_state_dict(state_dict["backup"])
+
+    @classmethod
+    def from_model(cls, model, *, backup_substrings=None, **kwargs):
+        """Build the hybrid straight from a model, splitting + validating params.
+
+        Routes 2D hidden weights to Muon and everything else to the backup (see
+        ``gefen.split_params_for_muon``), then validates that the split covers
+        every trainable parameter exactly once before constructing. All other
+        keyword arguments are forwarded to ``__init__``.
+        """
+        split_kwargs = {} if backup_substrings is None else {"backup_substrings": backup_substrings}
+        muon_named, backup_named = split_params_for_muon(model, **split_kwargs)
+        validate_split(muon_named, backup_named, model=model)
+        return cls(muon_named, backup_named, **kwargs)
 
     def add_param_group(self, param_group):
         raise NotImplementedError(
