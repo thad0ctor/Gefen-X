@@ -255,10 +255,10 @@ for s in range(1, args.steps + 1):
     loss.backward()
     opt.step()
     opt.zero_grad(set_to_none=True)
-    l = loss.item()  # also syncs the step before we read the wall clock
+    loss_val = loss.item()  # also syncs the step before we read the wall clock
     if s > warmup_steps:
         step_times.append(time.time() - t_step)
-    ema = l if ema is None else 0.95 * ema + 0.05 * l
+    ema = loss_val if ema is None else 0.95 * ema + 0.05 * loss_val
     if s % args.eval_every == 0:
         log(f"step {s}  train_ema {ema:.4f}  eval {evaluate():.4f}  "
             f"({(time.time()-t_start)/s:.2f}s/step)")
