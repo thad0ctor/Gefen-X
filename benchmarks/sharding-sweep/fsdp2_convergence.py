@@ -15,6 +15,11 @@ knob under test is --sharded-mode {exact, approx}:
            full matrix (bit-for-bit single-GPU parity), slices the update back.
   approx : each rank runs the whole pipeline on its LOCAL row-shard only (no
            all-gather, NS on a smaller matrix) -- NON-PARITY, but ~2.2x faster.
+  distributed : EXACT like exact, but each 2D matrix is round-robin assigned to
+           one owner rank that alone runs Newton-Schulz; the orthogonalized
+           update is broadcast so every rank slices its shard. Bit-for-bit
+           identical to exact, with NS/momentum compute (and momentum state)
+           cut ~world_size x.
 
 Data is REPLICATED across ranks (every rank sees the identical packed block each
 step), so exact-mode FSDP2 reproduces the single-GPU trajectory exactly and any
@@ -58,13 +63,21 @@ ap.add_argument("--lr", type=float, required=True)
 ap.add_argument("--seed", type=int, default=0)
 ap.add_argument("--steps", type=positive_int, default=2000)
 ap.add_argument("--seq", type=positive_int, default=2048)
-ap.add_argument("--sharded-mode", default="exact", choices=["exact", "approx"])
+ap.add_argument(
+    "--sharded-mode", default="exact", choices=["exact", "approx", "distributed"]
+)
 ap.add_argument("--tag", required=True)
 ap.add_argument("--out", required=True)
 ap.add_argument("--dataset", default="tatsu-lab/alpaca")
 ap.add_argument("--max-eval", type=positive_int, default=32)
 ap.add_argument("--eval-every", type=positive_int, default=50)
 ap.add_argument("--muon-adjust", default="match_rms_adamw")
+# NS speed levers (orthogonal to sharded_mode). Default values reproduce the
+# classic bf16 5-step quintic, so existing sweeps are unchanged.
+ap.add_argument("--ns-schedule", default="standard",
+                choices=["standard", "tuned3", "tuned4"])
+ap.add_argument("--fp8", type=int, default=0,
+                help="1 = fp8 (e4m3) Newton-Schulz (sm_89+, min-dim>=1024)")
 args = ap.parse_args()
 
 os.environ.setdefault("CUDA_DEVICE_ORDER", "PCI_BUS_ID")
@@ -214,10 +227,13 @@ def split_params_for_muon(model):
 from gefen import GefenMuonHybrid  # noqa: E402
 
 _adj = None if args.muon_adjust in ("none", "None") else args.muon_adjust
+_ns_sched = None if args.ns_schedule == "standard" else args.ns_schedule
 muon_p, backup_p = split_params_for_muon(m)
 opt = GefenMuonHybrid(muon_p, backup_p, lr=args.lr, adjust_lr_fn=_adj,
-                      fused=True, sharded_mode=args.sharded_mode)
+                      fused=True, sharded_mode=args.sharded_mode,
+                      ns_schedule=_ns_sched, fp8_ns=bool(args.fp8))
 log(f"[gefen_muon] adjust_lr_fn={_adj!r} sharded_mode={args.sharded_mode} "
+    f"ns_schedule={args.ns_schedule} fp8={bool(args.fp8)} "
     f"muon_params={len(muon_p)} backup_params={len(backup_p)}")
 
 
@@ -275,6 +291,7 @@ s_per_step = sum(step_times) / len(step_times) if step_times else None
 if rank == 0:
     res = {
         "tag": args.tag, "opt": "gefen_muon", "sharded_mode": args.sharded_mode,
+        "ns_schedule": args.ns_schedule, "fp8": bool(args.fp8),
         "world_size": world, "lr": args.lr, "seed": args.seed,
         "muon_adjust": args.muon_adjust, "steps": args.steps, "seq": BLOCK,
         "params_B": round(n_params / 1e9, 4), "gpu": dev_name,

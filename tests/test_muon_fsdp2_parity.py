@@ -362,6 +362,217 @@ def _run_fused_cuda_case(case):
     return ok
 
 
+# ---------------------------------------------------------------------------
+# "distributed" mode parity ("Parallel Muon"): each 2D matrix is round-robin
+# assigned to ONE owner rank that runs Newton-Schulz on the full matrix and
+# broadcasts the orthogonalized update. This must be EXACT vs (a) the single-GPU
+# oracle and (b) the existing "exact" mode (which runs NS redundantly on every
+# rank). The test uses SEVERAL matrices so the round-robin owner actually cycles
+# over ranks, runs MULTIPLE steps (so each owner's momentum state must persist),
+# and deliberately includes a matrix whose owner rank holds an EMPTY shard (owner
+# still all-gathers the full grad, runs NS, and broadcasts) plus matrices smaller
+# than world_size (empty non-owner shards) -- proving no collective deadlocks.
+DIST_TOL = 1e-3  # absorbs cross-rank bf16 NS noise vs the single-GPU oracle
+DIST_EXACT_TOL = 0.0  # distributed must be BIT-IDENTICAL to exact mode
+DIST_STEPS = 3
+
+
+def _dist_shapes(world):
+    # Shapes chosen so round-robin owner = idx % world hits, in order:
+    #   idx0 -> rank0 (normal), idx1 -> rank1 (normal),
+    #   idx2 -> rank2%world (normal-ish), idx3 -> rank3%world owns an EMPTY shard
+    # The (1, 8) matrix has a single row, so every rank except rank0 owns 0 rows;
+    # placing it at idx3 makes rank (3 % world) an empty OWNER when world>1.
+    return [(64, 96), (48, 64), (65, 96), (1, 8), (2, 12)]
+
+
+def _worker_distributed(rank, world, port, q, ns_schedule=None):
+    import os as _os
+    import sys as _sys
+
+    _sys.path[:] = [
+        pth
+        for pth in _sys.path
+        if not _os.path.isfile(_os.path.join(pth or ".", "gefen.py"))
+    ]
+
+    import torch.distributed as dist
+    from torch.distributed.tensor import Shard, distribute_tensor, init_device_mesh
+
+    from gefen.gefen_muon import GefenMuon
+
+    os.environ["MASTER_ADDR"] = "127.0.0.1"
+    os.environ["MASTER_PORT"] = port
+    os.environ["RANK"] = str(rank)
+    os.environ["WORLD_SIZE"] = str(world)
+    torch.cuda.set_device(rank)
+    dev = torch.device("cuda", rank)
+    dist.init_process_group("nccl", rank=rank, world_size=world)
+    try:
+        mesh = init_device_mesh("cuda", (world,))
+        shapes = _dist_shapes(world)
+
+        def make_grads(step):
+            # Identical full grads on every rank (same seed) per step.
+            g = torch.Generator(device="cpu").manual_seed(100 + step)
+            return [
+                (torch.randn(M, N, generator=g, dtype=torch.float32) * 0.01).to(
+                    dev, torch.bfloat16
+                )
+                for (M, N) in shapes
+            ]
+
+        torch.manual_seed(1234)
+        inits = [
+            (torch.randn(M, N, dtype=torch.float32) * 0.1).to(dev, torch.bfloat16)
+            for (M, N) in shapes
+        ]
+
+        def build(mode):
+            params = []
+            for i, init in enumerate(inits):
+                params.append(
+                    (
+                        f"w{i}",
+                        nn.Parameter(distribute_tensor(init.clone(), mesh, [Shard(0)])),
+                    )
+                )
+            opt = GefenMuon(
+                params,
+                lr=LR,
+                fused=True,
+                weight_decay=WD,
+                sharded_mode=mode,
+                ns_schedule=ns_schedule,
+            )
+            return params, opt
+
+        ex_params, ex_opt = build("exact")
+        di_params, di_opt = build("distributed")
+
+        owner_empty_seen = False
+        for step in range(DIST_STEPS):
+            grads = make_grads(step)
+            for (_, p), g in zip(ex_params, grads):
+                p.grad = distribute_tensor(g.clone(), mesh, [Shard(0)])
+            for (_, p), g in zip(di_params, grads):
+                p.grad = distribute_tensor(g.clone(), mesh, [Shard(0)])
+            ex_opt.step()
+            di_opt.step()
+
+        # Record whether this rank was an empty OWNER for some matrix (idx3 -> the
+        # (1,8) row matrix; rank (3%world) owns it and, for world>1, owns 0 rows).
+        owner_idx3 = 3 % world
+        if rank == owner_idx3:
+            local_rows_idx3 = di_params[3][1].to_local().shape[0]
+            owner_empty_seen = local_rows_idx3 == 0
+
+        ex_gathered = [p.detach().full_tensor() for _, p in ex_params]
+        di_gathered = [p.detach().full_tensor() for _, p in di_params]
+
+        if rank == 0:
+            # Single-GPU oracle: plain GefenMuon, same inits + grads, no mesh.
+            ref_params = [
+                (f"w{i}", nn.Parameter(init.clone())) for i, init in enumerate(inits)
+            ]
+            ref_opt = GefenMuon(
+                ref_params,
+                lr=LR,
+                fused=True,
+                weight_decay=WD,
+                ns_schedule=ns_schedule,
+            )
+            for step in range(DIST_STEPS):
+                grads = make_grads(step)
+                for (_, p), g in zip(ref_params, grads):
+                    p.grad = g.clone()
+                ref_opt.step()
+            ref = [p.detach() for _, p in ref_params]
+
+            max_vs_oracle = max(
+                (di_gathered[i].float() - ref[i].float()).abs().max().item()
+                for i in range(len(shapes))
+            )
+            max_vs_exact = max(
+                (di_gathered[i].float() - ex_gathered[i].float()).abs().max().item()
+                for i in range(len(shapes))
+            )
+            changed = all(
+                not torch.equal(di_gathered[i], inits[i]) for i in range(len(shapes))
+            )
+            finite = all(torch.isfinite(g).all().item() for g in di_gathered)
+            q.put(
+                ("result", max_vs_oracle, max_vs_exact, changed, finite)
+            )
+        else:
+            q.put(("owner_empty", rank, owner_empty_seen))
+    finally:
+        if dist.is_initialized():
+            dist.destroy_process_group()
+
+
+def _run_distributed_case(world, ns_schedule=None):
+    import torch.multiprocessing as mp
+
+    ctx = mp.get_context("spawn")
+    q = ctx.Queue()
+    port = _get_free_port()
+    procs = [
+        ctx.Process(
+            target=_worker_distributed, args=(r, world, port, q, ns_schedule)
+        )
+        for r in range(world)
+    ]
+    for pr in procs:
+        pr.start()
+
+    result = None
+    owner_empty = {}
+    for _ in range(world):
+        try:
+            item = q.get(timeout=300)
+        except queue.Empty:
+            break
+        if item[0] == "result":
+            result = item[1:]
+        else:
+            owner_empty[item[1]] = item[2]
+
+    for pr in procs:
+        pr.join(timeout=300)
+    for pr in procs:
+        if pr.is_alive():
+            pr.terminate()
+            pr.join(timeout=10)
+
+    for pr in procs:
+        assert pr.exitcode == 0, f"[dist x{world}] worker exited with {pr.exitcode}"
+    assert result is not None, f"[dist x{world}] no result from rank 0"
+
+    max_vs_oracle, max_vs_exact, changed, finite = result
+    # For world>1, rank (3%world) owns the (1,8) matrix and holds 0 rows -> proves
+    # an empty owner still gathers+NS+broadcasts without deadlock.
+    empty_owner_rank = 3 % world
+    empty_owner_ok = (
+        empty_owner_rank == 0 or owner_empty.get(empty_owner_rank, False)
+    )
+    ok = (
+        changed
+        and finite
+        and (max_vs_oracle <= DIST_TOL)
+        and (max_vs_exact <= DIST_EXACT_TOL)
+        and empty_owner_ok
+    )
+    sched_label = ns_schedule if ns_schedule is not None else "standard"
+    print(
+        f"[dist x{world} sched={sched_label}] changed={changed} finite={finite} "
+        f"max|dist-oracle|={max_vs_oracle:.3e} max|dist-exact|={max_vs_exact:.3e} "
+        f"empty_owner(rank{empty_owner_rank})={'n/a' if empty_owner_rank==0 else owner_empty.get(empty_owner_rank)} "
+        f"{'PASS' if ok else 'FAIL'}"
+    )
+    return ok
+
+
 def run():
     results = {c: _run_case(c) for c in CASES}
     if (
@@ -373,6 +584,14 @@ def run():
         if torch.cuda.device_count() >= 2:
             for c in FUSED_CASES:
                 results[f"fused_multirank_{c}"] = _run_fused_cuda_case(c)
+            results["distributed_x2"] = _run_distributed_case(2)
+            # Combined-lever coverage: distributed mode WITH the tuned4 schedule
+            # must still be bit-identical to exact mode (also tuned4) and within
+            # tol of the single-GPU tuned4 oracle.
+            results["distributed_x2_tuned4"] = _run_distributed_case(2, "tuned4")
+        if torch.cuda.device_count() >= 4:
+            results["distributed_x4"] = _run_distributed_case(4)
+            results["distributed_x4_tuned4"] = _run_distributed_case(4, "tuned4")
     return all(results.values())
 
 
@@ -401,6 +620,20 @@ if pytest is not None:
     @pytest.mark.parametrize("case", list(FUSED_CASES))
     def test_muon_fsdp2_fused_multirank_parity(case):
         assert _run_fused_cuda_case(case)
+
+    @pytest.mark.skipif(
+        not torch.cuda.is_available()
+        or not torch.distributed.is_available()
+        or not torch.distributed.is_nccl_available()
+        or torch.cuda.device_count() < 2,
+        reason="distributed Muon mode requires >=2 CUDA GPUs + NCCL",
+    )
+    @pytest.mark.parametrize(
+        "world", [2] + ([4] if torch.cuda.device_count() >= 4 else [])
+    )
+    @pytest.mark.parametrize("ns_schedule", [None, "tuned4"])
+    def test_muon_fsdp2_distributed_parity(world, ns_schedule):
+        assert _run_distributed_case(world, ns_schedule)
 
 
 if __name__ == "__main__":

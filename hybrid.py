@@ -65,8 +65,11 @@ class GefenMuonHybrid(torch.optim.Optimizer):
         momentum=0.95,
         nesterov=True,
         ns_steps=5,
+        ns_schedule=None,
         adjust_lr_fn="match_rms_adamw",
         sharded_mode="exact",
+        fp8_ns=False,
+        fp8_ns_compile=True,
         verbose=False,
     ):
         muon_named_params = list(muon_named_params)
@@ -126,9 +129,12 @@ class GefenMuonHybrid(torch.optim.Optimizer):
                 momentum=momentum,
                 nesterov=nesterov,
                 ns_steps=ns_steps,
+                ns_schedule=ns_schedule,
                 adjust_lr_fn=adjust_lr_fn,
                 fused=fused,
                 sharded_mode=sharded_mode,
+                fp8_ns=fp8_ns,
+                fp8_ns_compile=fp8_ns_compile,
                 verbose=verbose,
             )
             if muon_named_params
