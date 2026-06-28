@@ -15,6 +15,11 @@ knob under test is --sharded-mode {exact, approx}:
            full matrix (bit-for-bit single-GPU parity), slices the update back.
   approx : each rank runs the whole pipeline on its LOCAL row-shard only (no
            all-gather, NS on a smaller matrix) -- NON-PARITY, but ~2.2x faster.
+  distributed : EXACT like exact, but each 2D matrix is round-robin assigned to
+           one owner rank that alone runs Newton-Schulz; the orthogonalized
+           update is broadcast so every rank slices its shard. Bit-for-bit
+           identical to exact, with NS/momentum compute (and momentum state)
+           cut ~world_size x.
 
 Data is REPLICATED across ranks (every rank sees the identical packed block each
 step), so exact-mode FSDP2 reproduces the single-GPU trajectory exactly and any
@@ -58,7 +63,9 @@ ap.add_argument("--lr", type=float, required=True)
 ap.add_argument("--seed", type=int, default=0)
 ap.add_argument("--steps", type=positive_int, default=2000)
 ap.add_argument("--seq", type=positive_int, default=2048)
-ap.add_argument("--sharded-mode", default="exact", choices=["exact", "approx"])
+ap.add_argument(
+    "--sharded-mode", default="exact", choices=["exact", "approx", "distributed"]
+)
 ap.add_argument("--tag", required=True)
 ap.add_argument("--out", required=True)
 ap.add_argument("--dataset", default="tatsu-lab/alpaca")

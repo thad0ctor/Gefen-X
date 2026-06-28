@@ -96,9 +96,20 @@ def main():
     ap.add_argument("--fused", type=int, default=1)
     ap.add_argument("--ns-steps", type=int, default=5)
     ap.add_argument("--approx", type=int, default=0,
-                    help="use approximate sharded Muon (non-parity)")
+                    help="use approximate sharded Muon (non-parity); "
+                         "shorthand for --mode approx")
+    ap.add_argument("--mode", default=None,
+                    choices=["exact", "approx", "distributed"],
+                    help="sharded_mode (overrides --approx if set)")
     ap.add_argument("--dtype", default="bf16", choices=["bf16", "fp32"])
     args = ap.parse_args()
+
+    # Resolve the sharded mode (new --mode wins; --approx kept for back-compat).
+    mode = args.mode if args.mode is not None else (
+        "approx" if args.approx else "exact")
+    # exact and distributed both all-gather the full grad and run the full-matrix
+    # breakdown; distributed additionally splits NS across owners + broadcasts.
+    is_exactlike = mode in ("exact", "distributed")
 
     from torch.distributed.tensor import Shard, distribute_tensor, init_device_mesh
 
@@ -115,7 +126,7 @@ def main():
     n_params = sum(r * c for r, c in shapes)
     if rank == 0:
         print(f"=== {torch.cuda.get_device_name(0)} x{world}  "
-              f"fused={bool(args.fused)} approx={bool(args.approx)} "
+              f"fused={bool(args.fused)} mode={mode} "
               f"dtype={args.dtype} ns_steps={args.ns_steps} ===")
         print(f"shapes: {len(shapes)} matrices, {n_params/1e6:.1f}M params "
               f"(hidden={args.hidden} inter={args.inter} layers={args.layers})")
@@ -135,9 +146,8 @@ def main():
         params.append((f"layer{i}", p))
 
     kwargs = dict(lr=LR, ns_steps=args.ns_steps, fused=bool(args.fused),
-                  weight_decay=WD, adjust_lr_fn="match_rms_adamw")
-    if args.approx:
-        kwargs["sharded_mode"] = "approx"
+                  weight_decay=WD, adjust_lr_fn="match_rms_adamw",
+                  sharded_mode=mode)
     opt = GefenMuon(params, **kwargs)
 
     def set_grads():
@@ -154,10 +164,12 @@ def main():
     # The gather-only / NS-only breakdown is EXACT-mode only (approx has no
     # all-gather and runs NS on local shards), so skip this discarded work in
     # approx mode rather than paying the exact-mode cost on every approx run.
-    gather_ms = ns_ms = 0.0
-    if not args.approx:
+    gather_ms = ns_ms = ns_owned_ms = bcast_ms = 0.0
+    if is_exactlike:
         # gather-only: pure per-param all-gather (full_tensor) over pre-sharded
         # grads -- isolates the serial collective cost from distribute/compute.
+        # BOTH exact and distributed all-gather the grad (the collective every
+        # rank must join), so this cost is shared.
         sharded_grads = [distribute_tensor(g.clone(), mesh, [Shard(0)])
                          for g in full_grads]
 
@@ -168,9 +180,10 @@ def main():
                     fg = fg.wait()
         gather_ms = cuda_time(gather_only, args.iters, args.warmup)
 
-        # NS-only over full matrices (rank-redundant compute). Keep the param
-        # dtype (bf16) -- NS casts to bf16 internally, so .float() here would
-        # charge the timer an fp32->bf16 cast the real step never pays.
+        # NS-only over ALL full matrices (the REDUNDANT compute every rank pays in
+        # exact mode). Keep the param dtype (bf16) -- NS casts to bf16 internally,
+        # so .float() here would charge the timer an fp32->bf16 cast the real step
+        # never pays.
         ns_inputs = [g.clone() for g in full_grads]
 
         def ns_only():
@@ -179,13 +192,45 @@ def main():
                     x, (DEFAULT_A, DEFAULT_B, DEFAULT_C), args.ns_steps, 1e-7)
         ns_ms = cuda_time(ns_only, args.iters, args.warmup)
 
+        if mode == "distributed":
+            # NS over only THIS rank's round-robin matrices (owner = idx % world)
+            # -- the per-rank NS compute in distributed mode (~ns_ms / world).
+            owned = [ns_inputs[i] for i in range(len(ns_inputs))
+                     if i % world == rank]
+
+            def ns_owned():
+                for x in owned:
+                    _zeropower_via_newtonschulz(
+                        x, (DEFAULT_A, DEFAULT_B, DEFAULT_C), args.ns_steps, 1e-7)
+            ns_owned_ms = cuda_time(ns_owned, args.iters, args.warmup)
+
+            # broadcast-only: the ADDED comm -- every update broadcast from its
+            # owner to all ranks (full bf16 matrix).
+            pg = mesh.get_group()
+            bcast_bufs = [torch.empty(r, c, device=dev, dtype=torch.bfloat16)
+                          for r, c in shapes]
+
+            def bcast_only():
+                for i, buf in enumerate(bcast_bufs):
+                    src = dist.get_global_rank(pg, i % world)
+                    dist.broadcast(buf, src=src, group=pg)
+            bcast_ms = cuda_time(bcast_only, args.iters, args.warmup)
+
     if rank == 0:
-        if args.approx:
+        if mode == "approx":
             # gather_only / ns_only measure the EXACT full-matrix costs, which do
             # not apply to approx (no gather; NS on local shards) -- so only the
             # end-to-end step is meaningful here.
             print(f"step={step_ms:8.3f} ms  (approx: no all-gather, "
                   f"NS on local shard; full-matrix breakdown N/A)")
+        elif mode == "distributed":
+            rest = step_ms - gather_ms - ns_owned_ms - bcast_ms
+            print(f"step={step_ms:8.3f} ms | gather={gather_ms:8.3f} ms "
+                  f"({100*gather_ms/step_ms:4.1f}%) | NS_owned={ns_owned_ms:8.3f} ms "
+                  f"({100*ns_owned_ms/step_ms:4.1f}%) | bcast={bcast_ms:8.3f} ms "
+                  f"({100*bcast_ms/step_ms:4.1f}%) | rest(momentum+apply)~{rest:7.3f} ms")
+            print(f"        [ref] NS_full(redundant, exact-equiv)={ns_ms:8.3f} ms "
+                  f"-> NS_owned/NS_full={ns_owned_ms/ns_ms:.3f} (ideal 1/{world})")
         else:
             rest = step_ms - gather_ms - ns_ms
             print(f"step={step_ms:8.3f} ms | gather={gather_ms:8.3f} ms "
@@ -205,9 +250,8 @@ def main():
                for w in p_inits]
     named = [(f"L{i}", p) for i, p in enumerate(sharded)]
     kwargs2 = dict(lr=LR, ns_steps=args.ns_steps, fused=bool(args.fused),
-                   weight_decay=WD, adjust_lr_fn="match_rms_adamw")
-    if args.approx:
-        kwargs2["sharded_mode"] = "approx"
+                   weight_decay=WD, adjust_lr_fn="match_rms_adamw",
+                   sharded_mode=mode)
     opt2 = GefenMuon(named, **kwargs2)
     nsteps = 3
     for _ in range(nsteps):
@@ -238,7 +282,7 @@ def main():
             (gathered[i].float() - refs[i].detach().float()).abs().max().item()
             for i in range(len(shapes))
         )
-        tag = "approx(non-parity)" if args.approx else "exact"
+        tag = "approx(non-parity)" if mode == "approx" else mode
         print(f"parity[{tag}] vs single-GPU after {nsteps} steps: "
               f"max|dist-oracle|={max_abs:.3e}")
 

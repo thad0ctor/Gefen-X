@@ -1,4 +1,5 @@
 import math
+from collections import OrderedDict
 from typing import Iterable, Optional, Tuple, Union
 
 import torch
@@ -102,11 +103,10 @@ class GefenMuon(Gefen):
             raise ValueError(
                 "Adjust learning rate function {} is not supported".format(adjust_lr_fn)
             )
-        if sharded_mode not in ("exact", "approx"):
+        if sharded_mode not in ("exact", "approx", "distributed"):
             raise ValueError(
-                "sharded_mode must be 'exact' or 'approx' but is: {}".format(
-                    sharded_mode
-                )
+                "sharded_mode must be 'exact', 'approx' or 'distributed' but is: "
+                "{}".format(sharded_mode)
             )
         # "exact" (default): under FSDP2 every rank gathers the full gradient and
         # runs Newton-Schulz on the full matrix -> bit-for-bit single-GPU parity.
@@ -114,6 +114,16 @@ class GefenMuon(Gefen):
         # no all-gather and NS on a smaller (row-sharded) matrix, so it is
         # cheaper, but Newton-Schulz of a row block is NOT the orthogonalization
         # of the full matrix: this mode is explicitly NON-PARITY. Opt-in only.
+        # "distributed" ("Parallel Muon" / Moonshot): EXACT like "exact", but the
+        # redundant Newton-Schulz is removed. Each 2D matrix is round-robin
+        # assigned to a single owner rank; only that rank runs the quantized
+        # momentum + Newton-Schulz on the full matrix, then broadcasts the
+        # orthogonalized full-matrix update so every rank slices its own shard.
+        # The NS/momentum compute (and the persistent momentum state) is therefore
+        # cut ~world_size x while staying bit-for-bit identical to "exact". Only
+        # the per-step gradient all-gather (a collective every rank must join) and
+        # one extra update broadcast are replicated. Falls back to the "exact"
+        # full-NS-everywhere path for non-1D meshes (e.g. HSDP x TP).
         self._sharded_mode = sharded_mode
 
         super().__init__(
@@ -316,58 +326,23 @@ class GefenMuon(Gefen):
                 local = local.narrow(dim, min(start, size), length)
         return local.contiguous()
 
-    def _step_automatic(
-        self, group, param_name: str, p: torch.Tensor, grad: torch.Tensor
-    ) -> None:
-        is_sharded = self._is_sharded(p)
-        approx = is_sharded and group["sharded_mode"] == "approx"
-
-        if approx:
-            # NON-PARITY opt-in mode: operate on this rank's LOCAL shard only --
-            # no all-gather, and Newton-Schulz runs on the smaller row-sharded
-            # matrix. There are no collectives here, so an empty-shard rank may
-            # return early without risking a deadlock.
-            if hasattr(grad, "to_local"):
-                grad = grad.to_local()
-            if hasattr(grad, "wait"):
-                grad = grad.wait()
-            if grad.numel() == 0:
-                return
-        elif is_sharded:
-            # FSDP2: reconstruct the FULL gradient matrix on every rank so the
-            # period prediction, quantized momentum, and Newton-Schulz all run on
-            # the full matrix exactly as on a single GPU. full_tensor() is a
-            # collective (all-gather); every rank -- including a rank that owns an
-            # empty shard -- must reach it, so it precedes any early return.
-            if hasattr(grad, "full_tensor"):
-                grad = grad.full_tensor()
-            elif hasattr(grad, "to_local"):
-                grad = grad.to_local()
-            if hasattr(grad, "wait"):
-                grad = grad.wait()
-        elif not self.fused:
-            if hasattr(grad, "to_local"):
-                grad = grad.to_local()
-            if hasattr(grad, "wait"):
-                grad = grad.wait()
-
-        if torch.is_complex(p):
-            raise RuntimeError("GefenMuon does not support complex parameters")
-        if grad.is_sparse:
-            raise RuntimeError("GefenMuon does not support sparse gradients")
-        if grad.ndim != 2:
-            raise ValueError(
-                "GefenMuon gradient must be a 2D matrix for {}".format(param_name)
-            )
-
+    def _compute_muon_update(
+        self,
+        group,
+        param_name: str,
+        p: torch.Tensor,
+        grad: torch.Tensor,
+        eff_numel: int,
+    ) -> torch.Tensor:
+        # The full quantized-momentum + Newton-Schulz pipeline that turns a
+        # gradient matrix into the orthogonalized update. Shared verbatim by the
+        # exact path (grad = full matrix, eff_numel = global numel), the approx
+        # path (grad = local shard, eff_numel = local numel) and the distributed
+        # owner path (grad = full matrix, eff_numel = global numel) so all three
+        # are bit-identical on identical inputs. Reads/writes self.state[p].
         state = self.state[p]
-        lr = group["lr"]
         momentum = group["momentum"]
-
         flat_grad = grad.reshape(-1)
-        # In approx mode the pipeline operates on the local shard, so the period
-        # must divide the LOCAL numel; exact/non-sharded use the (global) numel.
-        eff_numel = flat_grad.numel() if approx else p.numel()
         if "step" not in state:
             if "automatic_period" in state:
                 automatic_period = state["automatic_period"]
@@ -421,26 +396,35 @@ class GefenMuon(Gefen):
 
         if group["nesterov"]:
             momentum_update.mul_(momentum).add_(grad_view, alpha=1 - momentum)
-            update = momentum_update.view_as(grad)
-        else:
-            update = momentum_update.view_as(grad)
+        update = momentum_update.view_as(grad)
 
-        update = _zeropower_via_newtonschulz(
+        return _zeropower_via_newtonschulz(
             update,
             group["ns_coefficients"],
             group["ns_steps"],
             group["eps"],
         )
 
+    def _apply_muon_update(
+        self,
+        group,
+        p: torch.Tensor,
+        update: torch.Tensor,
+        is_sharded: bool,
+        approx: bool,
+    ) -> None:
+        lr = group["lr"]
         # p.shape is the GLOBAL shape for a DTensor, which is exactly what the
         # rows/cols LR ratio wants -- keep it unchanged under sharding.
         adjusted_lr = _adjust_lr(lr, group["adjust_lr_fn"], p.shape)
 
         if is_sharded:
             # Apply to the local shard storage (to_local() is a view, so in-place
-            # ops propagate back). In exact mode `update` is the full-matrix
-            # Newton-Schulz result (identical on every rank) sliced to this shard;
-            # in approx mode `update` is already this shard's own NS result.
+            # ops propagate back). In exact/distributed mode `update` is the
+            # full-matrix Newton-Schulz result (identical on every rank -- computed
+            # redundantly under exact, broadcast from the owner under distributed)
+            # sliced to this shard; in approx mode `update` is already this shard's
+            # own NS result.
             p_local = p.to_local()
             if group["weight_decay"] > 0.0:
                 p_local.mul_(1 - lr * group["weight_decay"])
@@ -452,6 +436,173 @@ class GefenMuon(Gefen):
                 p.mul_(1 - lr * group["weight_decay"])
             p.add_(update, alpha=-adjusted_lr)
 
+    def _step_distributed(self, items) -> None:
+        # "distributed" / Parallel-Muon path. Each 2D matrix is round-robin
+        # assigned to one owner rank that alone runs the quantized-momentum +
+        # Newton-Schulz; the result is broadcast so every rank slices its shard.
+        #
+        # CRITICAL for the speed-up: the gather, compute and broadcast are
+        # SEPARATED into phases per bucket of `world` matrices. If we broadcast
+        # each update right after its owner computes it, the non-owner ranks block
+        # at the broadcast while the owner runs NS -- the NS serializes and there
+        # is no win. By all-gathering every grad in the bucket first, then letting
+        # each rank compute its ONE owned matrix with no collective in between, the
+        # owners' NS runs concurrently (NS critical path ~ NS_total / world), and
+        # the per-bucket broadcasts are a pure communication phase.
+        import torch.distributed as dist
+
+        # Eligibility (1-D mesh, world>=2) is a property of each param's mesh and
+        # so is identical on every rank -> the eligible/fallback split, and thus
+        # the collective order, agrees globally. Non-eligible matrices (multi-dim
+        # HSDP x TP meshes, world==1) keep the replicated exact full-NS path.
+        eligible, fallback = [], []
+        for (group, name, p, grad) in items:
+            mesh = p.device_mesh
+            if mesh.ndim == 1 and dist.get_world_size(mesh.get_group()) >= 2:
+                eligible.append((group, name, p, grad))
+            else:
+                fallback.append((group, name, p, grad))
+
+        for (group, name, p, grad) in fallback:
+            self._step_automatic(group, name, p, grad)
+
+        if not eligible:
+            return
+
+        # Group by process group (one mesh under plain FSDP2; multiple only under
+        # exotic setups). Insertion-ordered so the order is identical across ranks.
+        by_pg = OrderedDict()
+        for item in eligible:
+            pg = item[2].device_mesh.get_group()
+            by_pg.setdefault(pg, []).append(item)
+
+        for pg, pg_items in by_pg.items():
+            self._step_distributed_pg(pg, pg_items)
+
+    def _step_distributed_pg(self, pg, pg_items) -> None:
+        import torch.distributed as dist
+
+        world = dist.get_world_size(pg)
+        my_coord = dist.get_group_rank(pg, dist.get_rank())
+        global_rank = [dist.get_global_rank(pg, c) for c in range(world)]
+
+        # Buckets of `world` consecutive matrices; within a bucket the matrix at
+        # offset k is owned by rank k (so each bucket has exactly one matrix per
+        # rank, except possibly a short tail bucket). idx = b + k, b % world == 0,
+        # so owner == k -- the round-robin assignment, stable across steps.
+        for b in range(0, len(pg_items), world):
+            bucket = pg_items[b : b + world]
+
+            # --- Phase 1: all-gather every grad in the bucket; keep only mine. ---
+            # Every rank joins every full_tensor (matched collective). No compute
+            # is interleaved, so ranks march through the gathers in lockstep.
+            my_full_grad = None
+            my_entry = None
+            for k, (group, name, p, grad) in enumerate(bucket):
+                fg = grad
+                if hasattr(fg, "full_tensor"):
+                    fg = fg.full_tensor()
+                elif hasattr(fg, "to_local"):
+                    fg = fg.to_local()
+                if hasattr(fg, "wait"):
+                    fg = fg.wait()
+                if k == my_coord:
+                    if torch.is_complex(p):
+                        raise RuntimeError(
+                            "GefenMuon does not support complex parameters"
+                        )
+                    if fg.is_sparse:
+                        raise RuntimeError(
+                            "GefenMuon does not support sparse gradients"
+                        )
+                    if fg.ndim != 2:
+                        raise ValueError(
+                            "GefenMuon gradient must be a 2D matrix for {}".format(
+                                name
+                            )
+                        )
+                    my_full_grad = fg
+                    my_entry = (group, name, p)
+                else:
+                    fg = None  # drop the gathered full grad we do not own
+
+            # --- Phase 2: compute MY owned update (no collectives -> parallel). ---
+            my_update = None
+            if my_entry is not None:
+                group, name, p = my_entry
+                my_update = self._compute_muon_update(
+                    group, name, p, my_full_grad, p.numel()
+                )
+                my_full_grad = None
+
+            # --- Phase 3: broadcast each update from its owner; apply locally. ---
+            for k, (group, name, p, grad) in enumerate(bucket):
+                if k == my_coord:
+                    buf = my_update.contiguous()
+                    if buf.dtype != torch.bfloat16:
+                        buf = buf.to(torch.bfloat16)
+                else:
+                    buf = torch.empty(
+                        tuple(p.shape),
+                        dtype=torch.bfloat16,
+                        device=p.to_local().device,
+                    )
+                dist.broadcast(buf, src=global_rank[k], group=pg)
+                self._apply_muon_update(
+                    group, p, buf, is_sharded=True, approx=False
+                )
+                buf = None
+
+    def _step_automatic(
+        self, group, param_name: str, p: torch.Tensor, grad: torch.Tensor
+    ) -> None:
+        is_sharded = self._is_sharded(p)
+        approx = is_sharded and group["sharded_mode"] == "approx"
+
+        if approx:
+            # NON-PARITY opt-in mode: operate on this rank's LOCAL shard only --
+            # no all-gather, and Newton-Schulz runs on the smaller row-sharded
+            # matrix. There are no collectives here, so an empty-shard rank may
+            # return early without risking a deadlock.
+            if hasattr(grad, "to_local"):
+                grad = grad.to_local()
+            if hasattr(grad, "wait"):
+                grad = grad.wait()
+            if grad.numel() == 0:
+                return
+        elif is_sharded:
+            # FSDP2: reconstruct the FULL gradient matrix on every rank so the
+            # period prediction, quantized momentum, and Newton-Schulz all run on
+            # the full matrix exactly as on a single GPU. full_tensor() is a
+            # collective (all-gather); every rank -- including a rank that owns an
+            # empty shard -- must reach it, so it precedes any early return.
+            if hasattr(grad, "full_tensor"):
+                grad = grad.full_tensor()
+            elif hasattr(grad, "to_local"):
+                grad = grad.to_local()
+            if hasattr(grad, "wait"):
+                grad = grad.wait()
+        elif not self.fused:
+            if hasattr(grad, "to_local"):
+                grad = grad.to_local()
+            if hasattr(grad, "wait"):
+                grad = grad.wait()
+
+        if torch.is_complex(p):
+            raise RuntimeError("GefenMuon does not support complex parameters")
+        if grad.is_sparse:
+            raise RuntimeError("GefenMuon does not support sparse gradients")
+        if grad.ndim != 2:
+            raise ValueError(
+                "GefenMuon gradient must be a 2D matrix for {}".format(param_name)
+            )
+
+        # In approx mode the pipeline operates on the local shard, so the period
+        # must divide the LOCAL numel; exact/non-sharded use the (global) numel.
+        eff_numel = grad.reshape(-1).numel() if approx else p.numel()
+        update = self._compute_muon_update(group, param_name, p, grad, eff_numel)
+        self._apply_muon_update(group, p, update, is_sharded, approx)
+
     @torch.no_grad()
     def step(self, closure=None):
         loss = None
@@ -462,13 +613,27 @@ class GefenMuon(Gefen):
         self._maybe_refresh_gefen_codebook()
         self._maybe_save_gefen_grad_histogram()
 
+        # Partition the work. "distributed"-mode SHARDED matrices are handled by
+        # the bucketed Parallel-Muon path (round-robin owner per matrix, in the
+        # deterministic param-iteration order that agrees on every rank); every
+        # other matrix (exact / approx / non-sharded) takes the per-param path.
+        # The two passes run in the same order on every rank, so all collectives
+        # stay matched.
+        distributed_items = []
         for group in self.param_groups:
             name = group["name"]
+            distributed = group["sharded_mode"] == "distributed"
             for p in group["params"]:
                 grad = p.grad
                 if grad is None:
                     continue
-                self._step_automatic(group, name, p, grad)
+                if distributed and self._is_sharded(p):
+                    distributed_items.append((group, name, p, grad))
+                else:
+                    self._step_automatic(group, name, p, grad)
+
+        if distributed_items:
+            self._step_distributed(distributed_items)
 
         self._gefen_global_step += 1
         return loss
