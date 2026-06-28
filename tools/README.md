@@ -27,7 +27,7 @@ Two modes:
 
 ## Running it (env, dataset, GPUs)
 
-Worked example:
+Worked example (single GPU):
 ```bash
 python -m gefen.tools.find_lr \
     --model /path/to/Qwen3-1.7B \
@@ -38,9 +38,30 @@ python -m gefen.tools.find_lr \
 # -> RECOMMENDED base LR for gefen: <number>
 ```
 
-- **Environment.** The fork must be importable (`pip install -e .` of this repo). The default `fused=True` uses Gefen's CUDA kernels, which **require a CUDA toolkit whose `nvcc` matches `torch.version.cuda`** (the kernel build guard enforces this) — see the repo's CUDA build notes. If you don't have a matching toolkit, run with `fused=False` (programmatic) — pure-torch, no kernel build, just slower.
+**Parallel sweep across GPUs** (`--devices`). Each LR arm is independent, so a sweep fans across GPUs — one (or more) LRs per GPU — for a near-linear speedup, with the **same** lowest-eval selection as the sequential run:
+```bash
+python -m gefen.tools.find_lr \
+    --model /path/to/Qwen3-1.7B --optimizer gefen --method sweep \
+    --devices cuda:0 cuda:1 cuda:2 \   # one spawn worker per GPU; LRs round-robin'd
+    --sweep-lrs 1e-5 3e-5 1e-4 3e-4 1e-3 --seq 512 --bs 8
+# [find_lr] device cuda:0 <- LRs ['1.0e-05', '3.0e-04']  ... etc
+# -> RECOMMENDED base LR for gefen: <number>   (identical to the sequential pick)
+```
+Measured: a 5-LR `gefen` sweep on Qwen3-0.6B took **202 s on 1 GPU vs 56 s across 3** (~3.6×), same best LR. Workers load the model from `--model` per process (CUDA needs `spawn`; the in-memory `find_lr(model, ...)` API stays single-device). Each LR arm is one short fine-tune, so the wall time is set by the busiest GPU (`ceil(#LRs / #GPUs)` arms). A single `--devices`/`--device` falls back to the sequential path.
+
+**Environment redirection** (`--venv` / `--cuda-home`). If you launch from an interpreter whose CUDA doesn't match (the kernel build needs an `nvcc` matching `torch.version.cuda`), point the CLI at the right venv and toolkit and it **re-execs** itself there before importing the kernels:
+```bash
+PYTHONPATH=<this-repo-or-shim> python -m gefen.tools.find_lr \
+    --venv /path/to/cu130-venv --cuda-home /path/to/cuda-13.0 \
+    --model /path/to/Qwen3-0.6B --method range_test --device cuda:0
+# [find_lr] re-exec under /path/to/cu130-venv/bin/python (CUDA_HOME=/path/to/cuda-13.0)
+# Initializing Gefen optimizer (fused=True).   <- runs the real fused path
+```
+The re-exec preserves the environment (incl. `PYTHONPATH`, `CUDA_VISIBLE_DEVICES`), so you don't have to install this repo into the target venv — just carry it on `PYTHONPATH`. Omit `--venv/--python` when you already run inside the right env.
+
+- **Environment.** The fork must be importable (on `PYTHONPATH` or `pip install -e .`). The default `fused=True` uses Gefen's CUDA kernels, which **require a CUDA toolkit whose `nvcc` matches `torch.version.cuda`** (the kernel build guard enforces this; use `--venv/--cuda-home` above to satisfy it). If you don't have a matching toolkit, run with `fused=False` (programmatic) — pure-torch, no kernel build, just slower.
 - **Dataset.** `--dataset` accepts an installed/cached **HuggingFace dataset name** *or* a path to a local **`.txt` / `.json` / `.jsonl`** file (alpaca-style `instruction/input/output`, or a `text`/`content` field, are auto-detected). Offline machines should use a local file or a pre-cached dataset. The programmatic API takes a `[N, seq]` token tensor directly if you'd rather tokenize yourself.
-- **GPUs — single-GPU only (by design).** The finder runs in one process on one device; it does **not** shard across GPUs (no FSDP2/DDP), and `GefenMuonHybrid` is single-GPU/DDP-only regardless. For a model too large for one GPU: the good LR is largely **scale-transferable** (Gefen's factor is set by `head_dim`/norm-block structure, not parameter count — it holds across a model family; see the main README's LR section), so **find the LR on a size that fits one GPU (or a smaller same-`head_dim` proxy) and reuse it for the sharded run.** True sharded LR-finding is not implemented.
+- **Single large model.** `--devices` parallelizes *independent LR arms* across GPUs; it does **not** shard one model (no FSDP2/DDP), and `GefenMuonHybrid` is single-GPU/DDP-only regardless. For a model too large for one GPU: the good LR is largely **scale-transferable** (Gefen's factor tracks `head_dim`/norm-block structure, not parameter count — see the main README's LR section), so **find the LR on a size that fits one GPU (or a smaller same-`head_dim` proxy) and reuse it.**
 
 ## Diagnostic probes
 
