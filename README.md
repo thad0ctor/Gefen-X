@@ -183,7 +183,7 @@ fair learning-rate optimum** (from a per-optimizer LR sweep), 2000 steps.
 - **Models:** Qwen3-0.6B and Qwen3-1.7B — full fine-tune (all weights trained, no adapters).
 - **Regime:** bf16 master weights, gradient checkpointing, sequence length 2048, micro-batch 1, Alpaca greedy-packed to 2048-token blocks, 2000 steps, single seed, identical data order across optimizers; 32-example held-out eval.
 - **Learning rate (each at its own fair optimum):** AdamW (bf16 / 8-bit / 4-bit) = `5e-5`; Gefen (fused) = `2e-5`; Gefen-Muon = `5e-5` (with `adjust_lr_fn="match_rms_adamw"`).
-- **Optimizers:** `adamw_bf16` = torch fused AdamW · `adamw8bit` = bitsandbytes · `adamw4bit` = torchao · `gefen_fused` = `Gefen(fused=True)` · `gefen_muon` = `GefenMuonHybrid` (Muon on 2D hidden matrices, Gefen on everything else).
+- **Optimizers:** `adamw_bf16` = torch fused AdamW · `adamw8bit` = bitsandbytes · `adamw4bit` = torchao · `gefen_fused` = `Gefen(fused=True)` · `gefen_muon` = `GefenMuonHybrid(..., fused=True)` (Muon on 2D hidden matrices, Gefen on everything else). **Both Gefen runs use the fused CUDA kernels** (`fused=True`).
 
 | Model | Optimizer | LR | Eval loss | tok/s | Peak VRAM (GiB) | Opt-state B/param |
 |---|---|---|---|---|---|---|
@@ -242,8 +242,7 @@ afford the slowdown.
 
 *Caveats:* single seed; the `5e-5`/`2e-5` LRs are 175-step optima (the 2000-step
 optimum is likely lower for every optimizer); `adamw4bit` was run at the
-AdamW-family `5e-5` (its own 4-bit optimum was not separately swept); Gefen-Muon and
-Gefen-fused are within ~0.01 GiB / ~0.01 B/param on VRAM and optimizer state (a tie).
+AdamW-family `5e-5` (its own 4-bit optimum was not separately swept).
 
 **Review the raw runs:** per-cell training logs (step-by-step loss, throughput,
 VRAM) in [`docs/benchmarks/logs/`](docs/benchmarks/logs/) · aggregated metrics as
