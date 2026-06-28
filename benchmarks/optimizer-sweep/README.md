@@ -59,14 +59,51 @@ JIT-builds its fused kernels on the first CUDA run).
 ## 3. Usage
 
 Drive everything through `run.sh`. It runs the (optional) LR sweep, then the
-2000-step finals for every optimizer x model, then the plots and the aggregated
-table. Each (model, optimizer) job is pinned to one GPU from `--gpus`
-round-robin, so within a model all optimizers share a GPU type for a clean
-throughput comparison.
+finals for every optimizer x model, then the plots and the aggregated table.
+Each (model, optimizer) job is pinned to one GPU round-robin, so within a model
+all optimizers share a GPU type for a clean throughput comparison.
+
+Settings come from CLI flags and/or a YAML config, with
+
+```
+precedence:  CLI flag  >  config.yaml  >  built-in default
+```
+
+### Config file (recommended)
+
+Copy the template, edit it, and run with no flags — `run.sh` auto-loads
+`./config.yaml` when present (or pass `--config <path>`):
 
 ```bash
 cd benchmarks/optimizer-sweep
+cp config.example.yaml config.yaml
+$EDITOR config.yaml          # set venv, out, gpus, models
+./run.sh                     # uses config.yaml for everything
+./run.sh --steps 500 --no-muon   # CLI still overrides individual keys
+```
 
+`config.yaml` is gitignored, so your local venv/model paths never get committed.
+See `config.example.yaml` for every key. Use `./run.sh --dry-run` to resolve and
+print the effective settings without launching anything.
+
+### GPU selection (PCI-ordered)
+
+GPU indices are **PCI-bus-ordered** — `run.sh` exports
+`CUDA_DEVICE_ORDER=PCI_BUS_ID`, so the indices you put in `gpus:` / `--gpus`
+match `nvidia-smi` and the physical cards the cells pin. List them with:
+
+```bash
+./run.sh --list-gpus
+#   0  NVIDIA GeForce RTX 3090       00000000:21:00.0  used 18 MiB / 24576 MiB
+#   1  NVIDIA GeForce RTX 3090 Ti    00000000:02:00.0  used 19 MiB / 24564 MiB
+#   ...
+```
+
+Then set e.g. `gpus: "1,2,4,5,7"` (or `--gpus "1,2,4,5,7"`).
+
+### Pure CLI
+
+```bash
 ./run.sh \
   --venv   /path/to/your/venv/bin/python \
   --out    ./out \
@@ -82,7 +119,7 @@ cd benchmarks/optimizer-sweep
 - `gefen_muon` is in the default set; add `--no-muon` to skip it, or set `--opts "..."`.
 - Use `--model <tag>=<path>` (repeatable) for arbitrary models/tags.
 - `--arch` is your GPU's compute capability (`8.6` Ampere, `12.0` Blackwell).
-- Run `./run.sh -h` for the full flag list. Missing required args fail cleanly.
+- Run `./run.sh -h` for the full flag list. Missing required settings fail cleanly.
 
 You can also run a single cell directly:
 

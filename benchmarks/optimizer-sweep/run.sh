@@ -1,17 +1,28 @@
 #!/usr/bin/env bash
 # Reproducible AdamW-vs-Gefen optimizer benchmark launcher.
 #
-# Runs (optional per-optimizer LR sweep ->) 2000-step finals for every
-# optimizer x model -> plots -> aggregated table. Everything is passed via
-# CLI flags; there are NO hardcoded paths. Each (model, optimizer) job is
-# pinned to one GPU from --gpus, round-robin, so within a model all optimizers
-# share a GPU type for clean tok/s comparison.
+# Runs (optional per-optimizer LR sweep ->) finals for every optimizer x model
+# -> plots -> aggregated table. Settings come from CLI flags and/or a YAML
+# config; there are NO hardcoded paths.
+#
+#   precedence:  CLI flag  >  config.yaml  >  built-in default
+#
+# A config is loaded from --config <path>, else ./config.yaml if it exists
+# (see config.example.yaml). Each (model, optimizer) job is pinned to one GPU
+# from the GPU list, round-robin, so within a model all optimizers share a GPU
+# type for clean tok/s comparison. GPU indices are PCI-bus-ordered
+# (CUDA_DEVICE_ORDER=PCI_BUS_ID); list them with --list-gpus.
 #
 # See README.md for the full regime and a concrete example.
 set -u
 
+# PCI-bus order so the indices in --gpus / config match `--list-gpus` and the
+# physical GPUs the cells pin (children inherit this).
+export CUDA_DEVICE_ORDER=PCI_BUS_ID
+
 HERE="$(cd "$(dirname "$0")" && pwd)"
 
+# ---- built-in defaults (overridden by config.yaml, then by CLI) ----
 PY=""
 OUT=""
 GPUS=""
@@ -27,10 +38,24 @@ MUON_ADJUST="match_rms_adamw"
 OPTS_DEFAULT="adamw_bf16 adamw8bit adamw4bit gefen_fused gefen_muon"
 OPTS="$OPTS_DEFAULT"
 NO_MUON=0
+CONFIG=""
+DRY=0
 
-# tag -> model path, and the tag order, collected from CLI
+# tag -> model path (parallel arrays) and tag -> display label
 declare -a TAGS=()
 declare -a PATHS=()
+declare -A LABELS=([qwen0p6b]=Qwen3-0.6B [qwen1p7b]=Qwen3-1.7B)
+# keys explicitly set on the CLI (so config.yaml does not override them)
+declare -A CLI_SET=()
+
+die() { echo "ERROR: $*" >&2; exit 1; }
+
+list_gpus() {
+  command -v nvidia-smi >/dev/null 2>&1 || die "nvidia-smi not found"
+  echo "PCI-ordered GPUs (CUDA_DEVICE_ORDER=PCI_BUS_ID) — use the index column in --gpus / gpus:"
+  nvidia-smi --query-gpu=index,name,pci.bus_id,memory.used,memory.total \
+    --format=csv,noheader | awk -F', ' '{printf "  %s  %-28s  %s  used %s / %s\n",$1,$2,$3,$4,$5}'
+}
 
 # fair default LRs (each optimizer's own optimum); overridden by --lr-sweep
 fair_lr() {
@@ -54,21 +79,31 @@ sweep_grid() {
 
 usage() {
   cat <<EOF
-Usage: run.sh --venv <python> --out <dir> --gpus "2,5,7" [options] \\
+Usage: run.sh [--config config.yaml] [options]
+       run.sh --venv <python> --out <dir> --gpus "1,2,4" \\
               ( --model <tag>=<path> [--model ...] | --model-0p6b <path> --model-1p7b <path> )
 
-Required:
-  --venv <python>        Python interpreter of the env where the Gefen fork is
-                         installed (pip install -e . on THIS fork) plus
-                         bitsandbytes, torchao, matplotlib, datasets, transformers.
+Settings come from CLI flags and/or a YAML config (see config.example.yaml).
+Precedence: CLI flag > config.yaml > built-in default. ./config.yaml is loaded
+automatically when present; --config <path> points elsewhere. With a complete
+config, 'run.sh' needs no flags at all.
+
+Required (here or in the config):
+  --venv <python>        Python of the env with the Gefen fork (pip install -e .
+                         on THIS fork) + bitsandbytes, torchao, matplotlib,
+                         datasets, transformers.
   --out <dir>            Output dir for results.jsonl, logs/, table, charts.
-  --gpus "a,b,c"         Comma-separated CUDA device indices to use (round-robin).
+  --gpus "a,b,c"         PCI-ordered CUDA device indices to use (round-robin).
   At least one model:
     --model <tag>=<path>   Repeatable. tag groups results (e.g. qwen1p7b=/models/Qwen3-1.7B).
     --model-0p6b <path>    Convenience for --model qwen0p6b=<path>.
     --model-1p7b <path>    Convenience for --model qwen1p7b=<path>.
 
 Options:
+  --config <path>        YAML config file (default: ./config.yaml if it exists).
+  --list-gpus            Print the PCI-ordered GPU list and exit.
+  --dry-run, --check     Resolve config + CLI, print the effective settings, and exit
+                         without launching any runs.
   --steps N              Final-run steps (default $STEPS).
   --seq N                Sequence / pack-block length (default $SEQ).
   --arch X.Y             TORCH_CUDA_ARCH_LIST, e.g. 8.6 Ampere, 12.0 Blackwell (default $ARCH).
@@ -85,53 +120,118 @@ Options:
   --sweep-steps N        Steps per LR-sweep cell (default $SWEEP_STEPS).
   -h, --help             This help.
 
-Example:
+Example (all from config):
+  cp config.example.yaml config.yaml && \$EDITOR config.yaml
+  ./run.sh
+
+Example (pure CLI):
   ./run.sh --venv /path/to/venv/bin/python --out ./out \\
            --model-0p6b /models/Qwen3-0.6B --model-1p7b /models/Qwen3-1.7B \\
            --gpus "2,5,7" --steps 2000 --arch 8.6
 EOF
 }
 
-[ $# -eq 0 ] && { usage; exit 1; }
+# Nothing to do with no args and no config to fall back on.
+[ $# -eq 0 ] && [ ! -f "$HERE/config.yaml" ] && { usage; exit 1; }
 
+# ---- parse CLI (records which keys were explicitly set) ----
 while [ $# -gt 0 ]; do
   case "$1" in
-    --venv)        PY="$2"; shift 2 ;;
-    --out)         OUT="$2"; shift 2 ;;
-    --gpus)        GPUS="$2"; shift 2 ;;
-    --steps)       STEPS="$2"; shift 2 ;;
-    --seq)         SEQ="$2"; shift 2 ;;
-    --arch)        ARCH="$2"; shift 2 ;;
-    --seed)        SEED="$2"; shift 2 ;;
-    --dataset)     DATASET="$2"; shift 2 ;;
-    --opts)        OPTS="$2"; shift 2 ;;
-    --no-muon)     NO_MUON=1; shift ;;
-    --muon-adjust) MUON_ADJUST="$2"; shift 2 ;;
-    --eval-every)  EVAL_EVERY="$2"; shift 2 ;;
-    --lr-sweep)    LR_SWEEP=1; shift ;;
-    --sweep-steps) SWEEP_STEPS="$2"; shift 2 ;;
-    --model)       TAGS+=("${2%%=*}"); PATHS+=("${2#*=}"); shift 2 ;;
-    --model-0p6b)  TAGS+=("qwen0p6b"); PATHS+=("$2"); shift 2 ;;
-    --model-1p7b)  TAGS+=("qwen1p7b"); PATHS+=("$2"); shift 2 ;;
+    --config)      CONFIG="$2"; shift 2 ;;
+    --list-gpus)   list_gpus; exit 0 ;;
+    --dry-run|--check) DRY=1; shift ;;
+    --venv)        PY="$2"; CLI_SET[venv]=1; shift 2 ;;
+    --out)         OUT="$2"; CLI_SET[out]=1; shift 2 ;;
+    --gpus)        GPUS="$2"; CLI_SET[gpus]=1; shift 2 ;;
+    --steps)       STEPS="$2"; CLI_SET[steps]=1; shift 2 ;;
+    --seq)         SEQ="$2"; CLI_SET[seq]=1; shift 2 ;;
+    --arch)        ARCH="$2"; CLI_SET[arch]=1; shift 2 ;;
+    --seed)        SEED="$2"; CLI_SET[seed]=1; shift 2 ;;
+    --dataset)     DATASET="$2"; CLI_SET[dataset]=1; shift 2 ;;
+    --opts)        OPTS="$2"; CLI_SET[opts]=1; shift 2 ;;
+    --no-muon)     NO_MUON=1; CLI_SET[no_muon]=1; shift ;;
+    --muon-adjust) MUON_ADJUST="$2"; CLI_SET[muon_adjust]=1; shift 2 ;;
+    --eval-every)  EVAL_EVERY="$2"; CLI_SET[eval_every]=1; shift 2 ;;
+    --lr-sweep)    LR_SWEEP=1; CLI_SET[lr_sweep]=1; shift ;;
+    --sweep-steps) SWEEP_STEPS="$2"; CLI_SET[sweep_steps]=1; shift 2 ;;
+    --model)       TAGS+=("${2%%=*}"); PATHS+=("${2#*=}"); CLI_SET[models]=1; shift 2 ;;
+    --model-0p6b)  TAGS+=("qwen0p6b"); PATHS+=("$2"); CLI_SET[models]=1; shift 2 ;;
+    --model-1p7b)  TAGS+=("qwen1p7b"); PATHS+=("$2"); CLI_SET[models]=1; shift 2 ;;
     -h|--help)     usage; exit 0 ;;
     *) echo "ERROR: unknown arg '$1'" >&2; usage; exit 1 ;;
   esac
 done
 
-die() { echo "ERROR: $*" >&2; exit 1; }
-[ -n "$PY" ]   || die "--venv <python> is required"
-[ -x "$PY" ] || [ -f "$PY" ] || die "--venv python not found/executable: $PY"
-[ -n "$OUT" ]  || die "--out <dir> is required"
-[ -n "$GPUS" ] || die "--gpus \"a,b,c\" is required"
-[ "${#TAGS[@]}" -gt 0 ] || die "at least one --model / --model-0p6b / --model-1p7b is required"
+# ---- load YAML config for anything the CLI did not set ----
+[ -z "$CONFIG" ] && [ -f "$HERE/config.yaml" ] && CONFIG="$HERE/config.yaml"
+if [ -n "$CONFIG" ]; then
+  [ -f "$CONFIG" ] || die "config file not found: $CONFIG"
+  # a bare python3 can read the config (stdlib-only parser), even to discover venv
+  CFG_READER=""
+  for c in python3 python "$PY"; do
+    [ -n "$c" ] && command -v "$c" >/dev/null 2>&1 && { CFG_READER="$c"; break; }
+  done
+  [ -n "$CFG_READER" ] || die "need python3 (or python) on PATH to read $CONFIG"
+
+  declare -a YTAGS=() YPATHS=() YLABELS=()
+  set_if_unset() { # cli_key varname value
+    [ -n "${CLI_SET[$1]:-}" ] && return 0
+    printf -v "$2" '%s' "$3"
+  }
+  while IFS=$'\t' read -r key v1 v2 v3; do
+    case "$key" in
+      MODEL)       YTAGS+=("$v1"); YPATHS+=("$v2"); YLABELS+=("$v3") ;;
+      venv)        set_if_unset venv PY "$v1" ;;
+      out)         set_if_unset out OUT "$v1" ;;
+      gpus)        set_if_unset gpus GPUS "$v1" ;;
+      steps)       set_if_unset steps STEPS "$v1" ;;
+      seq)         set_if_unset seq SEQ "$v1" ;;
+      arch)        set_if_unset arch ARCH "$v1" ;;
+      seed)        set_if_unset seed SEED "$v1" ;;
+      dataset)     set_if_unset dataset DATASET "$v1" ;;
+      opts)        set_if_unset opts OPTS "$v1" ;;
+      muon_adjust) set_if_unset muon_adjust MUON_ADJUST "$v1" ;;
+      eval_every)  set_if_unset eval_every EVAL_EVERY "$v1" ;;
+      sweep_steps) set_if_unset sweep_steps SWEEP_STEPS "$v1" ;;
+      no_muon)     [ -n "${CLI_SET[no_muon]:-}" ] || { [ "$v1" = "true" ] && NO_MUON=1 || NO_MUON=0; } ;;
+      lr_sweep)    [ -n "${CLI_SET[lr_sweep]:-}" ] || { [ "$v1" = "true" ] && LR_SWEEP=1 || LR_SWEEP=0; } ;;
+      ""|\#*)      : ;;
+      *)           echo "WARN: ignoring unknown config key '$key'" >&2 ;;
+    esac
+  done < <("$CFG_READER" "$HERE/load_config.py" "$CONFIG")
+
+  # models from config only if the CLI gave none
+  if [ -z "${CLI_SET[models]:-}" ] && [ "${#YTAGS[@]}" -gt 0 ]; then
+    for i in "${!YTAGS[@]}"; do
+      TAGS+=("${YTAGS[$i]}"); PATHS+=("${YPATHS[$i]}")
+      [ -n "${YLABELS[$i]}" ] && LABELS["${YTAGS[$i]}"]="${YLABELS[$i]}"
+    done
+  fi
+fi
+
+# ---- validate ----
+[ -n "$PY" ]   || die "no python given (--venv or config 'venv:')"
+[ -x "$PY" ] || [ -f "$PY" ] || die "venv python not found/executable: $PY"
+[ -n "$OUT" ]  || die "no output dir (--out or config 'out:')"
+[ -n "$GPUS" ] || die "no GPUs (--gpus or config 'gpus:'); see --list-gpus"
+[ "${#TAGS[@]}" -gt 0 ] || die "no models (--model... or config 'models:')"
 
 IFS=',' read -r -a GPU_ARR <<< "$GPUS"
-[ "${#GPU_ARR[@]}" -gt 0 ] || die "no GPUs parsed from --gpus"
+[ "${#GPU_ARR[@]}" -gt 0 ] || die "no GPUs parsed from '$GPUS'"
 
-# --no-muon strips gefen_muon whether it came from the default set or --opts
+# --no-muon strips gefen_muon whether it came from the default set, config or --opts
 if [ "$NO_MUON" -eq 1 ]; then
   OPTS="$(echo "$OPTS" | tr ' ' '\n' | grep -vx 'gefen_muon' | tr '\n' ' ')"
 fi
+
+echo "config:  ${CONFIG:-<none>}"
+echo "venv:    $PY"
+echo "out:     $OUT"
+echo "gpus:    ${GPU_ARR[*]}  (PCI order)"
+echo "models:  ${TAGS[*]}"
+echo "opts:    $OPTS"
+echo "steps:   $STEPS   lr_sweep: $LR_SWEEP"
+[ "$DRY" -eq 1 ] && { echo "(dry run: config resolved OK; not launching)"; exit 0; }
 
 mkdir -p "$OUT" "$OUT/logs"
 RESULTS="$OUT/results.jsonl"
@@ -194,7 +294,7 @@ if [ "$LR_SWEEP" -eq 1 ]; then
   done
 fi
 
-# ---- 2000-step finals ----
+# ---- finals ----
 echo "=== FINALS (${STEPS} steps) ==="
 : > "$RESULTS"
 for i in "${!TAGS[@]}"; do
@@ -208,8 +308,12 @@ wait
 echo "=== ALL FINALS DONE $(date +%T) ==="
 
 # ---- table + charts ----
-"$PY" "$HERE/build_table.py" --results "$RESULTS" --out-dir "$OUT" \
-  --label qwen0p6b=Qwen3-0.6B --label qwen1p7b=Qwen3-1.7B
+LABEL_ARGS=()
+for i in "${!TAGS[@]}"; do
+  t="${TAGS[$i]}"
+  [ -n "${LABELS[$t]:-}" ] && LABEL_ARGS+=(--label "$t=${LABELS[$t]}")
+done
+"$PY" "$HERE/build_table.py" --results "$RESULTS" --out-dir "$OUT" ${LABEL_ARGS[@]+"${LABEL_ARGS[@]}"}
 "$PY" "$HERE/plot_quads.py"  --csv "$OUT/comparison_table.csv" --out-dir "$OUT"
 "$PY" "$HERE/plot_curves.py" --csv "$OUT/comparison_table.csv" --logs "$LOGS" --out-dir "$OUT"
 

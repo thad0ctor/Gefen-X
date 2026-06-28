@@ -1,0 +1,49 @@
+# Defaults for run.sh. Copy this to config.yaml and edit; run.sh auto-loads
+# ./config.yaml when present (or pass --config <path>). Any CLI flag overrides
+# the matching key here, which overrides the built-in defaults.
+#
+#   precedence:  CLI flag  >  config.yaml  >  built-in default
+#
+# config.yaml is gitignored so your local paths never get committed.
+
+# Python interpreter of the env where the Gefen fork is installed
+# (pip install -e . on this fork) plus bitsandbytes, torchao, matplotlib,
+# datasets, transformers.
+venv: /path/to/your/venv/bin/python
+
+# Output dir for results.jsonl, logs/, the table, and the charts.
+out: ./out
+
+# CUDA device indices to use, round-robin (one job per GPU).
+# These are PCI-bus-ordered indices (run.sh exports CUDA_DEVICE_ORDER=PCI_BUS_ID,
+# so they match the Index column of `./run.sh --list-gpus` / nvidia-smi).
+gpus: "1,2,4,5,7"
+
+# Regime / run knobs (all optional; shown with their built-in defaults).
+steps: 2000              # final-run steps per cell
+seq: 2048                # sequence / pack-block length
+arch: "8.6"              # TORCH_CUDA_ARCH_LIST (8.6 Ampere, 12.0 Blackwell)
+seed: 0                  # data order / RNG seed
+dataset: tatsu-lab/alpaca
+eval_every: 50           # intermediate eval-logging cadence
+muon_adjust: match_rms_adamw
+sweep_steps: 175         # steps per LR-sweep cell (only used with lr_sweep: true)
+
+# Optimizers to run. Default set includes gefen_muon (slow Newton-Schulz);
+# set no_muon: true to drop it, or override the whole list here.
+opts: "adamw_bf16 adamw8bit adamw4bit gefen_fused gefen_muon"
+no_muon: false
+
+# Re-derive each optimizer's best LR on this hardware before the finals,
+# instead of the documented fair LRs.
+lr_sweep: false
+
+# Models to benchmark. tag groups results; label is the display name in the
+# table/charts (optional, defaults to tag). Add as many as you like.
+models:
+  - tag: qwen0p6b
+    path: /path/to/Qwen3-0.6B
+    label: Qwen3-0.6B
+  - tag: qwen1p7b
+    path: /path/to/Qwen3-1.7B
+    label: Qwen3-1.7B
