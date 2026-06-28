@@ -25,6 +25,7 @@
 | Peak memory during the step | large transient spikes | much lower peak — room for bigger models / batches |
 | Sharded multi-GPU training (FSDP2) | breaks with the fast path | works — for plain Gefen *and* Muon |
 | Whole-model Muon | 2D weight matrices only | `GefenMuonHybrid` trains the entire model |
+| Muon step efficiency | generic momentum hack + redundant dequant gather | single-pass momentum kernel (bit-exact) + direct FSDP shard-slice |
 | Save / resume checkpoints | can corrupt state or lose tuning on resume | saves &amp; resumes correctly |
 | Crash safety | missing device / edge-case guards | guarded against wrong-device, empty-tensor, and race bugs |
 | Tested correctness | no fused-kernel tests | bit-exact + distributed parity test suite |
@@ -308,6 +309,30 @@ optim_args:
 **Not (yet) exposed via axolotl config:** the **Muon hybrid** (`GefenMuonHybrid` + `adjust_lr_fn`) is **not** in PR #3755 (the PR notes Muon is "more involved") — use it directly in Python per [Gefen-Muon](#extension-gefen-muon) above. `MEMORY_SAFE_FALLBACK` is a module default (on in this fork), toggled in code rather than YAML.
 
 > PR #3755 is an early draft and marked *untested* upstream; the config keys above may change — check the PR for the current state.
+
+## Experimental: approximate sharded Newton-Schulz (`sharded_mode`)
+
+> ⚠️ Opt-in, **non-parity** — default is `sharded_mode="exact"`.
+
+Under FSDP2 each rank holds a row-shard of every 2D weight, but Newton-Schulz orthogonalizes the **whole** matrix. The default (`"exact"`) all-gathers the full gradient per matrix and runs NS on it — bit-for-bit single-GPU parity. `"approx"` skips the gather and runs NS on each rank's **local shard only**: faster and lighter, but not parity — and the loss penalty **grows with shard count**.
+
+```python
+from gefen import GefenMuonHybrid
+
+opt = GefenMuonHybrid(
+    muon_named_params, backup_named_params,
+    lr=5e-5, adjust_lr_fn="match_rms_adamw", fused=True,
+    sharded_mode="approx",   # default "exact" (parity); "approx" = faster, non-parity
+)
+# only takes effect under FSDP2 (DTensor params); no-op single-GPU
+```
+
+Qwen3-0.6B, FSDP2, Alpaca, 2000 steps, lr `5e-5` (data replicated so the only variable is the NS approximation):
+
+![Gefen-Muon exact vs approx sharded — eval loss](docs/benchmarks/muon_shard_loss.png)
+![Gefen-Muon exact vs approx sharded — step time & VRAM](docs/benchmarks/muon_shard_perf.png)
+
+`approx` runs ~**1.3–1.7× faster**/step for **+0.036** eval loss at 2 shards and **+0.076** at 4 — the gap roughly doubles 2→4 shards, so treat it as an opt-in speed lever, not a default. For exact numerics without the per-step gather, instead **replicate** the Muon matrices under FSDP (a wrapping choice, not a flag).
 
 ## Citation:
 
