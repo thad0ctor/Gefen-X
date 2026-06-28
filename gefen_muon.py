@@ -1,4 +1,5 @@
 import math
+import warnings
 from collections import OrderedDict
 from typing import Iterable, Optional, Tuple, Union
 
@@ -56,7 +57,12 @@ _FP8_MIN_SCALE = 1e-12
 # fp8 tensor-core GEMMs (the e4m3 path used here) need sm_89+ (Ada / Hopper /
 # Blackwell). Older GPUs (e.g. Ampere sm_80/86) have no fp8 GEMM.
 _FP8_MIN_CAPABILITY = (8, 9)
+# fp8 only beats bf16 on LARGE matrices -- the per-row quant overhead dominates on
+# small/skinny ones (measured: 512x2048 loses, >=2048 min-dim wins on sm_120). So
+# even on a supported GPU, fp8 is used only when the matrix's smaller dim >= this.
+FP8_MIN_DIM = 1024
 _ns_fp8_compiled = None
+_fp8_fallback_warned = False
 
 
 def _fp8_supported() -> bool:
@@ -192,13 +198,23 @@ def _zeropower_via_newtonschulz(
         ortho_grad = ortho_grad.T
 
     ortho_grad = ortho_grad.div(ortho_grad.norm().clamp(min=eps))
-    if use_fp8:
-        if not _fp8_supported():
-            raise RuntimeError(
-                "fp8 Newton-Schulz (fp8_ns=True) requires a CUDA GPU with "
-                "compute capability >= 8.9 (Ada/Hopper/Blackwell); "
-                "torch._scaled_mm has no fp8 GEMM otherwise."
+    # Arch-gate fp8: requested but unsupported GPU (pre-sm_89) -> fall back to
+    # bf16 (warn once) so `fp8_ns=True` is a portable config, not a hard error.
+    if use_fp8 and not _fp8_supported():
+        global _fp8_fallback_warned
+        if not _fp8_fallback_warned:
+            warnings.warn(
+                "fp8_ns=True but this GPU is pre-sm_89 (no fp8 GEMM); "
+                "falling back to bf16 Newton-Schulz.",
+                RuntimeWarning,
             )
+            _fp8_fallback_warned = True
+        use_fp8 = False
+    # Size-gate fp8: it loses to bf16 on small/skinny matrices, so only use it
+    # when the smaller dimension is large enough to amortize the quant overhead.
+    if use_fp8 and min(grad.shape) < FP8_MIN_DIM:
+        use_fp8 = False
+    if use_fp8:
         core = _get_ns_fp8_core(compile_fp8)
         ortho_grad = core(ortho_grad.contiguous(), schedule)
     else:
@@ -322,11 +338,15 @@ class GefenMuon(Gefen):
         # bf16 accumulation; this requires sm_89+ and is only faster than bf16
         # once torch.compile fuses the quantization (fp8_ns_compile, default
         # True). At small Muon shapes (min-dim <~ 1024) bf16 is still faster.
+        # Arch-gating is handled per-call in _zeropower_via_newtonschulz (fp8 on
+        # sm_89+ and large matrices, bf16 fallback otherwise), so fp8_ns=True is a
+        # portable config that simply no-ops on unsupported GPUs/shapes rather than
+        # erroring. Warn once here if it can never engage on this machine.
         if fp8_ns and not _fp8_supported():
-            raise ValueError(
-                "fp8_ns=True requires a CUDA GPU with compute capability "
-                ">= 8.9 (Ada/Hopper/Blackwell); torch._scaled_mm has no fp8 "
-                "GEMM otherwise."
+            warnings.warn(
+                "fp8_ns=True but this GPU is pre-sm_89 (no fp8 GEMM); "
+                "Newton-Schulz will run in bf16.",
+                RuntimeWarning,
             )
         self._fp8_ns = fp8_ns
         self._fp8_ns_compile = fp8_ns_compile
