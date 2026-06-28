@@ -41,7 +41,7 @@ class GefenMuonHybrid(torch.optim.Optimizer):
         momentum=0.95,
         nesterov=True,
         ns_steps=5,
-        adjust_lr_fn=None,
+        adjust_lr_fn="match_rms_adamw",
         verbose=False,
     ):
         muon_named_params = list(muon_named_params)
