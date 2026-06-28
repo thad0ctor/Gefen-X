@@ -244,6 +244,124 @@ def case_fused_cuda():
             dist.destroy_process_group()
 
 
+# Multi-rank fused-CUDA parity: closes the gap that the only >1-rank coverage was
+# CPU/non-fused and the only fused coverage was world=1. Runs the *fused* Muon
+# kernel under a real 2-GPU shard and checks the gathered param against a fused
+# single-GPU oracle. The full-matrix gather is exact and the shard-slice is
+# byte-identical, so a single sharded matrix should match the oracle tightly; the
+# tolerance is a touch looser than the world=1 1e-5 only to absorb cross-rank bf16
+# NS noise (a wrong shard-slice would error by O(1), not ~1e-3).
+MULTI_FUSED_TOL = 1e-3
+# (M, N) on dim-0 shard; world_size=2. "even" splits 32/32, "uneven" splits 33/32
+# (exercises the ceil shard-slice arithmetic on the fused path).
+FUSED_CASES = {"even": (64, 96), "uneven": (65, 96)}
+
+
+def _worker_fused_cuda(rank, world, case, port, q):
+    import os as _os
+    import sys as _sys
+
+    _sys.path[:] = [
+        pth
+        for pth in _sys.path
+        if not _os.path.isfile(_os.path.join(pth or ".", "gefen.py"))
+    ]
+
+    import torch.distributed as dist
+    from torch.distributed.tensor import Shard, distribute_tensor, init_device_mesh
+
+    from gefen.gefen_muon import GefenMuon
+
+    os.environ["MASTER_ADDR"] = "127.0.0.1"
+    os.environ["MASTER_PORT"] = port
+    os.environ["RANK"] = str(rank)
+    os.environ["WORLD_SIZE"] = str(world)
+    torch.cuda.set_device(rank)
+    dev = torch.device("cuda", rank)
+    dist.init_process_group("nccl", rank=rank, world_size=world)
+    try:
+        mesh = init_device_mesh("cuda", (world,))
+        M, N = FUSED_CASES[case]
+        # identical full init+grad on every rank (same seed) so the gathered full
+        # grad equals the single-GPU oracle's exactly
+        torch.manual_seed(1234)
+        full_init = (torch.randn(M, N, device=dev, dtype=torch.bfloat16) * 0.1)
+        full_grad = (torch.randn(M, N, device=dev, dtype=torch.bfloat16) * 0.01)
+
+        p = nn.Parameter(distribute_tensor(full_init.clone(), mesh, [Shard(0)]))
+        p.grad = distribute_tensor(full_grad.clone(), mesh, [Shard(0)])
+        local_rows = p.to_local().shape[0]
+
+        opt = GefenMuon([("w", p)], lr=LR, fused=True, weight_decay=WD)
+        opt.step()
+        gathered = p.detach().full_tensor()  # collective; every rank must call
+
+        if rank == 0:
+            p_ref = nn.Parameter(full_init.clone())
+            p_ref.grad = full_grad.clone()
+            opt_ref = GefenMuon([("w", p_ref)], lr=LR, fused=True, weight_decay=WD)
+            opt_ref.step()
+            changed = not torch.equal(gathered, full_init)
+            finite = torch.isfinite(gathered).all().item()
+            max_abs = (gathered.float() - p_ref.detach().float()).abs().max().item()
+            q.put(("result", case, local_rows, changed, finite, max_abs))
+        else:
+            q.put(("rank", case, rank, local_rows))
+    finally:
+        if dist.is_initialized():
+            dist.destroy_process_group()
+
+
+def _run_fused_cuda_case(case):
+    import torch.multiprocessing as mp
+
+    ctx = mp.get_context("spawn")
+    q = ctx.Queue()
+    port = _get_free_port()
+    procs = [
+        ctx.Process(target=_worker_fused_cuda, args=(r, 2, case, port, q))
+        for r in range(2)
+    ]
+    for pr in procs:
+        pr.start()
+
+    results, rank_rows = {}, {}
+    for _ in range(2):
+        try:
+            item = q.get(timeout=300)
+        except queue.Empty:
+            break
+        if item[0] == "result":
+            results["main"] = item[1:]
+        else:
+            rank_rows[item[2]] = item[3]
+
+    for pr in procs:
+        pr.join(timeout=300)
+    for pr in procs:
+        if pr.is_alive():
+            pr.terminate()
+            pr.join(timeout=10)
+
+    for pr in procs:
+        assert pr.exitcode == 0, f"[fused {case}] worker exited with {pr.exitcode}"
+    assert "main" in results, f"[fused {case}] no result from rank 0"
+    assert 1 in rank_rows, f"[fused {case}] no shard metadata from rank 1"
+
+    _case, local_rows, changed, finite, max_abs = results["main"]
+    expected_rows = {"even": (32, 32), "uneven": (33, 32)}[case]
+    assert (local_rows, rank_rows[1]) == expected_rows, (
+        f"[fused {case}] shard rows {(local_rows, rank_rows[1])} != {expected_rows}"
+    )
+    ok = changed and finite and (max_abs <= MULTI_FUSED_TOL)
+    print(
+        f"[fused {case}] rank0_rows={local_rows} rank1_rows={rank_rows.get(1)} "
+        f"changed={changed} finite={finite} max|dist-oracle|={max_abs:.3e} "
+        f"{'PASS' if ok else 'FAIL'}"
+    )
+    return ok
+
+
 def run():
     results = {c: _run_case(c) for c in CASES}
     if (
@@ -252,6 +370,9 @@ def run():
         and torch.distributed.is_nccl_available()
     ):
         results["fused_cuda"] = case_fused_cuda()
+        if torch.cuda.device_count() >= 2:
+            for c in FUSED_CASES:
+                results[f"fused_multirank_{c}"] = _run_fused_cuda_case(c)
     return all(results.values())
 
 
@@ -269,6 +390,17 @@ if pytest is not None:
     )
     def test_muon_fsdp2_fused_cuda_parity():
         assert case_fused_cuda()
+
+    @pytest.mark.skipif(
+        not torch.cuda.is_available()
+        or not torch.distributed.is_available()
+        or not torch.distributed.is_nccl_available()
+        or torch.cuda.device_count() < 2,
+        reason="multi-rank fused Muon path requires >=2 CUDA GPUs + NCCL",
+    )
+    @pytest.mark.parametrize("case", list(FUSED_CASES))
+    def test_muon_fsdp2_fused_multirank_parity(case):
+        assert _run_fused_cuda_case(case)
 
 
 if __name__ == "__main__":

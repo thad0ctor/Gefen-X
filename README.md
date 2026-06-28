@@ -258,15 +258,17 @@ optimizer = GefenMuonHybrid(
 
 **Moun Learning rate — set `adjust_lr_fn="match_rms_adamw"`.** The Hybrid feeds a > *single* `lr` to both halves, but Muon (2D matrices) and AdamW/Gefen (everything > else) want different LR scales, so the shared `lr` is only meaningful after a per-parameter rescale:
 
- - **`adjust_lr_fn="match_rms_adamw"`** (recommended) rescales the Muon update to
+ - **`adjust_lr_fn="match_rms_adamw"`** (recommended, and the **`GefenMuonHybrid`
+   default**) rescales the Muon update to
    AdamW-equivalent RMS (`0.2·√max(rows, cols)`). Then **one AdamW-scale `lr` is
    correct for both halves**, and the [Learning rate](#learning-rate-when-porting-an-adamw-config)
    guidance above (Gefen wants ~0.6× AdamW's on Qwen3) applies to the whole model.
- - **`adjust_lr_fn=None`** (the *default*, = "original" Muon scaling
-   `√max(1, rows/cols)`) leaves the Muon half on its native scale. Passing an
-   AdamW-sized `lr` here **under-trains the 2D Muon matrices** — and because both
-   halves share one `lr`, there's no single value that suits Muon-native *and*
-   the Gefen backup. **Don't use the default with an AdamW-scale `lr`.**
+ - **`adjust_lr_fn=None`** (= "original" Muon scaling `√max(1, rows/cols)`; this
+   is the bare `GefenMuon` default, **not** the Hybrid's) leaves the Muon half on
+   its native scale. Passing an AdamW-sized `lr` here **under-trains the 2D Muon
+   matrices** — and because both halves share one `lr`, there's no single value
+   that suits Muon-native *and* the Gefen backup. **Don't pair `None` with an
+   AdamW-scale `lr`.**
 
 It supports `step()`, `zero_grad()`, `state_dict()`/`load_state_dict()`, and LR schedulers (e.g. `torch.optim.lr_scheduler.StepLR(optimizer, ...)`) like any optimizer. Because its constructor takes two parameter lists rather than a single iterable, build it yourself and hand it to the Hugging Face `Trainer` via `optimizers=` (not `optimizer_cls_and_kwargs`):
 

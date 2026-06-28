@@ -115,6 +115,10 @@ def main():
         # Momentum-only: the per-param quantized-momentum update that produces the
         # NS input, isolated from NS and the weight write. State (codebook /
         # period / m_codebook / m_magnitude) is already primed by full_step above.
+        # NB: this is a TIMING probe -- each call advances the quantized momentum
+        # state (the op isn't idempotent), so the measured cost reflects a steadily
+        # evolving state, not a fixed one. That's fine for wall-clock timing (the
+        # work per call is identical); don't read correctness into the values.
         mom_fn = opt._fused_quantized_momentum_update
         # baseline signature: (p, state, grad_view, momentum); this branch drops p.
         takes_p = len(inspect.signature(mom_fn).parameters) == 4

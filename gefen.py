@@ -942,7 +942,12 @@ class Gefen(torch.optim.Optimizer):
             raise ValueError(
                 "Expected Gefen codebook to be initialized before quantized momentum update."
             )
-        momentum_out = torch.empty_like(grad_view)
+        # Allocate contiguous explicitly (not empty_like, which would inherit a
+        # non-contiguous memory format and trip the kernel's contiguity guard);
+        # the kernel wrapper also forces grad_view contiguous.
+        momentum_out = torch.empty(
+            grad_view.shape, dtype=grad_view.dtype, device=grad_view.device
+        )
         _gefen_quantized_momentum_update_cuda(
             grad_view,
             state["m_codebook"],

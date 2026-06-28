@@ -275,15 +275,35 @@ class GefenMuon(Gefen):
         # deadlock.
         from torch.distributed.tensor.placement_types import Shard
 
+        # Fast narrow only reproduces DTensor's chunking for *plain* Shard (and
+        # Replicate, a no-op slice). Strided/other shard variants -- e.g.
+        # `_StridedShard`, used for FSDP2 x TP (HSDP) composition, which is NOT a
+        # `Shard` subclass -- have different split arithmetic, so fall back to the
+        # exact (slower) DTensor redistribute for any non-plain-Shard placement
+        # rather than silently slicing the wrong rows.
+        placements = dtensor_param.placements
+        if any(p.is_shard() and type(p) is not Shard for p in placements):
+            from torch.distributed.tensor import DTensor, Replicate
+
+            mesh = dtensor_param.device_mesh
+            replicated = DTensor.from_local(
+                full_tensor.contiguous(),
+                mesh,
+                [Replicate()] * mesh.ndim,
+                run_check=False,
+            )
+            return replicated.redistribute(placements=placements).to_local()
+
         mesh = dtensor_param.device_mesh
         coords = mesh.get_coordinate()
         if coords is None:
-            # This rank is not part of the mesh; redistribute would yield an
-            # empty local shard, so mirror that.
+            # This rank is not in the mesh -> it owns no shard. (The caller
+            # already guards on p_local.numel()==0 before reaching here, so this
+            # is a defensive empty return; dim 0 is fine because it is empty.)
             return full_tensor.narrow(0, 0, 0).contiguous()
 
         local = full_tensor
-        for mesh_dim, placement in enumerate(dtensor_param.placements):
+        for mesh_dim, placement in enumerate(placements):
             if isinstance(placement, Shard):
                 dim = placement.dim
                 size = local.size(dim)
