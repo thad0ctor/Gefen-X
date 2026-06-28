@@ -1,0 +1,5 @@
+# Local config carries machine-specific paths (venv, model) — never commit it.
+config.yaml
+# Benchmark outputs.
+out/
+results*.jsonl

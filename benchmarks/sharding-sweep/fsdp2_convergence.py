@@ -1,10 +1,15 @@
 """FSDP2 GefenMuon convergence cell: exact vs approx sharded Newton-Schulz.
 
+One cell of the `sharding-sweep` benchmark (analogous to optimizer-sweep's
+`sweep_cell.py`). `run.sh` launches this once per (world_size x sharded_mode)
+via `torchrun --nproc_per_node=<world>`; `plot_sharding.py` then turns the
+results.jsonl + per-cell logs into the two README charts.
+
 Runs ONE real fine-tune of a causal LM under FSDP2 (fully_shard / DTensor) with
-GefenMuonHybrid, in the SAME regime as sweep_cell.py (Alpaca, packed BLOCK-token
-blocks, bf16 master weights, gradient checkpointing, micro-batch 1, constant LR,
-fixed seed), and reports final eval loss. The ONLY knob under test is
---sharded-mode {exact, approx}:
+GefenMuonHybrid, in the SAME single-GPU regime as optimizer-sweep (Alpaca,
+packed BLOCK-token blocks, bf16 master weights, gradient checkpointing,
+micro-batch 1, constant LR, fixed seed), and reports final eval loss. The ONLY
+knob under test is --sharded-mode {exact, approx}:
 
   exact  : every rank all-gathers the full gradient, runs Newton-Schulz on the
            full matrix (bit-for-bit single-GPU parity), slices the update back.

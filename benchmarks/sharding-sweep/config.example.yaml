@@ -1,0 +1,45 @@
+# Defaults for run.sh. Copy this to config.yaml and edit; run.sh auto-loads
+# ./config.yaml when present (or pass --config <path>). Any CLI flag overrides
+# the matching key here, which overrides the built-in defaults.
+#
+#   precedence:  CLI flag  >  config.yaml  >  built-in default
+#
+# config.yaml is gitignored so your local paths never get committed.
+
+# Python interpreter of the env where the Gefen fork is installed
+# (pip install -e . on this fork) plus datasets, transformers, matplotlib.
+# torch must have FSDP2 (torch.distributed.fsdp.fully_shard), i.e. torch >= 2.5.
+venv: /path/to/your/venv/bin/python
+
+# Output dir for results_fsdp2.jsonl, logs/, and the two charts.
+out: ./out
+
+# CUDA device indices. Each world_size W cell pins the FIRST W of these, so the
+# pool must hold at least max(world_sizes) GPUs. These are PCI-bus-ordered
+# indices (run.sh exports CUDA_DEVICE_ORDER=PCI_BUS_ID, so they match the Index
+# column of `./run.sh --list-gpus` / nvidia-smi). Use one GPU type for clean
+# step-time comparisons across cells.
+gpus: "1,4,5,7"
+
+# Model to fine-tune, and a short tag used as the result key / chart label.
+model: /path/to/Qwen3-0.6B
+tag: qwen0p6b
+
+# Sweep axes.
+world_sizes: "2 4"        # shard counts (FSDP2 nproc_per_node) to compare
+modes: "exact approx"     # GefenMuon sharded_mode values to compare
+
+# Regime / run knobs (all optional; shown with their built-in defaults).
+steps: 2000               # steps per cell
+seq: 2048                 # sequence / pack-block length
+lr: "5e-5"                # constant LR (shared by all cells)
+arch: "8.6"               # TORCH_CUDA_ARCH_LIST (8.6 Ampere, 12.0 Blackwell)
+seed: 0                   # data order / RNG seed
+dataset: tatsu-lab/alpaca
+eval_every: 50            # intermediate eval-logging cadence
+max_eval: 32              # held-out eval examples
+muon_adjust: match_rms_adamw
+
+# Optional: export CUDA_HOME for the JIT kernel build (must match torch's CUDA
+# version). Leave commented to inherit it from your shell environment.
+# cuda_home: /usr/local/cuda-13.3
