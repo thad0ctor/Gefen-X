@@ -87,10 +87,47 @@ def test_restore_false_mutates():
     print("C. restore=False mutates the model (as documented) PASS")
 
 
+class _NS:
+    def __init__(self, **kw):
+        self.python = kw.get("python")
+        self.venv = kw.get("venv")
+        self.cuda_home = kw.get("cuda_home")
+
+
+def test_reexec_planner():
+    import sys
+    from gefen.tools.find_lr import _reexec_command, _strip_flags
+    real = sys.executable                 # a real, existing interpreter
+    exe = "/opt/envs/cu130/bin/python"    # a (fake) "current" interpreter, != real
+    base_argv = ["--model", "/m", "--optimizer", "gefen", "--method", "sweep"]
+
+    # No --python/--venv -> run as-is (None).
+    assert _reexec_command(_NS(), exe, base_argv, {}) is None
+    # Target == current interpreter -> no re-exec (checked before existence).
+    assert _reexec_command(_NS(python=exe), exe, base_argv, {}) is None
+    # Already the re-exec'd child -> no re-exec.
+    assert _reexec_command(_NS(python=real), exe, base_argv,
+                           {"GEFEN_FINDLR_REEXEC": "1"}) is None
+    # Different existing interpreter -> plan to re-exec, with CUDA_HOME + stripped argv.
+    plan = _reexec_command(_NS(python=real, cuda_home="/cuda"),
+                           exe, ["--venv", "/x"] + base_argv, {"PATH": "/bin"})
+    assert plan is not None
+    target, new_argv, env = plan
+    assert target == real
+    assert new_argv[:2] == ["-m", "gefen.tools.find_lr"]
+    assert "--venv" not in new_argv and "/x" not in new_argv          # stripped
+    assert env["CUDA_HOME"] == "/cuda" and env["PATH"].startswith("/cuda/bin")
+    assert env["GEFEN_FINDLR_REEXEC"] == "1"
+    # _strip_flags handles both spellings.
+    assert _strip_flags(["--venv=/x", "--model", "/m"], ("--venv",)) == ["--model", "/m"]
+    print("D. re-exec planner (venv/python/cuda-home, strip, child-guard) PASS")
+
+
 def run():
     test_build_optimizer_all_families()
     test_range_test_each_family_and_restore()
     test_restore_false_mutates()
+    test_reexec_planner()
     print("\nAll find_lr smoke checks passed.")
 
 

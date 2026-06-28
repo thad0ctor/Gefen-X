@@ -37,9 +37,10 @@ from typing import Callable, Dict, List, Optional, Union
 
 import torch
 
-from gefen import Gefen, GefenMuon, GefenMuonHybrid
-from gefen.tools.lr_calibration import lr_range_test, LRRangeResult
-from gefen.tools.run_model_calibration import split_params_for_muon
+# NOTE: gefen-package imports are done lazily inside the functions that use them,
+# so the CLI can re-exec under a target venv (--venv/--python) BEFORE importing
+# gefen -- whose CUDA kernel-build guard runs on first import of the optimizer
+# classes and needs an nvcc matching torch.version.cuda.
 
 
 OPTIMIZERS = ("gefen", "gefen_muon", "hybrid", "adamw")
@@ -84,6 +85,9 @@ def build_optimizer(
     """Construct the requested optimizer family at ``lr``. ``adjust_lr_fn`` applies
     to the Muon paths only (default ``match_rms_adamw`` -- the magnitude-matching
     v2/auto path is intentionally NOT used here)."""
+    from gefen import Gefen, GefenMuon, GefenMuonHybrid
+    from gefen.tools.run_model_calibration import split_params_for_muon
+
     if optimizer == "adamw":
         return torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
     named = [(n, p) for n, p in model.named_parameters() if p.requires_grad]
@@ -187,6 +191,8 @@ def find_lr(
         device = next(model.parameters()).device
     model.train()
     snap = _snapshot(model) if restore else None
+
+    from gefen.tools.lr_calibration import lr_range_test
 
     try:
         if method == "range_test":
@@ -321,13 +327,76 @@ def build_token_stream(tok, args):
 
 
 # --------------------------------------------------------------------------- #
+# Optional re-exec under a target venv (so the kernel build sees a matching nvcc)
+# --------------------------------------------------------------------------- #
+def _strip_flags(argv, flags):
+    """Drop ``--flag value`` and ``--flag=value`` occurrences from an argv list."""
+    out, i = [], 0
+    while i < len(argv):
+        a = argv[i]
+        hit = False
+        for fl in flags:
+            if a == fl:
+                i += 2; hit = True; break          # skip flag and its value
+            if a.startswith(fl + "="):
+                i += 1; hit = True; break
+        if not hit:
+            out.append(a); i += 1
+    return out
+
+
+def _reexec_command(args, current_exe, argv, environ):
+    """Pure/testable: return (target_python, new_argv, new_env) to re-exec under,
+    or None to run in the current interpreter.
+
+    Re-exec happens only when --python/--venv names a *different* interpreter and
+    we're not already the re-exec'd child. If neither is given (the common case --
+    already inside a venv/conda/uv), returns None and we run as-is.
+    """
+    import os
+    if environ.get("GEFEN_FINDLR_REEXEC"):
+        return None
+    target = args.python
+    if not target and args.venv:
+        target = os.path.join(args.venv, "bin", "python")
+    if not target:
+        return None
+    if os.path.realpath(target) == os.path.realpath(current_exe):
+        return None                                   # already this interpreter
+    if not os.path.exists(target):
+        raise SystemExit(f"--python/--venv interpreter not found: {target}")
+    env = dict(environ)
+    env["GEFEN_FINDLR_REEXEC"] = "1"
+    if args.cuda_home:
+        env["CUDA_HOME"] = args.cuda_home
+        env["PATH"] = os.path.join(args.cuda_home, "bin") + os.pathsep + env.get("PATH", "")
+    new_argv = _strip_flags(argv, ("--python", "--venv", "--cuda-home"))
+    return target, ["-m", "gefen.tools.find_lr", *new_argv], env
+
+
+def _maybe_reexec(args):
+    import os, sys
+    plan = _reexec_command(args, sys.executable, sys.argv[1:], os.environ)
+    if plan is None:
+        return
+    target, new_argv, env = plan
+    note = f" (CUDA_HOME={env['CUDA_HOME']})" if args.cuda_home else ""
+    print(f"[find_lr] re-exec under {target}{note}", flush=True)
+    os.execve(target, [target, *new_argv], env)
+
+
+# --------------------------------------------------------------------------- #
 # CLI
 # --------------------------------------------------------------------------- #
 def main():
-    from gefen.tools.run_model_calibration import load_model
-
     ap = argparse.ArgumentParser(description="Auto-find a base LR for a Gefen-family optimizer.")
     ap.add_argument("--model", required=True)
+    # Optional environment redirection (skip if you already run inside the right
+    # venv/conda/uv env). --venv <dir> uses <dir>/bin/python; --cuda-home points
+    # the kernel build at a matching nvcc.
+    ap.add_argument("--venv", default=None, help="path to a venv/conda env dir; re-exec under <dir>/bin/python")
+    ap.add_argument("--python", default=None, help="path to a python interpreter to re-exec under")
+    ap.add_argument("--cuda-home", default=None, help="CUDA toolkit dir (sets CUDA_HOME + PATH for the kernel build)")
     ap.add_argument("--optimizer", choices=OPTIMIZERS, default="gefen")
     ap.add_argument("--method", choices=["range_test", "sweep"], default="range_test")
     ap.add_argument("--dataset", default="tatsu-lab/alpaca")
@@ -350,6 +419,11 @@ def main():
     ap.add_argument("--warmup", type=int, default=10)
     args = ap.parse_args()
 
+    # If --venv/--python names a different interpreter, re-exec under it BEFORE
+    # importing gefen (kernel build). No-op when already in the right env.
+    _maybe_reexec(args)
+
+    from gefen.tools.run_model_calibration import load_model
     tok, model = load_model(args.model, args.device, getattr(torch, args.dtype))
     train_blocks, eval_blocks = build_token_stream(tok, args)
     res = find_lr(
