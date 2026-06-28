@@ -5,10 +5,16 @@ warms up, then CUDA-event times:
 
   * full opt.step()                      -- end-to-end steady-state cost
   * _zeropower_via_newtonschulz only     -- the NS orthogonalization
-  * the quantized-momentum update only   -- fused kernel + dequant roundtrip
+  * the quantized-momentum update only   -- the per-param quantized-momentum
+                                            update that emits the NS input
 
 and sweeps ns_steps in {3,4,5}. Prints per-step ms and the NS fraction so we can
 confirm (or refute) "Newton-Schulz dominates steady state" before optimizing.
+
+The momentum-only timer calls GefenMuon._fused_quantized_momentum_update over
+every primed param. It is signature-tolerant so the SAME script can be pointed
+(via PYTHONPATH) at either the baseline (which takes a `p` scratch + does a
+separate dequant gather) or this branch (single-pass emit) for before/after.
 
 Run:
   CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=<3090> \
@@ -16,6 +22,7 @@ Run:
   python profile_muon_step.py
 """
 import argparse
+import inspect
 
 import torch
 
@@ -105,10 +112,34 @@ def main():
 
         ns_ms = cuda_time(ns_only, args.iters, args.warmup)
 
+        # Momentum-only: the per-param quantized-momentum update that produces the
+        # NS input, isolated from NS and the weight write. State (codebook /
+        # period / m_codebook / m_magnitude) is already primed by full_step above.
+        mom_fn = opt._fused_quantized_momentum_update
+        # baseline signature: (p, state, grad_view, momentum); this branch drops p.
+        takes_p = len(inspect.signature(mom_fn).parameters) == 4
+        primed = []  # (p_or_None, state, grad_view, momentum) precomputed once
+        for (_, p), g in zip(params, grads):
+            state = opt.state[p]
+            gv = opt._automatic_view(g.reshape(-1), state["automatic_period"])
+            primed.append((p if takes_p else None, state, gv))
+        momentum = opt.param_groups[0]["momentum"]
+
+        def momentum_only():
+            for p_arg, state, gv in primed:
+                if takes_p:
+                    mom_fn(p_arg, state, gv, momentum)
+                else:
+                    mom_fn(state, gv, momentum)
+
+        mom_ms = cuda_time(momentum_only, args.iters, args.warmup)
+
         frac = 100.0 * ns_ms / step_ms if step_ms else 0.0
+        mom_frac = 100.0 * mom_ms / step_ms if step_ms else 0.0
         print(f"ns_steps={ns_steps}: step={step_ms:7.3f} ms  "
               f"NS-only={ns_ms:7.3f} ms  NS≈{frac:4.1f}% of step  "
-              f"(rest≈{step_ms-ns_ms:6.3f} ms)")
+              f"(rest≈{step_ms-ns_ms:6.3f} ms)  "
+              f"momentum-only={mom_ms:6.3f} ms ({mom_frac:4.1f}% of step)")
 
 
 if __name__ == "__main__":

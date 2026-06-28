@@ -216,24 +216,17 @@ class GefenMuon(Gefen):
 
     def _fused_quantized_momentum_update(
         self,
-        p: torch.Tensor,
         state,
         grad_view: torch.Tensor,
         momentum: float,
     ) -> torch.Tensor:
-
-        dummy_stepsize = grad_view[:, 0:1].detach().float()
-        self._automatic_gefen_fused_update(
-            p,
-            state,
-            grad_view,
-            momentum,
-            dummy_stepsize,
-            0.0,
-        )
-        quantized_momentum = self._gefen_dequantize_m_coefficients(state, grad_view)
-        quantized_momentum.mul_(state["m_magnitude"])
-        return quantized_momentum
+        # Single-pass Muon momentum update: the kernel advances the quantized
+        # momentum state and emits the dense quantized momentum for Newton-Schulz
+        # directly, so the old lr==0 dummy-stepsize call into the generic update
+        # kernel followed by a second full-size codebook gather is gone. The
+        # emitted momentum is bit-identical to the old
+        # `dequantize(m_codebook) * m_magnitude`.
+        return self._gefen_quantized_momentum_update(state, grad_view, momentum)
 
     @staticmethod
     def _is_sharded(p: torch.Tensor) -> bool:
@@ -340,15 +333,10 @@ class GefenMuon(Gefen):
         grad_view = self._automatic_view(flat_grad, automatic_period)
 
         if self._use_fused_gefen_automatic_step():
-            # The fused kernel flat-indexes its `p` argument but only writes
-            # p -= lr*update with lr=0 (see _fused_quantized_momentum_update), so
-            # p is left untouched and never feeds the momentum math -- it only has
-            # to be a contiguous tensor whose numel matches the (full) grad_view.
-            # Under sharding the real param's local shard is smaller than the full
-            # grad, so pass a full-matrix scratch instead of the DTensor param.
-            fused_p = grad.new_empty(grad.shape) if is_sharded else p
+            # The Muon momentum kernel reads grad + quantized state and emits the
+            # dense quantized momentum; it never touches p, so no full-matrix
+            # scratch is needed under sharding.
             momentum_update = self._fused_quantized_momentum_update(
-                fused_p,
                 state,
                 grad_view,
                 momentum,

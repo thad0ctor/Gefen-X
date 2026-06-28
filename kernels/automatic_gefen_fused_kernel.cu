@@ -565,6 +565,66 @@ __global__ void gefen_update_flat_kernel(
 }
 
 // ---------------------------------------------------------------------------
+// Muon momentum emit (phase 2): identical magnitude/quantize/state-write ops as
+// gefen_update_flat_kernel, but instead of writing the parameter it emits the
+// DENSE quantized momentum (codebook[new_index] * new_magnitude) that Muon's
+// Newton-Schulz consumes. This replaces the old lr==0 dummy-stepsize call into
+// the generic update kernel followed by a separate full-size codebook gather:
+// the dense momentum is written in the SAME pass that quantizes the state, so
+// the second gather over every parameter is eliminated.
+//
+// Bit-exactness contract (vs the old `dequantize(m_sign) * m_magnitude`):
+//   * m_sign / new_magnitude are produced by the identical ops as
+//     gefen_update_flat_kernel (phase 1 magnitude kernels are reused verbatim),
+//     so they are bit-identical to the generic v2 update -> and, by the v1/v2
+//     parity suite, to v1 as well.
+//   * momentum_out reproduces the host dequant rounding op-for-op: the old path
+//     was `coeff = codebook[idx].to(scalar_t)` (a single fp32->scalar_t round)
+//     then `coeff.mul_(m_magnitude)` (an in-place bf16/fp16 multiply, i.e. the
+//     fp32 product rounded back to scalar_t). So: cast codebook value to
+//     scalar_t FIRST, multiply by the fp32 magnitude, then cast the product to
+//     scalar_t. For fp32 params both casts are no-ops.
+// ---------------------------------------------------------------------------
+template <typename scalar_t>
+__global__ void gefen_momentum_emit_flat_kernel(
+    const scalar_t* __restrict__ grad_view,
+    uint8_t* __restrict__ m_sign,
+    const float* __restrict__ old_magnitude,
+    const float* __restrict__ new_magnitude,
+    const float* __restrict__ codebook,
+    scalar_t* __restrict__ momentum_out,
+    int codebook_size,
+    int64_t period,
+    int64_t total_numel,
+    float beta1
+) {
+    extern __shared__ float s_codebook[];
+    for (int i = threadIdx.x; i < codebook_size; i += blockDim.x) {
+        s_codebook[i] = codebook[i];
+    }
+    __syncthreads();
+    const int64_t stride = static_cast<int64_t>(gridDim.x) * blockDim.x;
+    for (int64_t idx = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+         idx < total_numel; idx += stride) {
+        const int64_t block_idx = idx / period;
+        const float new_mag = new_magnitude[block_idx];
+        const float updated = updated_momentum(
+            grad_view, m_sign, s_codebook, old_magnitude[block_idx], idx, beta1);
+        float normalized_value = 0.0f;
+        if (new_mag > 0.0f) {
+            normalized_value = updated / new_mag;
+        }
+        const uint8_t quantized_index =
+            nearest_codebook_index(normalized_value, s_codebook, codebook_size);
+        m_sign[idx] = quantized_index;
+        // Dense quantized momentum, rounded exactly as the old host
+        // `codebook[idx].to(scalar_t).mul_(m_magnitude)` two-step round.
+        const scalar_t coeff = static_cast<scalar_t>(s_codebook[static_cast<int>(quantized_index)]);
+        momentum_out[idx] = static_cast<scalar_t>(static_cast<float>(coeff) * new_mag);
+    }
+}
+
+// ---------------------------------------------------------------------------
 // v2 fully-fused (Tier-1 K1/K2/K3 on the two-phase path).
 //
 // Phase 1 already streams every grad element to form the per-block magnitude;
@@ -1117,6 +1177,129 @@ void automatic_gefen_fused_update_v2_cuda(
                 m_magnitude.data_ptr<float>(), new_magnitude.data_ptr<float>(),
                 stepsize.data_ptr<float>(), codebook.data_ptr<float>(), codebook_size,
                 period, total_numel, static_cast<float>(beta1), static_cast<float>(lr));
+        });
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+
+    m_magnitude.copy_(new_magnitude);
+}
+
+void gefen_quantized_momentum_update_cuda(
+    at::Tensor grad_view,
+    at::Tensor m_sign,
+    at::Tensor m_magnitude,
+    at::Tensor codebook,
+    at::Tensor momentum_out,
+    double beta1
+) {
+    if (!grad_view.is_cuda() || !m_sign.is_cuda() || !m_magnitude.is_cuda() ||
+        !codebook.is_cuda() || !momentum_out.is_cuda()) {
+        throw std::invalid_argument("Expected all tensors to be on CUDA.");
+    }
+    if (grad_view.device() != momentum_out.device() || m_sign.device() != momentum_out.device() ||
+        m_magnitude.device() != momentum_out.device() || codebook.device() != momentum_out.device()) {
+        throw std::invalid_argument("Expected all tensors on the same device.");
+    }
+    if (!grad_view.is_contiguous() || !m_sign.is_contiguous() || !m_magnitude.is_contiguous() ||
+        !codebook.is_contiguous() || !momentum_out.is_contiguous()) {
+        throw std::invalid_argument("Expected all tensors to be contiguous.");
+    }
+    if (grad_view.dim() != 2 || momentum_out.dim() != 2) {
+        throw std::invalid_argument("Expected grad_view and momentum_out to be 2D.");
+    }
+    if (m_magnitude.dim() != 2 || m_magnitude.size(1) != 1) {
+        throw std::invalid_argument("Expected m_magnitude to have shape [num_blocks, 1].");
+    }
+    if (m_sign.scalar_type() != at::kByte) {
+        throw std::invalid_argument("Expected m_sign to have dtype uint8.");
+    }
+    if (codebook.scalar_type() != at::kFloat) {
+        throw std::invalid_argument("Expected codebook to have dtype float32.");
+    }
+    if (m_magnitude.scalar_type() != at::kFloat) {
+        throw std::invalid_argument("Expected m_magnitude to have dtype float32.");
+    }
+    // momentum_out is written as scalar_t (grad_view's dispatch dtype); a
+    // mismatch would reinterpret memory at the wrong width.
+    if (grad_view.scalar_type() != momentum_out.scalar_type()) {
+        throw std::invalid_argument("Expected momentum_out dtype to match grad_view.");
+    }
+
+    c10::cuda::CUDAGuard device_guard(grad_view.device());
+
+    const int64_t num_blocks = grad_view.size(0);
+    const int64_t period = grad_view.size(1);
+    const int64_t total_numel = num_blocks * period;
+    if (m_sign.numel() != total_numel || momentum_out.numel() != total_numel) {
+        throw std::invalid_argument("Expected m_sign and momentum_out numel to match grad_view.");
+    }
+    if (m_magnitude.size(0) != num_blocks) {
+        throw std::invalid_argument("Expected m_magnitude to match num_blocks.");
+    }
+    if (codebook.numel() < 1 || codebook.numel() > 256) {
+        throw std::invalid_argument("Expected codebook size in [1, 256].");
+    }
+    if (period <= 0) {
+        throw std::invalid_argument("Expected grad_view to have a positive period.");
+    }
+    // Empty param: nothing to quantize/emit, and the launch math below divides by
+    // num_blocks. Bail before any launch / divide-by-zero.
+    if (total_numel == 0) {
+        return;
+    }
+
+    // new per-block magnitude (absmax of the updated momentum); the atomicMax
+    // target must start at zero, exactly as the generic v2 path.
+    auto new_magnitude = at::zeros_like(m_magnitude);
+
+    const int codebook_size = static_cast<int>(codebook.numel());
+    const int threads = 256;
+    const int sm_count = cached_sm_count(grad_view.get_device());
+    const int64_t flat_blocks_cap = static_cast<int64_t>(sm_count) * 32;
+    const size_t codebook_bytes = static_cast<size_t>(codebook_size) * sizeof(float);
+
+    // Phase 1: per-block magnitude (reuses the generic v2 magnitude kernels, so
+    // new_magnitude is bit-identical to the generic update's m_magnitude).
+    AT_DISPATCH_FLOATING_TYPES_AND2(
+        at::kHalf, at::kBFloat16, grad_view.scalar_type(),
+        "gefen_momentum_magnitude", [&] {
+            if (period <= 2048) {
+                int64_t nblocks = (total_numel + threads - 1) / threads;
+                if (nblocks > flat_blocks_cap) nblocks = flat_blocks_cap;
+                if (nblocks < 1) nblocks = 1;
+                gefen_magnitude_flat_kernel<scalar_t><<<static_cast<unsigned int>(nblocks), threads, codebook_bytes>>>(
+                    grad_view.data_ptr<scalar_t>(), m_sign.data_ptr<uint8_t>(),
+                    m_magnitude.data_ptr<float>(), codebook.data_ptr<float>(),
+                    new_magnitude.data_ptr<float>(), codebook_size, period, total_numel,
+                    static_cast<float>(beta1));
+            } else {
+                int blocks_per_row = static_cast<int>((period + threads * 64 - 1) / (threads * 64));
+                if (blocks_per_row < 1) blocks_per_row = 1;
+                const int max_bpr = static_cast<int>((flat_blocks_cap + num_blocks - 1) / num_blocks);
+                if (blocks_per_row > max_bpr && max_bpr >= 1) blocks_per_row = max_bpr;
+                if (blocks_per_row < 1) blocks_per_row = 1;
+                const int64_t grid = num_blocks * blocks_per_row;
+                const size_t shmem = static_cast<size_t>(threads) * sizeof(float) + codebook_bytes;
+                gefen_magnitude_split_kernel<scalar_t><<<static_cast<unsigned int>(grid), threads, shmem>>>(
+                    grad_view.data_ptr<scalar_t>(), m_sign.data_ptr<uint8_t>(),
+                    m_magnitude.data_ptr<float>(), codebook.data_ptr<float>(),
+                    new_magnitude.data_ptr<float>(), codebook_size, period, num_blocks, blocks_per_row,
+                    static_cast<float>(beta1));
+            }
+        });
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+
+    // Phase 2: quantize state + emit the dense quantized momentum (no p write).
+    AT_DISPATCH_FLOATING_TYPES_AND2(
+        at::kHalf, at::kBFloat16, grad_view.scalar_type(),
+        "gefen_momentum_emit", [&] {
+            int64_t nblocks = (total_numel + threads - 1) / threads;
+            if (nblocks > flat_blocks_cap) nblocks = flat_blocks_cap;
+            if (nblocks < 1) nblocks = 1;
+            gefen_momentum_emit_flat_kernel<scalar_t><<<static_cast<unsigned int>(nblocks), threads, codebook_bytes>>>(
+                grad_view.data_ptr<scalar_t>(), m_sign.data_ptr<uint8_t>(),
+                m_magnitude.data_ptr<float>(), new_magnitude.data_ptr<float>(),
+                codebook.data_ptr<float>(), momentum_out.data_ptr<scalar_t>(), codebook_size,
+                period, total_numel, static_cast<float>(beta1));
         });
     C10_CUDA_KERNEL_LAUNCH_CHECK();
 

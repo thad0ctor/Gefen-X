@@ -167,6 +167,29 @@ def automatic_gefen_fused_full_update_cuda(
     )
 
 
+def gefen_quantized_momentum_update_cuda(
+    grad_view: torch.Tensor,
+    m_sign: torch.Tensor,
+    m_magnitude: torch.Tensor,
+    codebook: torch.Tensor,
+    momentum_out: torch.Tensor,
+    beta1: float,
+) -> None:
+    """Muon-specific quantized-momentum update: advance the quantized momentum
+    state (m_sign / m_magnitude) AND emit the dense quantized momentum
+    (codebook[new_index] * new_magnitude) for Newton-Schulz in a single pass,
+    replacing the old lr==0 dummy-stepsize update + separate full-size codebook
+    gather. The C++ guards enforce dtype/shape/device; only normalize contiguity
+    here, and only when actually needed."""
+    grad_c = grad_view if grad_view.is_contiguous() else grad_view.contiguous()
+    cb_c = codebook if codebook.is_contiguous() else codebook.contiguous()
+
+    module = _load_extension()
+    module.gefen_quantized_momentum_update_cuda(
+        grad_c, m_sign, m_magnitude, cb_c, momentum_out, beta1
+    )
+
+
 def automatic_gefen_fused_update_v2_full_cuda(
     p: torch.Tensor,
     grad_view: torch.Tensor,
