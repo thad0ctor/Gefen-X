@@ -87,6 +87,12 @@ print('Finished successfully.')
 
 Gefen matches AdamW's *interface*, but it needs a **lower learning rate** — about **0.6× AdamW's** on modern architectures tested *(Qwen3, i.e. SwiGLU MLP + grouped-query attention)*. This factor is set by the model's `head_dim`/RMSNorm block structure (see below), not its parameter count, it holds (~0.6×) across Qwen3-0.6B → 8B (all `head_dim = 128`), so re-measure only for a different architecture or `head_dim`. **At its own optimal LR, Gefen closely matches AdamW's loss and run-to-run reproducibility**, while keeping its optimizer-memory advantage.
 
+> **Don't want to guess the factor? Find it.** Run the LR finder to get Gefen's optimal LR empirically for *your* model instead of relying on the ~0.6× heuristic:
+> ```bash
+> python -m gefen.tools.find_lr --model <path> --optimizer gefen --method sweep
+> ```
+> The `sweep` mode picks the lowest held-out-eval LR over a grid (gold standard); see [`tools/README.md`](tools/README.md). The heuristic below is the fallback when you can't run a sweep.
+
 **Why:** Gefen's second moment is a *block-shared* RMS of the gradient rather than AdamW's per-element `√v`. Globally the two take similar-magnitude steps, but on a few high-leverage tensors — most sharply the RMSNorm weights (`q_norm`/`k_norm`, whose length equals the head dim, so the whole tensor is a *single shared block*) — Gefen over-steps by ~1.5×. Those tensors set the stability ceiling, so the usable LR is ~0.6× AdamW's on modern decoder architectures *(SwiGLU MLP + grouped-query attention, e.g. Qwen3)*.
 
 Measured on Qwen3-4B full fine-tune (each optimizer at its own optimum):
