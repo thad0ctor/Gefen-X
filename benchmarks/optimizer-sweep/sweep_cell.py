@@ -243,6 +243,8 @@ ema = None
 step_tokens = BLOCK
 steady_tokens = 0
 steady_time = 0.0
+# never exclude every step: short runs (steps <= warmup) still report a tok/s.
+warmup_eff = min(args.warmup, args.steps - 1) if args.steps > 1 else 0
 for s in range(1, args.steps + 1):
     ids, lab = blocks[s - 1]
     ids = ids.cuda()
@@ -255,7 +257,7 @@ for s in range(1, args.steps + 1):
     opt.zero_grad(set_to_none=True)
     torch.cuda.synchronize()
     dt = time.time() - t0
-    if s > args.warmup:
+    if s > warmup_eff:
         steady_tokens += step_tokens
         steady_time += dt
     l = loss.item()
