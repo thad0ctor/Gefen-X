@@ -265,7 +265,10 @@ for s in range(1, args.steps + 1):
               f"{step_tokens/dt:.0f} tok/s", flush=True)
 
 final_eval = evaluate()
+# allocated = real tensor bytes (the apples-to-apples optimizer-memory metric);
+# reserved = caching-allocator pool incl. slack/fragmentation (closer to nvidia-smi).
 peak = torch.cuda.max_memory_allocated() / 1024**3
+peak_reserved = torch.cuda.max_memory_reserved() / 1024**3
 tok_s = steady_tokens / steady_time if steady_time else float("nan")
 
 
@@ -299,6 +302,7 @@ res = {
     "gpu": dev_name, "final_train_ema": round(ema, 4),
     "eval0": round(eval0, 4), "final_eval": round(final_eval, 4),
     "tok_per_s": round(tok_s, 1), "peak_vram_gib": round(peak, 2),
+    "peak_vram_reserved_gib": round(peak_reserved, 2),
     "opt_state_bpp": round(state_bpp, 3),
     "opt_state_gib": round(state_bytes / 1024**3, 3),
 }

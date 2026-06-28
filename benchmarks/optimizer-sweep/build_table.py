@@ -48,7 +48,7 @@ def main():
         return label_map.get(tag, tag)
 
     cols = ["model", "tag", "optimizer", "LR", "final_eval_loss", "final_train_ema",
-            "tok_per_s", "peak_vram_gib", "opt_state_bpp"]
+            "tok_per_s", "peak_vram_gib", "peak_vram_reserved_gib", "opt_state_bpp"]
 
     csv_rows = []
     for tag in tag_order:
@@ -59,7 +59,8 @@ def main():
             csv_rows.append([
                 label(tag), tag, opt, f"{r['lr']:.0e}",
                 r["final_eval"], r["final_train_ema"],
-                r["tok_per_s"], r["peak_vram_gib"], r["opt_state_bpp"],
+                r["tok_per_s"], r["peak_vram_gib"],
+                r.get("peak_vram_reserved_gib", ""), r["opt_state_bpp"],
             ])
 
     os.makedirs(args.out_dir, exist_ok=True)
@@ -76,18 +77,20 @@ def main():
         "constant LR, fixed seed, identical data order within a model.\n",
     ]
     hdr = ("| Model | Optimizer | LR | Final eval loss | Final train EMA | "
-           "tok/s | Peak VRAM (GiB) | Opt-state B/param |")
+           "tok/s | Peak VRAM alloc (GiB) | Peak VRAM reserved (GiB) | Opt-state B/param |")
     md.append(hdr)
-    md.append("|" + "---|" * 8)
+    md.append("|" + "---|" * 9)
     for tag in tag_order:
         for opt in OPT_ORDER:
             r = by.get((tag, opt))
             if not r:
                 continue
+            rsv = r.get("peak_vram_reserved_gib")
+            rsv_s = f"{rsv:.2f}" if isinstance(rsv, (int, float)) else "-"
             md.append(f"| {label(tag)} | {opt} | {r['lr']:.0e} | "
                       f"{r['final_eval']:.4f} | {r['final_train_ema']:.4f} | "
                       f"{r['tok_per_s']:.0f} | {r['peak_vram_gib']:.2f} | "
-                      f"{r['opt_state_bpp']:.3f} |")
+                      f"{rsv_s} | {r['opt_state_bpp']:.3f} |")
 
     # headline: gefen_fused vs AdamW family per model
     md.append("\n## Headline\n")
@@ -110,7 +113,7 @@ def main():
             md.append(f"- Throughput: gefen_fused {gef['tok_per_s']:.0f} tok/s vs "
                       f"adamw_bf16 {ref['tok_per_s']:.0f} tok/s "
                       f"({gef['tok_per_s']/ref['tok_per_s']:.2f}x).")
-            md.append(f"- Peak VRAM: gefen_fused {gef['peak_vram_gib']:.2f} GiB vs "
+            md.append(f"- Peak VRAM (allocated): gefen_fused {gef['peak_vram_gib']:.2f} GiB vs "
                       f"adamw_bf16 {ref['peak_vram_gib']:.2f} GiB "
                       f"(saves {ref['peak_vram_gib']-gef['peak_vram_gib']:.2f} GiB).")
         present = [o for o in ('adamw_bf16', 'adamw8bit', 'adamw4bit') if (tag, o) in by]

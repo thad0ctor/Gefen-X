@@ -24,8 +24,9 @@ EVAL_EVERY=50
 LR_SWEEP=0
 SWEEP_STEPS=175
 MUON_ADJUST="match_rms_adamw"
-OPTS_DEFAULT="adamw_bf16 adamw8bit adamw4bit gefen_fused"
+OPTS_DEFAULT="adamw_bf16 adamw8bit adamw4bit gefen_fused gefen_muon"
 OPTS="$OPTS_DEFAULT"
+NO_MUON=0
 
 # tag -> model path, and the tag order, collected from CLI
 declare -a TAGS=()
@@ -75,7 +76,8 @@ Options:
   --dataset NAME         HF Alpaca-format dataset id (default $DATASET).
   --opts "a b c"         Optimizers to run (default: "$OPTS_DEFAULT").
                          Available: adamw_bf16 adamw8bit adamw4bit gefen_fused gefen_nonfused gefen_muon
-  --with-muon            Shorthand to append gefen_muon to the default optimizer set.
+  --no-muon              Drop gefen_muon from the run (it is in the default set but is
+                         the slowest optimizer; use this to skip the Newton-Schulz cost).
   --muon-adjust MODE     gefen_muon adjust_lr_fn (default $MUON_ADJUST).
   --eval-every N         Intermediate eval-logging cadence (default $EVAL_EVERY).
   --lr-sweep             Run a short per-optimizer LR sweep first and use each
@@ -103,7 +105,7 @@ while [ $# -gt 0 ]; do
     --seed)        SEED="$2"; shift 2 ;;
     --dataset)     DATASET="$2"; shift 2 ;;
     --opts)        OPTS="$2"; shift 2 ;;
-    --with-muon)   OPTS="$OPTS_DEFAULT gefen_muon"; shift ;;
+    --no-muon)     NO_MUON=1; shift ;;
     --muon-adjust) MUON_ADJUST="$2"; shift 2 ;;
     --eval-every)  EVAL_EVERY="$2"; shift 2 ;;
     --lr-sweep)    LR_SWEEP=1; shift ;;
@@ -125,6 +127,11 @@ die() { echo "ERROR: $*" >&2; exit 1; }
 
 IFS=',' read -r -a GPU_ARR <<< "$GPUS"
 [ "${#GPU_ARR[@]}" -gt 0 ] || die "no GPUs parsed from --gpus"
+
+# --no-muon strips gefen_muon whether it came from the default set or --opts
+if [ "$NO_MUON" -eq 1 ]; then
+  OPTS="$(echo "$OPTS" | tr ' ' '\n' | grep -vx 'gefen_muon' | tr '\n' ' ')"
+fi
 
 mkdir -p "$OUT" "$OUT/logs"
 RESULTS="$OUT/results.jsonl"

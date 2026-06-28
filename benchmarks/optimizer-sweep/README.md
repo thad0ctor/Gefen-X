@@ -11,7 +11,11 @@ For each (model, optimizer) it measures, under one fixed regime:
 
 - **Final eval loss** on a 32-example held-out set, plus the train-loss EMA
 - **Throughput** (steady-state tokens/sec, warmup steps excluded)
-- **Peak VRAM** (`torch.cuda.max_memory_allocated`)
+- **Peak VRAM** — recorded two ways: `peak_vram_gib` =
+  `torch.cuda.max_memory_allocated` (real tensor bytes; the apples-to-apples
+  optimizer-memory metric and the one the charts use) and
+  `peak_vram_reserved_gib` = `torch.cuda.max_memory_reserved` (caching-allocator
+  pool incl. slack/fragmentation; closer to what `nvidia-smi` reports)
 - **Optimizer-state bytes/param** (real packed bytes, recursing into tensor
   subclasses so torchao's 4-bit packed state isn't over-counted)
 
@@ -27,7 +31,9 @@ For each (model, optimizer) it measures, under one fixed regime:
 - Each optimizer runs at **its own fair LR** (see below)
 
 Optimizers (`--opt`): `adamw_bf16`, `adamw8bit` (bitsandbytes), `adamw4bit`
-(torchao), `gefen_fused`, `gefen_nonfused`, `gefen_muon` (GefenMuonHybrid).
+(torchao), `gefen_fused`, `gefen_nonfused`, `gefen_muon` (GefenMuonHybrid). The
+default set run by `run.sh` is `adamw_bf16 adamw8bit adamw4bit gefen_fused
+gefen_muon` — pass `--no-muon` to drop the (slow) Newton-Schulz `gefen_muon`.
 
 The fair default LRs (175-step fair-sweep optima): AdamW family `5e-5`,
 `gefen_fused` / `gefen_nonfused` `2e-5`, `gefen_muon` `5e-5` (with
@@ -73,7 +79,7 @@ cd benchmarks/optimizer-sweep
 
 - Add `--lr-sweep` to run a short per-optimizer LR sweep first and use each
   optimizer's best LR for the finals (instead of the documented defaults).
-- Add `--with-muon` to also benchmark `gefen_muon`, or set `--opts "..."`.
+- `gefen_muon` is in the default set; add `--no-muon` to skip it, or set `--opts "..."`.
 - Use `--model <tag>=<path>` (repeatable) for arbitrary models/tags.
 - `--arch` is your GPU's compute capability (`8.6` Ampere, `12.0` Blackwell).
 - Run `./run.sh -h` for the full flag list. Missing required args fail cleanly.
