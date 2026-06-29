@@ -18,6 +18,23 @@ full matrix per step (GefenMuon._step_automatic), run the quantized-momentum +
 Newton-Schulz pipeline on the full matrix so the numerics match the single-GPU
 reference, then slice the orthogonalized update back to the local shard. Tensor
 parallelism / multi-dim (HSDP x TP) meshes are not validated.
+
+Recommended configuration (minimizes divergence vs AdamW at matched LR -- see the
+loss-recovery sweep; Qwen3-0.6B/1.7B, 300 steps): keep the Muon half at AdamW
+scale and lower only the backup half, plus per-element 2nd moment on the 1D
+backup tensors. Both are free on throughput::
+
+    opt = GefenMuonHybrid(
+        *split_params_for_muon(model),
+        lr=ADAMW_LR,                  # Muon (2D) half stays at AdamW scale
+        backup_lr=0.5 * ADAMW_LR,     # backup half ~0.4-0.6x (tune); the main lever
+        adjust_lr_fn="match_rms_adamw",
+        backup_1d_period_one=True,    # AdamW-like per-element 2nd moment on norms/biases
+    )
+
+This closed the eval-loss gap to AdamW (and beat it at 0.6B) while keeping ~1.0
+B/param optimizer state. Defaults below stay parity-preserving (period-1 off,
+shared lr), so set these explicitly to opt in.
 """
 from collections import OrderedDict
 
@@ -25,6 +42,7 @@ import torch
 
 from gefen.gefen import Gefen
 from gefen.gefen_muon import GefenMuon
+from gefen.params import split_params_for_muon, validate_split
 
 
 class GefenMuonHybrid(torch.optim.Optimizer):
@@ -34,51 +52,151 @@ class GefenMuonHybrid(torch.optim.Optimizer):
         backup_named_params,
         *,
         lr,
+        muon_lr=None,
+        backup_lr=None,
         weight_decay=0.0,
+        muon_weight_decay=None,
+        backup_weight_decay=None,
+        no_decay_substrings=(),
+        backup_1d_period_one=False,
         betas=(0.9, 0.999),
         eps=1e-8,
         fused=True,
         momentum=0.95,
         nesterov=True,
         ns_steps=5,
+        ns_schedule=None,
         adjust_lr_fn="match_rms_adamw",
         sharded_mode="exact",
+        fp8_ns=False,
+        fp8_ns_compile=True,
         verbose=False,
     ):
         muon_named_params = list(muon_named_params)
         backup_named_params = list(backup_named_params)
         if not muon_named_params and not backup_named_params:
             raise ValueError("GefenMuonHybrid received no parameters to optimize")
+        # Catch the silent footguns: a param routed to both halves (stepped
+        # twice) or a duplicate name (codebook cache key collision). Completeness
+        # (a trainable param in neither list) needs the model, so it is checked in
+        # split_params_for_muon's callers, not here.
+        validate_split(muon_named_params, backup_named_params)
+
+        # adjust_lr_fn guard (idea 5). The default is "match_rms_adamw", which
+        # rescales each Muon update to AdamW-equivalent RMS so a single AdamW-scale
+        # lr is correct for both halves. The legacy None/"original" scaling leaves
+        # the Muon matrices on Muon-native footing; feeding them an AdamW-scale lr
+        # then under-trains them, and no single shared lr suits both halves. Make
+        # that loud rather than silent.
+        if adjust_lr_fn in (None, "original"):
+            import warnings
+
+            warnings.warn(
+                "GefenMuonHybrid: adjust_lr_fn={!r} uses Muon-native LR scaling, so "
+                "an AdamW-scale lr will mis-scale the 2D Muon matrices relative to "
+                "the backup half. Use adjust_lr_fn='match_rms_adamw' (the default) "
+                "to share one AdamW-scale lr, or set muon_lr explicitly.".format(
+                    adjust_lr_fn
+                ),
+                stacklevel=2,
+            )
+
+        # Per-half learning rates. The shared ``lr`` keeps the documented
+        # single-LR behavior; ``muon_lr`` / ``backup_lr`` override it per half so
+        # the Muon matrices (with ``adjust_lr_fn`` rescaling them to AdamW-RMS)
+        # and the backup-Gefen norms/embeddings/head can be tuned independently.
+        # NOTE: an LR scheduler that overwrites every group to one absolute value
+        # collapses the split; a multiplicative scheduler (the common case)
+        # preserves the muon/backup ratio because each sub-optimizer's groups
+        # carry their own lr.
+        muon_lr = lr if muon_lr is None else muon_lr
+        backup_lr = lr if backup_lr is None else backup_lr
+
+        # Per-half weight decay. Decoupled (AdamW-style) decay is `lr*wd` per
+        # step; keeping muon/backup decay separate lets a recipe decay the 2D
+        # matrices while leaving the backup (norms/biases/embeddings/head) on a
+        # different schedule. Both default to the shared weight_decay.
+        muon_weight_decay = weight_decay if muon_weight_decay is None else muon_weight_decay
+        backup_weight_decay = (
+            weight_decay if backup_weight_decay is None else backup_weight_decay
+        )
 
         self.muon = (
             GefenMuon(
                 muon_named_params,
-                lr=lr,
-                weight_decay=weight_decay,
+                lr=muon_lr,
+                weight_decay=muon_weight_decay,
                 momentum=momentum,
                 nesterov=nesterov,
                 ns_steps=ns_steps,
+                ns_schedule=ns_schedule,
                 adjust_lr_fn=adjust_lr_fn,
                 fused=fused,
                 sharded_mode=sharded_mode,
+                fp8_ns=fp8_ns,
+                fp8_ns_compile=fp8_ns_compile,
                 verbose=verbose,
             )
             if muon_named_params
             else None
         )
-        self.backup = (
-            Gefen(
-                backup_named_params,
-                lr=lr,
-                betas=betas,
-                eps=eps,
-                weight_decay=weight_decay,
-                fused=fused,
-                verbose=verbose,
+        # AdamW-style group semantics: names matching no_decay_substrings (e.g.
+        # "norm", "bias") form a separate backup group with weight_decay=0, the
+        # rest keep backup_weight_decay. With the default empty no_decay_substrings
+        # the backup is a single flat group at backup_weight_decay -- identical to
+        # the previous single-group construction.
+        no_decay_substrings = tuple(s.lower() for s in no_decay_substrings)
+
+        def _is_no_decay(name):
+            lname = name.lower()
+            return any(sub in lname for sub in no_decay_substrings)
+
+        if backup_named_params and no_decay_substrings:
+            decay_group = [(n, p) for n, p in backup_named_params if not _is_no_decay(n)]
+            no_decay_group = [(n, p) for n, p in backup_named_params if _is_no_decay(n)]
+            backup_groups = [
+                g
+                for g in (
+                    {
+                        "params": decay_group,
+                        "lr": backup_lr,
+                        "betas": betas,
+                        "eps": eps,
+                        "weight_decay": backup_weight_decay,
+                    }
+                    if decay_group
+                    else None,
+                    {
+                        "params": no_decay_group,
+                        "lr": backup_lr,
+                        "betas": betas,
+                        "eps": eps,
+                        "weight_decay": 0.0,
+                    }
+                    if no_decay_group
+                    else None,
+                )
+                if g is not None
+            ]
+            self.backup = Gefen(backup_groups, lr=backup_lr, betas=betas, eps=eps,
+                                 weight_decay=backup_weight_decay, fused=fused,
+                                 force_1d_period_one=backup_1d_period_one,
+                                 verbose=verbose)
+        else:
+            self.backup = (
+                Gefen(
+                    backup_named_params,
+                    lr=backup_lr,
+                    betas=betas,
+                    eps=eps,
+                    weight_decay=backup_weight_decay,
+                    fused=fused,
+                    force_1d_period_one=backup_1d_period_one,
+                    verbose=verbose,
+                )
+                if backup_named_params
+                else None
             )
-            if backup_named_params
-            else None
-        )
         self._subopts = [o for o in (self.muon, self.backup) if o is not None]
 
         # Deliberately do NOT call super().__init__(): we expose each
@@ -133,6 +251,20 @@ class GefenMuonHybrid(torch.optim.Optimizer):
             self.muon.load_state_dict(state_dict["muon"])
         if self.backup is not None and state_dict.get("backup") is not None:
             self.backup.load_state_dict(state_dict["backup"])
+
+    @classmethod
+    def from_model(cls, model, *, backup_substrings=None, **kwargs):
+        """Build the hybrid straight from a model, splitting + validating params.
+
+        Routes 2D hidden weights to Muon and everything else to the backup (see
+        ``gefen.split_params_for_muon``), then validates that the split covers
+        every trainable parameter exactly once before constructing. All other
+        keyword arguments are forwarded to ``__init__``.
+        """
+        split_kwargs = {} if backup_substrings is None else {"backup_substrings": backup_substrings}
+        muon_named, backup_named = split_params_for_muon(model, **split_kwargs)
+        validate_split(muon_named, backup_named, model=model)
+        return cls(muon_named, backup_named, **kwargs)
 
     def add_param_group(self, param_group):
         raise NotImplementedError(

@@ -464,6 +464,7 @@ class Gefen(torch.optim.Optimizer):
         weight_decay: float = 0.0,
         *,
         fused: bool = True,
+        force_1d_period_one: bool = False,
         verbose: bool = False,
     ):
         if fused and not torch.cuda.is_available():
@@ -539,6 +540,14 @@ class Gefen(torch.optim.Optimizer):
             )
 
         self.fused = fused
+        # When set, 1D parameters (RMSNorm/LayerNorm weights, biases) skip the
+        # block-period search and use period==1 -> per-element 2nd moment +
+        # momentum magnitude, i.e. AdamW-like fidelity. Without it the memory-safe
+        # fallback can lump a whole 1D norm tensor into a single shared block,
+        # which over-steps on these high-leverage tensors (the norm weights set
+        # the LR stability ceiling). 1D tensors are tiny, so per-element state here
+        # is a negligible memory cost. See partitioning.memory_safe_fallback_period.
+        self._force_1d_period_one = force_1d_period_one
         self.verbose = verbose
 
         self._printed_optimizer_memory = False
@@ -647,6 +656,16 @@ class Gefen(torch.optim.Optimizer):
         self, flat_tensor: torch.Tensor, period: int, reduce_op: str
     ) -> torch.Tensor:
         return automatic_partition_reduce(flat_tensor, period, reduce_op)
+
+    def _resolve_automatic_period(
+        self, param_name: str, param: torch.Tensor, grad: torch.Tensor
+    ) -> int:
+        # Single decision point for a parameter's automatic period so the
+        # codebook-learning pass and the step agree. force_1d_period_one short-
+        # circuits 1D params to per-element (period==1) before the block search.
+        if self._force_1d_period_one and param.ndim == 1:
+            return 1
+        return self._predict_period_from_grad_sq(param_name, param, grad)
 
     def _predict_period_from_grad_sq(
         self, param_name: str, param: torch.Tensor, grad: torch.Tensor
@@ -763,7 +782,7 @@ class Gefen(torch.optim.Optimizer):
                 elif flat.numel() == 1:
                     period = 1
                 else:
-                    period = self._predict_period_from_grad_sq(group["name"], p, grad)
+                    period = self._resolve_automatic_period(group["name"], p, grad)
 
                 self.state[p]["automatic_period"] = period
 
@@ -1245,7 +1264,7 @@ class Gefen(torch.optim.Optimizer):
             elif local_numel == 1:
                 automatic_period = 1
             elif local_numel > 1:
-                automatic_period = self._predict_period_from_grad_sq(
+                automatic_period = self._resolve_automatic_period(
                     param_name, p, grad
                 )
             else:

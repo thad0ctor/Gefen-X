@@ -70,6 +70,18 @@ ap.add_argument("--eval-every", type=positive_int, default=50,
 ap.add_argument("--muon-adjust", default="match_rms_adamw",
                 help="adjust_lr_fn for gefen_muon (GefenMuonHybrid): match_rms_adamw "
                      "(AdamW-scale LR) or original/none (Muon-scale LR)")
+# --- recommended loss-recovery flags (gefen_muon only) ---
+ap.add_argument("--variant", default=None,
+                help="free-form label recorded in the result line; defaults to opt name")
+ap.add_argument("--muon-lr", type=float, default=None,
+                help="GefenMuonHybrid muon_lr override (default: shared --lr)")
+ap.add_argument("--backup-lr", type=float, default=None,
+                help="GefenMuonHybrid backup_lr override; recommended ~0.5x --lr")
+ap.add_argument("--backup-1d-period-one", action="store_true",
+                help="force period==1 (per-element 2nd moment) for 1D backup params")
+ap.add_argument("--no-decay-substrings", default="",
+                help="comma-separated name substrings routed to a weight_decay=0 "
+                     "backup group (e.g. 'norm,bias')")
 args = ap.parse_args()
 
 # GPU pin BEFORE importing torch
@@ -229,10 +241,24 @@ elif args.opt == "gefen_nonfused":
     opt = Gefen(m.parameters(), lr=lr, fused=False)
 elif args.opt == "gefen_muon":
     from gefen import GefenMuonHybrid
+    try:
+        from gefen import split_params_for_muon as _split  # public splitter (this fork)
+    except ImportError:
+        _split = split_params_for_muon  # local fallback (older gefen)
     _adj = None if args.muon_adjust in ("none", "None") else args.muon_adjust
-    opt = GefenMuonHybrid(*split_params_for_muon(m), lr=lr,
-                          adjust_lr_fn=_adj, fused=True)
-    print(f"[gefen_muon] adjust_lr_fn={_adj!r}", flush=True)
+    _no_decay = tuple(
+        s.strip() for s in args.no_decay_substrings.split(",") if s.strip()
+    )
+    opt = GefenMuonHybrid(
+        *_split(m), lr=lr,
+        muon_lr=args.muon_lr, backup_lr=args.backup_lr,
+        adjust_lr_fn=_adj, fused=True,
+        backup_1d_period_one=args.backup_1d_period_one,
+        no_decay_substrings=_no_decay,
+    )
+    print(f"[gefen_muon] adjust_lr_fn={_adj!r} muon_lr={args.muon_lr} "
+          f"backup_lr={args.backup_lr} backup_1d_period_one={args.backup_1d_period_one} "
+          f"no_decay={_no_decay}", flush=True)
 else:
     sys.exit(f"unknown opt {args.opt}")
 
@@ -315,8 +341,18 @@ state_bytes = sum(
 state_bpp = state_bytes / n_params
 
 res = {
-    "tag": args.tag, "opt": args.opt, "lr": lr, "seed": args.seed,
+    "tag": args.tag, "opt": args.opt, "variant": args.variant or args.opt,
+    "lr": lr, "seed": args.seed,
     "muon_adjust": (args.muon_adjust if args.opt == "gefen_muon" else None),
+    "muon_flags": (
+        {
+            "muon_lr": args.muon_lr, "backup_lr": args.backup_lr,
+            "backup_1d_period_one": args.backup_1d_period_one,
+            "no_decay_substrings": args.no_decay_substrings,
+        }
+        if args.opt == "gefen_muon"
+        else None
+    ),
     "steps": args.steps, "seq": BLOCK, "params_B": round(n_params / 1e9, 4),
     "gpu": dev_name, "final_train_ema": round(ema, 4),
     "eval0": round(eval0, 4), "final_eval": round(final_eval, 4),
