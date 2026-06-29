@@ -136,7 +136,7 @@ You can run these yourself — see [`benchmarks/`](benchmarks/README.md) for wha
 - **Hardware:** NVIDIA RTX 3090 (Ampere, sm_86), single GPU per run.
 - **Software:** PyTorch 2.12.0 (cu133), Python 3.12; Gefen fused CUDA kernels JIT-built for sm_86.
 - **Models:** Qwen3-0.6B and Qwen3-1.7B — full fine-tune (all weights trained, no adapters).
-- **Regime:** bf16 master weights, gradient checkpointing, sequence length 2048, micro-batch 1, Alpaca greedy-packed to 2048-token blocks, 2000 steps, single seed, identical data order across optimizers; 32-example held-out eval.
+- **Regime:** bf16 master weights, gradient checkpointing, sequence length 2048, micro-batch 1, Alpaca greedy-packed to 2048-token blocks, 2000 steps, single seed, identical data order across optimizers; 32-example held-out eval. (Single-seed, n=1: the data order + init are seeded but CUDA kernels aren't forced fully deterministic, so re-running at the same seed reproduces the training trajectory — train-EMA to ±0.001 — while the 32-example eval moves ~±0.005–0.007 from bf16 nondeterminism; treat sub-0.01 eval gaps as noise.)
 - **Learning rate (each at its own fair optimum):** AdamW (bf16 / 8-bit / 4-bit) = `5e-5`; Gefen (fused) = `2e-5`; Gefen-Muon = `5e-5` with the recommended config (`adjust_lr_fn="match_rms_adamw"`, `backup_lr=2.5e-5` for the non-Muon params, `backup_1d_period_one=True`).
 - **Optimizers:** `adamw_bf16` = torch fused AdamW · `adamw8bit` = bitsandbytes · `adamw4bit` = torchao · `gefen_fused` = `Gefen(fused=True)` · `gefen_muon` = `GefenMuonHybrid(..., fused=True)` (Muon on 2D hidden matrices, Gefen on everything else). **Both Gefen runs use the fused CUDA kernels** (`fused=True`).
 
