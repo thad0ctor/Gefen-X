@@ -644,6 +644,35 @@ class GefenMuon(Gefen):
             compile_fp8=group.get("fp8_ns_compile", True),
         )
 
+    def _lr_scalar(self, group) -> float:
+        """Resolve ``group["lr"]`` to a python float, caching a tensor lr's ``.item()``.
+
+        A float lr is returned as-is (no sync). A tensor lr is ``.item()``'d (a
+        D2H sync) only when its identity or ``_version`` changes -- an in-place
+        scheduler update (e.g. ``lr.mul_``) bumps ``_version``, a replacement
+        swaps identity. The cache is keyed by tensor identity and shared across
+        ALL param groups on the optimizer (not per group): GefenMuon assigns one
+        param-group per param, so a per-group cache would still re-read once per
+        param after every in-place scheduler step (O(params) syncs/step). With a
+        shared cache, a tensor lr common to every group costs a single ``.item()``
+        per step (O(steps), per version). The cached value equals ``lr.item()``,
+        so callers stay bit-identical. Kept as a plain instance attribute so it is
+        not serialized into ``param_groups`` / the optimizer ``state_dict``.
+        """
+        lr = group["lr"]
+        if not isinstance(lr, torch.Tensor):
+            return lr
+        cache = getattr(self, "_lr_scalar_cache", None)
+        if cache is None:
+            cache = self._lr_scalar_cache = {}
+        ver = lr._version
+        entry = cache.get(id(lr))
+        if entry is not None and entry[0] is lr and entry[1] == ver:
+            return entry[2]
+        val = lr.item()
+        cache[id(lr)] = (lr, ver, val)
+        return val
+
     def _apply_muon_update(
         self,
         group,
@@ -655,7 +684,17 @@ class GefenMuon(Gefen):
         lr = group["lr"]
         # p.shape is the GLOBAL shape for a DTensor, which is exactly what the
         # rows/cols LR ratio wants -- keep it unchanged under sharding.
-        adjusted_lr = _adjust_lr(lr, group["adjust_lr_fn"], p.shape)
+        # Resolve a tensor LR (tensor-LR / capturable scheduler) to a python float
+        # via a cached scalar instead of a fresh lr.item() per Muon param. A tensor
+        # lr.item() is a D2H sync; GefenMuon assigns one param-group per param, so
+        # the per-param _adjust_lr call meant ~one sync per param per step,
+        # serializing the Newton-Schulz pipeline. The cache re-reads only when the
+        # lr tensor's identity or _version changes (an in-place scheduler update
+        # bumps _version), so a constant tensor lr is read once and reused; the
+        # value is exactly lr.item(), making _adjust_lr bit-identical.
+        adjusted_lr = _adjust_lr(
+            self._lr_scalar(group), group["adjust_lr_fn"], p.shape
+        )
 
         if is_sharded:
             # Apply to the local shard storage (to_local() is a view, so in-place
