@@ -53,6 +53,11 @@ declare -A LABELS=([qwen0p6b]=Qwen3-0.6B [qwen1p7b]=Qwen3-1.7B)
 declare -A CLI_SET=()
 
 die() { echo "ERROR: $*" >&2; exit 1; }
+# fail fast on a non-numeric float (else awk silently coerces typos to 0).
+validate_float() { # name value
+  [[ "$2" =~ ^[0-9]*([.][0-9]+)?([eE][-+]?[0-9]+)?$ && -n "$2" ]] \
+    || die "$1 must be a number, got '$2'"
+}
 
 list_gpus() {
   command -v nvidia-smi >/dev/null 2>&1 || die "nvidia-smi not found"
@@ -119,7 +124,8 @@ Options:
                          the slowest optimizer; use this to skip the Newton-Schulz cost).
   --muon-adjust MODE     gefen_muon adjust_lr_fn (default $MUON_ADJUST).
   --muon-backup-lr-frac F  gefen_muon backup_lr as a fraction of the cell LR (default $MUON_BACKUP_LR_FRACTION).
-  --no-muon-backup-1d    disable gefen_muon backup_1d_period_one (default: on).
+  --muon-backup-1d       enable gefen_muon backup_1d_period_one (default: on).
+  --no-muon-backup-1d    disable gefen_muon backup_1d_period_one.
   --eval-every N         Intermediate eval-logging cadence (default $EVAL_EVERY).
   --lr-sweep             Run a short per-optimizer LR sweep first and use each
                          optimizer's best LR for the finals (default: documented fair LRs).
@@ -158,6 +164,7 @@ while [ $# -gt 0 ]; do
     --no-muon)     NO_MUON=1; CLI_SET[no_muon]=1; shift ;;
     --muon-adjust) MUON_ADJUST="$2"; CLI_SET[muon_adjust]=1; shift 2 ;;
     --muon-backup-lr-frac) MUON_BACKUP_LR_FRACTION="$2"; CLI_SET[muon_backup_lr_fraction]=1; shift 2 ;;
+    --muon-backup-1d) MUON_BACKUP_1D=1; CLI_SET[muon_backup_1d]=1; shift ;;
     --no-muon-backup-1d) MUON_BACKUP_1D=0; CLI_SET[muon_backup_1d]=1; shift ;;
     --eval-every)  EVAL_EVERY="$2"; CLI_SET[eval_every]=1; shift 2 ;;
     --lr-sweep)    LR_SWEEP=1; CLI_SET[lr_sweep]=1; shift ;;
@@ -228,6 +235,7 @@ fi
 
 IFS=',' read -r -a GPU_ARR <<< "$GPUS"
 [ "${#GPU_ARR[@]}" -gt 0 ] || die "no GPUs parsed from '$GPUS'"
+validate_float muon_backup_lr_fraction "$MUON_BACKUP_LR_FRACTION"
 
 # Tables/plots compare optimizers within a model side by side, which is only
 # apples-to-apples on one GPU type; round-robin pins by index, not model, so warn
@@ -295,8 +303,16 @@ run_cell() { # gpu tag model opt lr steps out logfile
   if [ "$opt" = "gefen_muon" ]; then
     local blr
     blr=$(awk -v l="$lr" -v f="$MUON_BACKUP_LR_FRACTION" 'BEGIN{printf "%g", l*f}')
-    muon_flags+=(--backup-lr "$blr" --variant recommended)
+    muon_flags+=(--backup-lr "$blr")
     [ "$MUON_BACKUP_1D" = "1" ] && muon_flags+=(--backup-1d-period-one)
+    # only label the run "recommended" when the config matches the defaults;
+    # otherwise record it as "custom" so overridden runs aren't mislabeled.
+    if [ "$MUON_ADJUST" = "match_rms_adamw" ] && [ "$MUON_BACKUP_LR_FRACTION" = "0.5" ] \
+       && [ "$MUON_BACKUP_1D" = "1" ]; then
+      muon_flags+=(--variant recommended)
+    else
+      muon_flags+=(--variant custom)
+    fi
   fi
   echo "[start $(date +%T)] $tag $opt lr=$lr gpu=$gpu steps=$steps -> $log"
   "$PY" "$CELL" --opt "$opt" --model "$model" --lr "$lr" --seed "$SEED" \
