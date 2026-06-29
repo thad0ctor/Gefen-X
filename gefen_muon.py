@@ -150,16 +150,18 @@ def _normalize_ns_schedule(
       * a sequence of ``(a, b, c)`` tuples -> an explicit per-iteration schedule
         whose length IS the iteration count (``ns_steps`` is then ignored).
     """
-    if ns_steps >= 100:
-        raise ValueError(
-            "Number of steps must be less than 100 for computational efficiency"
-        )
     if len(ns_coefficients) == 0:
         raise ValueError("ns_coefficients must be non-empty")
 
     first = ns_coefficients[0]
     is_single_tuple = isinstance(first, (int, float))
     if is_single_tuple:
+        # ns_steps only applies to the single-tuple path (it sets the repeat
+        # count); an explicit schedule carries its own length and ignores it.
+        if ns_steps >= 100:
+            raise ValueError(
+                "Number of steps must be less than 100 for computational efficiency"
+            )
         if len(ns_coefficients) != 3:
             raise ValueError(
                 "A single coefficient set must be a tuple of exactly 3 values"
@@ -173,6 +175,11 @@ def _normalize_ns_schedule(
                 "Each Newton-Schulz schedule entry must have exactly 3 values"
             )
         schedule.append(tuple(float(x) for x in entry))
+    if len(schedule) >= 100:
+        raise ValueError(
+            "Newton-Schulz schedule length must be less than 100 for "
+            "computational efficiency"
+        )
     return schedule
 
 

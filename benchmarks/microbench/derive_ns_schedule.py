@@ -54,8 +54,28 @@ def singular_values_normalized(rows, cols, seed):
     return s
 
 
-def collect_distribution(seeds=(0, 1, 2, 3), cache="/tmp/ns_svdist.npy"):
+def collect_distribution(seeds=(0, 1, 2, 3), cache=None):
+    import hashlib
+    import json
     import os
+    import tempfile
+
+    if cache is None:
+        # Key the cache on every input that changes the singular values, so a new
+        # SHAPES/seeds list or a switch between the CUDA and NumPy backends does
+        # not silently reuse a stale distribution.
+        meta = {
+            "shapes": SHAPES,
+            "seeds": list(seeds),
+            "backend": "torch-cuda"
+            if _HAVE_TORCH and torch.cuda.is_available()
+            else "numpy",
+        }
+        key = hashlib.sha256(
+            json.dumps(meta, sort_keys=True).encode()
+        ).hexdigest()[:12]
+        cache = os.path.join(tempfile.gettempdir(), f"ns_svdist_{key}.npy")
+
     if os.path.exists(cache):
         return np.load(cache)
     vals = []

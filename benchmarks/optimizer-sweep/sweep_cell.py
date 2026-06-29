@@ -246,7 +246,9 @@ elif args.opt == "gefen_muon":
     except ImportError:
         _split = split_params_for_muon  # local fallback (older gefen)
     _adj = None if args.muon_adjust in ("none", "None") else args.muon_adjust
-    _no_decay = tuple(s for s in args.no_decay_substrings.split(",") if s)
+    _no_decay = tuple(
+        s.strip() for s in args.no_decay_substrings.split(",") if s.strip()
+    )
     opt = GefenMuonHybrid(
         *_split(m), lr=lr,
         muon_lr=args.muon_lr, backup_lr=args.backup_lr,

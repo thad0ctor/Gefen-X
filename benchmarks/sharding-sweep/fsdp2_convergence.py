@@ -211,24 +211,32 @@ for layer in layers:
 fully_shard(m, mesh=mesh)
 
 
-def split_params_for_muon(model):
-    muon, backup = [], []
-    for name, p in model.named_parameters():
-        if not p.requires_grad:
-            continue
-        is_hidden_matrix = (
-            p.ndim == 2
-            and not any(k in name.lower() for k in ("embed", "wte", "lm_head"))
-        )
-        (muon if is_hidden_matrix else backup).append((name, p))
-    return muon, backup
-
-
 from gefen import GefenMuonHybrid  # noqa: E402
+
+try:
+    # Centralized splitter/validation (this fork): keeps this benchmark on the
+    # same Muon/backup routing policy as the rest of the repo instead of a
+    # file-local copy that can drift.
+    from gefen import split_params_for_muon, validate_split  # noqa: E402
+except ImportError:  # older gefen without the public splitter
+    def split_params_for_muon(model):
+        muon, backup = [], []
+        for name, p in model.named_parameters():
+            if not p.requires_grad:
+                continue
+            is_hidden_matrix = (
+                p.ndim == 2
+                and not any(k in name.lower() for k in ("embed", "wte", "lm_head"))
+            )
+            (muon if is_hidden_matrix else backup).append((name, p))
+        return muon, backup
+
+    def validate_split(muon_named_params, backup_named_params, model=None):
+        return muon_named_params, backup_named_params
 
 _adj = None if args.muon_adjust in ("none", "None") else args.muon_adjust
 _ns_sched = None if args.ns_schedule == "standard" else args.ns_schedule
-muon_p, backup_p = split_params_for_muon(m)
+muon_p, backup_p = validate_split(*split_params_for_muon(m), model=m)
 opt = GefenMuonHybrid(muon_p, backup_p, lr=args.lr, adjust_lr_fn=_adj,
                       fused=True, sharded_mode=args.sharded_mode,
                       ns_schedule=_ns_sched, fp8_ns=bool(args.fp8))

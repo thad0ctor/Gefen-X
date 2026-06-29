@@ -145,6 +145,16 @@ def main():
     mesh = init_device_mesh("cuda", (world,))
     dtype = torch.bfloat16 if args.dtype == "bf16" else torch.float32
 
+    def reduce_max_ms(ms: float) -> float:
+        # The distributed path gives different ranks different NS workloads, so a
+        # rank-local timing can understate the real wall-clock cost. Report the
+        # slowest rank. Must be called on EVERY rank (collective all_reduce).
+        if world <= 1:
+            return ms
+        t = torch.tensor(ms, device=dev)
+        dist.all_reduce(t, op=dist.ReduceOp.MAX)
+        return float(t.item())
+
     shapes = make_shapes(args.hidden, args.inter, args.layers, args.kv_groups)
     n_params = sum(r * c for r, c in shapes)
     if rank == 0:
@@ -184,7 +194,7 @@ def main():
         opt.step()
 
     # ---- timing ----
-    step_ms = cuda_time(full_step, args.iters, args.warmup)
+    step_ms = reduce_max_ms(cuda_time(full_step, args.iters, args.warmup))
 
     # The gather-only / NS-only breakdown is EXACT-mode only (approx has no
     # all-gather and runs NS on local shards), so skip this discarded work in
@@ -203,7 +213,7 @@ def main():
                 fg = dg.full_tensor()
                 if hasattr(fg, "wait"):
                     fg = fg.wait()
-        gather_ms = cuda_time(gather_only, args.iters, args.warmup)
+        gather_ms = reduce_max_ms(cuda_time(gather_only, args.iters, args.warmup))
 
         # NS-only over ALL full matrices (the REDUNDANT compute every rank pays in
         # exact mode). Keep the param dtype (bf16) -- NS casts to bf16 internally,
@@ -216,7 +226,7 @@ def main():
                 _zeropower_via_newtonschulz(
                     x, ns_coeffs_for_timer, ns_steps_for_timer, 1e-7,
                     use_fp8=bool(args.fp8), compile_fp8=bool(args.fp8_compile))
-        ns_ms = cuda_time(ns_only, args.iters, args.warmup)
+        ns_ms = reduce_max_ms(cuda_time(ns_only, args.iters, args.warmup))
 
         if mode == "distributed":
             # NS over only THIS rank's round-robin matrices (owner = idx % world)
@@ -230,7 +240,7 @@ def main():
                         x, ns_coeffs_for_timer, ns_steps_for_timer, 1e-7,
                         use_fp8=bool(args.fp8),
                         compile_fp8=bool(args.fp8_compile))
-            ns_owned_ms = cuda_time(ns_owned, args.iters, args.warmup)
+            ns_owned_ms = reduce_max_ms(cuda_time(ns_owned, args.iters, args.warmup))
 
             # broadcast-only: the ADDED comm -- every update broadcast from its
             # owner to all ranks (full bf16 matrix).
@@ -242,7 +252,7 @@ def main():
                 for i, buf in enumerate(bcast_bufs):
                     src = dist.get_global_rank(pg, i % world)
                     dist.broadcast(buf, src=src, group=pg)
-            bcast_ms = cuda_time(bcast_only, args.iters, args.warmup)
+            bcast_ms = reduce_max_ms(cuda_time(bcast_only, args.iters, args.warmup))
 
     if rank == 0:
         if mode == "approx":

@@ -25,7 +25,7 @@ def is_muon_param(name: str, param, backup_substrings=DEFAULT_BACKUP_SUBSTRINGS)
     if param.ndim != 2:
         return False
     lname = name.lower()
-    return not any(sub in lname for sub in backup_substrings)
+    return not any(sub.lower() in lname for sub in backup_substrings)
 
 
 def split_params_for_muon(
@@ -78,7 +78,9 @@ def validate_split(muon_named_params, backup_named_params, model: nn.Module = No
             "be stepped twice per optimizer step".format(dupes)
         )
 
-    names = [n for n, _ in muon_named_params] + [n for n, _ in backup_named_params]
+    names = [str(n).lower() for n, _ in muon_named_params] + [
+        str(n).lower() for n, _ in backup_named_params
+    ]
     if len(set(names)) != len(names):
         seen, dupes = set(), set()
         for n in names:

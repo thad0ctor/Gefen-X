@@ -87,8 +87,10 @@ def main():
     axq.set_axisbelow(True)
     axq.legend(fontsize=9)
 
+    min_dim = d.get("fp8_min_dim", "?")
     fig.suptitle("Gefen-Muon fp8 (e4m3) Newton-Schulz: opt-in, arch+size-gated "
-                 "(sm_89+, min-dim ≥ 1024)", fontsize=12.5, fontweight="bold")
+                 f"(sm_89+, min-dim ≥ {min_dim})",
+                 fontsize=12.5, fontweight="bold")
     fig.tight_layout(rect=[0, 0, 1, 0.95])
     fig.savefig(args.out, dpi=140)
     print("wrote", args.out)
