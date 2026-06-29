@@ -12,7 +12,7 @@
  - **Robustness hardening:** same-device/dtype guards before raw-pointer kernel launches, thread-safe SM-count caches, codebook & empty-tensor bounds checks.
  - See detailed listing in collapsible section below
 
- See **[Benchmarks](#benchmarks)** for a fair optimizer comparison (loss · speed · memory) with raw logs..
+ See **[Benchmarks](#benchmarks)** for a optimizer comparison (loss · speed · memory) with raw logs..
 
 <details>
 <summary><b>Detailed Fork Improvements</b> (vs upstream)</summary>
@@ -30,6 +30,10 @@
 | Crash safety | missing device / edge-case guards | guarded against wrong-device, empty-tensor, and race bugs |
 | Tested correctness | no fused-kernel tests | bit-exact + distributed parity test suite |
 | Getting started | no Axolotl / fork-install guidance | Axolotl how-to + fair loss/speed/memory benchmarks |
+| Muon-vs-AdamW eval-loss gap | no Muon-specific LR handling — Muon trails AdamW | split `muon_lr`/`backup_lr` (~0.5×) + `backup_1d_period_one` + `match_rms_adamw` default recover most of the gap → best Gefen variant (Qwen3-0.6B 1.501→1.459, 1.7B 1.326→1.271) |
+| Newton-Schulz iteration cost | fixed classic 5-step quintic only | tunable `ns_schedule` — `tuned4` (~1.25×) / `tuned3` (~1.6×); default `standard` is bit-identical to the quintic |
+| Low-precision orthogonalization | bf16 Newton-Schulz only | opt-in `fp8_ns` (e4m3), arch+size-gated (sm_89+, min-dim ≥ 1024) with bit-identical bf16 fallback — ~1.26–1.35× on large matrices |
+| Sharded Muon orthogonalization (FSDP2) | every rank redundantly runs full NS | `sharded_mode="distributed"` round-robins matrix ownership (exact NS + broadcast) — parity with `exact` (±0.001), scales with ranks (1.06×@2, 1.12×@4 GPUs) |
 
 Measured numbers (Qwen3 0.6B / 1.7B) and the technical details are in [Benchmarks](#benchmarks) and the sections below.
 
@@ -124,14 +128,14 @@ When porting an AdamW recipe, **scale the learning rate to ~0.6× and tune from 
 
 Optimizer comparison on a full fine-tune, **with each optimizer at its own fair learning-rate optimum** (from a per-optimizer LR sweep), 2000 steps.
 
-> Measured on the fused-kernel performance series commits unique to Gefen-X as of `191817d`
+> Measured on the Muon/Gefen performance commits unique to this fork — with Gefen-Muon at its recommended hybrid config — as of `16d66af`
 
 **Testing environment**
 - **Hardware:** NVIDIA RTX 3090 (Ampere, sm_86), single GPU per run.
 - **Software:** PyTorch 2.12.0 (cu133), Python 3.12; Gefen fused CUDA kernels JIT-built for sm_86.
 - **Models:** Qwen3-0.6B and Qwen3-1.7B — full fine-tune (all weights trained, no adapters).
 - **Regime:** bf16 master weights, gradient checkpointing, sequence length 2048, micro-batch 1, Alpaca greedy-packed to 2048-token blocks, 2000 steps, single seed, identical data order across optimizers; 32-example held-out eval.
-- **Learning rate (each at its own fair optimum):** AdamW (bf16 / 8-bit / 4-bit) = `5e-5`; Gefen (fused) = `2e-5`; Gefen-Muon = `5e-5` (with `adjust_lr_fn="match_rms_adamw"`).
+- **Learning rate (each at its own fair optimum):** AdamW (bf16 / 8-bit / 4-bit) = `5e-5`; Gefen (fused) = `2e-5`; Gefen-Muon = `5e-5` with the recommended config (`adjust_lr_fn="match_rms_adamw"`, `backup_lr=2.5e-5` for the non-Muon params, `backup_1d_period_one=True`).
 - **Optimizers:** `adamw_bf16` = torch fused AdamW · `adamw8bit` = bitsandbytes · `adamw4bit` = torchao · `gefen_fused` = `Gefen(fused=True)` · `gefen_muon` = `GefenMuonHybrid(..., fused=True)` (Muon on 2D hidden matrices, Gefen on everything else). **Both Gefen runs use the fused CUDA kernels** (`fused=True`).
 
 | Model | Optimizer | LR | Eval loss | tok/s | Peak VRAM (GiB) | Opt-state B/param |
@@ -140,19 +144,19 @@ Optimizer comparison on a full fine-tune, **with each optimizer at its own fair 
 | Qwen3-0.6B | adamw8bit | 5e-5 | 1.439 | 4690 | 5.86 | 2.03 |
 | Qwen3-0.6B | adamw4bit | 5e-5 | 1.444 | 4005 | 6.32 | 1.06 |
 | Qwen3-0.6B | **gefen_fused** | 2e-5 | 1.635 | 4815 | 5.31 | 1.03 |
-| Qwen3-0.6B | **gefen_muon** | 5e-5 | 1.501 | 2770 | **5.30** | **1.01** |
+| Qwen3-0.6B | **gefen_muon** | 5e-5 | 1.459 | 2682 | **5.30** | **1.01** |
 | Qwen3-1.7B | adamw_bf16 | 5e-5 | **1.221** | 2650 | 14.00 | 4.00 |
 | Qwen3-1.7B | adamw8bit | 5e-5 | 1.251 | 2466 | 10.84 | 2.03 |
 | Qwen3-1.7B | adamw4bit | 5e-5 | 1.242 | 2195 | 15.11 | 1.06 |
 | Qwen3-1.7B | **gefen_fused** | 2e-5 | 1.331 | **2676** | 9.21 | 1.02 |
-| Qwen3-1.7B | **gefen_muon** | 5e-5 | 1.326 | 924 | **9.20** | **1.01** |
+| Qwen3-1.7B | **gefen_muon** | 5e-5 | 1.271 | 946 | **9.20** | **1.01** |
 
 ![Qwen3-1.7B optimizer comparison](docs/benchmarks/quad_qwen1p7b.png)
 ![Qwen3-0.6B optimizer comparison](docs/benchmarks/quad_qwen0p6b.png)
 
 **Loss curves** — loss over the 2000 steps. For each optimizer (distinguished by **color**), there are two lines: **solid = held-out eval loss** (the 32-example validation set, logged every 50 steps — this is the comparison metric in the table above) and **dashed = train-loss EMA** (exponential moving average of the training loss). 
 
-Gefen-fused converges stably and its eval curve tracks just above the AdamW cluster (the ~0.1–0.2 loss gap), with no instability at its fair LR. **Gefen-Muon recovers most of that gap**, its curve sits between Gefen-fused and the AdamW cluster, most visibly at 0.6B where it closes the gap to the best AdamW from +0.198 to +0.064.
+Gefen-fused converges stably and its eval curve tracks just above the AdamW cluster (the ~0.1–0.2 loss gap), with no instability at its fair LR. **Gefen-Muon recovers most of that gap**, its curve sits between Gefen-fused and the AdamW cluster, most visibly at 0.6B where it closes the gap to the best AdamW from +0.198 (Gefen-fused) to +0.022.
 
 ![Qwen3-1.7B loss curves](docs/benchmarks/loss_curve_qwen1p7b.png)
 ![Qwen3-0.6B loss curves](docs/benchmarks/loss_curve_qwen0p6b.png)
@@ -166,17 +170,13 @@ Gefen-Muon shares Gefen-fused's lowest-VRAM column but sits far lower on through
 
 **Gefen Hybrid** At its fair LR, **Gefen-fused has the lowest peak VRAM and the lowest optimizer-state footprint, with competitive-to-best throughput** (fastest at 1.7B on sm_86) — at a **modest loss cost** (~0.1 at 1.7B, ~0.2 at 0.6B) vs the best-tuned AdamW. Note that AdamW-4-bit's optimizer state is also small (~1.06 B/param) but its **peak VRAM is the highest** (torchao compiled-step transient buffers), so Gefen, not 4-bit, is the real peak-memory winner. Gefen's clear optimizer-state edge is over 8-bit (2.03) and bf16 (4.00).
 
-**Gefen-Muon** (`GefenMuonHybrid`, Muon on 2D hidden matrices + Gefen elsewhere, `match_rms_adamw` LR) is the **best Gefen variant on loss** at both scales — 1.501 @0.6B (vs Gefen-fused 1.635) and 1.326 @1.7B (~tied with Gefen-fused, +0.105 vs the best AdamW) — while tying Gefen-fused for the lowest peak VRAM and lowest optimizer state (~1.01 B/param). The cost is throughput: Newton-Schulz makes it the slowest optimizer (~0.58× Gefen-fused at 0.6B, ~0.35× at 1.7B). So **Gefen-fused is the speed+memory sweet spot; Gefen-Muon is the loss-recovery option** when you can afford the slowdown.
+**Gefen-Muon** (`GefenMuonHybrid`, Muon on 2D hidden matrices + Gefen elsewhere, `match_rms_adamw` with a half-rate backup LR for the non-Muon params) is the **best Gefen variant on loss** at both scales — 1.459 @0.6B (vs Gefen-fused 1.635; +0.022 vs the best AdamW) and 1.271 @1.7B (beats Gefen-fused's 1.331; +0.051 vs the best AdamW) — while tying Gefen-fused for the lowest peak VRAM and lowest optimizer state (~1.01 B/param). The cost is throughput: Newton-Schulz makes it the slowest optimizer (~0.56× Gefen-fused at 0.6B, ~0.35× at 1.7B). So **Gefen-fused is the speed+memory sweet spot; Gefen-Muon is the loss-recovery option** when you can afford the slowdown.
 
-**Review the raw runs:** per-cell training logs (step-by-step loss, throughput,
-VRAM) in [`docs/benchmarks/logs/`](docs/benchmarks/logs/) · aggregated metrics as
-[CSV](docs/benchmarks/optimizer_comparison_2000steps.csv) and
-[JSONL](docs/benchmarks/optimizer_comparison_2000steps.jsonl).
+**Review the raw runs:** per-cell training logs (step-by-step loss, throughput, VRAM) in [`docs/benchmarks/logs/`](docs/benchmarks/logs/) · aggregated metrics as [CSV](docs/benchmarks/optimizer_comparison_2000steps.csv) and [JSONL](docs/benchmarks/optimizer_comparison_2000steps.jsonl).
 
 ## Hugging Face Trainer
 
-Until native `optim="gefen"` support is released in Transformers, pass Gefen to
-the Trainer with `optimizer_cls_and_kwargs`:
+Until native `optim="gefen"` support is released in Transformers, pass Gefen to the Trainer with `optimizer_cls_and_kwargs`:
 
 ```python
 from gefen import Gefen
@@ -258,17 +258,8 @@ optimizer = GefenMuonHybrid(
 
 **Moun Learning rate — set `adjust_lr_fn="match_rms_adamw"`.** The Hybrid feeds a > *single* `lr` to both halves, but Muon (2D matrices) and AdamW/Gefen (everything > else) want different LR scales, so the shared `lr` is only meaningful after a per-parameter rescale:
 
- - **`adjust_lr_fn="match_rms_adamw"`** (recommended, and the **`GefenMuonHybrid`
-   default**) rescales the Muon update to
-   AdamW-equivalent RMS (`0.2·√max(rows, cols)`). Then **one AdamW-scale `lr` is
-   correct for both halves**, and the [Learning rate](#learning-rate-when-porting-an-adamw-config)
-   guidance above (Gefen wants ~0.6× AdamW's on Qwen3) applies to the whole model.
- - **`adjust_lr_fn=None`** (= "original" Muon scaling `√max(1, rows/cols)`; this
-   is the bare `GefenMuon` default, **not** the Hybrid's) leaves the Muon half on
-   its native scale. Passing an AdamW-sized `lr` here **under-trains the 2D Muon
-   matrices** — and because both halves share one `lr`, there's no single value
-   that suits Muon-native *and* the Gefen backup. **Don't pair `None` with an
-   AdamW-scale `lr`.**
+ - **`adjust_lr_fn="match_rms_adamw"`** (recommended, and the **`GefenMuonHybrid` default**) rescales the Muon update to AdamW-equivalent RMS (`0.2·√max(rows, cols)`). Then **one AdamW-scale `lr` is correct for both halves**, and the [Learning rate]#learning-rate-when-porting-an-adamw-config) guidance above (Gefen wants ~0.6× AdamW's on Qwen3) applies to the whole model.
+ - **`adjust_lr_fn=None`** (= "original" Muon scaling `√max(1, rows/cols)`; this is the bare `GefenMuon` default, **not** the Hybrid's) leaves the Muon half on its native scale. Passing an AdamW-sized `lr` here **under-trains the 2D Muon matrices** — and because both halves share one `lr`, there's no single value that suits Muon-native *and* the Gefen backup. **Don't pair `None` with an AdamW-scale `lr`.**
 
 It supports `step()`, `zero_grad()`, `state_dict()`/`load_state_dict()`, and LR schedulers (e.g. `torch.optim.lr_scheduler.StepLR(optimizer, ...)`) like any optimizer. Because its constructor takes two parameter lists rather than a single iterable, build it yourself and hand it to the Hugging Face `Trainer` via `optimizers=` (not `optimizer_cls_and_kwargs`):
 
@@ -320,11 +311,38 @@ optim_args:
 
 > PR #3755 is an early draft and marked *untested* upstream; the config keys above may change — check the PR for the current state.
 
-## Experimental: approximate sharded Newton-Schulz (`sharded_mode`)
+## Experimental Lever: faster Newton-Schulz (`ns_schedule`, `fp8_ns`)
 
-> ⚠️ Opt-in, **non-parity** — default is `sharded_mode="exact"`.
+> Opt-in. The defaults (`ns_schedule="standard"`, `fp8_ns=False`) are unchanged — bit-for-bit the classic 5-step quintic.
 
-Under FSDP2 each rank holds a row-shard of every 2D weight, but Newton-Schulz orthogonalizes the **whole** matrix. The default (`"exact"`) all-gathers the full gradient per matrix and runs NS on it — bit-for-bit single-GPU parity. `"approx"` skips the gather and runs NS on each rank's **local shard only**: faster and lighter, but not parity — and the loss penalty **grows with shard count**.
+Newton-Schulz orthogonalization is ~90% of a Muon step and is GEMM-FLOP-bound, so it has two independent per-rank speed levers that stack with `sharded_mode` below:
+
+- **`ns_schedule`** — tuned per-iteration NS coefficients instead of one fixed quintic. `"tuned4"` matches the standard 5-step orthogonality in **4 iterations** (~**1.2×** faster NS); `"tuned3"` is more aggressive (3 iterations, ~**1.6×**) at some orthogonality cost on square/wide shapes.
+- **`fp8_ns`** — run the NS matmuls in fp8 (e4m3) with a bf16 master. **Arch+size-gated**: it engages only on sm_89+ (Ada/Blackwell) and matrices with min-dim ≥ 1024, and otherwise falls back bit-identically to bf16 with a one-time warning — so `fp8_ns=True` is a portable config, not a hard error. ~**1.3×** on the NS kernel for large matrices; orthogonality stays within ~11% of bf16 (non-parity, self-correcting). Needs `torch.compile` (on by default via `fp8_ns_compile`).
+
+```python
+opt = GefenMuonHybrid(
+    muon_named_params, backup_named_params,
+    lr=5e-5, adjust_lr_fn="match_rms_adamw", fused=True,
+    ns_schedule="tuned4",   # "standard" (default) | "tuned4" (equal-quality, ~1.2x) | "tuned3" (aggressive)
+    fp8_ns=True,            # sm_89+ large matrices only; a no-op bf16 fallback elsewhere
+)
+```
+
+Below (RTX 5090, Qwen3-0.6B, 400 steps). **`tuned4` is the safe win** (faster, equal quality); `tuned3` is fastest but loosens orthogonality; `fp8` speeds the NS kernel but its `torch.compile`/quant overhead can slow the full step on small models (the win shows on larger ones). No lever hurts loss — all track default Muon (AdamW shown for reference).
+
+![Gefen-Muon faster Newton-Schulz — real-training loss (AdamW + variants)](docs/benchmarks/muon_ns_loss.png)
+![Gefen-Muon faster Newton-Schulz — end-to-end throughput (tok/s)](docs/benchmarks/muon_ns_throughput.png)
+
+## Experimental Lever: sharded Newton-Schulz under FSDP2 (`sharded_mode`)
+
+> Opt-in. Default is `sharded_mode="exact"` (single-GPU parity).
+
+Under FSDP2 each rank holds a row-shard of every 2D weight, but Newton-Schulz orthogonalizes the **whole** matrix, so the shards have to be reconciled. Three strategies trade parity for speed:
+
+- **`"exact"`** (default) — every rank all-gathers the full gradient for every matrix and runs NS on it. Bit-for-bit single-GPU parity, but every rank redundantly does the same NS work.
+- **`"distributed"`** — round-robin matrix *ownership* across ranks: each rank all-gathers and runs exact NS only on the matrices it owns, then broadcasts the result. Same math as `"exact"` (parity — train-EMA matches to ±0.001), but the NS compute is split across ranks instead of replicated: faster as you add ranks.
+- **`"approx"`** — skip the gather entirely and run NS on each rank's **local shard only**. Fastest and lightest, but **non-parity**; the penalty grows with shard count.
 
 ```python
 from gefen import GefenMuonHybrid
@@ -332,17 +350,17 @@ from gefen import GefenMuonHybrid
 opt = GefenMuonHybrid(
     muon_named_params, backup_named_params,
     lr=5e-5, adjust_lr_fn="match_rms_adamw", fused=True,
-    sharded_mode="approx",   # default "exact" (parity); "approx" = faster, non-parity
+    sharded_mode="distributed",  # "exact" (default, parity) | "distributed" (parity, faster) | "approx" (fastest, non-parity)
 )
 # only takes effect under FSDP2 (DTensor params); no-op single-GPU
 ```
 
-Qwen3-0.6B, FSDP2, Alpaca, 2000 steps, lr `5e-5` (data replicated so the only variable is the NS approximation):
+Qwen3-0.6B, FSDP2 on **2× and 4× RTX 3090**, Alpaca, 2000 steps, lr `5e-5`, with data **replicated** across ranks so the only variable is the NS strategy (so tok/s reflects per-step optimizer+model cost, not data-parallel scaling):
 
-![Gefen-Muon exact vs approx sharded — eval loss](docs/benchmarks/muon_shard_loss.png)
-![Gefen-Muon exact vs approx sharded — step time & VRAM](docs/benchmarks/muon_shard_perf.png)
+![Gefen-Muon exact / distributed / approx sharded — eval loss](docs/benchmarks/muon_shard_loss.png)
+![Gefen-Muon exact / distributed / approx sharded — throughput & VRAM](docs/benchmarks/muon_shard_perf.png)
 
-`approx` runs ~**1.3× faster**/step for **+0.033** eval loss at 2 shards and **+0.067** at 4 — the gap roughly doubles 2→4 shards, so treat it as an opt-in speed lever, not a default. For exact numerics without the per-step gather, instead **replicate** the Muon matrices under FSDP (a wrapping choice, not a flag).
+`"distributed"` is a **free** speedup at parity — **1.06×** (2 GPUs) / **1.12×** (4 GPUs), with train-EMA matching `"exact"` to ±0.001. `"approx"` is faster — **1.25×** / **1.39×** — but costs **+0.033** train-EMA at 2 shards and **+0.071** at 4; the penalty roughly doubles 2→4 shards, so it as an opt-in speed lever. End-to-end speedups are on a 0.6B model (NS is a smaller slice of the full step); the win grows with model size and rank count.
 
 ## Citation:
 

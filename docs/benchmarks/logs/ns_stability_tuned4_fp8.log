@@ -1,0 +1,19 @@
+[gpu] world=1 local0->NVIDIA GeForce RTX 5090 sharded_mode=exact
+[rank0]:W0628 19:14:21.961000 1008583 torch/utils/_pytree.py:630] <enum 'KernelPreference'> is an Enum subclass and is now natively supported by torch.compile as an opaque value type. Calling register_constant() on Enum subclasses is deprecated and will be an error in a future release.
+[rank0]:W0628 19:14:21.976000 1008583 torch/utils/_pytree.py:630] <enum 'ScaleCalculationMode'> is an Enum subclass and is now natively supported by torch.compile as an opaque value type. Calling register_constant() on Enum subclasses is deprecated and will be an error in a future release.
+Loading weights:   0%|          | 0/311 [00:00<?, ?it/s]Loading weights: 100%|██████████| 311/311 [00:00<00:00, 13024.23it/s]
+Initializing Gefen optimizer (fused=True).
+Initializing Gefen optimizer (fused=True).
+[gefen_muon] adjust_lr_fn='match_rms_adamw' sharded_mode=exact ns_schedule=tuned4 fp8=True muon_params=196 backup_params=114
+=== qwen0p6b_tuned4_fp8 gefen_muon[exact] x1 lr=5.000e-05 seed=0 steps=400 seq=2048 params=0.596B ===
+step 0  eval_loss 2.9856
+step 50  train_ema 1.7553  eval 1.8154  (1.59s/step)
+step 100  train_ema 1.6786  eval 1.6478  (1.06s/step)
+step 150  train_ema 1.6647  eval 1.6242  (0.87s/step)
+step 200  train_ema 1.6446  eval 1.6221  (0.77s/step)
+step 250  train_ema 1.6701  eval 1.6038  (0.72s/step)
+step 300  train_ema 1.6912  eval 1.6412  (0.68s/step)
+step 350  train_ema 1.6414  eval 1.6403  (0.65s/step)
+step 400  train_ema 1.6246  eval 1.6278  (0.63s/step)
+RESULT {"tag": "qwen0p6b_tuned4_fp8", "opt": "gefen_muon", "sharded_mode": "exact", "ns_schedule": "tuned4", "fp8": true, "world_size": 1, "lr": 5e-05, "seed": 0, "muon_adjust": "match_rms_adamw", "steps": 400, "seq": 2048, "params_B": 0.596, "gpu": "NVIDIA GeForce RTX 5090", "final_train_ema": 1.6246, "eval0": 2.9856, "final_eval": 1.6278, "peak_vram_gib": 5.64, "s_per_step": 0.4803}
+  return func(*args, **kwargs)
