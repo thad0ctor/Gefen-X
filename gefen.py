@@ -26,6 +26,9 @@ from gefen.kernels.automatic_gefen_fused import (
 )
 from gefen.kernels.automatic_gefen_fused import _should_use_v2
 
+# Optional explicit override for the period-search backend ("cuda_kernel" / "cpu"
+# / "gpu"). None (default) means resolve per call from each tensor's own device
+# -- see _resolve_find_period_backend. NOT used as an auto-populated cache.
 FIND_PERIOD_BACKEND = None
 FUSE_AUTOMATIC_VMEAN_UPDATE = True
 FUSE_GEFEN_AUTOMATIC_STEP = True
@@ -442,16 +445,17 @@ def learn_gefen_exact_codebook_from_grad_periods(
 
 
 def _resolve_find_period_backend(grad: torch.Tensor) -> str:
-    global FIND_PERIOD_BACKEND
+    # An explicit FIND_PERIOD_BACKEND (set by config/tests) is an override and
+    # wins. Otherwise resolve PER CALL from the tensor's own device. Do NOT cache
+    # a device-derived value in the module global: the first tensor's device
+    # would leak into every later call, so a CUDA step poisons a subsequent CPU
+    # parameter ("cuda_kernel" backend on a CPU tensor -> ValueError). The
+    # resolution is a trivial device-type check, so per-call costs nothing.
     if FIND_PERIOD_BACKEND is not None:
         return FIND_PERIOD_BACKEND
 
     grad_work = grad.to_local() if hasattr(grad, "to_local") else grad
-    if grad_work.device.type == "cuda":
-        FIND_PERIOD_BACKEND = "cuda_kernel"
-    else:
-        FIND_PERIOD_BACKEND = "cpu"
-    return FIND_PERIOD_BACKEND
+    return "cuda_kernel" if grad_work.device.type == "cuda" else "cpu"
 
 
 class Gefen(torch.optim.Optimizer):
