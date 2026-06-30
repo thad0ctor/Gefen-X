@@ -41,7 +41,9 @@ void automatic_gefen_fused_full_update_cuda(
     double eps,
     double inv_sqrt_bias_correction_2,
     double inv_bias_correction_1,
-    double weight_decay_factor
+    double weight_decay_factor,
+    bool stochastic_round,
+    int64_t rng_seed
 );
 
 void automatic_gefen_fused_update_v2_full_cuda(
@@ -58,7 +60,9 @@ void automatic_gefen_fused_update_v2_full_cuda(
     double eps,
     double inv_sqrt_bias_correction_2,
     double inv_bias_correction_1,
-    double weight_decay_factor
+    double weight_decay_factor,
+    bool stochastic_round,
+    int64_t rng_seed
 );
 
 void gefen_quantized_momentum_update_cuda(
@@ -67,7 +71,9 @@ void gefen_quantized_momentum_update_cuda(
     at::Tensor m_magnitude,
     at::Tensor codebook,
     at::Tensor momentum_out,
-    double beta1
+    double beta1,
+    bool stochastic_round,
+    int64_t rng_seed
 );
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
@@ -117,7 +123,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         py::arg("eps"),
         py::arg("inv_sqrt_bias_correction_2"),
         py::arg("inv_bias_correction_1"),
-        py::arg("weight_decay_factor")
+        py::arg("weight_decay_factor"),
+        py::arg("stochastic_round") = false,
+        py::arg("rng_seed") = 0
     );
     m.def(
         "automatic_gefen_fused_update_v2_full_cuda",
@@ -137,7 +145,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         py::arg("eps"),
         py::arg("inv_sqrt_bias_correction_2"),
         py::arg("inv_bias_correction_1"),
-        py::arg("weight_decay_factor")
+        py::arg("weight_decay_factor"),
+        py::arg("stochastic_round") = false,
+        py::arg("rng_seed") = 0
     );
     m.def(
         "gefen_quantized_momentum_update_cuda",
@@ -149,6 +159,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         py::arg("m_magnitude"),
         py::arg("codebook"),
         py::arg("momentum_out"),
-        py::arg("beta1")
+        py::arg("beta1"),
+        py::arg("stochastic_round") = false,
+        py::arg("rng_seed") = 0
     );
 }

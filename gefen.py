@@ -465,6 +465,8 @@ class Gefen(torch.optim.Optimizer):
         *,
         fused: bool = True,
         force_1d_period_one: bool = False,
+        force_2d_period_one: bool = False,
+        stochastic_round: bool = False,
         verbose: bool = False,
     ):
         if fused and not torch.cuda.is_available():
@@ -548,6 +550,21 @@ class Gefen(torch.optim.Optimizer):
         # the LR stability ceiling). 1D tensors are tiny, so per-element state here
         # is a negligible memory cost. See partitioning.memory_safe_fallback_period.
         self._force_1d_period_one = force_1d_period_one
+        # When set, 2D parameters (in the hybrid backup these are the token
+        # embedding / LM head -- hidden 2D matrices go to Muon) skip the block
+        # search and use period==1 -> per-element 2nd moment + magnitude, i.e.
+        # AdamW-like fidelity on the vocab projections. These are the most
+        # AdamW-divergent backup tensors; the block-shared vmean coarsens their
+        # per-element second moment. Memory cost is real (per-element fp32 vmean +
+        # magnitude on a vocab x hidden tensor), so this is an opt-in loss/memory
+        # trade, not free like force_1d_period_one (1D tensors are tiny).
+        self._force_2d_period_one = force_2d_period_one
+        # When set, momentum->codebook quantization uses unbiased stochastic
+        # rounding (seeded per optimizer step) instead of deterministic nearest.
+        # This cancels the systematic bias that nearest-rounding the EMA momentum
+        # accumulates over a long horizon. Default False is bit-identical to the
+        # prior behavior (the kernels take the same parity-preserving fast path).
+        self._stochastic_round = stochastic_round
         self.verbose = verbose
 
         self._printed_optimizer_memory = False
@@ -664,6 +681,8 @@ class Gefen(torch.optim.Optimizer):
         # codebook-learning pass and the step agree. force_1d_period_one short-
         # circuits 1D params to per-element (period==1) before the block search.
         if self._force_1d_period_one and param.ndim == 1:
+            return 1
+        if self._force_2d_period_one and param.ndim == 2:
             return 1
         return self._predict_period_from_grad_sq(param_name, param, grad)
 
@@ -974,6 +993,8 @@ class Gefen(torch.optim.Optimizer):
             codebook,
             momentum_out,
             beta1,
+            self._stochastic_round,
+            self._gefen_global_step,
         )
         return momentum_out
 
@@ -1017,6 +1038,8 @@ class Gefen(torch.optim.Optimizer):
             1.0 / math.sqrt(bias_correction_2),
             1.0 / bias_correction_1,
             weight_decay_factor,
+            self._stochastic_round,
+            self._gefen_global_step,
         )
 
     def _automatic_gefen_fused_update_v2_full(
@@ -1059,6 +1082,8 @@ class Gefen(torch.optim.Optimizer):
             1.0 / math.sqrt(bias_correction_2),
             1.0 / bias_correction_1,
             weight_decay_factor,
+            self._stochastic_round,
+            self._gefen_global_step,
         )
 
     def _automatic_momentum_update(

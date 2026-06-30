@@ -30,8 +30,8 @@
 | Crash safety | missing device / edge-case guards | guarded against wrong-device, empty-tensor, and race bugs |
 | Tested correctness | no fused-kernel tests | bit-exact + distributed parity test suite |
 | Getting started | no Axolotl / fork-install guidance | Axolotl how-to + fair loss/speed/memory benchmarks |
-| Muon-vs-AdamW eval-loss gap | no Muon-specific LR handling — Muon trails AdamW | split `muon_lr`/`backup_lr` (~0.5×) + `backup_1d_period_one` + `match_rms_adamw` default recover most of the gap → best Gefen variant (Qwen3-0.6B 1.501→1.459, 1.7B 1.326→1.271) |
-| Newton-Schulz iteration cost | fixed classic 5-step quintic only | tunable `ns_schedule` — `tuned4` (~1.25×) / `tuned3` (~1.6×); default `standard` is bit-identical to the quintic |
+| Muon-vs-AdamW eval-loss gap | no Muon-specific LR handling — Muon trails AdamW | split `muon_lr`/`backup_lr` (~0.5×) + `backup_1d_period_one` + `match_rms_adamw` default recover most of the gap → best Gefen variant (Qwen3-0.6B 1.501→1.459, 1.7B 1.326→1.271); opt-in `backup_2d_period_one` (per-element 2nd moment on embed/LM-head) **closes the residual gap to AdamW** at 1.7B (+0.0195→~0.000) for a memory cost (still 0.6× AdamW) |
+| Newton-Schulz iteration cost | fixed classic 5-step quintic only | tunable `ns_schedule` — `tuned4` (~1.25×) / `tuned3` (~1.6×, loss-neutral at 2000 steps). **`GefenMuonHybrid` now defaults to `tuned3`** (~+28% step throughput); the `GefenMuon` primitive default `standard` stays bit-identical to the quintic |
 | Low-precision orthogonalization | bf16 Newton-Schulz only | opt-in `fp8_ns` (e4m3), arch+size-gated (sm_89+, min-dim ≥ 1536) with bit-identical bf16 fallback — ~1.26–1.35× on large matrices |
 | Sharded Muon orthogonalization (FSDP2) | every rank redundantly runs full NS | `sharded_mode="distributed"` round-robins matrix ownership (exact NS + broadcast) — parity with `exact` (±0.001), scales with ranks (1.06×@2, 1.12×@4 GPUs) |
 
@@ -153,6 +153,8 @@ You can run these yourself — see [`benchmarks/`](benchmarks/README.md) for wha
 | Qwen3-1.7B | **gefen_fused** | 2e-5 | 1.331 | **2676** | 9.21 | 1.02 |
 | Qwen3-1.7B | **gefen_muon** | 5e-5 | 1.271 | 946 | **9.20** | **1.01** |
 
+> The `gefen_muon` rows above were measured with the classic `standard` Newton-Schulz schedule (the prior default). `GefenMuonHybrid` now defaults to `ns_schedule="tuned3"`, which is **loss-neutral and ~+28% faster** per step (see [the faster-NS lever](#experimental-lever-faster-newton-schulz-ns_schedule-fp8_ns)), so the default-config throughput is higher than the `tok/s` shown here. The eval-loss / VRAM / state columns are unchanged.
+
 ![Qwen3-1.7B optimizer comparison](docs/benchmarks/quad_qwen1p7b.png)
 ![Qwen3-0.6B optimizer comparison](docs/benchmarks/quad_qwen0p6b.png)
 
@@ -263,6 +265,8 @@ optimizer = GefenMuonHybrid(
  - **`adjust_lr_fn="match_rms_adamw"`** (recommended, and the **`GefenMuonHybrid` default**) rescales the Muon update to AdamW-equivalent RMS (`0.2·√max(rows, cols)`). Then **one AdamW-scale `lr` is correct for both halves**, and the [Learning rate](#learning-rate-when-porting-an-adamw-config) guidance above (Gefen wants ~0.6× AdamW's on Qwen3) applies to the whole model.
  - **`adjust_lr_fn=None`** (= "original" Muon scaling `√max(1, rows/cols)`; this is the bare `GefenMuon` default, **not** the Hybrid's) leaves the Muon half on its native scale. Passing an AdamW-sized `lr` here **under-trains the 2D Muon matrices** — and because both halves share one `lr`, there's no single value that suits Muon-native *and* the Gefen backup. **Don't pair `None` with an AdamW-scale `lr`.**
 
+**Optional knobs.** `GefenMuonHybrid` defaults to the `tuned3` Newton-Schulz schedule (~+28% step throughput, loss-neutral; pass `ns_schedule="standard"` for the classic quintic). Two opt-in quality levers are off by default: `backup_2d_period_one=True` gives the embedding / LM head per-element 2nd moment to **match AdamW's loss at lower memory** (see [the experimental section](#experimental-lever-match-adamw-2nd-moment-on-embed--lm-head-backup_2d_period_one)), and `stochastic_round=True` switches the 8-bit momentum to unbiased stochastic rounding (free, loss-neutral).
+
 It supports `step()`, `zero_grad()`, `state_dict()`/`load_state_dict()`, and LR schedulers (e.g. `torch.optim.lr_scheduler.StepLR(optimizer, ...)`) like any optimizer. Because its constructor takes two parameter lists rather than a single iterable, build it yourself and hand it to the Hugging Face `Trainer` via `optimizers=` (not `optimizer_cls_and_kwargs`):
 
 ```python
@@ -315,7 +319,7 @@ optim_args:
 
 ## Experimental Lever: faster Newton-Schulz (`ns_schedule`, `fp8_ns`)
 
-> Opt-in. The defaults (`ns_schedule="standard"`, `fp8_ns=False`) are unchanged — bit-for-bit the classic 5-step quintic.
+> **`GefenMuonHybrid` defaults to `ns_schedule="tuned3"`** (loss-neutral at 2000 steps, ~+28% step throughput — see below); the low-level `GefenMuon` primitive keeps `ns_schedule="standard"`, bit-for-bit the classic 5-step quintic. `fp8_ns=False` by default. Pass `ns_schedule="standard"` to the hybrid to restore the classic quintic.
 
 Newton-Schulz orthogonalization is ~90% of a Muon step and is GEMM-FLOP-bound, so it has two independent per-rank speed levers that stack with `sharded_mode` below:
 
@@ -326,15 +330,36 @@ Newton-Schulz orthogonalization is ~90% of a Muon step and is GEMM-FLOP-bound, s
 opt = GefenMuonHybrid(
     muon_named_params, backup_named_params,
     lr=5e-5, adjust_lr_fn="match_rms_adamw", fused=True,
-    ns_schedule="tuned4",   # "standard" (default) | "tuned4" (equal-quality, ~1.2x) | "tuned3" (aggressive)
+    ns_schedule="tuned4",   # "tuned3" (hybrid default, ~1.6x) | "tuned4" (equal-quality, ~1.2x) | "standard" (classic quintic)
     fp8_ns=True,            # sm_89+ large matrices only; a no-op bf16 fallback elsewhere
 )
 ```
 
-Below (RTX 5090, Qwen3-0.6B, 400 steps; the chart force-engages `fp8` to isolate it). **`tuned4` is the safe win** (faster, equal quality); `tuned3` is fastest but loosens orthogonality; **`fp8` only wins once the matrices are large enough for the fp8 GEMM to beat cuBLAS bf16** (measured crossover ~min-dim 1536) — forced on it's **0.89×** end-to-end at 0.6B (all matmuls min-dim 1024) but **1.21×** at Qwen3-4B (949 → 1151 tok/s, same VRAM). The default size gate (`FP8_MIN_DIM=1536`) falls back to bf16 below the crossover, so in practice you keep the large-model win without the small-model penalty. No lever hurts loss — all track default Muon (AdamW shown for reference).
+Below (RTX 5090, Qwen3-0.6B, 400 steps; the chart force-engages `fp8` to isolate it). **`tuned4` is the safe win** (faster, equal quality); `tuned3` is fastest but loosens orthogonality; **`fp8` only wins once the matrices are large enough for the fp8 GEMM to beat cuBLAS bf16** (measured crossover ~min-dim 1536) — forced on it's **0.89×** end-to-end at 0.6B (all matmuls min-dim 1024) but **1.21×** at Qwen3-4B (949 → 1151 tok/s, same VRAM). The default size gate (`FP8_MIN_DIM=1536`) falls back to bf16 below the crossover, so in practice you keep the large-model win without the small-model penalty. No lever hurts loss — all track default Muon (AdamW shown for reference). A longer-horizon check (Qwen3-1.7B, 2000 steps, RTX 3090) confirms `tuned3` is **loss-neutral** vs the standard quintic while running ~**1.28×** end-to-end — which is why `GefenMuonHybrid` now defaults to it.
 
 ![Gefen-Muon faster Newton-Schulz — real-training loss (AdamW + variants)](docs/benchmarks/muon_ns_loss.png)
 ![Gefen-Muon faster Newton-Schulz — end-to-end throughput (tok/s)](docs/benchmarks/muon_ns_throughput.png)
+
+## Experimental Lever: match-AdamW 2nd moment on embed / LM-head (`backup_2d_period_one`)
+
+> Opt-in, default **off**. Unlike the levers above this one **costs memory** — it is a deliberate loss-vs-memory trade, not free.
+
+With the recommended config (`backup_lr≈0.5×`, `backup_1d_period_one`, `match_rms_adamw`) `GefenMuonHybrid` already beats AdamW at 0.6B and trails it only slightly at 1.7B. The remaining gap is **not** quantization noise — it is the **block-shared second moment on the large vocab tensors** (the token embedding / LM head, which route to the Gefen backup). `backup_1d_period_one` only sharpens 1D norms/biases; `backup_2d_period_one` extends the same per-element 2nd-moment + magnitude to those 2D backup tensors, giving them AdamW-like fidelity.
+
+```python
+opt = GefenMuonHybrid(
+    *split_params_for_muon(model),
+    lr=5e-5, backup_lr=2.5e-5, adjust_lr_fn="match_rms_adamw",
+    backup_1d_period_one=True,
+    backup_2d_period_one=True,   # per-element v on embed/LM-head — matches AdamW loss, costs memory
+)
+```
+
+Measured (Qwen3-1.7B, alpaca, 2000 steps, 2 seeds, RTX 3090): it **closes the eval-loss gap to AdamW** — average gap **+0.0195 → ~0.000** (seed0 +0.0011, seed1 −0.0010) — while keeping the optimizer state at **2.45 B/param vs AdamW's 4.0** (still 0.6×). Throughput is unchanged. So it is the **"match AdamW loss at lower memory"** setting; leave it off to keep the ~1 B/param memory-first footprint. The cheap per-token (per-row) approximation was tried and is **null** — the benefit genuinely needs per-element granularity.
+
+![Gefen-Muon — per-element 2nd moment on embed/LM-head closes the AdamW gap](docs/benchmarks/muon_l5_loss_qwen1p7b.png)
+
+A related opt-in, **`stochastic_round=True`**, switches the 8-bit momentum quantization from nearest to unbiased stochastic rounding (Philox, throughput-neutral, bit-identical when off). It cuts the momentum-quant bias ~11× but is **loss-neutral** in practice (the gap above is 2nd-moment, not quantization, driven) — kept as a free, validated option, not a default.
 
 ## Experimental Lever: sharded Newton-Schulz under FSDP2 (`sharded_mode`)
 

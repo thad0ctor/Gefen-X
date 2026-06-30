@@ -126,6 +126,85 @@ __device__ __forceinline__ uint8_t nearest_codebook_index(
     return static_cast<uint8_t>(left_dist <= right_dist ? left_idx : right_idx);
 }
 
+// Counter-based (stateless) uniform in [0, 1) from a 64-bit key, SplitMix64
+// finalizer over (rng_seed, element_idx). Stateless so it needs no per-thread
+// curand setup, is reproducible run-to-run for a fixed (seed, idx), and costs a
+// handful of integer ops -- negligible against the per-element global-memory
+// codebook gather + binary search already in the quantize loop. The seed is the
+// optimizer's global step (varied each step on the host) so the stochastic
+// rounding decorrelates across steps, which is what debiases the EMA trajectory.
+__device__ __forceinline__ float gefen_sr_uniform(
+    uint64_t rng_seed, int64_t element_idx
+) {
+    uint64_t z = rng_seed + 0x9E3779B97F4A7C15ULL *
+        (static_cast<uint64_t>(element_idx) + 1ULL);
+    z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ULL;
+    z = (z ^ (z >> 27)) * 0x94D049BB133111EBULL;
+    z = z ^ (z >> 31);
+    // top 24 bits -> [0, 1) with 2^-24 resolution (exact in fp32).
+    return static_cast<float>(z >> 40) * (1.0f / 16777216.0f);
+}
+
+// Quantize one normalized value to a codebook index. When ``stochastic`` is
+// false this is bit-for-bit ``nearest_codebook_index`` (the parity-preserving
+// default). When true it rounds to one of the two bracketing codewords with
+// probability proportional to closeness so that E[codebook[idx]] == value
+// exactly (unbiased stochastic rounding): P(round up to the right codeword) =
+// (value - lo) / (hi - lo). This removes the systematic bias that deterministic
+// nearest-rounding of the EMA momentum accumulates over a long horizon.
+__device__ __forceinline__ uint8_t quantize_codebook_index(
+    float normalized_value,
+    const float* __restrict__ codebook,
+    int codebook_size,
+    bool stochastic,
+    uint64_t rng_seed,
+    int64_t element_idx
+) {
+    if (!stochastic) {
+        return nearest_codebook_index(normalized_value, codebook, codebook_size);
+    }
+
+    int left = 0;
+    int right = codebook_size;
+    while (left < right) {
+        const int mid = left + (right - left) / 2;
+        if (codebook[mid] < normalized_value) {
+            left = mid + 1;
+        } else {
+            right = mid;
+        }
+    }
+
+    int right_idx = left;
+    if (right_idx < 0) {
+        right_idx = 0;
+    } else if (right_idx >= codebook_size) {
+        right_idx = codebook_size - 1;
+    }
+    int left_idx = right_idx - 1;
+    if (left_idx < 0) {
+        left_idx = 0;
+    }
+    if (left_idx == right_idx) {
+        return static_cast<uint8_t>(right_idx);
+    }
+
+    const float lo = codebook[left_idx];
+    const float hi = codebook[right_idx];
+    const float span = hi - lo;
+    // value clamps into [lo, hi] at the codebook ends (searchsorted can land out
+    // of the bracket); inside the bracket the clamp is a no-op.
+    float v = normalized_value;
+    if (v < lo) {
+        v = lo;
+    } else if (v > hi) {
+        v = hi;
+    }
+    const float p_up = (span > 0.0f) ? (v - lo) / span : 0.0f;
+    const float u = gefen_sr_uniform(rng_seed, element_idx);
+    return static_cast<uint8_t>((u < p_up) ? right_idx : left_idx);
+}
+
 template <typename scalar_t>
 __global__ void automatic_gefen_fused_update_kernel(
     scalar_t* __restrict__ p,
@@ -270,7 +349,9 @@ __global__ void automatic_gefen_fused_full_update_kernel(
     float eps,
     float inv_sqrt_bias_correction_2,
     float inv_bias_correction_1,
-    float weight_decay_factor
+    float weight_decay_factor,
+    bool stochastic_round,
+    uint64_t rng_seed
 ) {
     // Shared layout: [codebook_size codebook][blockDim.x max][blockDim.x sumsq].
     extern __shared__ float smem[];
@@ -358,7 +439,8 @@ __global__ void automatic_gefen_fused_full_update_kernel(
         if (new_magnitude > 0.0f) {
             normalized_value = updated_value / new_magnitude;
         }
-        const uint8_t quantized_index = nearest_codebook_index(normalized_value, s_codebook, codebook_size);
+        const uint8_t quantized_index = quantize_codebook_index(
+            normalized_value, s_codebook, codebook_size, stochastic_round, rng_seed, idx);
         store_packed_codebook_index(m_sign, idx, quantized_index, packed_indices);
         if (lr != 0.0f) {
             const float quantized_value = s_codebook[static_cast<int>(quantized_index)] * new_magnitude;
@@ -596,7 +678,9 @@ __global__ void gefen_momentum_emit_flat_kernel(
     int codebook_size,
     int64_t period,
     int64_t total_numel,
-    float beta1
+    float beta1,
+    bool stochastic_round,
+    uint64_t rng_seed
 ) {
     extern __shared__ float s_codebook[];
     for (int i = threadIdx.x; i < codebook_size; i += blockDim.x) {
@@ -614,8 +698,8 @@ __global__ void gefen_momentum_emit_flat_kernel(
         if (new_mag > 0.0f) {
             normalized_value = updated / new_mag;
         }
-        const uint8_t quantized_index =
-            nearest_codebook_index(normalized_value, s_codebook, codebook_size);
+        const uint8_t quantized_index = quantize_codebook_index(
+            normalized_value, s_codebook, codebook_size, stochastic_round, rng_seed, idx);
         m_sign[idx] = quantized_index;
         // Dense quantized momentum, rounded exactly as the old host
         // `codebook[idx].to(scalar_t).mul_(m_magnitude)` two-step round.
@@ -800,7 +884,9 @@ __global__ void gefen_update_flat_full_kernel(
     int64_t total_numel,
     float beta1,
     float lr,
-    float weight_decay_factor
+    float weight_decay_factor,
+    bool stochastic_round,
+    uint64_t rng_seed
 ) {
     extern __shared__ float s_codebook[];
     for (int i = threadIdx.x; i < codebook_size; i += blockDim.x) {
@@ -818,8 +904,8 @@ __global__ void gefen_update_flat_full_kernel(
         if (new_mag > 0.0f) {
             normalized_value = updated / new_mag;
         }
-        const uint8_t quantized_index =
-            nearest_codebook_index(normalized_value, s_codebook, codebook_size);
+        const uint8_t quantized_index = quantize_codebook_index(
+            normalized_value, s_codebook, codebook_size, stochastic_round, rng_seed, idx);
         m_sign[idx] = quantized_index;
         if (lr != 0.0f) {
             const float quantized_value = s_codebook[static_cast<int>(quantized_index)] * new_mag;
@@ -960,7 +1046,9 @@ void automatic_gefen_fused_full_update_cuda(
     double eps,
     double inv_sqrt_bias_correction_2,
     double inv_bias_correction_1,
-    double weight_decay_factor
+    double weight_decay_factor,
+    bool stochastic_round,
+    int64_t rng_seed
 ) {
     if (!p.is_cuda() || !grad_view.is_cuda() || !m_sign.is_cuda() || !m_magnitude.is_cuda() || !vmean.is_cuda() || !codebook.is_cuda()) {
         throw std::invalid_argument("Expected all tensors to be on CUDA.");
@@ -1061,7 +1149,9 @@ void automatic_gefen_fused_full_update_cuda(
                 static_cast<float>(eps),
                 static_cast<float>(inv_sqrt_bias_correction_2),
                 static_cast<float>(inv_bias_correction_1),
-                static_cast<float>(weight_decay_factor)
+                static_cast<float>(weight_decay_factor),
+                stochastic_round,
+                static_cast<uint64_t>(rng_seed)
             );
         }
     );
@@ -1189,7 +1279,9 @@ void gefen_quantized_momentum_update_cuda(
     at::Tensor m_magnitude,
     at::Tensor codebook,
     at::Tensor momentum_out,
-    double beta1
+    double beta1,
+    bool stochastic_round,
+    int64_t rng_seed
 ) {
     if (!grad_view.is_cuda() || !m_sign.is_cuda() || !m_magnitude.is_cuda() ||
         !codebook.is_cuda() || !momentum_out.is_cuda()) {
@@ -1299,7 +1391,8 @@ void gefen_quantized_momentum_update_cuda(
                 grad_view.data_ptr<scalar_t>(), m_sign.data_ptr<uint8_t>(),
                 m_magnitude.data_ptr<float>(), new_magnitude.data_ptr<float>(),
                 codebook.data_ptr<float>(), momentum_out.data_ptr<scalar_t>(), codebook_size,
-                period, total_numel, static_cast<float>(beta1));
+                period, total_numel, static_cast<float>(beta1),
+                stochastic_round, static_cast<uint64_t>(rng_seed));
         });
     C10_CUDA_KERNEL_LAUNCH_CHECK();
 
@@ -1320,7 +1413,9 @@ void automatic_gefen_fused_update_v2_full_cuda(
     double eps,
     double inv_sqrt_bias_correction_2,
     double inv_bias_correction_1,
-    double weight_decay_factor
+    double weight_decay_factor,
+    bool stochastic_round,
+    int64_t rng_seed
 ) {
     if (packed_indices) {
         throw std::invalid_argument("v2 fused update does not support packed indices.");
@@ -1458,7 +1553,8 @@ void automatic_gefen_fused_update_v2_full_cuda(
                 m_magnitude.data_ptr<float>(), new_magnitude.data_ptr<float>(),
                 sumsq.data_ptr<float>(), codebook.data_ptr<float>(), codebook_size,
                 period, total_numel, static_cast<float>(beta1), static_cast<float>(lr),
-                static_cast<float>(weight_decay_factor));
+                static_cast<float>(weight_decay_factor),
+                stochastic_round, static_cast<uint64_t>(rng_seed));
         });
     C10_CUDA_KERNEL_LAUNCH_CHECK();
 

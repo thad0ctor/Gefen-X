@@ -79,6 +79,14 @@ ap.add_argument("--backup-lr", type=float, default=None,
                 help="GefenMuonHybrid backup_lr override; recommended ~0.5x --lr")
 ap.add_argument("--backup-1d-period-one", action="store_true",
                 help="force period==1 (per-element 2nd moment) for 1D backup params")
+ap.add_argument("--backup-2d-period-one", action="store_true",
+                help="force period==1 (per-element 2nd moment) for 2D backup params "
+                     "(embed/LM-head); memory tradeoff")
+ap.add_argument("--stochastic-round", action="store_true",
+                help="GefenMuonHybrid: unbiased stochastic rounding of the quantized "
+                     "momentum (both Muon + backup halves) instead of nearest")
+ap.add_argument("--ns-schedule", default=None,
+                help="GefenMuon NS schedule: standard/tuned3/tuned4 (default tuned3 in hybrid)")
 ap.add_argument("--no-decay-substrings", default="",
                 help="comma-separated name substrings routed to a weight_decay=0 "
                      "backup group (e.g. 'norm,bias')")
@@ -249,16 +257,25 @@ elif args.opt == "gefen_muon":
     _no_decay = tuple(
         s.strip() for s in args.no_decay_substrings.split(",") if s.strip()
     )
-    opt = GefenMuonHybrid(
-        *_split(m), lr=lr,
+    _hybrid_kwargs = dict(
+        lr=lr,
         muon_lr=args.muon_lr, backup_lr=args.backup_lr,
         adjust_lr_fn=_adj, fused=True,
         backup_1d_period_one=args.backup_1d_period_one,
+        backup_2d_period_one=args.backup_2d_period_one,
+        stochastic_round=args.stochastic_round,
         no_decay_substrings=_no_decay,
     )
+    # Only override the GefenMuonHybrid ns_schedule default ("tuned3") when the
+    # flag is explicitly set, so the harness reflects the shipped default.
+    if args.ns_schedule is not None:
+        _hybrid_kwargs["ns_schedule"] = args.ns_schedule
+    opt = GefenMuonHybrid(*_split(m), **_hybrid_kwargs)
+    _eff_ns = args.ns_schedule if args.ns_schedule is not None else "tuned3 (default)"
     print(f"[gefen_muon] adjust_lr_fn={_adj!r} muon_lr={args.muon_lr} "
           f"backup_lr={args.backup_lr} backup_1d_period_one={args.backup_1d_period_one} "
-          f"no_decay={_no_decay}", flush=True)
+          f"backup_2d_period_one={args.backup_2d_period_one} ns_schedule={_eff_ns} "
+          f"no_decay={_no_decay} stochastic_round={args.stochastic_round}", flush=True)
 else:
     sys.exit(f"unknown opt {args.opt}")
 
@@ -348,6 +365,9 @@ res = {
         {
             "muon_lr": args.muon_lr, "backup_lr": args.backup_lr,
             "backup_1d_period_one": args.backup_1d_period_one,
+            "backup_2d_period_one": args.backup_2d_period_one,
+            "ns_schedule": args.ns_schedule,
+            "stochastic_round": args.stochastic_round,
             "no_decay_substrings": args.no_decay_substrings,
         }
         if args.opt == "gefen_muon"

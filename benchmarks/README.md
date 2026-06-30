@@ -19,7 +19,9 @@ Outputs land in the configured out-dir: per-cell logs, `results.jsonl`, `compari
 
 ## Reproducing the published Gefen-Muon numbers
 
-`run.sh` applies the **recommended Gefen-Muon config by default** — `adjust_lr_fn=match_rms_adamw`, `backup_lr = 0.5 × the cell LR`, and `backup_1d_period_one` — which is what the published table/plots use. Override via config keys (`muon_adjust`, `muon_backup_lr_fraction`, `muon_backup_1d`) or flags (`--muon-adjust`, `--muon-backup-lr-frac`, `--no-muon-backup-1d`). See [the optimizer-sweep README](optimizer-sweep/README.md) for the full flag list.
+`run.sh` applies the **recommended Gefen-Muon config by default** — `adjust_lr_fn=match_rms_adamw`, `backup_lr = 0.5 × the cell LR`, and `backup_1d_period_one`. Override via config keys (`muon_adjust`, `muon_backup_lr_fraction`, `muon_backup_1d`) or flags (`--muon-adjust`, `--muon-backup-lr-frac`, `--no-muon-backup-1d`). See [the optimizer-sweep README](optimizer-sweep/README.md) for the full flag list.
+
+> **Note on the published table:** those `gefen_muon` numbers were produced with the classic `standard` Newton-Schulz schedule (the prior `GefenMuonHybrid` default). The hybrid now defaults to `ns_schedule="tuned3"` (loss-neutral, ~+28% faster per step), so a fresh `run.sh` reproduces the same eval loss / VRAM / state but **higher throughput** than the published `tok/s`. Pass `--ns-schedule standard` (sweep_cell) to reproduce the exact published throughput.
 
 ## microbench scripts
 

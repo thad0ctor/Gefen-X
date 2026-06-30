@@ -279,6 +279,7 @@ class GefenMuon(Gefen):
         sharded_mode: str = "exact",
         fp8_ns: bool = False,
         fp8_ns_compile: bool = True,
+        stochastic_round: bool = False,
         verbose: bool = False,
     ) -> None:
         if isinstance(lr, torch.Tensor) and lr.numel() != 1:
@@ -368,6 +369,7 @@ class GefenMuon(Gefen):
             eps=eps,
             weight_decay=weight_decay,
             fused=fused,
+            stochastic_round=stochastic_round,
             verbose=verbose,
         )
 

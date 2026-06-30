@@ -140,11 +140,18 @@ def automatic_gefen_fused_full_update_cuda(
     inv_sqrt_bias_correction_2: float,
     inv_bias_correction_1: float,
     weight_decay_factor: float,
+    stochastic_round: bool = False,
+    rng_seed: int = 0,
 ) -> None:
     """Single-kernel v1 update that folds the vmean (2nd-moment) EMA and the
     per-block stepsize/bias-correction math into the fused update (Tier-1 K1+K2).
     The C++ guards enforce dtype/shape/contiguity; only normalize contiguity
-    here, and only when actually needed."""
+    here, and only when actually needed.
+
+    ``stochastic_round`` (default False) switches the momentum->codebook
+    quantization from deterministic nearest to unbiased stochastic rounding
+    (seeded by ``rng_seed``, the optimizer step); False is bit-identical to the
+    prior kernel."""
     grad_c = grad_view if grad_view.is_contiguous() else grad_view.contiguous()
     cb_c = codebook if codebook.is_contiguous() else codebook.contiguous()
 
@@ -164,6 +171,8 @@ def automatic_gefen_fused_full_update_cuda(
         inv_sqrt_bias_correction_2,
         inv_bias_correction_1,
         weight_decay_factor,
+        stochastic_round,
+        rng_seed,
     )
 
 
@@ -174,19 +183,26 @@ def gefen_quantized_momentum_update_cuda(
     codebook: torch.Tensor,
     momentum_out: torch.Tensor,
     beta1: float,
+    stochastic_round: bool = False,
+    rng_seed: int = 0,
 ) -> None:
     """Muon-specific quantized-momentum update: advance the quantized momentum
     state (m_sign / m_magnitude) AND emit the dense quantized momentum
     (codebook[new_index] * new_magnitude) for Newton-Schulz in a single pass,
     replacing the old lr==0 dummy-stepsize update + separate full-size codebook
     gather. The C++ guards enforce dtype/shape/device; only normalize contiguity
-    here, and only when actually needed."""
+    here, and only when actually needed.
+
+    ``stochastic_round`` (default False) switches momentum->codebook quantization
+    to unbiased stochastic rounding (seeded by ``rng_seed``); False is
+    bit-identical to the prior kernel."""
     grad_c = grad_view if grad_view.is_contiguous() else grad_view.contiguous()
     cb_c = codebook if codebook.is_contiguous() else codebook.contiguous()
 
     module = _load_extension()
     module.gefen_quantized_momentum_update_cuda(
-        grad_c, m_sign, m_magnitude, cb_c, momentum_out, beta1
+        grad_c, m_sign, m_magnitude, cb_c, momentum_out, beta1,
+        stochastic_round, rng_seed
     )
 
 
@@ -205,12 +221,18 @@ def automatic_gefen_fused_update_v2_full_cuda(
     inv_sqrt_bias_correction_2: float,
     inv_bias_correction_1: float,
     weight_decay_factor: float,
+    stochastic_round: bool = False,
+    rng_seed: int = 0,
 ) -> None:
     """Two-phase (v2) fully-fused update for occupancy-flexible (few-block /
     tiny-period) params: folds the vmean (2nd-moment) EMA, the per-block stepsize
     and weight decay into the two-phase magnitude/update kernels, eliminating the
     separate vmean kernel + host stepsize/weight-decay passes. The C++ guards
-    enforce dtype/shape/contiguity; only normalize contiguity when needed."""
+    enforce dtype/shape/contiguity; only normalize contiguity when needed.
+
+    ``stochastic_round`` (default False) switches momentum->codebook quantization
+    to unbiased stochastic rounding (seeded by ``rng_seed``); False is
+    bit-identical to the prior kernel."""
     grad_c = grad_view if grad_view.is_contiguous() else grad_view.contiguous()
     cb_c = codebook if codebook.is_contiguous() else codebook.contiguous()
 
@@ -230,4 +252,6 @@ def automatic_gefen_fused_update_v2_full_cuda(
         inv_sqrt_bias_correction_2,
         inv_bias_correction_1,
         weight_decay_factor,
+        stochastic_round,
+        rng_seed,
     )

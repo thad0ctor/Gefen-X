@@ -20,21 +20,28 @@ reference, then slice the orthogonalized update back to the local shard. Tensor
 parallelism / multi-dim (HSDP x TP) meshes are not validated.
 
 Recommended configuration (minimizes divergence vs AdamW at matched LR -- see the
-loss-recovery sweep; Qwen3-0.6B/1.7B, 300 steps): keep the Muon half at AdamW
-scale and lower only the backup half, plus per-element 2nd moment on the 1D
-backup tensors. Both are free on throughput::
+loss-recovery sweep; Qwen3-0.6B/1.7B): keep the Muon half at AdamW scale and lower
+only the backup half, plus per-element 2nd moment on the 1D backup tensors. Both
+are free on throughput; ``ns_schedule`` defaults to ``"tuned3"`` (loss-neutral,
+~+28% step throughput)::
 
     opt = GefenMuonHybrid(
         *split_params_for_muon(model),
         lr=ADAMW_LR,                  # Muon (2D) half stays at AdamW scale
-        backup_lr=0.5 * ADAMW_LR,     # backup half ~0.4-0.6x (tune); the main lever
+        backup_lr=0.5 * ADAMW_LR,     # backup half ~0.4-0.6x (tune); the main LR lever
         adjust_lr_fn="match_rms_adamw",
         backup_1d_period_one=True,    # AdamW-like per-element 2nd moment on norms/biases
     )
 
-This closed the eval-loss gap to AdamW (and beat it at 0.6B) while keeping ~1.0
-B/param optimizer state. Defaults below stay parity-preserving (period-1 off,
-shared lr), so set these explicitly to opt in.
+This beats AdamW at 0.6B and trails it only slightly at 1.7B while keeping ~1.0
+B/param optimizer state. To CLOSE the residual 1.7B gap to AdamW, add
+``backup_2d_period_one=True`` -- per-element 2nd moment on the embedding/LM-head
+too -- which matches AdamW's loss at ~2.45 B/param (still 0.6x AdamW), a
+loss/memory trade. ``stochastic_round=True`` is a free (throughput-neutral,
+loss-neutral) opt-in that debiases the 8-bit momentum quantization. The
+constructor defaults stay parity-preserving (period-1 off, shared lr,
+stochastic_round off) except ``ns_schedule="tuned3"``; set the rest explicitly to
+opt in.
 """
 from collections import OrderedDict
 
@@ -59,17 +66,19 @@ class GefenMuonHybrid(torch.optim.Optimizer):
         backup_weight_decay=None,
         no_decay_substrings=(),
         backup_1d_period_one=False,
+        backup_2d_period_one=False,
         betas=(0.9, 0.999),
         eps=1e-8,
         fused=True,
         momentum=0.95,
         nesterov=True,
         ns_steps=5,
-        ns_schedule=None,
+        ns_schedule="tuned3",
         adjust_lr_fn="match_rms_adamw",
         sharded_mode="exact",
         fp8_ns=False,
         fp8_ns_compile=True,
+        stochastic_round=False,
         verbose=False,
     ):
         muon_named_params = list(muon_named_params)
@@ -135,6 +144,7 @@ class GefenMuonHybrid(torch.optim.Optimizer):
                 sharded_mode=sharded_mode,
                 fp8_ns=fp8_ns,
                 fp8_ns_compile=fp8_ns_compile,
+                stochastic_round=stochastic_round,
                 verbose=verbose,
             )
             if muon_named_params
@@ -181,6 +191,8 @@ class GefenMuonHybrid(torch.optim.Optimizer):
             self.backup = Gefen(backup_groups, lr=backup_lr, betas=betas, eps=eps,
                                  weight_decay=backup_weight_decay, fused=fused,
                                  force_1d_period_one=backup_1d_period_one,
+                                 force_2d_period_one=backup_2d_period_one,
+                                 stochastic_round=stochastic_round,
                                  verbose=verbose)
         else:
             self.backup = (
@@ -192,6 +204,8 @@ class GefenMuonHybrid(torch.optim.Optimizer):
                     weight_decay=backup_weight_decay,
                     fused=fused,
                     force_1d_period_one=backup_1d_period_one,
+                    force_2d_period_one=backup_2d_period_one,
+                    stochastic_round=stochastic_round,
                     verbose=verbose,
                 )
                 if backup_named_params
