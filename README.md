@@ -30,7 +30,7 @@
 | Crash safety | missing device / edge-case guards | guarded against wrong-device, empty-tensor, and race bugs |
 | Tested correctness | no fused-kernel tests | bit-exact + distributed parity test suite |
 | Getting started | no Axolotl / fork-install guidance | Axolotl how-to + fair loss/speed/memory benchmarks |
-| Muon-vs-AdamW eval-loss gap | no Muon-specific LR handling — Muon trails AdamW | split `muon_lr`/`backup_lr` (~0.5×) + `backup_1d_period_one` + `match_rms_adamw` default recover the gap → best Gefen variant (Qwen3-0.6B 1.501→1.433, *beats* AdamW; 1.7B 1.326→1.238, +0.017 vs AdamW); opt-in `backup_2d_period_one` (per-element 2nd moment on embed/LM-head) **closes the residual 1.7B gap to AdamW** for a memory cost (still 0.6× AdamW) |
+| Muon-vs-AdamW eval-loss gap | no Muon-specific LR handling — Muon trails AdamW | split `muon_lr`/`backup_lr` (~0.5×) + `backup_1d_period_one` + `match_rms_adamw` default recover the gap → best Gefen variant (Qwen3-0.6B 1.501→1.427, *beats* AdamW; 1.7B 1.326→1.239, +0.021 vs AdamW); default-on `normuon` (throughput-free per-neuron 2nd moment on the NS output) nudges it further (−0.007/−0.010 @0.6B over two seeds, ~⅓ of the residual 1.7B gap on the tail-mean); opt-in `backup_2d_period_one` (per-element 2nd moment on embed/LM-head) **closes the residual 1.7B gap to AdamW** for a memory cost (still 0.6× AdamW) |
 | Newton-Schulz iteration cost | fixed classic 5-step quintic only | tunable `ns_schedule` — `tuned4` (~1.25×) / `tuned3` (~1.6×, loss-neutral at 2000 steps). **`GefenMuonHybrid` now defaults to `tuned3`** (~1.4× end-to-end step throughput, +38% measured); the `GefenMuon` primitive default (`ns_schedule=None`, equivalent to `standard`) stays bit-identical to the quintic |
 | Low-precision orthogonalization | bf16 Newton-Schulz only | opt-in `fp8_ns` (e4m3), arch+size-gated (sm_89+, min-dim ≥ 1536) with bit-identical bf16 fallback — ~1.26–1.35× on large matrices |
 | Sharded Muon orthogonalization (FSDP2) | every rank redundantly runs full NS | `sharded_mode="distributed"` round-robins matrix ownership (exact NS + broadcast) — parity with `exact` (±0.001), scales with ranks (1.06×@2, 1.12×@4 GPUs) |
@@ -137,30 +137,30 @@ You can run these yourself — see [`benchmarks/`](benchmarks/README.md) for wha
 - **Software:** PyTorch 2.12.0 (cu133), Python 3.12; Gefen fused CUDA kernels JIT-built for sm_86.
 - **Models:** Qwen3-0.6B and Qwen3-1.7B — full fine-tune (all weights trained, no adapters).
 - **Regime:** bf16 master weights, gradient checkpointing, sequence length 2048, micro-batch 1, Alpaca greedy-packed to 2048-token blocks, 2000 steps, single seed, identical data order across optimizers; 32-example held-out eval. (Single-seed, n=1: the data order + init are seeded but CUDA kernels aren't forced fully deterministic, so re-running at the same seed reproduces the training trajectory — train-EMA to ±0.001 — while the 32-example eval moves ~±0.005–0.007 from bf16 nondeterminism; treat sub-0.01 eval gaps as noise.)
-- **Learning rate (each at its own fair optimum):** AdamW (bf16 / 8-bit / 4-bit) = `5e-5`; Gefen (fused) = `2e-5`; Gefen-Muon = `5e-5` with the recommended config (`adjust_lr_fn="match_rms_adamw"`, `backup_lr=2.5e-5` for the non-Muon params, `backup_1d_period_one=True`).
+- **Learning rate (each at its own fair optimum):** AdamW (bf16 / 8-bit / 4-bit) = `5e-5`; Gefen (fused) = `2e-5`; Gefen-Muon = `5e-5` with the recommended config (`adjust_lr_fn="match_rms_adamw"`, `backup_lr=2.5e-5` for the non-Muon params, `backup_1d_period_one=True`, plus the `normuon=True` hybrid default).
 - **Optimizers:** `adamw_bf16` = torch fused AdamW · `adamw8bit` = bitsandbytes · `adamw4bit` = torchao · `gefen_fused` = `Gefen(fused=True)` · `gefen_muon` = `GefenMuonHybrid(..., fused=True)` (Muon on 2D hidden matrices, Gefen on everything else). **Both Gefen runs use the fused CUDA kernels** (`fused=True`).
 
 | Model | Optimizer | LR | Eval loss | tok/s | Peak VRAM (GiB) | Opt-state B/param |
 |---|---|---|---|---|---|---|
-| Qwen3-0.6B | adamw_bf16 | 5e-5 | 1.443 | 5652 | 6.95 | 4.00 |
-| Qwen3-0.6B | adamw8bit | 5e-5 | 1.470 | 5358 | 5.87 | 2.03 |
-| Qwen3-0.6B | adamw4bit | 5e-5 | 1.469 | 5031 | 6.32 | 1.06 |
-| Qwen3-0.6B | **gefen_fused** | 2e-5 | 1.496 | 5598 | 5.30 | 1.02 |
-| Qwen3-0.6B | **gefen_muon** | 5e-5 | **1.433** | 3615 | **5.30** | **1.01** |
-| Qwen3-1.7B | adamw_bf16 | 5e-5 | **1.221** | 2950 | 14.00 | 4.00 |
-| Qwen3-1.7B | adamw8bit | 5e-5 | 1.232 | 2738 | 10.84 | 2.03 |
-| Qwen3-1.7B | adamw4bit | 5e-5 | 1.246 | 2569 | 15.11 | 1.06 |
-| Qwen3-1.7B | **gefen_fused** | 2e-5 | 1.281 | 2892 | 9.21 | 1.01 |
-| Qwen3-1.7B | **gefen_muon** | 5e-5 | 1.238 | 1298 | **9.20** | **1.01** |
+| Qwen3-0.6B | adamw_bf16 | 5e-5 | 1.438 | 5672 | 6.95 | 4.00 |
+| Qwen3-0.6B | adamw8bit | 5e-5 | 1.477 | 5366 | 5.87 | 2.03 |
+| Qwen3-0.6B | adamw4bit | 5e-5 | 1.465 | 5029 | 6.32 | 1.06 |
+| Qwen3-0.6B | **gefen_fused** | 2e-5 | 1.489 | 5486 | 5.30 | 1.02 |
+| Qwen3-0.6B | **gefen_muon** | 5e-5 | **1.427** | 3590 | **5.30** | **1.01** |
+| Qwen3-1.7B | adamw_bf16 | 5e-5 | **1.218** | 3011 | 14.00 | 4.00 |
+| Qwen3-1.7B | adamw8bit | 5e-5 | 1.244 | 2755 | 10.84 | 2.03 |
+| Qwen3-1.7B | adamw4bit | 5e-5 | 1.241 | 2593 | 15.11 | 1.06 |
+| Qwen3-1.7B | **gefen_fused** | 2e-5 | 1.281 | 2917 | 9.21 | 1.01 |
+| Qwen3-1.7B | **gefen_muon** | 5e-5 | 1.239 | 1293 | **9.20** | **1.01** |
 
-> Single-session sweep on RTX 3090 Ti (0.6B) / RTX 3090 (1.7B). `gefen_muon` uses the `GefenMuonHybrid` default `ns_schedule="tuned3"` (~1.4× the classic quintic, loss-neutral — see [the faster-NS lever](#experimental-lever-faster-newton-schulz-ns_schedule-fp8_ns)); pass `ns_schedule="standard"` for the bit-identical quintic (~0.7× this throughput).
+> Single-session sweep on RTX 3090 Ti (0.6B) / RTX 3090 (1.7B). `gefen_muon` uses the shipped `GefenMuonHybrid` defaults: `ns_schedule="tuned3"` (~1.4× the classic quintic, loss-neutral — see [the faster-NS lever](#experimental-lever-faster-newton-schulz-ns_schedule-fp8_ns); `ns_schedule="standard"` is the bit-identical quintic at ~0.7× this throughput) and `normuon=True` (throughput-free per-neuron 2nd moment — see [the normuon lever](#quality-lever-per-neuron-2nd-moment-on-the-newton-schulz-output-normuon); disable with `normuon=False` / harness `--no-muon-normuon`).
 
 ![Qwen3-1.7B optimizer comparison](docs/benchmarks/quad_qwen1p7b.png)
 ![Qwen3-0.6B optimizer comparison](docs/benchmarks/quad_qwen0p6b.png)
 
 **Loss curves** — loss over the 2000 steps. For each optimizer (distinguished by **color**), there are two lines: **solid = held-out eval loss** (the 32-example validation set, logged every 50 steps — this is the comparison metric in the table above) and **dashed = train-loss EMA** (exponential moving average of the training loss). 
 
-Gefen-fused converges stably and its eval curve tracks just above the AdamW cluster (a ~0.05–0.06 loss gap), with no instability at its fair LR. **Gefen-Muon closes that gap entirely**: its curve sits on the AdamW cluster — at 0.6B it edges past the best AdamW (−0.011) and at 1.7B it trails by only +0.017 (vs Gefen-fused's +0.053 / +0.059).
+Gefen-fused converges stably and its eval curve tracks just above the AdamW cluster (a ~0.05–0.06 loss gap), with no instability at its fair LR. **Gefen-Muon closes that gap entirely**: its curve sits on the AdamW cluster — at 0.6B it edges past the best AdamW (−0.011) and at 1.7B it trails by only +0.021 (vs Gefen-fused's +0.051 / +0.063).
 
 ![Qwen3-1.7B loss curves](docs/benchmarks/loss_curve_qwen1p7b.png)
 ![Qwen3-0.6B loss curves](docs/benchmarks/loss_curve_qwen0p6b.png)
@@ -174,7 +174,7 @@ Gefen-Muon shares Gefen-fused's lowest-VRAM column but sits far lower on through
 
 **Gefen Hybrid** At its fair LR, **Gefen-fused has the lowest peak VRAM and the lowest optimizer-state footprint, with competitive-to-best throughput** (fastest at 1.7B on sm_86) — at a **modest loss cost** (~0.1 at 1.7B, ~0.2 at 0.6B) vs the best-tuned AdamW. Note that AdamW-4-bit's optimizer state is also small (~1.06 B/param) but its **peak VRAM is the highest** (torchao compiled-step transient buffers), so Gefen, not 4-bit, is the real peak-memory winner. Gefen's clear optimizer-state edge is over 8-bit (2.03) and bf16 (4.00).
 
-**Gefen-Muon** (`GefenMuonHybrid`, Muon on 2D hidden matrices + Gefen elsewhere, `match_rms_adamw` with a half-rate backup LR for the non-Muon params) is the **best Gefen variant on loss** at both scales — 1.433 @0.6B (vs Gefen-fused 1.496; **beats** the best AdamW by 0.011) and 1.238 @1.7B (vs Gefen-fused's 1.281; +0.017 vs the best AdamW) — while tying Gefen-fused for the lowest peak VRAM and lowest optimizer state (~1.01 B/param). The cost is throughput: at the `tuned3` default Newton-Schulz still makes it the slowest optimizer (~0.65× Gefen-fused at 0.6B, ~0.45× at 1.7B). So **Gefen-fused is the speed+memory sweet spot; Gefen-Muon is the loss-recovery option** when you can afford the slowdown.
+**Gefen-Muon** (`GefenMuonHybrid`, Muon on 2D hidden matrices + Gefen elsewhere, `match_rms_adamw` with a half-rate backup LR for the non-Muon params, `normuon` on) is the **best Gefen variant on loss** at both scales — 1.427 @0.6B (vs Gefen-fused 1.489; **beats** the best AdamW by 0.011) and 1.239 @1.7B (vs Gefen-fused's 1.281; +0.021 vs the best AdamW) — while tying Gefen-fused for the lowest peak VRAM and lowest optimizer state (~1.01 B/param). The cost is throughput: at the `tuned3` default Newton-Schulz still makes it the slowest optimizer (~0.65× Gefen-fused at 0.6B, ~0.44× at 1.7B). So **Gefen-fused is the speed+memory sweet spot; Gefen-Muon is the loss-recovery option** when you can afford the slowdown.
 
 **Review the raw runs:** per-cell training logs (step-by-step loss, throughput, VRAM) in [`docs/benchmarks/logs/`](docs/benchmarks/logs/) · aggregated metrics as [CSV](docs/benchmarks/optimizer_comparison_2000steps.csv) and [JSONL](docs/benchmarks/optimizer_comparison_2000steps.jsonl).
 
@@ -265,7 +265,7 @@ optimizer = GefenMuonHybrid(
  - **`adjust_lr_fn="match_rms_adamw"`** (recommended, and the **`GefenMuonHybrid` default**) rescales the Muon update to AdamW-equivalent RMS (`0.2·√max(rows, cols)`). Then **one AdamW-scale `lr` is correct for both halves**, and the [Learning rate](#learning-rate-when-porting-an-adamw-config) guidance above (Gefen wants ~0.6× AdamW's on Qwen3) applies to the whole model.
  - **`adjust_lr_fn=None`** (= "original" Muon scaling `√max(1, rows/cols)`; this is the bare `GefenMuon` default, **not** the Hybrid's) leaves the Muon half on its native scale. Passing an AdamW-sized `lr` here **under-trains the 2D Muon matrices** — and because both halves share one `lr`, there's no single value that suits Muon-native *and* the Gefen backup. **Don't pair `None` with an AdamW-scale `lr`.**
 
-**Optional knobs.** `GefenMuonHybrid` defaults to the `tuned3` Newton-Schulz schedule (~1.4× step throughput, loss-neutral; pass `ns_schedule="standard"` for the classic quintic). Two opt-in quality levers are off by default: `backup_2d_period_one=True` gives the embedding / LM head per-element 2nd moment to **match AdamW's loss at lower memory** (see [the experimental section](#experimental-lever-match-adamw-2nd-moment-on-embed--lm-head-backup_2d_period_one)), and `stochastic_round=True` switches the 8-bit momentum to unbiased stochastic rounding (free, loss-neutral).
+**Optional knobs.** `GefenMuonHybrid` defaults to the `tuned3` Newton-Schulz schedule (~1.4× step throughput, loss-neutral; pass `ns_schedule="standard"` for the classic quintic) and to `normuon=True` — a throughput-free per-neuron 2nd moment on the Newton-Schulz output that consistently nudges eval loss toward (or past) AdamW (see [the normuon lever](#quality-lever-per-neuron-2nd-moment-on-the-newton-schulz-output-normuon); disable with `normuon=False`). Two opt-in quality levers are off by default: `backup_2d_period_one=True` gives the embedding / LM head per-element 2nd moment to **match AdamW's loss at lower memory** (see [the experimental section](#experimental-lever-match-adamw-2nd-moment-on-embed--lm-head-backup_2d_period_one)), and `stochastic_round=True` switches the 8-bit momentum to unbiased stochastic rounding (free, loss-neutral).
 
 It supports `step()`, `zero_grad()`, `state_dict()`/`load_state_dict()`, and LR schedulers (e.g. `torch.optim.lr_scheduler.StepLR(optimizer, ...)`) like any optimizer. Because its constructor takes two parameter lists rather than a single iterable, build it yourself and hand it to the Hugging Face `Trainer` via `optimizers=` (not `optimizer_cls_and_kwargs`):
 
@@ -340,11 +340,21 @@ Below (RTX 5090, Qwen3-0.6B, 400 steps; the chart force-engages `fp8` to isolate
 ![Gefen-Muon faster Newton-Schulz — real-training loss (AdamW + variants)](docs/benchmarks/muon_ns_loss.png)
 ![Gefen-Muon faster Newton-Schulz — end-to-end throughput (tok/s)](docs/benchmarks/muon_ns_throughput.png)
 
+## Quality Lever: per-neuron 2nd moment on the Newton-Schulz output (`normuon`)
+
+> **On by default in `GefenMuonHybrid`** (the low-level `GefenMuon` primitive keeps `normuon=False`, mirroring the `ns_schedule` split). Throughput-free and ~free on memory; disable with `normuon=False`.
+
+Truncated Newton-Schulz leaves the row norms of the "orthogonalized" update visibly non-uniform, so different output neurons get different effective step sizes. `normuon` (after [NorMuon](https://arxiv.org/abs/2510.05491)) tracks an EMA of each output row's mean-square on the NS output, divides each row by its bias-corrected EMA-RMS, then rescales the matrix back to its pre-normalization Frobenius norm — so the overall update scale, and therefore the `match_rms_adamw` LR calibration, is untouched. State is one fp32 scalar per output neuron (~+0.002 B/param); compute is one row-norm reduction plus one in-place scale (~4% of one `tuned3` NS call, invisible end-to-end: 3524 vs 3506 tok/s at 0.6B).
+
+Ablation (the recommended config with normuon on vs off; fair-LR regime above, seed 0 + a seed-1 replication): at **0.6B** normuon is worth **−0.007/−0.010** final eval on the two seeds — moving `GefenMuonHybrid` past the best AdamW — and at **1.7B** it trims the residual gap to AdamW by ~⅓ on the tail-mean of the last 10 evals (single-point finals at 1.7B are within the ±0.005–0.007 eval noise; the seed replication at 0.6B is the robust signal). A sign-agreement "cautious" mask over the NS output was benchmarked in the same sweep and clearly **lost** (+0.06 eval at 0.6B, −5% tok/s); it remains available as `cautious=True` for experimentation only.
+
+![Gefen-Muon normuon — eval loss vs AdamW and recommended](docs/benchmarks/muon_normuon_loss.png)
+
 ## Experimental Lever: match-AdamW 2nd moment on embed / LM-head (`backup_2d_period_one`)
 
 > Opt-in, default **off**. Unlike the levers above this one **costs memory** — it is a deliberate loss-vs-memory trade, not free.
 
-With the recommended config (`backup_lr≈0.5×`, `backup_1d_period_one`, `match_rms_adamw`) `GefenMuonHybrid` already beats AdamW at 0.6B and trails it only slightly at 1.7B. The remaining gap is **not** quantization noise — it is the **block-shared second moment on the large vocab tensors** (the token embedding / LM head, which route to the Gefen backup). `backup_1d_period_one` only sharpens 1D norms/biases; `backup_2d_period_one` extends the same per-element 2nd-moment + magnitude to those 2D backup tensors, giving them AdamW-like fidelity.
+With the recommended config (`backup_lr≈0.5×`, `backup_1d_period_one`, `match_rms_adamw`; measured pre-`normuon`) `GefenMuonHybrid` already beats AdamW at 0.6B and trails it only slightly at 1.7B. The remaining gap is **not** quantization noise — it is the **block-shared second moment on the large vocab tensors** (the token embedding / LM head, which route to the Gefen backup). `backup_1d_period_one` only sharpens 1D norms/biases; `backup_2d_period_one` extends the same per-element 2nd-moment + magnitude to those 2D backup tensors, giving them AdamW-like fidelity.
 
 ```python
 opt = GefenMuonHybrid(

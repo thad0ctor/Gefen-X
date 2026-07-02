@@ -34,14 +34,28 @@ are free on throughput; ``ns_schedule`` defaults to ``"tuned3"`` (loss-neutral,
     )
 
 This beats AdamW at 0.6B and trails it only slightly at 1.7B while keeping ~1.0
-B/param optimizer state. To CLOSE the residual 1.7B gap to AdamW, add
+B/param optimizer state. ``normuon`` (NorMuon-style per-row 2nd-moment
+normalization of the Newton-Schulz output, Frobenius-norm-preserving so the
+match_rms_adamw calibration is untouched) is ON BY DEFAULT in this hybrid (the
+raw ``GefenMuon`` keeps it off, mirroring the tuned3-vs-standard split): it is
+throughput-free and ~free on memory (one fp32 scalar per output neuron,
+~+0.002 B/param); in the fair-LR ablation (same config, normuon on vs off) it
+was worth -0.007/-0.010 final eval at 0.6B on both seeds (beating AdamW
+outright) and cut the residual
+1.7B gap to AdamW by ~1/3 (tail-mean of the last 10 evals). Disable with
+``normuon=False``. Resuming a checkpoint saved without normuon state is safe:
+the per-row state initializes lazily with bias correction, so the first steps
+just apply a near-uniform normalization while the EMA warms up. To CLOSE the
+residual 1.7B gap to AdamW, add
 ``backup_2d_period_one=True`` -- per-element 2nd moment on the embedding/LM-head
 too -- which matches AdamW's loss at ~2.45 B/param (still 0.6x AdamW), a
 loss/memory trade. ``stochastic_round=True`` is a free (throughput-neutral,
-loss-neutral) opt-in that debiases the 8-bit momentum quantization. The
-constructor defaults stay parity-preserving (period-1 off, shared lr,
-stochastic_round off) except ``ns_schedule="tuned3"``; set the rest explicitly to
-opt in.
+loss-neutral) opt-in that debiases the 8-bit momentum quantization. ``cautious``
+(sign-agreement masking) is exposed for experimentation but LOST clearly in the
+same sweep (+0.06 eval at 0.6B) -- leave it off. The remaining constructor
+defaults stay parity-preserving (period-1 off, shared lr, stochastic_round off)
+except ``ns_schedule="tuned3"`` and ``normuon=True``; set the rest explicitly
+to opt in.
 """
 from collections import OrderedDict
 
@@ -79,6 +93,10 @@ class GefenMuonHybrid(torch.optim.Optimizer):
         fp8_ns=False,
         fp8_ns_compile=True,
         stochastic_round=False,
+        normuon=True,
+        normuon_beta2=0.95,
+        normuon_eps=1e-8,
+        cautious=False,
         verbose=False,
     ):
         muon_named_params = list(muon_named_params)
@@ -145,6 +163,10 @@ class GefenMuonHybrid(torch.optim.Optimizer):
                 fp8_ns=fp8_ns,
                 fp8_ns_compile=fp8_ns_compile,
                 stochastic_round=stochastic_round,
+                normuon=normuon,
+                normuon_beta2=normuon_beta2,
+                normuon_eps=normuon_eps,
+                cautious=cautious,
                 verbose=verbose,
             )
             if muon_named_params

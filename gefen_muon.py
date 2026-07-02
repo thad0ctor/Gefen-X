@@ -244,6 +244,19 @@ def _zeropower_via_newtonschulz(
     return ortho_grad
 
 
+def _cautious_mask_(update: torch.Tensor, grad: torch.Tensor) -> torch.Tensor:
+    # Cautious masking (Cautious Optimizers, Liang et al. 2024): zero every
+    # update coordinate whose sign disagrees with the current gradient, then
+    # rescale by 1/mean(mask) so the expected update magnitude is preserved.
+    # Zero extra state; one elementwise pass over the (already materialized)
+    # Newton-Schulz output.
+    mask = (update * grad) > 0
+    agree = mask.sum()
+    scale = mask.numel() / agree.clamp(min=1).to(torch.float32)
+    update.mul_(mask.to(update.dtype)).mul_(scale.to(update.dtype))
+    return update
+
+
 def _adjust_lr(
     lr: float, adjust_lr_fn: Optional[str], param_shape: torch.Size
 ) -> float:
@@ -280,6 +293,10 @@ class GefenMuon(Gefen):
         fp8_ns: bool = False,
         fp8_ns_compile: bool = True,
         stochastic_round: bool = False,
+        normuon: bool = False,
+        normuon_beta2: float = 0.95,
+        normuon_eps: float = 1e-8,
+        cautious: bool = False,
         verbose: bool = False,
     ) -> None:
         if isinstance(lr, torch.Tensor) and lr.numel() != 1:
@@ -362,6 +379,22 @@ class GefenMuon(Gefen):
         self._fp8_ns = fp8_ns
         self._fp8_ns_compile = fp8_ns_compile
 
+        # NorMuon-style per-neuron 2nd moment on the orthogonalized update
+        # (opt-in). After Newton-Schulz, each ROW of the update (an output
+        # neuron) is divided by the bias-corrected EMA-RMS of that row across
+        # steps, then the whole matrix is rescaled to its pre-normalization
+        # Frobenius norm so the global update scale (and therefore the
+        # match_rms_adamw LR semantics) is unchanged. State is one fp32 scalar
+        # per row (~4 bytes/row -- negligible next to the 8-bit momentum).
+        if not 0.0 <= normuon_beta2 < 1.0:
+            raise ValueError(
+                "normuon_beta2 must be in [0, 1) but is: {}".format(normuon_beta2)
+            )
+        # Cautious masking (opt-in): zero update coordinates whose sign
+        # disagrees with the current gradient, rescaled to preserve magnitude.
+        self._normuon = normuon
+        self._cautious = cautious
+
         super().__init__(
             params,
             lr=lr,
@@ -382,6 +415,10 @@ class GefenMuon(Gefen):
             group["sharded_mode"] = sharded_mode
             group["fp8_ns"] = fp8_ns
             group["fp8_ns_compile"] = fp8_ns_compile
+            group["normuon"] = normuon
+            group["normuon_beta2"] = normuon_beta2
+            group["normuon_eps"] = normuon_eps
+            group["cautious"] = cautious
             for p in group["params"]:
                 if p.ndim != 2:
                     raise ValueError(
@@ -637,7 +674,7 @@ class GefenMuon(Gefen):
             momentum_update.mul_(momentum).add_(grad_view, alpha=1 - momentum)
         update = momentum_update.view_as(grad)
 
-        return _zeropower_via_newtonschulz(
+        ortho = _zeropower_via_newtonschulz(
             update,
             group["ns_coefficients"],
             group["ns_steps"],
@@ -645,6 +682,53 @@ class GefenMuon(Gefen):
             use_fp8=group.get("fp8_ns", False),
             compile_fp8=group.get("fp8_ns_compile", True),
         )
+        if group.get("normuon", False):
+            ortho = self._normuon_normalize(
+                state, ortho, group["normuon_beta2"], group["normuon_eps"]
+            )
+        if group.get("cautious", False):
+            ortho = _cautious_mask_(ortho.contiguous(), grad)
+        return ortho
+
+    def _normuon_normalize(
+        self,
+        state,
+        ortho: torch.Tensor,
+        beta2: float,
+        eps: float,
+    ) -> torch.Tensor:
+        # Per-neuron 2nd-moment normalization of the Newton-Schulz output
+        # (NorMuon, Zhang et al. 2025). NS truncated at a few iterations leaves
+        # the row norms of the "orthogonalized" update visibly non-uniform; an
+        # EMA of each row's mean-square tracks that and divides it out, giving
+        # each output neuron a uniform effective step. The final rescale to the
+        # pre-normalization Frobenius norm keeps the overall update scale --
+        # and thus the adjust_lr_fn / match_rms_adamw calibration -- intact.
+        # Two passes over the matrix total: one fp32-accumulated row-norm
+        # reduction, one in-place scale. Everything else is O(rows). The
+        # Frobenius norms before/after row normalization are both derivable
+        # from the row norms alone (||O||^2 = sum_r ||o_r||^2 and
+        # ||O/denom||^2 = sum_r ||o_r||^2 / denom_r^2), so no full-size fp32
+        # copy of the update is ever materialized.
+        v = state.get("normuon_v")
+        if v is None or v.shape[0] != ortho.shape[0]:
+            v = torch.zeros(
+                ortho.shape[0], 1, dtype=torch.float32, device=ortho.device
+            )
+            state["normuon_v"] = v
+            state["normuon_step"] = 0
+        row_norm = torch.linalg.vector_norm(
+            ortho, dim=1, keepdim=True, dtype=torch.float32
+        )
+        row_sq = row_norm.square()
+        v.mul_(beta2).add_(row_sq, alpha=(1 - beta2) / ortho.shape[1])
+        state["normuon_step"] += 1
+        bias_correction = 1 - beta2 ** state["normuon_step"]
+        denom = (v / bias_correction).sqrt_().add_(eps)
+        frob_scale = row_sq.sum().sqrt_() / torch.linalg.vector_norm(
+            row_norm / denom
+        ).clamp(min=torch.finfo(torch.float32).tiny)
+        return ortho.mul_((frob_scale / denom).to(ortho.dtype))
 
     def _lr_scalar(self, group) -> float:
         """Resolve ``group["lr"]`` to a python float, caching a tensor lr's ``.item()``.

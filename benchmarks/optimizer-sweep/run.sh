@@ -39,6 +39,9 @@ MUON_ADJUST="match_rms_adamw"
 # (backup_lr = fraction x the cell LR) + per-element 2nd moment on 1D params.
 MUON_BACKUP_LR_FRACTION="0.5"
 MUON_BACKUP_1D=1
+# per-neuron 2nd moment on the NS output (throughput-free; see hybrid docstring).
+# ""=follow the shipped GefenMuonHybrid default (ON), 1=force on, 0=force off.
+MUON_NORMUON=""
 OPTS_DEFAULT="adamw_bf16 adamw8bit adamw4bit gefen_fused gefen_muon"
 OPTS="$OPTS_DEFAULT"
 NO_MUON=0
@@ -126,6 +129,10 @@ Options:
   --muon-backup-lr-frac F  gefen_muon backup_lr as a fraction of the cell LR (default $MUON_BACKUP_LR_FRACTION).
   --muon-backup-1d       enable gefen_muon backup_1d_period_one (default: on).
   --no-muon-backup-1d    disable gefen_muon backup_1d_period_one.
+  --muon-normuon         force ON gefen_muon normuon (per-neuron 2nd moment on
+                         the Newton-Schulz output; throughput-free). Default:
+                         follow the shipped GefenMuonHybrid default (on).
+  --no-muon-normuon      force OFF gefen_muon normuon.
   --eval-every N         Intermediate eval-logging cadence (default $EVAL_EVERY).
   --lr-sweep             Run a short per-optimizer LR sweep first and use each
                          optimizer's best LR for the finals (default: documented fair LRs).
@@ -166,6 +173,8 @@ while [ $# -gt 0 ]; do
     --muon-backup-lr-frac) MUON_BACKUP_LR_FRACTION="$2"; CLI_SET[muon_backup_lr_fraction]=1; shift 2 ;;
     --muon-backup-1d) MUON_BACKUP_1D=1; CLI_SET[muon_backup_1d]=1; shift ;;
     --no-muon-backup-1d) MUON_BACKUP_1D=0; CLI_SET[muon_backup_1d]=1; shift ;;
+    --muon-normuon) MUON_NORMUON=1; CLI_SET[muon_normuon]=1; shift ;;
+    --no-muon-normuon) MUON_NORMUON=0; CLI_SET[muon_normuon]=1; shift ;;
     --eval-every)  EVAL_EVERY="$2"; CLI_SET[eval_every]=1; shift 2 ;;
     --lr-sweep)    LR_SWEEP=1; CLI_SET[lr_sweep]=1; shift ;;
     --sweep-steps) SWEEP_STEPS="$2"; CLI_SET[sweep_steps]=1; shift 2 ;;
@@ -208,6 +217,7 @@ if [ -n "$CONFIG" ]; then
       muon_adjust) set_if_unset muon_adjust MUON_ADJUST "$v1" ;;
       muon_backup_lr_fraction) set_if_unset muon_backup_lr_fraction MUON_BACKUP_LR_FRACTION "$v1" ;;
       muon_backup_1d) [ -n "${CLI_SET[muon_backup_1d]:-}" ] || { [ "$v1" = "false" ] && MUON_BACKUP_1D=0 || MUON_BACKUP_1D=1; } ;;
+      muon_normuon) [ -n "${CLI_SET[muon_normuon]:-}" ] || { [ "$v1" = "true" ] && MUON_NORMUON=1 || MUON_NORMUON=0; } ;;
       eval_every)  set_if_unset eval_every EVAL_EVERY "$v1" ;;
       sweep_steps) set_if_unset sweep_steps SWEEP_STEPS "$v1" ;;
       no_muon)     [ -n "${CLI_SET[no_muon]:-}" ] || { [ "$v1" = "true" ] && NO_MUON=1 || NO_MUON=0; } ;;
@@ -305,11 +315,16 @@ run_cell() { # gpu tag model opt lr steps out logfile
     blr=$(awk -v l="$lr" -v f="$MUON_BACKUP_LR_FRACTION" 'BEGIN{printf "%g", l*f}')
     muon_flags+=(--backup-lr "$blr")
     [ "$MUON_BACKUP_1D" = "1" ] && muon_flags+=(--backup-1d-period-one)
-    # only label the run "recommended" when the config matches the defaults;
-    # otherwise record it as "custom" so overridden runs aren't mislabeled.
+    [ "$MUON_NORMUON" = "1" ] && muon_flags+=(--muon-normuon)
+    [ "$MUON_NORMUON" = "0" ] && muon_flags+=(--no-muon-normuon)
+    # only label the run "recommended" when the config matches the defaults
+    # (normuon ""/1 both mean on -- the shipped default); label the explicit
+    # opt-out "recommended-no-normuon" and anything else "custom" so
+    # overridden runs aren't mislabeled.
     if [ "$MUON_ADJUST" = "match_rms_adamw" ] && [ "$MUON_BACKUP_LR_FRACTION" = "0.5" ] \
        && [ "$MUON_BACKUP_1D" = "1" ]; then
-      muon_flags+=(--variant recommended)
+      [ "$MUON_NORMUON" = "0" ] && muon_flags+=(--variant recommended-no-normuon) \
+        || muon_flags+=(--variant recommended)
     else
       muon_flags+=(--variant custom)
     fi

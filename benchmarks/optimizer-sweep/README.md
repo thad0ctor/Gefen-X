@@ -148,6 +148,11 @@ Written to `--out`:
   noise is not estimated. Re-run with other seeds to bound it.
 - **`gefen_muon` needs `--muon-adjust match_rms_adamw`** to share the AdamW LR
   scale; with the original Muon scaling its LR is on a different footing.
+- **`gefen_muon` follows the shipped `GefenMuonHybrid` defaults** unless
+  overridden — including `normuon` (per-neuron 2nd moment on the Newton-Schulz
+  output, on by default). Pass `--no-muon-normuon` to disable it; the effective
+  value is recorded in each result line (`muon_flags.normuon` /
+  `normuon_explicit`).
 - **Muon is slower per step** — the Newton-Schulz orthogonalization adds work,
   so `gefen_muon` trades throughput for its update geometry.
 - **Throughput is per-GPU.** Compare optimizers *within* a model (same GPU
