@@ -32,8 +32,8 @@ muon_adjust: match_rms_adamw
 muon_backup_lr_fraction: 0.5
 muon_backup_1d: true
 # per-neuron 2nd moment on the NS output (throughput-free loss lever, ON by
-# default in GefenMuonHybrid; comment the key out to follow the shipped
-# default, or set false to reproduce the pre-normuon published table)
+# default in GefenMuonHybrid and used by the published table; comment the key
+# out to follow the shipped default, or set false for the pre-normuon config)
 # muon_normuon: true
 sweep_steps: 175         # steps per LR-sweep cell (only used with lr_sweep: true)
 

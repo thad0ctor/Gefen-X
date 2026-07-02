@@ -41,9 +41,9 @@ raw ``GefenMuon`` keeps it off, mirroring the tuned3-vs-standard split): it is
 throughput-free and ~free on memory (one fp32 scalar per output neuron,
 ~+0.002 B/param); in the fair-LR sweep it beat plain recommended at 0.6B on both
 seeds (-0.007/-0.010 final eval, beating AdamW outright) and cut the residual
-1.7B gap to AdamW by ~1/3 (tail-mean of the last 10 evals). Set
-``normuon=False`` for the pre-normuon trajectory (e.g. to reproduce the
-published sweep table). Resuming a pre-normuon checkpoint with it on is safe:
+1.7B gap to AdamW by ~1/3 (tail-mean of the last 10 evals). The published
+benchmark table is measured with it; set ``normuon=False`` for the pre-normuon
+trajectory. Resuming a pre-normuon checkpoint with it on is safe:
 the per-row state initializes lazily with bias correction, so the first steps
 just apply a near-uniform normalization while the EMA warms up. To CLOSE the
 residual 1.7B gap to AdamW, add
