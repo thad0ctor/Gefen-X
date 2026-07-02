@@ -704,6 +704,12 @@ class GefenMuon(Gefen):
         # each output neuron a uniform effective step. The final rescale to the
         # pre-normalization Frobenius norm keeps the overall update scale --
         # and thus the adjust_lr_fn / match_rms_adamw calibration -- intact.
+        # Two passes over the matrix total: one fp32-accumulated row-norm
+        # reduction, one in-place scale. Everything else is O(rows). The
+        # Frobenius norms before/after row normalization are both derivable
+        # from the row norms alone (||O||^2 = sum_r ||o_r||^2 and
+        # ||O/denom||^2 = sum_r ||o_r||^2 / denom_r^2), so no full-size fp32
+        # copy of the update is ever materialized.
         v = state.get("normuon_v")
         if v is None or v.shape[0] != ortho.shape[0]:
             v = torch.zeros(
@@ -711,17 +717,18 @@ class GefenMuon(Gefen):
             )
             state["normuon_v"] = v
             state["normuon_step"] = 0
-        ortho_f32 = ortho.float()
-        row_ms = ortho_f32.pow(2).mean(dim=1, keepdim=True)
-        v.mul_(beta2).add_(row_ms, alpha=1 - beta2)
+        row_norm = torch.linalg.vector_norm(
+            ortho, dim=1, keepdim=True, dtype=torch.float32
+        )
+        row_sq = row_norm.square()
+        v.mul_(beta2).add_(row_sq, alpha=(1 - beta2) / ortho.shape[1])
         state["normuon_step"] += 1
         bias_correction = 1 - beta2 ** state["normuon_step"]
         denom = (v / bias_correction).sqrt_().add_(eps)
-        normed = ortho_f32.div_(denom)
-        scale = row_ms.sum().mul_(ortho.shape[1]).sqrt_() / normed.norm().clamp(
-            min=torch.finfo(torch.float32).tiny
-        )
-        return normed.mul_(scale).to(ortho.dtype)
+        frob_scale = row_sq.sum().sqrt_() / torch.linalg.vector_norm(
+            row_norm / denom
+        ).clamp(min=torch.finfo(torch.float32).tiny)
+        return ortho.mul_((frob_scale / denom).to(ortho.dtype))
 
     def _lr_scalar(self, group) -> float:
         """Resolve ``group["lr"]`` to a python float, caching a tensor lr's ``.item()``.
