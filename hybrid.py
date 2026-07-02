@@ -79,6 +79,10 @@ class GefenMuonHybrid(torch.optim.Optimizer):
         fp8_ns=False,
         fp8_ns_compile=True,
         stochastic_round=False,
+        normuon=False,
+        normuon_beta2=0.95,
+        normuon_eps=1e-8,
+        cautious=False,
         verbose=False,
     ):
         muon_named_params = list(muon_named_params)
@@ -145,6 +149,10 @@ class GefenMuonHybrid(torch.optim.Optimizer):
                 fp8_ns=fp8_ns,
                 fp8_ns_compile=fp8_ns_compile,
                 stochastic_round=stochastic_round,
+                normuon=normuon,
+                normuon_beta2=normuon_beta2,
+                normuon_eps=normuon_eps,
+                cautious=cautious,
                 verbose=verbose,
             )
             if muon_named_params

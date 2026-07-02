@@ -85,6 +85,12 @@ ap.add_argument("--backup-2d-period-one", action="store_true",
 ap.add_argument("--stochastic-round", action="store_true",
                 help="GefenMuonHybrid: unbiased stochastic rounding of the quantized "
                      "momentum (both Muon + backup halves) instead of nearest")
+ap.add_argument("--muon-normuon", action="store_true",
+                help="GefenMuonHybrid: NorMuon-style per-neuron 2nd-moment "
+                     "normalization of the Newton-Schulz output (Muon half only)")
+ap.add_argument("--muon-cautious", action="store_true",
+                help="GefenMuonHybrid: cautious masking of the Muon update "
+                     "(zero coords whose sign disagrees with the gradient)")
 ap.add_argument("--ns-schedule", default=None,
                 help="GefenMuon NS schedule: standard/tuned3/tuned4 (default tuned3 in hybrid)")
 ap.add_argument("--no-decay-substrings", default="",
@@ -264,6 +270,8 @@ elif args.opt == "gefen_muon":
         backup_1d_period_one=args.backup_1d_period_one,
         backup_2d_period_one=args.backup_2d_period_one,
         stochastic_round=args.stochastic_round,
+        normuon=args.muon_normuon,
+        cautious=args.muon_cautious,
         no_decay_substrings=_no_decay,
     )
     # Only override the GefenMuonHybrid ns_schedule default ("tuned3") when the
@@ -279,7 +287,8 @@ elif args.opt == "gefen_muon":
     print(f"[gefen_muon] adjust_lr_fn={_adj!r} muon_lr={args.muon_lr} "
           f"backup_lr={args.backup_lr} backup_1d_period_one={args.backup_1d_period_one} "
           f"backup_2d_period_one={args.backup_2d_period_one} ns_schedule={_eff_ns} "
-          f"no_decay={_no_decay} stochastic_round={args.stochastic_round}", flush=True)
+          f"no_decay={_no_decay} stochastic_round={args.stochastic_round} "
+          f"normuon={args.muon_normuon} cautious={args.muon_cautious}", flush=True)
 else:
     sys.exit(f"unknown opt {args.opt}")
 
