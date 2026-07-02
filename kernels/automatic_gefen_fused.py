@@ -24,6 +24,47 @@ _V2_BLOCKS_PER_SM = 2  # below 2 blocks/SM the single-pass kernel can't fill SMs
 _GEFEN_UPDATE_V2_ENV = os.environ.get("GEFEN_UPDATE_V2")
 _SM_COUNT_BY_DEVICE: dict = {}
 
+# Codebook-search LUT (bit-exact accelerator; see the kernel-side comment on
+# gefen_lut_search_bounds). lut[b] = #codebook entries whose bucket < b, with
+# bucket(v) = clamp(floor((v+1)*BUCKETS/2), 0, BUCKETS-1) over the normalized
+# domain [-1, 1]. The kernels run the identical binary search on the narrowed
+# [lut[b], lut[b+1]] range, so results are bit-identical to the full search for
+# both nearest and stochastic rounding. Built once per (codebook, version,
+# device) -- the exact-DP codebook is learned on step 1 and then frozen, so in
+# practice this is one 8 KiB int16 tensor per device for the whole run; a
+# codebook refresh (identity or _version change) rebuilds it.
+_LUT_BUCKETS = 4096
+_LUT_CACHE: dict = {}
+
+
+def _codebook_search_lut(codebook: torch.Tensor) -> torch.Tensor:
+    key = (id(codebook), codebook._version, codebook.device)
+    cached = _LUT_CACHE.get(key)
+    if cached is not None and cached[0] is codebook:
+        return cached[1]
+    # Entry buckets are monotone because the codebook is sorted ascending (the
+    # kernels' binary search already relies on that). Count entries per bucket
+    # boundary with searchsorted on the bucketized entries.
+    entry_buckets = torch.clamp(
+        torch.floor((codebook.detach().float() + 1.0) * (_LUT_BUCKETS / 2)),
+        0,
+        _LUT_BUCKETS - 1,
+    )
+    boundaries = torch.arange(
+        _LUT_BUCKETS + 1, device=codebook.device, dtype=entry_buckets.dtype
+    )
+    lut = torch.searchsorted(entry_buckets, boundaries, right=False).to(torch.int16)
+    lut = lut.contiguous()
+    # Steady state holds one entry per live codebook (e.g. two under
+    # GefenMuonHybrid: the Muon half's and the backup half's). Entries only go
+    # stale on a codebook refresh (rare: first step / checkpoint resume), so a
+    # small size cap is enough to bound the 8 KiB LUTs without ever evicting a
+    # live one mid-run.
+    if len(_LUT_CACHE) >= 16:
+        _LUT_CACHE.clear()
+    _LUT_CACHE[key] = (codebook, lut)
+    return lut
+
 
 def _load_extension():
     global _EXTENSION_MODULE
@@ -163,6 +204,7 @@ def automatic_gefen_fused_full_update_cuda(
         m_magnitude,
         vmean,
         cb_c,
+        _codebook_search_lut(cb_c),
         packed_indices,
         beta1,
         beta2,
@@ -244,6 +286,7 @@ def automatic_gefen_fused_update_v2_full_cuda(
         m_magnitude,
         vmean,
         cb_c,
+        _codebook_search_lut(cb_c),
         packed_indices,
         beta1,
         beta2,
