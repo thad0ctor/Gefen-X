@@ -42,7 +42,7 @@ def _run_steps(seed=0, n=4, shape=(256, 512), **kw):
 def check_flags_off_no_state_and_deterministic():
     """Default construction stores no lever state and is repeatable."""
     p1, opt1 = _run_steps()
-    p2, opt2 = _run_steps()
+    p2, _opt2 = _run_steps()
     assert torch.equal(p1, p2), "default path is not deterministic"
     state = next(iter(opt1.state.values()))
     assert "normuon_v" not in state and "normuon_step" not in state, (
@@ -72,7 +72,7 @@ def check_normuon_norm_preserving():
         lr=1e-3, normuon=True,
     )
     for shape in [(256, 1024), (1024, 256)]:
-        for step in range(3):
+        for _step in range(3):
             state = {}
             o = torch.randn(*shape, device="cuda").bfloat16()
             out = opt._normuon_normalize(state, o.clone(), 0.95, 1e-8)
@@ -87,7 +87,14 @@ def check_normuon_state_roundtrip():
     without being downcast (the generic aux-tensor restore covers it)."""
     _, opt = _run_steps(normuon=True)
     sd = opt.state_dict()
-    p3, opt3 = _run_steps(normuon=True)  # fresh, same trajectory
+    # Different seed so opt3's pre-load state differs from opt's -- the
+    # equality below then proves load_state_dict actually restored the
+    # tensors rather than matching an independently-identical trajectory.
+    _, opt3 = _run_steps(normuon=True, seed=99)
+    s_pre = next(iter(opt3.state.values()))
+    assert not torch.equal(
+        s_pre["normuon_v"], next(iter(opt.state.values()))["normuon_v"]
+    ), "seed-99 trajectory unexpectedly matches seed-0; test would be vacuous"
     opt3.load_state_dict(sd)
     s_old = next(iter(opt.state.values()))
     s_new = next(iter(opt3.state.values()))
