@@ -150,9 +150,9 @@ Written to `--out`:
   scale; with the original Muon scaling its LR is on a different footing.
 - **`gefen_muon` follows the shipped `GefenMuonHybrid` defaults** unless
   overridden — including `normuon` (per-neuron 2nd moment on the Newton-Schulz
-  output, on by default; the published table is measured with it). Pass
-  `--no-muon-normuon` for the pre-normuon config; the effective value is
-  recorded in each result line (`muon_flags.normuon` / `normuon_explicit`).
+  output, on by default). Pass `--no-muon-normuon` to disable it; the effective
+  value is recorded in each result line (`muon_flags.normuon` /
+  `normuon_explicit`).
 - **Muon is slower per step** — the Newton-Schulz orthogonalization adds work,
   so `gefen_muon` trades throughput for its update geometry.
 - **Throughput is per-GPU.** Compare optimizers *within* a model (same GPU

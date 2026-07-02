@@ -92,8 +92,7 @@ ap.add_argument("--muon-normuon", dest="muon_normuon", action="store_true",
                      "(Muon half only). Omit both flags to follow the shipped "
                      "GefenMuonHybrid default (currently ON).")
 ap.add_argument("--no-muon-normuon", dest="muon_normuon", action="store_false",
-                help="GefenMuonHybrid: force OFF normuon (the pre-normuon "
-                     "config; the published table uses the default, on)")
+                help="GefenMuonHybrid: force OFF normuon")
 ap.add_argument("--muon-cautious", action="store_true",
                 help="GefenMuonHybrid: cautious masking of the Muon update "
                      "(zero coords whose sign disagrees with the gradient)")
