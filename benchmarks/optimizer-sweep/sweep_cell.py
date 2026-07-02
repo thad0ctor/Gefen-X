@@ -85,9 +85,15 @@ ap.add_argument("--backup-2d-period-one", action="store_true",
 ap.add_argument("--stochastic-round", action="store_true",
                 help="GefenMuonHybrid: unbiased stochastic rounding of the quantized "
                      "momentum (both Muon + backup halves) instead of nearest")
-ap.add_argument("--muon-normuon", action="store_true",
-                help="GefenMuonHybrid: NorMuon-style per-neuron 2nd-moment "
-                     "normalization of the Newton-Schulz output (Muon half only)")
+ap.add_argument("--muon-normuon", dest="muon_normuon", action="store_true",
+                default=None,
+                help="GefenMuonHybrid: force ON the NorMuon-style per-neuron "
+                     "2nd-moment normalization of the Newton-Schulz output "
+                     "(Muon half only). Omit both flags to follow the shipped "
+                     "GefenMuonHybrid default (currently ON).")
+ap.add_argument("--no-muon-normuon", dest="muon_normuon", action="store_false",
+                help="GefenMuonHybrid: force OFF normuon (reproduces the "
+                     "pre-normuon published-table trajectory)")
 ap.add_argument("--muon-cautious", action="store_true",
                 help="GefenMuonHybrid: cautious masking of the Muon update "
                      "(zero coords whose sign disagrees with the gradient)")
@@ -270,10 +276,13 @@ elif args.opt == "gefen_muon":
         backup_1d_period_one=args.backup_1d_period_one,
         backup_2d_period_one=args.backup_2d_period_one,
         stochastic_round=args.stochastic_round,
-        normuon=args.muon_normuon,
         cautious=args.muon_cautious,
         no_decay_substrings=_no_decay,
     )
+    # Like ns_schedule: only override normuon when a flag was given, so the
+    # harness reflects the shipped GefenMuonHybrid default when omitted.
+    if args.muon_normuon is not None:
+        _hybrid_kwargs["normuon"] = args.muon_normuon
     # Only override the GefenMuonHybrid ns_schedule default ("tuned3") when the
     # flag is explicitly set, so the harness reflects the shipped default.
     if args.ns_schedule is not None:
@@ -284,11 +293,17 @@ elif args.opt == "gefen_muon":
     # default changes; keep an explicit-vs-default marker alongside it.
     _resolved_ns = args.ns_schedule if args.ns_schedule is not None else "tuned3"
     _eff_ns = _resolved_ns if args.ns_schedule is not None else f"{_resolved_ns} (default)"
+    # Effective normuon (the GefenMuonHybrid default is True when no flag given).
+    _resolved_normuon = args.muon_normuon if args.muon_normuon is not None else True
+    _eff_normuon = (
+        str(_resolved_normuon) if args.muon_normuon is not None
+        else f"{_resolved_normuon} (default)"
+    )
     print(f"[gefen_muon] adjust_lr_fn={_adj!r} muon_lr={args.muon_lr} "
           f"backup_lr={args.backup_lr} backup_1d_period_one={args.backup_1d_period_one} "
           f"backup_2d_period_one={args.backup_2d_period_one} ns_schedule={_eff_ns} "
           f"no_decay={_no_decay} stochastic_round={args.stochastic_round} "
-          f"normuon={args.muon_normuon} cautious={args.muon_cautious}", flush=True)
+          f"normuon={_eff_normuon} cautious={args.muon_cautious}", flush=True)
 else:
     sys.exit(f"unknown opt {args.opt}")
 
@@ -381,6 +396,8 @@ res = {
             "backup_2d_period_one": args.backup_2d_period_one,
             "ns_schedule": _resolved_ns,
             "ns_schedule_explicit": args.ns_schedule is not None,
+            "normuon": _resolved_normuon,
+            "normuon_explicit": args.muon_normuon is not None,
             "stochastic_round": args.stochastic_round,
             "no_decay_substrings": args.no_decay_substrings,
         }

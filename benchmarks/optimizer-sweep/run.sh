@@ -40,8 +40,9 @@ MUON_ADJUST="match_rms_adamw"
 MUON_BACKUP_LR_FRACTION="0.5"
 MUON_BACKUP_1D=1
 # per-neuron 2nd moment on the NS output (throughput-free; see hybrid docstring).
-# Off by default so the published table stays reproducible; opt in per run.
-MUON_NORMUON=0
+# ""=follow the shipped GefenMuonHybrid default (ON), 1=force on, 0=force off
+# (0 reproduces the pre-normuon published table).
+MUON_NORMUON=""
 OPTS_DEFAULT="adamw_bf16 adamw8bit adamw4bit gefen_fused gefen_muon"
 OPTS="$OPTS_DEFAULT"
 NO_MUON=0
@@ -129,9 +130,11 @@ Options:
   --muon-backup-lr-frac F  gefen_muon backup_lr as a fraction of the cell LR (default $MUON_BACKUP_LR_FRACTION).
   --muon-backup-1d       enable gefen_muon backup_1d_period_one (default: on).
   --no-muon-backup-1d    disable gefen_muon backup_1d_period_one.
-  --muon-normuon         enable gefen_muon normuon (per-neuron 2nd moment on the
-                         Newton-Schulz output; throughput-free, default: off).
-  --no-muon-normuon      disable gefen_muon normuon.
+  --muon-normuon         force ON gefen_muon normuon (per-neuron 2nd moment on
+                         the Newton-Schulz output; throughput-free). Default:
+                         follow the shipped GefenMuonHybrid default (on).
+  --no-muon-normuon      force OFF gefen_muon normuon (reproduces the
+                         pre-normuon published table).
   --eval-every N         Intermediate eval-logging cadence (default $EVAL_EVERY).
   --lr-sweep             Run a short per-optimizer LR sweep first and use each
                          optimizer's best LR for the finals (default: documented fair LRs).
@@ -315,11 +318,14 @@ run_cell() { # gpu tag model opt lr steps out logfile
     muon_flags+=(--backup-lr "$blr")
     [ "$MUON_BACKUP_1D" = "1" ] && muon_flags+=(--backup-1d-period-one)
     [ "$MUON_NORMUON" = "1" ] && muon_flags+=(--muon-normuon)
-    # only label the run "recommended" when the config matches the defaults;
-    # otherwise record it as "custom" so overridden runs aren't mislabeled.
+    [ "$MUON_NORMUON" = "0" ] && muon_flags+=(--no-muon-normuon)
+    # only label the run "recommended" when the config matches the defaults
+    # (normuon ""/1 both mean on -- the shipped default); label the explicit
+    # opt-out "recommended-no-normuon" (the pre-normuon published config) and
+    # anything else "custom" so overridden runs aren't mislabeled.
     if [ "$MUON_ADJUST" = "match_rms_adamw" ] && [ "$MUON_BACKUP_LR_FRACTION" = "0.5" ] \
        && [ "$MUON_BACKUP_1D" = "1" ]; then
-      [ "$MUON_NORMUON" = "1" ] && muon_flags+=(--variant recommended+normuon) \
+      [ "$MUON_NORMUON" = "0" ] && muon_flags+=(--variant recommended-no-normuon) \
         || muon_flags+=(--variant recommended)
     else
       muon_flags+=(--variant custom)
