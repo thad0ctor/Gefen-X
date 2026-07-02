@@ -31,6 +31,10 @@ muon_adjust: match_rms_adamw
 # (backup_lr = fraction x the cell LR) + per-element 2nd moment on 1D params.
 muon_backup_lr_fraction: 0.5
 muon_backup_1d: true
+# per-neuron 2nd moment on the NS output (throughput-free loss lever, ON by
+# default in GefenMuonHybrid; comment the key out to follow the shipped
+# default, or set false to reproduce the pre-normuon published table)
+# muon_normuon: true
 sweep_steps: 175         # steps per LR-sweep cell (only used with lr_sweep: true)
 
 # Optimizers to run. Default set includes gefen_muon (slow Newton-Schulz);

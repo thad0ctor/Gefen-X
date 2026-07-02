@@ -38,21 +38,34 @@ LR = 5e-3
 WD = 0.1
 TOL = 1e-5
 
-# (M, N) per case. world_size is always 2.
+# (M, N) per case. world_size is always 2. The normuon-* cases re-run the
+# even/uneven shardings with normuon=True (the GefenMuonHybrid default), so the
+# per-row 2nd-moment state and the row-normalized update are covered under
+# sharding: rank parity vs the single-process oracle must hold exactly like the
+# plain path (the normalization runs on the full-matrix NS output every rank
+# reconstructs, so it is deterministic and identical across ranks).
 CASES = {
     "even": (8, 6),
     "uneven": (5, 4),
     "empty": (1, 4),
+    "normuon-even": (8, 6),
+    "normuon-uneven": (5, 4),
 }
 
 
-def _reference(full_init, full_grad):
+def _case_opt_kwargs(case):
+    return {"normuon": True} if case.startswith("normuon-") else {}
+
+
+def _reference(full_init, full_grad, opt_kwargs=None):
     """Single-process plain-tensor GefenMuon: the single-GPU oracle."""
     from gefen.gefen_muon import GefenMuon
 
     p_ref = nn.Parameter(full_init.clone())
     p_ref.grad = full_grad.clone()
-    opt = GefenMuon([("w", p_ref)], lr=LR, fused=False, weight_decay=WD)
+    opt = GefenMuon(
+        [("w", p_ref)], lr=LR, fused=False, weight_decay=WD, **(opt_kwargs or {})
+    )
     opt.step()
     return p_ref.detach()
 
@@ -104,13 +117,16 @@ def _worker(rank, world, case, port, q):
         p.grad = distribute_tensor(full_grad.clone(), mesh, [Shard(0)])
         local_rows = p.to_local().shape[0]
 
-        opt = GefenMuon([("w", p)], lr=LR, fused=False, weight_decay=WD)
+        opt = GefenMuon(
+            [("w", p)], lr=LR, fused=False, weight_decay=WD,
+            **_case_opt_kwargs(case),
+        )
         opt.step()
 
         gathered = p.detach().full_tensor()  # collective; all ranks must call
 
         if rank == 0:
-            ref = _reference(full_init, full_grad)
+            ref = _reference(full_init, full_grad, _case_opt_kwargs(case))
             changed = not torch.equal(gathered, full_init)
             finite = torch.isfinite(gathered).all().item()
             max_abs = (gathered - ref).abs().max().item()
@@ -164,7 +180,9 @@ def _run_case(case):
     _case, local_rows, changed, finite, max_abs = results["main"]
     # Make the shard split explicit so the empty/uneven coverage can't silently
     # regress (rank0_rows, rank1_rows), world_size=2.
-    expected_rows = {"even": (4, 4), "uneven": (3, 2), "empty": (1, 0)}[case]
+    expected_rows = {"even": (4, 4), "uneven": (3, 2), "empty": (1, 0)}[
+        case.replace("normuon-", "")
+    ]
     assert (local_rows, rank_rows[1]) == expected_rows, (
         f"[{case}] shard rows {(local_rows, rank_rows[1])} != {expected_rows}"
     )
