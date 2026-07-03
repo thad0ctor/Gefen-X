@@ -23,6 +23,7 @@
 | Learning rate on those architectures | no guidance — silently over-steps | documented ~0.6× AdamW, so quality matches AdamW |
 | Optimizer-step speed | baseline | ~2× faster `opt.step()` (fused kernels), plus multi-row + LUT-search update kernels (bit-exact; up to ~2.4× on small-period shapes) — identical results |
 | Peak memory during the step | large transient spikes | much lower peak — room for bigger models / batches |
+| Plain-Gefen-vs-AdamW eval-loss gap (~0.06) | block-shared 2nd moment only | opt-in `factored_v_2d` (Adafactor-style row×col 2nd moment, fused kernel) **closes it**: statistically AdamW's loss at ~1.01 B/param and baseline VRAM, ~0.93–0.95× throughput — see [the factored-v lever](#quality-lever-factored-second-moment-on-2d-params-factored_v_2d) |
 | Sharded multi-GPU training (FSDP2) | breaks with the fast path | works — for plain Gefen *and* Muon |
 | Whole-model Muon | 2D weight matrices only | `GefenMuonHybrid` trains the entire model |
 | Muon step efficiency | generic momentum hack + redundant dequant gather | single-pass momentum kernel (bit-exact) + direct FSDP shard-slice |
@@ -172,7 +173,7 @@ Gefen-Muon shares Gefen-fused's lowest-VRAM column but sits far lower on through
 ![Qwen3-1.7B throughput vs VRAM](docs/benchmarks/tput_vram_qwen1p7b.png)
 ![Qwen3-0.6B throughput vs VRAM](docs/benchmarks/tput_vram_qwen0p6b.png)
 
-**Gefen Hybrid** At its fair LR, **Gefen-fused has the lowest peak VRAM and the lowest optimizer-state footprint, with near-AdamW throughput** (0.997× fused AdamW at 1.7B, 0.97× at 0.6B, with the multi-row + LUT fused kernels) — at a **modest loss cost** (~0.06 at both scales) vs the best-tuned AdamW. Note that AdamW-4-bit's optimizer state is also small (~1.06 B/param) but its **peak VRAM is the highest** (torchao compiled-step transient buffers), so Gefen, not 4-bit, is the real peak-memory winner. Gefen's clear optimizer-state edge is over 8-bit (2.03) and bf16 (4.00).
+**Gefen Hybrid** At its fair LR, **Gefen-fused has the lowest peak VRAM and the lowest optimizer-state footprint, with near-AdamW throughput** (0.997× fused AdamW at 1.7B, 0.97× at 0.6B, with the multi-row + LUT fused kernels) — at a **modest loss cost** (~0.06 at both scales) vs the best-tuned AdamW; the opt-in [`factored_v_2d` lever](#quality-lever-factored-second-moment-on-2d-params-factored_v_2d) closes that gap to statistical parity for ~6–8% throughput. Note that AdamW-4-bit's optimizer state is also small (~1.06 B/param) but its **peak VRAM is the highest** (torchao compiled-step transient buffers), so Gefen, not 4-bit, is the real peak-memory winner. Gefen's clear optimizer-state edge is over 8-bit (2.03) and bf16 (4.00).
 
 **Gefen-Muon** (`GefenMuonHybrid`, Muon on 2D hidden matrices + Gefen elsewhere, `match_rms_adamw` with a half-rate backup LR for the non-Muon params, `normuon` on) is the **best Gefen variant on loss** at both scales — 1.422 @0.6B (vs Gefen-fused 1.494; **beats** the best AdamW by 0.012) and 1.239 @1.7B (vs Gefen-fused's 1.281; +0.019 vs the best AdamW) — while tying Gefen-fused for the lowest peak VRAM and lowest optimizer state (~1.01 B/param). The cost is throughput: at the `tuned3` default Newton-Schulz still makes it the slowest optimizer (~0.66× Gefen-fused at 0.6B, ~0.44× at 1.7B). So **Gefen-fused is the speed+memory sweet spot; Gefen-Muon is the loss-recovery option** when you can afford the slowdown.
 
@@ -316,6 +317,25 @@ optim_args:
 **Not (yet) exposed via axolotl config:** the **Muon hybrid** (`GefenMuonHybrid` + `adjust_lr_fn`) is **not** in PR #3755 (the PR notes Muon is "more involved") — use it directly in Python per [Gefen-Muon](#extension-gefen-muon) above. `MEMORY_SAFE_FALLBACK` is a module default (on in this fork), toggled in code rather than YAML.
 
 > PR #3755 is an early draft and marked *untested* upstream; the config keys above may change — check the PR for the current state.
+
+## Quality Lever: factored second moment on 2D params (`factored_v_2d`)
+
+> **Opt-in, default off** (flags-off is byte-identical). This is the **AdamW-parity configuration for plain Gefen**: it trades ~6–8% throughput for AdamW-level loss while keeping ~1.01 B/param optimizer state and baseline-Gefen peak VRAM. Use `lr ≈ 0.6× your AdamW LR` (its measured fair LR, same ratio as the standard Gefen heuristic).
+
+Plain Gefen's ~0.06 eval-loss gap to fused AdamW comes from second-moment **granularity**: the block-shared `vmean` gives every parameter in a block the same adaptive stepsize, where AdamW keeps one per element. `factored_v_2d=True` replaces `vmean` on 2D params with Adafactor-style factored statistics ([Shazeer & Stern 2018](https://arxiv.org/abs/1804.04235)): fp32 row/col EMAs of the squared gradient whose outer product reconstructs a **per-element** second moment `V_ij ≈ R_i · C_j / mean(R)` at only `rows + cols` state (~+0.001 B/param). The 8-bit quantized momentum machinery is unchanged.
+
+The fused implementation is a two-phase CUDA path: phase 1 computes the per-block momentum absmax **and** the raw row/col gradient statistics in a single pass over the gradient (warp-per-row tiles; the EMAs advance in place device-side, no host sync); phase 2 quantizes (LUT-narrowed search) and applies with the per-element stepsize computed in registers — no full-size temporaries anywhere, measured **0 MiB step transients**. The row/col sums use atomic accumulation and carry the same documented sub-ULP run-to-run nondeterminism as the v2-full `vmean`.
+
+```python
+opt = Gefen(model.named_parameters(), lr=0.6 * ADAMW_LR, fused=True,
+            factored_v_2d=True)   # AdamW-parity config, ~1.01 B/param
+```
+
+Measured (fair-LR regime above; factored at its swept optimum `3e-5` vs plain Gefen's `2e-5`): **Qwen3-0.6B 1.4234 (beats the best AdamW 1.4348 by 0.011; plain Gefen 1.4970) and Qwen3-1.7B 1.2246 (+0.006 vs AdamW 1.2186 — inside the ±0.005–0.007 single-eval noise band; plain Gefen 1.2875)**, replicated at a second seed at 0.6B (−0.063 vs control, matching seed 0's −0.061) and LR-swept at 1.7B (unimodal optimum at 3e-5). Throughput 0.945×/0.925× of plain Gefen at 0.6B/1.7B (same-GPU A/B); peak VRAM identical to plain Gefen at both scales (4.8 GiB under AdamW at 1.7B); optimizer state 1.009–1.014 B/param. Under FSDP2/DTensor, 2D shards fall back to the standard block-`vmean` path (local-shard row/col statistics would be wrong under sharding).
+
+Two sibling levers from the same investigation ship as flags but measured **ineffective** on this workload and stay off: `period_one_substrings` (per-element state on name-matched tensors, e.g. embeddings — the plain-Gefen gap lives in the *hidden* matrices, unlike the hybrid case) and `codebook_refresh_every` (periodic codebook refit + momentum requantization — the frozen step-1 codebook is not stale; within noise).
+
+![Gefen factored-v — eval loss vs AdamW and plain Gefen-fused](docs/benchmarks/gefen_factored_v_loss.png)
 
 ## Experimental Lever: faster Newton-Schulz (`ns_schedule`, `fp8_ns`)
 
