@@ -152,10 +152,37 @@ def parity(device, wd=0.0):
     return ok
 
 
+def malformed_lut_is_safe(device):
+    """A garbage LUT handed to the raw extension API must not read the codebook
+    out of bounds: the kernel clamps the narrowed range, so the run completes
+    with finite params and in-range stored indices (values may be wrong -- the
+    contract is safety, not correctness, for malformed LUTs)."""
+    mod = _load_extension()
+    cb = _codebook(device)
+    bad_luts = {
+        "negative": torch.full((4097,), -7, dtype=torch.int16, device=device),
+        "oob": torch.full((4097,), 300, dtype=torch.int16, device=device),
+        "nonmono": torch.tensor(
+            [256, 0] * 2048 + [128], dtype=torch.int16, device=device),
+    }
+    ok = True
+    for name, lut in bad_luts.items():
+        p, gv, ms, mm, vm = _make(1024 * 64, 64, torch.float32, device, 7)
+        fp, fms, _, _ = _fused(mod, p, gv, ms, mm, vm, cb, 3, 0.0, lut)
+        torch.cuda.synchronize(device)
+        good = bool(torch.isfinite(fp).all().item()) and int(fms.max().item()) < 256
+        ok = ok and good
+        if not good:
+            print(f"  [FAIL] malformed lut '{name}' produced non-finite p or OOB index")
+    print(f"[malformed-LUT safety] {len(bad_luts)} cases -> {'PASS' if ok else 'FAIL'}")
+    return ok
+
+
 def run_suite(device):
     cap = torch.cuda.get_device_capability(device)
     print(f"=== device {device} ({torch.cuda.get_device_name(device)}, sm_{cap[0]}{cap[1]}) ===")
-    results = [parity(device, wd=0.0), parity(device, wd=0.1)]
+    results = [parity(device, wd=0.0), parity(device, wd=0.1),
+               malformed_lut_is_safe(device)]
     ok = all(results)
     print(f"OVERALL [{device}]: {'PASS' if ok else 'FAIL'}\n")
     return ok

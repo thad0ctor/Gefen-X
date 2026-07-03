@@ -239,8 +239,27 @@ __device__ __forceinline__ void gefen_lut_search_bounds(
     } else if (b > lut_buckets - 1) {
         b = lut_buckets - 1;
     }
-    *left = __ldg(&lut[b]);
-    *right = __ldg(&lut[b + 1]);
+    // Defensive clamp: the host-built LUT is monotone in [0, codebook_size] by
+    // construction (torch.searchsorted over the bucketized sorted codebook), so
+    // for every legitimate caller these clamps are no-ops and the search stays
+    // bit-identical. They exist so a malformed LUT handed to the raw extension
+    // API (negative / non-monotonic / out-of-range int16 values -- which the
+    // host wrapper cannot value-check without a D2H sync) degrades to a safe
+    // in-bounds search instead of out-of-bounds codebook indexing.
+    int lo = __ldg(&lut[b]);
+    int hi = __ldg(&lut[b + 1]);
+    if (lo < 0) {
+        lo = 0;
+    } else if (lo > codebook_size) {
+        lo = codebook_size;
+    }
+    if (hi < lo) {
+        hi = lo;
+    } else if (hi > codebook_size) {
+        hi = codebook_size;
+    }
+    *left = lo;
+    *right = hi;
 }
 
 // quantize_codebook_index with a LUT-narrowed lower_bound. Bit-identical to

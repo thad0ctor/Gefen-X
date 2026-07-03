@@ -58,10 +58,15 @@ def _codebook_search_lut(codebook: torch.Tensor) -> torch.Tensor:
     # Steady state holds one entry per live codebook (e.g. two under
     # GefenMuonHybrid: the Muon half's and the backup half's). Entries only go
     # stale on a codebook refresh (rare: first step / checkpoint resume), so a
-    # small size cap is enough to bound the 8 KiB LUTs without ever evicting a
-    # live one mid-run.
-    if len(_LUT_CACHE) >= 16:
-        _LUT_CACHE.clear()
+    # small size cap bounds the 8 KiB LUTs; evict oldest-first (dict preserves
+    # insertion order) so the live entries -- re-inserted most recently -- are
+    # never dropped mid-run. Dropping the cache reference is also safe for any
+    # in-flight kernel: the launch was enqueued while the caller's argument
+    # frame still referenced the tensor, and the caching allocator's
+    # deallocation is stream-ordered, so the storage cannot be reused before
+    # already-enqueued same-stream work completes.
+    while len(_LUT_CACHE) >= 16:
+        _LUT_CACHE.pop(next(iter(_LUT_CACHE)))
     _LUT_CACHE[key] = (codebook, lut)
     return lut
 
