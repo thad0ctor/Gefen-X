@@ -962,28 +962,7 @@ class Gefen(torch.optim.Optimizer):
         automatic_period = state["automatic_period"]
         grad_view = self._automatic_view(flat_grad, automatic_period)
 
-        # Row/col mean-square EMAs, computed over bounded row-chunks: one fp32
-        # chunk of grad^2 serves both the row sums and the col accumulation, so
-        # the transient is capped at the chunk size instead of a full-size fp32
-        # copy of the gradient (vector_norm's dtype= upcast materializes one).
-        grad2d = grad.detach()
         rows, cols = p.shape
-        row_ms = torch.empty(rows, dtype=torch.float32, device=p.device)
-        col_sq = torch.zeros(cols, dtype=torch.float32, device=p.device)
-        # Small chunk: the allocator keeps ~2-3 chunk temporaries live across
-        # iterations, so the transient is a few x this (measured ~3x); 1M
-        # elements caps it around ~12 MiB regardless of parameter size.
-        rows_per_chunk = max(1, (1 << 20) // max(1, cols))
-        for r0 in range(0, rows, rows_per_chunk):
-            r1 = min(r0 + rows_per_chunk, rows)
-            chunk_sq = grad2d[r0:r1].float().square_()
-            row_ms[r0:r1] = chunk_sq.sum(dim=1)
-            col_sq += chunk_sq.sum(dim=0)
-        row_ms.div_(cols)
-        col_sq.div_(rows)
-        state["v_row"].mul_(beta2).add_(row_ms, alpha=1 - beta2)
-        state["v_col"].mul_(beta2).add_(col_sq, alpha=1 - beta2)
-
         state["step"] += 1
         bias_correction_1 = 1 - beta1 ** state["step"]
         bias_correction_2 = 1 - beta2 ** state["step"]
@@ -993,10 +972,12 @@ class Gefen(torch.optim.Optimizer):
             and p.is_cuda
             and p.is_contiguous()
         ):
-            # Fused path: the per-element stepsize V_ij ~= r_i * c_j / mean(r)
-            # is computed in-kernel (registers) -- no vmean state and no
-            # full-size stepsize/update temporaries; mean(v_row) travels as a
-            # 1-element device tensor so no host sync happens per step.
+            # Fused path. Phase 1 of the kernel computes the per-block absmax
+            # AND the raw row/col grad^2 sums in ONE pass over grad + m_sign;
+            # the v_row/v_col EMAs advance in place device-side and the
+            # per-element stepsize V_ij ~= r_i * c_j / mean(r) is computed in
+            # registers in phase 2 -- no host-side reduction pass, no host
+            # sync, no full-size temporaries anywhere in the step.
             codebook = self._gefen_codebook
             if codebook is None:
                 raise ValueError(
@@ -1011,10 +992,10 @@ class Gefen(torch.optim.Optimizer):
                 state["m_magnitude"],
                 state["v_row"],
                 state["v_col"],
-                state["v_row"].mean().reshape(1),
                 codebook,
                 cols,
                 beta1,
+                beta2,
                 lr,
                 eps,
                 1.0 / bias_correction_2,
@@ -1024,6 +1005,23 @@ class Gefen(torch.optim.Optimizer):
                 self._gefen_global_step,
             )
             return
+
+        # Decomposed fallback (CPU / fused disabled). Row/col mean-square EMAs
+        # over bounded fp32 row-chunks (one chunk serves both reductions, so
+        # the transient stays ~a few chunk sizes), then whole-tensor torch ops.
+        grad2d = grad.detach()
+        row_ms = torch.empty(rows, dtype=torch.float32, device=p.device)
+        col_sq = torch.zeros(cols, dtype=torch.float32, device=p.device)
+        rows_per_chunk = max(1, (1 << 20) // max(1, cols))
+        for r0 in range(0, rows, rows_per_chunk):
+            r1 = min(r0 + rows_per_chunk, rows)
+            chunk_sq = grad2d[r0:r1].float().square_()
+            row_ms[r0:r1] = chunk_sq.sum(dim=1)
+            col_sq += chunk_sq.sum(dim=0)
+        row_ms.div_(cols)
+        col_sq.div_(rows)
+        state["v_row"].mul_(beta2).add_(row_ms, alpha=1 - beta2)
+        state["v_col"].mul_(beta2).add_(col_sq, alpha=1 - beta2)
 
         # Decomposed fallback (CPU / fused disabled): whole-tensor torch ops.
         # The kernel above is the canonical numerics; this matches it within

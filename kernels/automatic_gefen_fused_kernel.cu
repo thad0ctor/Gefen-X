@@ -1068,6 +1068,93 @@ __global__ void gefen_update_flat_full_kernel(
     }
 }
 
+// Factored-mode phase 1: ONE pass over grad + m_sign computing, per element,
+// (a) the updated-momentum absmax per gefen block (atomic max, order-free) and
+// (b) the row/col sum-of-squares of the RAW gradient for the Adafactor EMAs.
+// Layout: each CUDA block owns a (TR rows x TC cols) matrix tile; warp w scans
+// row (tile_row + w) in lane-strided column segments, so every global read is
+// coalesced. Row sums reduce via warp shuffles (one atomicAdd per row per
+// tile); col sums accumulate in shared partials (one atomicAdd per col per
+// tile). The atomicAdd accumulation makes v_row/v_col run-to-run
+// nondeterministic at sub-ULP scale -- the same documented, convergence-
+// neutral property as the v2-full atomic vmean.
+#define GEFEN_FACTORED_TILE_COLS 256
+#define GEFEN_FACTORED_TILE_ROWS 8
+
+template <typename scalar_t>
+__global__ void gefen_factored_stats_kernel(
+    const scalar_t* __restrict__ grad_view,
+    const uint8_t* __restrict__ m_sign,
+    const float* __restrict__ old_magnitude,
+    const float* __restrict__ codebook,
+    float* __restrict__ new_magnitude,
+    float* __restrict__ row_sq,
+    float* __restrict__ col_sq,
+    int codebook_size,
+    int64_t period,
+    int64_t rows,
+    int64_t cols,
+    float beta1
+) {
+    // Shared: [codebook][TC col partials]
+    extern __shared__ float smem[];
+    float* s_codebook = smem;
+    float* s_col = smem + codebook_size;
+    for (int i = threadIdx.x; i < codebook_size; i += blockDim.x) {
+        s_codebook[i] = codebook[i];
+    }
+    for (int i = threadIdx.x; i < GEFEN_FACTORED_TILE_COLS; i += blockDim.x) {
+        s_col[i] = 0.0f;
+    }
+    __syncthreads();
+
+    const int64_t col0 =
+        static_cast<int64_t>(blockIdx.x) * GEFEN_FACTORED_TILE_COLS;
+    const int64_t row0 =
+        static_cast<int64_t>(blockIdx.y) * GEFEN_FACTORED_TILE_ROWS;
+    const int warp = threadIdx.x >> 5;
+    const int lane = threadIdx.x & 31;
+
+    // Each warp owns rows row0+warp, row0+warp+warps_per_block, ...
+    const int warps_per_block = blockDim.x >> 5;
+    for (int64_t r = row0 + warp; r < row0 + GEFEN_FACTORED_TILE_ROWS && r < rows;
+         r += warps_per_block) {
+        const int64_t row_base = r * cols;
+        float row_acc = 0.0f;
+        for (int64_t c = col0 + lane; c < col0 + GEFEN_FACTORED_TILE_COLS && c < cols;
+             c += 32) {
+            const int64_t idx = row_base + c;
+            const float g = static_cast<float>(grad_view[idx]);
+            const float g2 = g * g;
+            row_acc += g2;
+            atomicAdd(&s_col[static_cast<int>(c - col0)], g2);
+            // Per-gefen-block absmax of the updated momentum (same math and
+            // atomic as gefen_magnitude_flat_kernel).
+            const int64_t block_idx = idx / period;
+            const float coeff = s_codebook[static_cast<int>(m_sign[idx])];
+            const float updated =
+                beta1 * (old_magnitude[block_idx] * coeff) + (1.0f - beta1) * g;
+            atomic_max_nonneg(&new_magnitude[block_idx], fabsf(updated));
+        }
+        // Warp-reduce the row partial; one global atomic per row per tile.
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            row_acc += __shfl_down_sync(0xffffffffu, row_acc, offset);
+        }
+        if (lane == 0) {
+            atomicAdd(&row_sq[r], row_acc);
+        }
+    }
+    __syncthreads();
+
+    // One global atomic per column per tile.
+    for (int i = threadIdx.x; i < GEFEN_FACTORED_TILE_COLS; i += blockDim.x) {
+        const int64_t c = col0 + i;
+        if (c < cols && s_col[i] != 0.0f) {
+            atomicAdd(&col_sq[c], s_col[i]);
+        }
+    }
+}
+
 // Factored-second-moment (Adafactor-style) phase 2 for 2D params: quantize +
 // apply with a PER-ELEMENT stepsize computed in registers from the row/col
 // grad^2 EMAs, V_ij ~= v_row[i] * v_col[j] / mean(v_row), instead of the
@@ -1534,11 +1621,11 @@ void gefen_factored_update_cuda(
     at::Tensor m_magnitude,
     at::Tensor v_row,
     at::Tensor v_col,
-    at::Tensor mean_v_row,
     at::Tensor codebook,
     at::Tensor lut,
     int64_t cols,
     double beta1,
+    double beta2,
     double lr,
     double eps,
     double inv_bias_correction_2,
@@ -1547,28 +1634,27 @@ void gefen_factored_update_cuda(
     bool stochastic_round,
     int64_t rng_seed
 ) {
-    // Factored-second-moment (Adafactor-style) fused update for 2D params:
-    // phase 1 reuses the v2 magnitude kernels (per-block absmax of the updated
-    // momentum); phase 2 quantizes + applies with a per-element stepsize
-    // computed in registers from v_row/v_col (no vmean state, no full-size
-    // stepsize tensor). v_row/v_col hold the CURRENT (already EMA-advanced)
-    // row/col mean-square grads; mean_v_row is their device-computed mean
-    // ([1] fp32) so no host sync happens per step.
+    // Factored-second-moment (Adafactor-style) fused update for 2D params.
+    // Phase 1 is the combined stats kernel: ONE pass over grad + m_sign
+    // computes the per-block absmax AND the raw row/col grad^2 sums; the
+    // v_row/v_col EMAs are then advanced IN PLACE here as tiny device ops and
+    // their mean stays on device (no host sync). Phase 2 quantizes
+    // (LUT-narrowed) + applies with the per-element stepsize
+    // V_ij ~= v_row[i] * v_col[j] / mean(v_row) computed in registers -- no
+    // vmean state and no full-size temporaries anywhere in the step.
     if (!p.is_cuda() || !grad_view.is_cuda() || !m_sign.is_cuda() ||
         !m_magnitude.is_cuda() || !v_row.is_cuda() || !v_col.is_cuda() ||
-        !mean_v_row.is_cuda() || !codebook.is_cuda()) {
+        !codebook.is_cuda()) {
         throw std::invalid_argument("Expected all tensors to be on CUDA.");
     }
     if (grad_view.device() != p.device() || m_sign.device() != p.device() ||
         m_magnitude.device() != p.device() || v_row.device() != p.device() ||
-        v_col.device() != p.device() || mean_v_row.device() != p.device() ||
-        codebook.device() != p.device()) {
+        v_col.device() != p.device() || codebook.device() != p.device()) {
         throw std::invalid_argument("Expected all tensors on the same device as p.");
     }
     if (!p.is_contiguous() || !grad_view.is_contiguous() || !m_sign.is_contiguous() ||
         !m_magnitude.is_contiguous() || !v_row.is_contiguous() ||
-        !v_col.is_contiguous() || !mean_v_row.is_contiguous() ||
-        !codebook.is_contiguous()) {
+        !v_col.is_contiguous() || !codebook.is_contiguous()) {
         throw std::invalid_argument("Expected all tensors to be contiguous.");
     }
     const bool use_lut = lut.numel() > 0;
@@ -1590,10 +1676,9 @@ void gefen_factored_update_cuda(
         throw std::invalid_argument("Expected m_sign to have dtype uint8.");
     }
     if (codebook.scalar_type() != at::kFloat || m_magnitude.scalar_type() != at::kFloat ||
-        v_row.scalar_type() != at::kFloat || v_col.scalar_type() != at::kFloat ||
-        mean_v_row.scalar_type() != at::kFloat) {
+        v_row.scalar_type() != at::kFloat || v_col.scalar_type() != at::kFloat) {
         throw std::invalid_argument(
-            "Expected codebook/m_magnitude/v_row/v_col/mean_v_row to have dtype float32.");
+            "Expected codebook/m_magnitude/v_row/v_col to have dtype float32.");
     }
     if (grad_view.scalar_type() != p.scalar_type()) {
         throw std::invalid_argument("Expected grad_view dtype to match p.");
@@ -1614,9 +1699,8 @@ void gefen_factored_update_cuda(
         throw std::invalid_argument("Expected cols to divide the total numel.");
     }
     const int64_t rows = total_numel / cols;
-    if (v_row.numel() != rows || v_col.numel() != cols || mean_v_row.numel() != 1) {
-        throw std::invalid_argument(
-            "Expected v_row [rows], v_col [cols] and mean_v_row [1].");
+    if (v_row.numel() != rows || v_col.numel() != cols) {
+        throw std::invalid_argument("Expected v_row [rows] and v_col [cols].");
     }
     if (codebook.numel() < 1 || codebook.numel() > 256) {
         throw std::invalid_argument("Expected codebook size in [1, 256].");
@@ -1636,36 +1720,42 @@ void gefen_factored_update_cuda(
     const int64_t flat_blocks_cap = static_cast<int64_t>(sm_count) * 32;
     const size_t codebook_bytes = static_cast<size_t>(codebook_size) * sizeof(float);
 
-    // Phase 1: per-block magnitude (absmax of updated momentum) -- identical
-    // kernels and routing to the v2 wrapper.
-    AT_DISPATCH_FLOATING_TYPES_AND2(
-        at::kHalf, at::kBFloat16, p.scalar_type(),
-        "gefen_factored_magnitude", [&] {
-            if (period <= 2048) {
-                int64_t nblocks = (total_numel + threads - 1) / threads;
-                if (nblocks > flat_blocks_cap) nblocks = flat_blocks_cap;
-                if (nblocks < 1) nblocks = 1;
-                gefen_magnitude_flat_kernel<scalar_t><<<static_cast<unsigned int>(nblocks), threads, codebook_bytes>>>(
+    // Phase 1 (combined stats): ONE pass over grad + m_sign computes the
+    // per-block absmax AND the raw row/col sum-of-squares for the Adafactor
+    // EMAs -- the separate magnitude launch and the host-side chunked grad^2
+    // reduction are both gone.
+    auto row_sq = at::zeros({rows}, m_magnitude.options());
+    auto col_sq = at::zeros({cols}, m_magnitude.options());
+    {
+        const int64_t grid_x =
+            (cols + GEFEN_FACTORED_TILE_COLS - 1) / GEFEN_FACTORED_TILE_COLS;
+        const int64_t grid_y =
+            (rows + GEFEN_FACTORED_TILE_ROWS - 1) / GEFEN_FACTORED_TILE_ROWS;
+        const dim3 grid(static_cast<unsigned int>(grid_x),
+                        static_cast<unsigned int>(grid_y));
+        const size_t shmem =
+            codebook_bytes + GEFEN_FACTORED_TILE_COLS * sizeof(float);
+        AT_DISPATCH_FLOATING_TYPES_AND2(
+            at::kHalf, at::kBFloat16, p.scalar_type(),
+            "gefen_factored_stats", [&] {
+                gefen_factored_stats_kernel<scalar_t><<<grid, threads, shmem>>>(
                     grad_view.data_ptr<scalar_t>(), m_sign.data_ptr<uint8_t>(),
                     m_magnitude.data_ptr<float>(), codebook.data_ptr<float>(),
-                    new_magnitude.data_ptr<float>(), codebook_size, period, total_numel,
+                    new_magnitude.data_ptr<float>(), row_sq.data_ptr<float>(),
+                    col_sq.data_ptr<float>(), codebook_size, period, rows, cols,
                     static_cast<float>(beta1));
-            } else {
-                int blocks_per_row = static_cast<int>((period + threads * 64 - 1) / (threads * 64));
-                if (blocks_per_row < 1) blocks_per_row = 1;
-                const int max_bpr = static_cast<int>((flat_blocks_cap + num_blocks - 1) / num_blocks);
-                if (blocks_per_row > max_bpr && max_bpr >= 1) blocks_per_row = max_bpr;
-                if (blocks_per_row < 1) blocks_per_row = 1;
-                const int64_t grid = num_blocks * blocks_per_row;
-                const size_t shmem = static_cast<size_t>(threads) * sizeof(float) + codebook_bytes;
-                gefen_magnitude_split_kernel<scalar_t><<<static_cast<unsigned int>(grid), threads, shmem>>>(
-                    grad_view.data_ptr<scalar_t>(), m_sign.data_ptr<uint8_t>(),
-                    m_magnitude.data_ptr<float>(), codebook.data_ptr<float>(),
-                    new_magnitude.data_ptr<float>(), codebook_size, period, num_blocks, blocks_per_row,
-                    static_cast<float>(beta1));
-            }
-        });
-    C10_CUDA_KERNEL_LAUNCH_CHECK();
+            });
+        C10_CUDA_KERNEL_LAUNCH_CHECK();
+    }
+
+    // EMA advance + mean, all as tiny device ops (no host sync): the caller's
+    // v_row/v_col are updated in place from the raw sums.
+    v_row.mul_(beta2).add_(
+        row_sq.div_(static_cast<double>(cols)), 1.0 - beta2);
+    v_col.mul_(beta2).add_(
+        col_sq.div_(static_cast<double>(rows)), 1.0 - beta2);
+    auto mean_v_row = v_row.mean().reshape({1}).contiguous();
+
 
     // Phase 2: quantize + parameter update with the in-register factored
     // per-element stepsize.

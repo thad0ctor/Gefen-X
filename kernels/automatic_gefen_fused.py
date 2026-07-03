@@ -230,10 +230,10 @@ def gefen_factored_update_cuda(
     m_magnitude: torch.Tensor,
     v_row: torch.Tensor,
     v_col: torch.Tensor,
-    mean_v_row: torch.Tensor,
     codebook: torch.Tensor,
     cols: int,
     beta1: float,
+    beta2: float,
     lr: float,
     eps: float,
     inv_bias_correction_2: float,
@@ -242,12 +242,13 @@ def gefen_factored_update_cuda(
     stochastic_round: bool = False,
     rng_seed: int = 0,
 ) -> None:
-    """Factored-second-moment (Adafactor-style) fused update for a 2D param:
-    the per-element stepsize V_ij ~= v_row[i] * v_col[j] / mean(v_row) is
-    computed in registers (no vmean state, no full-size stepsize tensor).
-    ``v_row``/``v_col`` must already hold the CURRENT (EMA-advanced) row/col
-    mean-square grads and ``mean_v_row`` their device-computed mean ([1] fp32);
-    weight decay is folded via ``weight_decay_factor`` like the v2-full path."""
+    """Factored-second-moment (Adafactor-style) fused update for a 2D param.
+    Phase 1 computes the per-block absmax AND the raw row/col grad^2 sums in
+    ONE pass; the ``v_row``/``v_col`` EMAs are advanced IN PLACE device-side
+    (pass the state tensors directly) and their mean never leaves the device.
+    Phase 2 applies with the per-element stepsize
+    V_ij ~= v_row[i] * v_col[j] / mean(v_row) computed in registers; weight
+    decay is folded via ``weight_decay_factor`` like the v2-full path."""
     grad_c = grad_view if grad_view.is_contiguous() else grad_view.contiguous()
     cb_c = codebook if codebook.is_contiguous() else codebook.contiguous()
 
@@ -259,11 +260,11 @@ def gefen_factored_update_cuda(
         m_magnitude,
         v_row,
         v_col,
-        mean_v_row,
         cb_c,
         _codebook_search_lut(cb_c),
         cols,
         beta1,
+        beta2,
         lr,
         eps,
         inv_bias_correction_2,
