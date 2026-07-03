@@ -24,6 +24,9 @@ from gefen.kernels.automatic_gefen_fused import (
 from gefen.kernels.automatic_gefen_fused import (
     gefen_quantized_momentum_update_cuda as _gefen_quantized_momentum_update_cuda,
 )
+from gefen.kernels.automatic_gefen_fused import (
+    gefen_factored_update_cuda as _gefen_factored_update_cuda,
+)
 from gefen.kernels.automatic_gefen_fused import _should_use_v2
 
 # Optional explicit override for the period-search backend ("cuda_kernel" / "cpu"
@@ -913,9 +916,9 @@ class Gefen(torch.optim.Optimizer):
         # the second moment differs: instead of the block-shared vmean EMA, we
         # keep fp32 row/col EMAs of grad^2 and reconstruct a per-element
         # V ~= outer(R, C) / mean(R) each step (Shazeer & Stern 2018), giving
-        # per-element stepsize fidelity at (rows + cols) state. Decomposed
-        # whole-tensor torch ops -- a deliberate speed-agnostic exploration
-        # path, not a fused kernel.
+        # per-element stepsize fidelity at (rows + cols) state. On the fused
+        # CUDA path the stepsize is computed in-kernel (no full-size
+        # temporaries); elsewhere a decomposed whole-tensor fallback applies.
         if hasattr(grad, "to_local"):
             grad = grad.to_local()
         if hasattr(grad, "wait"):
@@ -959,16 +962,72 @@ class Gefen(torch.optim.Optimizer):
         automatic_period = state["automatic_period"]
         grad_view = self._automatic_view(flat_grad, automatic_period)
 
-        grad_sq = grad.detach().float().square()
-        state["v_row"].mul_(beta2).add_(grad_sq.mean(dim=1), alpha=1 - beta2)
-        state["v_col"].mul_(beta2).add_(grad_sq.mean(dim=0), alpha=1 - beta2)
-        del grad_sq
+        # Row/col mean-square EMAs, computed over bounded row-chunks: one fp32
+        # chunk of grad^2 serves both the row sums and the col accumulation, so
+        # the transient is capped at the chunk size instead of a full-size fp32
+        # copy of the gradient (vector_norm's dtype= upcast materializes one).
+        grad2d = grad.detach()
+        rows, cols = p.shape
+        row_ms = torch.empty(rows, dtype=torch.float32, device=p.device)
+        col_sq = torch.zeros(cols, dtype=torch.float32, device=p.device)
+        # Small chunk: the allocator keeps ~2-3 chunk temporaries live across
+        # iterations, so the transient is a few x this (measured ~3x); 1M
+        # elements caps it around ~12 MiB regardless of parameter size.
+        rows_per_chunk = max(1, (1 << 20) // max(1, cols))
+        for r0 in range(0, rows, rows_per_chunk):
+            r1 = min(r0 + rows_per_chunk, rows)
+            chunk_sq = grad2d[r0:r1].float().square_()
+            row_ms[r0:r1] = chunk_sq.sum(dim=1)
+            col_sq += chunk_sq.sum(dim=0)
+        row_ms.div_(cols)
+        col_sq.div_(rows)
+        state["v_row"].mul_(beta2).add_(row_ms, alpha=1 - beta2)
+        state["v_col"].mul_(beta2).add_(col_sq, alpha=1 - beta2)
 
         state["step"] += 1
         bias_correction_1 = 1 - beta1 ** state["step"]
         bias_correction_2 = 1 - beta2 ** state["step"]
 
-        # Per-element factored second-moment estimate and stepsize.
+        if (
+            self._use_fused_gefen_automatic_step()
+            and p.is_cuda
+            and p.is_contiguous()
+        ):
+            # Fused path: the per-element stepsize V_ij ~= r_i * c_j / mean(r)
+            # is computed in-kernel (registers) -- no vmean state and no
+            # full-size stepsize/update temporaries; mean(v_row) travels as a
+            # 1-element device tensor so no host sync happens per step.
+            codebook = self._gefen_codebook
+            if codebook is None:
+                raise ValueError(
+                    "Expected Gefen codebook to be initialized before the "
+                    "factored update."
+                )
+            weight_decay_factor = 1.0 - lr * group["weight_decay"]
+            _gefen_factored_update_cuda(
+                p,
+                grad_view,
+                state["m_codebook"],
+                state["m_magnitude"],
+                state["v_row"],
+                state["v_col"],
+                state["v_row"].mean().reshape(1),
+                codebook,
+                cols,
+                beta1,
+                lr,
+                eps,
+                1.0 / bias_correction_2,
+                1.0 / bias_correction_1,
+                weight_decay_factor,
+                self._stochastic_round,
+                self._gefen_global_step,
+            )
+            return
+
+        # Decomposed fallback (CPU / fused disabled): whole-tensor torch ops.
+        # The kernel above is the canonical numerics; this matches it within
+        # float tolerance (different op association), not bit-for-bit.
         v_hat = torch.outer(state["v_row"], state["v_col"]).div_(
             state["v_row"].mean().clamp_(min=torch.finfo(torch.float32).tiny)
         )
@@ -1993,10 +2052,17 @@ class Gefen(torch.optim.Optimizer):
                 grad = p.grad
                 if grad is None:
                     continue
-                # Factored-v routing (opt-in): 2D params keep their quantized
-                # momentum but step through the decomposed factored-second-
-                # moment path instead of any fused/merged vmean path.
-                if self._factored_v_2d and p.ndim == 2:
+                # Factored-v routing (opt-in): plain 2D params keep their
+                # quantized momentum but step through the factored-second-
+                # moment path (in-kernel elementwise stepsize on the fused
+                # path) instead of any vmean path. Sharded (DTensor) params
+                # fall through to the standard path: local-shard row/col
+                # statistics would be wrong under sharding.
+                if (
+                    self._factored_v_2d
+                    and p.ndim == 2
+                    and not hasattr(p, "placements")
+                ):
                     self._step_automatic_factored(group, name, p, grad)
                     continue
                 if (

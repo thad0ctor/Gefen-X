@@ -1,0 +1,153 @@
+"""Coverage for the factored-second-moment (Adafactor-style) Gefen path
+(factored_v_2d): fused kernel vs decomposed fallback consistency, single-step
+quantize adjacency, bounded transient memory, and state/flag hygiene.
+
+The fused kernel is the canonical numerics for this mode. The decomposed
+fallback differs benignly: it dequantizes momentum coefficients through a bf16
+template (the nonfused-path convention) while the kernel reads the fp32
+codebook directly (the fused-path convention), and the momentum op association
+differs (lerp vs fma). The 8-bit quantizer discretizes both, so single-step
+index flips must land on ADJACENT codewords and multi-step trajectories stay
+close in aggregate, not bit-for-bit.
+
+Run: python tests/test_gefen_factored_v.py
+"""
+import os
+import sys
+
+sys.path[:] = [p for p in sys.path if not os.path.isfile(os.path.join(p or ".", "gefen.py"))]
+
+import torch  # noqa: E402
+import torch.nn as nn  # noqa: E402
+
+try:
+    import pytest
+except ImportError:  # pragma: no cover
+    pytest = None
+
+from gefen import Gefen  # noqa: E402
+
+
+def _run(fused, steps=6, shape=(768, 512), seed=3):
+    torch.manual_seed(seed)
+    p = nn.Parameter((torch.randn(*shape, device="cuda") * 0.02).bfloat16())
+    opt = Gefen([("w", p)], lr=1e-3, fused=fused, factored_v_2d=True,
+                weight_decay=0.1)
+    torch.manual_seed(seed + 1)
+    for _ in range(steps):
+        p.grad = torch.randn(*shape, device="cuda").bfloat16() * 1e-3
+        opt.step()
+    return p.detach().float(), opt
+
+
+def check_kernel_vs_fallback_aggregate():
+    pk, ok = _run(fused=True)
+    pf, of = _run(fused=False)
+    sk = next(iter(ok.state.values()))
+    sf = next(iter(of.state.values()))
+    assert torch.allclose(sk["v_row"], sf["v_row"], rtol=1e-5, atol=1e-12)
+    assert torch.allclose(sk["v_col"], sf["v_col"], rtol=1e-5, atol=1e-12)
+    rel_mean = ((pk - pf).abs().mean() / pf.abs().mean()).item()
+    rel_max = ((pk - pf).abs().max() / pf.abs().max()).item()
+    print(f"  6-step kernel-vs-fallback rel diff: mean {rel_mean:.2e} max {rel_max:.2e}")
+    assert torch.isfinite(pk).all()
+    assert rel_mean < 2e-3, rel_mean
+    assert rel_max < 5e-2, rel_max
+    return True
+
+
+def check_single_step_adjacency():
+    _, ok = _run(fused=True, steps=1)
+    _, of = _run(fused=False, steps=1)
+    sk = next(iter(ok.state.values()))
+    sf = next(iter(of.state.values()))
+    didx = (sk["m_codebook"].short() - sf["m_codebook"].short()).abs()
+    adjacent = (didx <= 1).float().mean().item()
+    print(f"  single-step m_sign within-1-codeword: {adjacent*100:.4f}%")
+    assert adjacent > 0.9999, adjacent
+    return True
+
+
+def check_transient_memory_bounded():
+    shape = (4096, 4096)
+    p = nn.Parameter((torch.randn(*shape, device="cuda") * 0.02).bfloat16())
+    opt = Gefen([("w", p)], lr=1e-3, fused=True, factored_v_2d=True)
+    p.grad = torch.randn(*shape, device="cuda").bfloat16() * 1e-3
+    opt.step()  # state init
+    p.grad = torch.randn(*shape, device="cuda").bfloat16() * 1e-3
+    torch.cuda.synchronize()
+    torch.cuda.reset_peak_memory_stats()
+    base = torch.cuda.memory_allocated()
+    opt.step()
+    torch.cuda.synchronize()
+    extra = (torch.cuda.max_memory_allocated() - base) / 2**20
+    full_fp32 = shape[0] * shape[1] * 4 / 2**20
+    print(f"  transient {extra:.1f} MiB (full fp32 tensor = {full_fp32:.0f} MiB)")
+    assert extra < 0.35 * full_fp32, extra
+    return True
+
+
+def check_state_and_flag_hygiene():
+    _, opt = _run(fused=True, steps=2)
+    st = next(iter(opt.state.values()))
+    assert st["v_row"].dtype == torch.float32 and st["v_row"].shape == (768,)
+    assert st["v_col"].dtype == torch.float32 and st["v_col"].shape == (512,)
+    assert "vmean" not in st, "factored param must not carry block vmean"
+    # flags-off must not create factored state
+    torch.manual_seed(3)
+    p = nn.Parameter((torch.randn(64, 32, device="cuda") * 0.02).bfloat16())
+    opt2 = Gefen([("w", p)], lr=1e-3, fused=True)
+    p.grad = torch.randn(64, 32, device="cuda").bfloat16() * 1e-3
+    opt2.step()
+    st2 = next(iter(opt2.state.values()))
+    assert "v_row" not in st2 and "vmean" in st2
+    return True
+
+
+def run():
+    if not torch.cuda.is_available():
+        print("SKIP: CUDA required")
+        return True
+    print("device:", torch.cuda.get_device_name(0))
+    checks = [
+        ("kernel_vs_fallback_aggregate", check_kernel_vs_fallback_aggregate),
+        ("single_step_adjacency", check_single_step_adjacency),
+        ("transient_memory_bounded", check_transient_memory_bounded),
+        ("state_and_flag_hygiene", check_state_and_flag_hygiene),
+    ]
+    ok = True
+    for name, fn in checks:
+        try:
+            r = fn()
+            print(f"[{name}] {'PASS' if r else 'FAIL'}")
+            ok = ok and r
+        except Exception as e:
+            print(f"[{name}] FAIL: {e}")
+            ok = False
+    return ok
+
+
+if pytest is not None:
+    _skip = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+
+    @_skip
+    def test_kernel_vs_fallback_aggregate():
+        assert check_kernel_vs_fallback_aggregate()
+
+    @_skip
+    def test_single_step_adjacency():
+        assert check_single_step_adjacency()
+
+    @_skip
+    def test_transient_memory_bounded():
+        assert check_transient_memory_bounded()
+
+    @_skip
+    def test_state_and_flag_hygiene():
+        assert check_state_and_flag_hygiene()
+
+
+if __name__ == "__main__":
+    ok = run()
+    print("\nFACTORED-V OVERALL:", "PASS" if ok else "FAIL")
+    raise SystemExit(0 if ok else 1)

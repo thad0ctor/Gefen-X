@@ -223,6 +223,57 @@ def automatic_gefen_fused_full_update_cuda(
     )
 
 
+def gefen_factored_update_cuda(
+    p: torch.Tensor,
+    grad_view: torch.Tensor,
+    m_sign: torch.Tensor,
+    m_magnitude: torch.Tensor,
+    v_row: torch.Tensor,
+    v_col: torch.Tensor,
+    mean_v_row: torch.Tensor,
+    codebook: torch.Tensor,
+    cols: int,
+    beta1: float,
+    lr: float,
+    eps: float,
+    inv_bias_correction_2: float,
+    inv_bias_correction_1: float,
+    weight_decay_factor: float,
+    stochastic_round: bool = False,
+    rng_seed: int = 0,
+) -> None:
+    """Factored-second-moment (Adafactor-style) fused update for a 2D param:
+    the per-element stepsize V_ij ~= v_row[i] * v_col[j] / mean(v_row) is
+    computed in registers (no vmean state, no full-size stepsize tensor).
+    ``v_row``/``v_col`` must already hold the CURRENT (EMA-advanced) row/col
+    mean-square grads and ``mean_v_row`` their device-computed mean ([1] fp32);
+    weight decay is folded via ``weight_decay_factor`` like the v2-full path."""
+    grad_c = grad_view if grad_view.is_contiguous() else grad_view.contiguous()
+    cb_c = codebook if codebook.is_contiguous() else codebook.contiguous()
+
+    module = _load_extension()
+    module.gefen_factored_update_cuda(
+        p,
+        grad_c,
+        m_sign,
+        m_magnitude,
+        v_row,
+        v_col,
+        mean_v_row,
+        cb_c,
+        _codebook_search_lut(cb_c),
+        cols,
+        beta1,
+        lr,
+        eps,
+        inv_bias_correction_2,
+        inv_bias_correction_1,
+        weight_decay_factor,
+        stochastic_round,
+        rng_seed,
+    )
+
+
 def gefen_quantized_momentum_update_cuda(
     grad_view: torch.Tensor,
     m_sign: torch.Tensor,
