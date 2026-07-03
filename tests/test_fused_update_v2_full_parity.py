@@ -29,7 +29,7 @@ try:
 except ImportError:  # pragma: no cover
     pytest = None
 
-from gefen.kernels.automatic_gefen_fused import _load_extension
+from gefen.kernels.automatic_gefen_fused import _codebook_search_lut, _load_extension
 from gefen.kernels.automatic_vmean import automatic_vmean_update_cuda
 
 BETA1, BETA2, EPS, LR = 0.9, 0.999, 1e-8, 5e-5
@@ -98,13 +98,15 @@ def _host_stepsize(vmean, bc1, bc2):
     return stepsize
 
 
-def _fused(mod, p, gv, ms, mm, vm, cb, step, wd):
+def _fused(mod, p, gv, ms, mm, vm, cb, step, wd, lut=None):
     p, ms, mm, vm = p.clone(), ms.clone(), mm.clone(), vm.clone()
     bc1 = 1 - BETA1 ** step
     bc2 = 1 - BETA2 ** step
     weight_decay_factor = 1.0 - LR * wd
+    if lut is None:
+        lut = torch.empty(0, dtype=torch.int16, device=p.device)
     mod.automatic_gefen_fused_update_v2_full_cuda(
-        p, gv, ms, mm, vm, cb, False, BETA1, BETA2, LR, EPS,
+        p, gv, ms, mm, vm, cb, lut, False, BETA1, BETA2, LR, EPS,
         1.0 / math.sqrt(bc2), 1.0 / bc1, weight_decay_factor)
     return p, ms, mm, vm
 
@@ -143,8 +145,18 @@ def parity(device, wd=0.0):
                 fp, fms, fmm, fvm = _fused(mod, p, gv, ms, mm, vm, cb, step, wd)
                 rp, rms, rmm = _reference(mod, p, gv, ms, mm, fvm, cb, step, wd)
                 svm = _standalone_vmean(vm, gv)
+                # LUT-narrowed quantize vs the full-range search on identical
+                # inputs: the quantize inputs (old/new magnitude) are atomic-
+                # order-independent, so m_sign and m_magnitude must be
+                # bit-identical; p inherits only the documented vmean/stepsize
+                # atomic jitter between the two runs.
+                lp, lms, lmm, _ = _fused(mod, p, gv, ms, mm, vm, cb, step, wd,
+                                         lut=_codebook_search_lut(cb))
+                lut_ok = (_bit_equal(lms, fms) and _bit_equal(lmm, fmm)
+                          and torch.allclose(lp.float(), fp.float(),
+                                             rtol=VMEAN_RTOL, atol=VMEAN_ATOL))
                 bitwise = (_bit_equal(rp, fp) and _bit_equal(rms, fms)
-                           and _bit_equal(rmm, fmm))
+                           and _bit_equal(rmm, fmm) and lut_ok)
                 # period==1 has a single grad^2 term per block, so the atomic
                 # accumulation degenerates to one add and must match the
                 # standalone tree reduction bit-for-bit -- no tolerance there.

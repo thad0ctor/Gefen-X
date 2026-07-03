@@ -205,6 +205,123 @@ __device__ __forceinline__ uint8_t quantize_codebook_index(
     return static_cast<uint8_t>((u < p_up) ? right_idx : left_idx);
 }
 
+// ---------------------------------------------------------------------------
+// LUT-narrowed codebook search. lut[b] = #codebook entries whose bucket < b,
+// with bucket(v) = clamp(floor((v+1) * buckets / 2), 0, buckets-1) over the
+// normalized domain [-1, 1]. Bucketization is monotone in v, so for any v the
+// lower_bound answer lies in [lut[bucket(v)], lut[bucket(v)+1]]: every entry
+// in an earlier bucket is strictly < v and every entry in a later bucket is
+// > v. Running the IDENTICAL binary search on that sub-range therefore reaches
+// the identical lower_bound, and the identical left/right tie-break (nearest)
+// or bracketing pair (stochastic) returns the identical index -- the LUT is a
+// pure search accelerator, bit-exact by construction. The LUT is built host-
+// side once per codebook (the exact-DP codebook is frozen after step 1) and
+// read via __ldg, so it stays resident in L1/L2. A null lut falls back to the
+// full-range search (bit-identical, just slower).
+// ---------------------------------------------------------------------------
+__device__ __forceinline__ void gefen_lut_search_bounds(
+    float normalized_value,
+    const int16_t* __restrict__ lut,
+    int lut_buckets,
+    int codebook_size,
+    int* left,
+    int* right
+) {
+    if (lut == nullptr) {
+        *left = 0;
+        *right = codebook_size;
+        return;
+    }
+    int b = static_cast<int>(
+        floorf((normalized_value + 1.0f) * (0.5f * static_cast<float>(lut_buckets))));
+    if (b < 0) {
+        b = 0;
+    } else if (b > lut_buckets - 1) {
+        b = lut_buckets - 1;
+    }
+    // Defensive clamp: the host-built LUT is monotone in [0, codebook_size] by
+    // construction (torch.searchsorted over the bucketized sorted codebook), so
+    // for every legitimate caller these clamps are no-ops and the search stays
+    // bit-identical. They exist so a malformed LUT handed to the raw extension
+    // API (negative / non-monotonic / out-of-range int16 values -- which the
+    // host wrapper cannot value-check without a D2H sync) degrades to a safe
+    // in-bounds search instead of out-of-bounds codebook indexing.
+    int lo = __ldg(&lut[b]);
+    int hi = __ldg(&lut[b + 1]);
+    if (lo < 0) {
+        lo = 0;
+    } else if (lo > codebook_size) {
+        lo = codebook_size;
+    }
+    if (hi < lo) {
+        hi = lo;
+    } else if (hi > codebook_size) {
+        hi = codebook_size;
+    }
+    *left = lo;
+    *right = hi;
+}
+
+// quantize_codebook_index with a LUT-narrowed lower_bound. Bit-identical to
+// quantize_codebook_index for both rounding modes (see gefen_lut_search_bounds);
+// lut == nullptr degrades to the exact full-range behavior.
+__device__ __forceinline__ uint8_t quantize_codebook_index_lut(
+    float normalized_value,
+    const float* __restrict__ codebook,
+    int codebook_size,
+    const int16_t* __restrict__ lut,
+    int lut_buckets,
+    bool stochastic,
+    uint64_t rng_seed,
+    int64_t element_idx
+) {
+    int left;
+    int right;
+    gefen_lut_search_bounds(
+        normalized_value, lut, lut_buckets, codebook_size, &left, &right);
+    while (left < right) {
+        const int mid = left + (right - left) / 2;
+        if (codebook[mid] < normalized_value) {
+            left = mid + 1;
+        } else {
+            right = mid;
+        }
+    }
+
+    int right_idx = left;
+    if (right_idx < 0) {
+        right_idx = 0;
+    } else if (right_idx >= codebook_size) {
+        right_idx = codebook_size - 1;
+    }
+    int left_idx = right_idx - 1;
+    if (left_idx < 0) {
+        left_idx = 0;
+    }
+
+    if (!stochastic) {
+        const float left_dist = fabsf(normalized_value - codebook[left_idx]);
+        const float right_dist = fabsf(normalized_value - codebook[right_idx]);
+        return static_cast<uint8_t>(left_dist <= right_dist ? left_idx : right_idx);
+    }
+
+    if (left_idx == right_idx) {
+        return static_cast<uint8_t>(right_idx);
+    }
+    const float lo = codebook[left_idx];
+    const float hi = codebook[right_idx];
+    const float span = hi - lo;
+    float v = normalized_value;
+    if (v < lo) {
+        v = lo;
+    } else if (v > hi) {
+        v = hi;
+    }
+    const float p_up = (span > 0.0f) ? (v - lo) / span : 0.0f;
+    const float u = gefen_sr_uniform(rng_seed, element_idx);
+    return static_cast<uint8_t>((u < p_up) ? right_idx : left_idx);
+}
+
 template <typename scalar_t>
 __global__ void automatic_gefen_fused_update_kernel(
     scalar_t* __restrict__ p,
@@ -331,6 +448,17 @@ int choose_threads(int64_t period) {
 //     to float exactly as PyTorch casts the scalar operands of div_/mul_.
 // Only routed for period > warpSize with full SM occupancy (the v1 regime);
 // tiny-period / few-block shapes stay on the v2 decomposed path.
+//
+// Multi-row packing: one CUDA block hosts blockDim.y gefen-blocks (rows), each
+// processed by its own blockDim.x-thread slice with the IDENTICAL per-row
+// thread-stride schedule, halving reduction tree, and scalar math as the
+// one-row-per-block original -- so every per-row result is bit-exact by
+// construction. The wins are (a) the 256-entry codebook is staged into shared
+// once per ~256 threads instead of once per row (the dominant cost at small
+// periods, where a row is a single warp), and (b) blocks are >= 2 warps, so
+// small-period shapes stop running at 1-warp occupancy. Rows past num_blocks
+// (the remainder of the last CUDA block) stay resident but inactive: they skip
+// all global reads/writes yet join every __syncthreads (no early return).
 template <typename scalar_t>
 __global__ void automatic_gefen_fused_full_update_kernel(
     scalar_t* __restrict__ p,
@@ -339,6 +467,8 @@ __global__ void automatic_gefen_fused_full_update_kernel(
     float* __restrict__ m_magnitude,
     float* __restrict__ vmean,
     const float* __restrict__ codebook,
+    const int16_t* __restrict__ lut,
+    int lut_buckets,
     int codebook_size,
     bool packed_indices,
     int64_t period,
@@ -353,48 +483,59 @@ __global__ void automatic_gefen_fused_full_update_kernel(
     bool stochastic_round,
     uint64_t rng_seed
 ) {
-    // Shared layout: [codebook_size codebook][blockDim.x max][blockDim.x sumsq].
+    // Shared layout: [codebook_size codebook][tpr*rows max][tpr*rows sumsq],
+    // where tpr = blockDim.x (threads per row) and rows = blockDim.y.
     extern __shared__ float smem[];
     float* s_codebook = smem;
-    float* shared_max = smem + codebook_size;
-    float* shared_sum = shared_max + blockDim.x;
-    for (int i = threadIdx.x; i < codebook_size; i += blockDim.x) {
+    const int tpr = blockDim.x;
+    const int rows = blockDim.y;
+    float* shared_max_all = smem + codebook_size;
+    float* shared_sum_all = shared_max_all + tpr * rows;
+
+    const int lin = threadIdx.y * tpr + threadIdx.x;
+    for (int i = lin; i < codebook_size; i += tpr * rows) {
         s_codebook[i] = codebook[i];
     }
     __syncthreads();
 
-    const int64_t block_idx = static_cast<int64_t>(blockIdx.x);
-    if (block_idx >= num_blocks) {
-        return;
-    }
+    const int64_t block_idx =
+        static_cast<int64_t>(blockIdx.x) * rows + threadIdx.y;
+    const bool active = block_idx < num_blocks;
 
-    const int64_t start = block_idx * period;
-    const float old_magnitude = m_magnitude[block_idx];
+    // Per-row slices of the reduction buffers: each row reduces over its own
+    // tpr-wide slice with the same stride schedule the one-row kernel used.
+    float* shared_max = shared_max_all + threadIdx.y * tpr;
+    float* shared_sum = shared_sum_all + threadIdx.y * tpr;
+
+    const int64_t start = active ? block_idx * period : 0;
+    const float old_magnitude = active ? m_magnitude[block_idx] : 0.0f;
     float local_absmax = 0.0f;
     float local_sumsq = 0.0f;
 
-    for (int64_t offset = threadIdx.x; offset < period; offset += blockDim.x) {
-        const int64_t idx = start + offset;
-        const float coeff = s_codebook[static_cast<int>(unpack_codebook_index(m_sign, idx, packed_indices))];
-        const float current_m = old_magnitude * coeff;
-        const float grad_value = static_cast<float>(grad_view[idx]);
-        const float updated_value = beta1 * current_m + (1.0f - beta1) * grad_value;
-        const float abs_value = fabsf(updated_value);
-        if (abs_value > local_absmax) {
-            local_absmax = abs_value;
+    if (active) {
+        for (int64_t offset = threadIdx.x; offset < period; offset += tpr) {
+            const int64_t idx = start + offset;
+            const float coeff = s_codebook[static_cast<int>(unpack_codebook_index(m_sign, idx, packed_indices))];
+            const float current_m = old_magnitude * coeff;
+            const float grad_value = static_cast<float>(grad_view[idx]);
+            const float updated_value = beta1 * current_m + (1.0f - beta1) * grad_value;
+            const float abs_value = fabsf(updated_value);
+            if (abs_value > local_absmax) {
+                local_absmax = abs_value;
+            }
+            // Same per-thread accumulation order as automatic_vmean_update_kernel.
+            local_sumsq += grad_value * grad_value;
         }
-        // Same per-thread accumulation order as automatic_vmean_update_kernel.
-        local_sumsq += grad_value * grad_value;
     }
 
     shared_max[threadIdx.x] = local_absmax;
     shared_sum[threadIdx.x] = local_sumsq;
     __syncthreads();
 
-    // Fused max + sum tree: the sum half is bit-identical to the standalone
-    // vmean kernel (same stride schedule, same `+=` order); the max half is
-    // bit-identical to v1.
-    for (unsigned int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+    // Fused max + sum tree per row slice: the sum half is bit-identical to the
+    // standalone vmean kernel (same stride schedule over tpr, same `+=` order);
+    // the max half is bit-identical to v1. Inactive rows reduce zeros.
+    for (unsigned int stride = tpr / 2; stride > 0; stride >>= 1) {
         if (threadIdx.x < stride) {
             if (shared_max[threadIdx.x + stride] > shared_max[threadIdx.x]) {
                 shared_max[threadIdx.x] = shared_max[threadIdx.x + stride];
@@ -405,7 +546,7 @@ __global__ void automatic_gefen_fused_full_update_kernel(
     }
 
     const float new_magnitude = shared_max[0];
-    if (threadIdx.x == 0) {
+    if (threadIdx.x == 0 && active) {
         m_magnitude[block_idx] = new_magnitude;
         // vmean EMA, op-identical to automatic_vmean_update_kernel.
         const float mean_square = shared_sum[0] / static_cast<float>(period);
@@ -429,36 +570,39 @@ __global__ void automatic_gefen_fused_full_update_kernel(
     __syncthreads();
     const float stepsize_val = shared_sum[0];
 
-    for (int64_t offset = threadIdx.x; offset < period; offset += blockDim.x) {
-        const int64_t idx = start + offset;
-        float normalized_value = 0.0f;
-        const float coeff = s_codebook[static_cast<int>(unpack_codebook_index(m_sign, idx, packed_indices))];
-        const float current_m = old_magnitude * coeff;
-        const float grad_value = static_cast<float>(grad_view[idx]);
-        const float updated_value = beta1 * current_m + (1.0f - beta1) * grad_value;
-        if (new_magnitude > 0.0f) {
-            normalized_value = updated_value / new_magnitude;
-        }
-        const uint8_t quantized_index = quantize_codebook_index(
-            normalized_value, s_codebook, codebook_size, stochastic_round, rng_seed, idx);
-        store_packed_codebook_index(m_sign, idx, quantized_index, packed_indices);
-        if (lr != 0.0f) {
-            const float quantized_value = s_codebook[static_cast<int>(quantized_index)] * new_magnitude;
-            const float update_value = __fmul_rn(__fmul_rn(quantized_value, stepsize_val), lr);
-            // K3: fold weight decay into the write. weight_decay_factor is a
-            // kernel-wide scalar, so this branch is uniform (no warp divergence).
-            // When it is 1.0f (wd == 0 -- the common case) take the exact same
-            // write the K1+K2 path used, which is bit-identical to the v1 kernel;
-            // restructuring it would change nvcc's FMA-contraction of `p - update`
-            // and perturb fp32 params at rounding boundaries. Otherwise reproduce
-            // the host p.mul_(1 - lr*wd) pass, which rounds back to scalar_t before
-            // the update reads it (the inner scalar_t cast mirrors that round).
-            if (weight_decay_factor == 1.0f) {
-                p[idx] = static_cast<scalar_t>(__fsub_rn(static_cast<float>(p[idx]), update_value));
-            } else {
-                const float decayed = static_cast<float>(
-                    static_cast<scalar_t>(__fmul_rn(static_cast<float>(p[idx]), weight_decay_factor)));
-                p[idx] = static_cast<scalar_t>(__fsub_rn(decayed, update_value));
+    if (active) {
+        for (int64_t offset = threadIdx.x; offset < period; offset += tpr) {
+            const int64_t idx = start + offset;
+            float normalized_value = 0.0f;
+            const float coeff = s_codebook[static_cast<int>(unpack_codebook_index(m_sign, idx, packed_indices))];
+            const float current_m = old_magnitude * coeff;
+            const float grad_value = static_cast<float>(grad_view[idx]);
+            const float updated_value = beta1 * current_m + (1.0f - beta1) * grad_value;
+            if (new_magnitude > 0.0f) {
+                normalized_value = updated_value / new_magnitude;
+            }
+            const uint8_t quantized_index = quantize_codebook_index_lut(
+                normalized_value, s_codebook, codebook_size, lut, lut_buckets,
+                stochastic_round, rng_seed, idx);
+            store_packed_codebook_index(m_sign, idx, quantized_index, packed_indices);
+            if (lr != 0.0f) {
+                const float quantized_value = s_codebook[static_cast<int>(quantized_index)] * new_magnitude;
+                const float update_value = __fmul_rn(__fmul_rn(quantized_value, stepsize_val), lr);
+                // K3: fold weight decay into the write. weight_decay_factor is a
+                // kernel-wide scalar, so this branch is uniform (no warp divergence).
+                // When it is 1.0f (wd == 0 -- the common case) take the exact same
+                // write the K1+K2 path used, which is bit-identical to the v1 kernel;
+                // restructuring it would change nvcc's FMA-contraction of `p - update`
+                // and perturb fp32 params at rounding boundaries. Otherwise reproduce
+                // the host p.mul_(1 - lr*wd) pass, which rounds back to scalar_t before
+                // the update reads it (the inner scalar_t cast mirrors that round).
+                if (weight_decay_factor == 1.0f) {
+                    p[idx] = static_cast<scalar_t>(__fsub_rn(static_cast<float>(p[idx]), update_value));
+                } else {
+                    const float decayed = static_cast<float>(
+                        static_cast<scalar_t>(__fmul_rn(static_cast<float>(p[idx]), weight_decay_factor)));
+                    p[idx] = static_cast<scalar_t>(__fsub_rn(decayed, update_value));
+                }
             }
         }
     }
@@ -879,6 +1023,8 @@ __global__ void gefen_update_flat_full_kernel(
     const float* __restrict__ new_magnitude,
     const float* __restrict__ stepsize,
     const float* __restrict__ codebook,
+    const int16_t* __restrict__ lut,
+    int lut_buckets,
     int codebook_size,
     int64_t period,
     int64_t total_numel,
@@ -904,8 +1050,9 @@ __global__ void gefen_update_flat_full_kernel(
         if (new_mag > 0.0f) {
             normalized_value = updated / new_mag;
         }
-        const uint8_t quantized_index = quantize_codebook_index(
-            normalized_value, s_codebook, codebook_size, stochastic_round, rng_seed, idx);
+        const uint8_t quantized_index = quantize_codebook_index_lut(
+            normalized_value, s_codebook, codebook_size, lut, lut_buckets,
+            stochastic_round, rng_seed, idx);
         m_sign[idx] = quantized_index;
         if (lr != 0.0f) {
             const float quantized_value = s_codebook[static_cast<int>(quantized_index)] * new_mag;
@@ -1039,6 +1186,7 @@ void automatic_gefen_fused_full_update_cuda(
     at::Tensor m_magnitude,
     at::Tensor vmean,
     at::Tensor codebook,
+    at::Tensor lut,
     bool packed_indices,
     double beta1,
     double beta2,
@@ -1052,6 +1200,20 @@ void automatic_gefen_fused_full_update_cuda(
 ) {
     if (!p.is_cuda() || !grad_view.is_cuda() || !m_sign.is_cuda() || !m_magnitude.is_cuda() || !vmean.is_cuda() || !codebook.is_cuda()) {
         throw std::invalid_argument("Expected all tensors to be on CUDA.");
+    }
+    // Optional search LUT (empty tensor -> full-range binary search). Built on
+    // the host once per (frozen) codebook; int16 [buckets + 1] on p's device.
+    const bool use_lut = lut.numel() > 0;
+    if (use_lut) {
+        if (!lut.is_cuda() || lut.device() != p.device()) {
+            throw std::invalid_argument("Expected lut on the same device as p.");
+        }
+        if (!lut.is_contiguous() || lut.scalar_type() != at::kShort) {
+            throw std::invalid_argument("Expected lut to be contiguous int16.");
+        }
+        if (lut.numel() < 2) {
+            throw std::invalid_argument("Expected lut to have at least 2 entries.");
+        }
     }
     if (!p.is_contiguous() || !grad_view.is_contiguous() || !m_sign.is_contiguous() ||
         !m_magnitude.is_contiguous() || !vmean.is_contiguous() || !codebook.is_contiguous()) {
@@ -1121,12 +1283,22 @@ void automatic_gefen_fused_full_update_cuda(
     }
 
     const int threads = choose_threads(period);
-    const dim3 grid(static_cast<unsigned int>(num_blocks));
-    const dim3 block(static_cast<unsigned int>(threads));
+    // Multi-row packing: host ~256 threads (>= 2 warps) per CUDA block by
+    // stacking 256/threads rows, so small-period shapes stop launching 1-warp
+    // blocks and the codebook is staged once per ~256 threads instead of once
+    // per row. threads is capped at 256, so rows >= 1 always.
+    int rows = 256 / threads;
+    if (rows < 1) {
+        rows = 1;
+    }
+    const int64_t grid_blocks = (num_blocks + rows - 1) / rows;
+    const dim3 grid(static_cast<unsigned int>(grid_blocks));
+    const dim3 block(static_cast<unsigned int>(threads), static_cast<unsigned int>(rows));
     // Shared holds the staged codebook plus two per-thread reduction buffers
-    // (absmax and sum-of-squares).
+    // (absmax and sum-of-squares) for every hosted row.
     const size_t shared_bytes =
-        (static_cast<size_t>(codebook.numel()) + 2 * static_cast<size_t>(threads)) * sizeof(float);
+        (static_cast<size_t>(codebook.numel()) +
+         2 * static_cast<size_t>(threads) * static_cast<size_t>(rows)) * sizeof(float);
 
     GEFEN_DISPATCH_FLOAT_HALF_BF16(
         p.scalar_type(),
@@ -1139,6 +1311,8 @@ void automatic_gefen_fused_full_update_cuda(
                 m_magnitude.data_ptr<float>(),
                 vmean.data_ptr<float>(),
                 codebook.data_ptr<float>(),
+                use_lut ? lut.data_ptr<int16_t>() : nullptr,
+                use_lut ? static_cast<int>(lut.numel() - 1) : 0,
                 static_cast<int>(codebook.numel()),
                 packed_indices,
                 period,
@@ -1406,6 +1580,7 @@ void automatic_gefen_fused_update_v2_full_cuda(
     at::Tensor m_magnitude,
     at::Tensor vmean,
     at::Tensor codebook,
+    at::Tensor lut,
     bool packed_indices,
     double beta1,
     double beta2,
@@ -1419,6 +1594,20 @@ void automatic_gefen_fused_update_v2_full_cuda(
 ) {
     if (packed_indices) {
         throw std::invalid_argument("v2 fused update does not support packed indices.");
+    }
+    // Optional search LUT (empty tensor -> full-range binary search), used by
+    // the phase-2 quantize kernel. Same contract as the v1-full path.
+    const bool use_lut = lut.numel() > 0;
+    if (use_lut) {
+        if (!lut.is_cuda() || lut.device() != p.device()) {
+            throw std::invalid_argument("Expected lut on the same device as p.");
+        }
+        if (!lut.is_contiguous() || lut.scalar_type() != at::kShort) {
+            throw std::invalid_argument("Expected lut to be contiguous int16.");
+        }
+        if (lut.numel() < 2) {
+            throw std::invalid_argument("Expected lut to have at least 2 entries.");
+        }
     }
     if (!p.is_cuda() || !grad_view.is_cuda() || !m_sign.is_cuda() || !m_magnitude.is_cuda() || !vmean.is_cuda() || !codebook.is_cuda()) {
         throw std::invalid_argument("Expected all tensors to be on CUDA.");
@@ -1551,7 +1740,10 @@ void automatic_gefen_fused_update_v2_full_cuda(
             gefen_update_flat_full_kernel<scalar_t><<<static_cast<unsigned int>(nblocks), threads, codebook_bytes>>>(
                 p.data_ptr<scalar_t>(), grad_view.data_ptr<scalar_t>(), m_sign.data_ptr<uint8_t>(),
                 m_magnitude.data_ptr<float>(), new_magnitude.data_ptr<float>(),
-                sumsq.data_ptr<float>(), codebook.data_ptr<float>(), codebook_size,
+                sumsq.data_ptr<float>(), codebook.data_ptr<float>(),
+                use_lut ? lut.data_ptr<int16_t>() : nullptr,
+                use_lut ? static_cast<int>(lut.numel() - 1) : 0,
+                codebook_size,
                 period, total_numel, static_cast<float>(beta1), static_cast<float>(lr),
                 static_cast<float>(weight_decay_factor),
                 stochastic_round, static_cast<uint64_t>(rng_seed));
