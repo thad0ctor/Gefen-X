@@ -471,6 +471,9 @@ class Gefen(torch.optim.Optimizer):
         fused: bool = True,
         force_1d_period_one: bool = False,
         force_2d_period_one: bool = False,
+        period_one_substrings: Tuple[str, ...] = (),
+        factored_v_2d: bool = False,
+        codebook_refresh_every: int = 0,
         stochastic_round: bool = False,
         verbose: bool = False,
     ):
@@ -564,6 +567,37 @@ class Gefen(torch.optim.Optimizer):
         # magnitude on a vocab x hidden tensor), so this is an opt-in loss/memory
         # trade, not free like force_1d_period_one (1D tensors are tiny).
         self._force_2d_period_one = force_2d_period_one
+        # Name-substring routing to period==1 (per-element 2nd moment +
+        # momentum magnitude, AdamW-like fidelity) for SELECTED params only --
+        # the surgical form of the force_*_period_one flags. E.g.
+        # ("embed", "lm_head") gives the vocab projections per-element state
+        # (the most AdamW-divergent tensors under block-shared vmean, per the
+        # hybrid backup_2d_period_one finding) without paying per-element
+        # memory on every hidden matrix. Matching is case-insensitive substring
+        # over the parameter name.
+        self._period_one_substrings = tuple(
+            s.lower() for s in period_one_substrings
+        )
+        # Adafactor-style factored second moment for 2D params (opt-in,
+        # speed/memory experiment): keep the quantized momentum machinery
+        # unchanged but replace the block-shared vmean with row/col fp32 EMAs
+        # of grad^2 whose outer product reconstructs a per-element second
+        # moment at (rows + cols) state instead of numel. Affected params step
+        # through a decomposed (non-fused) update with an elementwise stepsize.
+        self._factored_v_2d = factored_v_2d
+        # Re-learn the exact-DP codebook from the CURRENT gradients every N
+        # steps (0 = off, the default: learn once on step 1 and freeze). The
+        # stored momentum indices are re-quantized from the old codebook onto
+        # the new one, so the momentum state survives the swap with only
+        # nearest-codeword rounding error. Tests whether the frozen step-1
+        # codebook goes stale as the gradient distribution shifts.
+        if codebook_refresh_every < 0:
+            raise ValueError(
+                "codebook_refresh_every must be >= 0 but is: {}".format(
+                    codebook_refresh_every
+                )
+            )
+        self._codebook_refresh_every = codebook_refresh_every
         # When set, momentum->codebook quantization uses unbiased stochastic
         # rounding (seeded per optimizer step) instead of deterministic nearest.
         # This cancels the systematic bias that nearest-rounding the EMA momentum
@@ -702,6 +736,10 @@ class Gefen(torch.optim.Optimizer):
             return 1
         if self._force_2d_period_one and param.ndim == 2:
             return 1
+        if self._period_one_substrings:
+            lname = str(param_name).lower()
+            if any(sub in lname for sub in self._period_one_substrings):
+                return 1
         return self._predict_period_from_grad_sq(param_name, param, grad)
 
     def _predict_period_from_grad_sq(
@@ -865,6 +903,114 @@ class Gefen(torch.optim.Optimizer):
         )
         if codebook is not None:
             self._gefen_codebook = codebook
+
+    def _step_automatic_factored(
+        self, group, param_name: str, p: torch.Tensor, grad: torch.Tensor
+    ) -> None:
+        # Adafactor-style factored second moment for a 2D param (opt-in via
+        # factored_v_2d). The quantized-momentum machinery is byte-identical to
+        # the merged non-fused path (_automatic_momentum_update_merged); only
+        # the second moment differs: instead of the block-shared vmean EMA, we
+        # keep fp32 row/col EMAs of grad^2 and reconstruct a per-element
+        # V ~= outer(R, C) / mean(R) each step (Shazeer & Stern 2018), giving
+        # per-element stepsize fidelity at (rows + cols) state. Decomposed
+        # whole-tensor torch ops -- a deliberate speed-agnostic exploration
+        # path, not a fused kernel.
+        if hasattr(grad, "to_local"):
+            grad = grad.to_local()
+        if hasattr(grad, "wait"):
+            grad = grad.wait()
+        state = self.state[p]
+        beta1 = group["beta1"]
+        beta2 = group["beta2"]
+        lr = group["lr"]
+        eps = group["eps"]
+
+        flat_grad = grad.reshape(-1)
+        if flat_grad.numel() == 0:
+            return
+
+        if "step" not in state:
+            if "automatic_period" in state:
+                automatic_period = state["automatic_period"]
+            elif flat_grad.numel() == 1:
+                automatic_period = 1
+            else:
+                automatic_period = self._resolve_automatic_period(
+                    param_name, p, grad
+                )
+            if flat_grad.numel() % automatic_period != 0:
+                raise ValueError(
+                    "Automatic partition period {} does not divide parameter {} with numel {}".format(
+                        automatic_period, param_name, flat_grad.numel()
+                    )
+                )
+            state["automatic_period"] = automatic_period
+            state["step"] = 0
+            grad_view = self._automatic_view(flat_grad, automatic_period)
+            self._init_gefen_state(state, grad_view)
+            state["v_row"] = torch.zeros(
+                p.shape[0], dtype=torch.float32, device=p.device
+            )
+            state["v_col"] = torch.zeros(
+                p.shape[1], dtype=torch.float32, device=p.device
+            )
+
+        automatic_period = state["automatic_period"]
+        grad_view = self._automatic_view(flat_grad, automatic_period)
+
+        grad_sq = grad.detach().float().square()
+        state["v_row"].mul_(beta2).add_(grad_sq.mean(dim=1), alpha=1 - beta2)
+        state["v_col"].mul_(beta2).add_(grad_sq.mean(dim=0), alpha=1 - beta2)
+        del grad_sq
+
+        state["step"] += 1
+        bias_correction_1 = 1 - beta1 ** state["step"]
+        bias_correction_2 = 1 - beta2 ** state["step"]
+
+        # Per-element factored second-moment estimate and stepsize.
+        v_hat = torch.outer(state["v_row"], state["v_col"]).div_(
+            state["v_row"].mean().clamp_(min=torch.finfo(torch.float32).tiny)
+        )
+        denom = v_hat.div_(bias_correction_2).sqrt_().add_(eps)
+        stepsize = denom.reciprocal_().mul_(1.0 / bias_correction_1)
+
+        # Quantized momentum advance, identical math to the merged non-fused
+        # path; returns the reconstructed fp32 momentum (codebook * magnitude).
+        shared_m = self._automatic_momentum_update_merged(state, grad_view, beta1)
+
+        if group["weight_decay"] > 0.0:
+            p.mul_(1 - lr * group["weight_decay"])
+        update = shared_m.view(p.shape).mul_(stepsize).mul_(lr)
+        p.add_(-update)
+
+    def _refresh_codebook_with_requant(self) -> None:
+        # Re-learn the exact-DP codebook from the CURRENT step's gradients
+        # (periods reused -- block geometry is baked into the per-param state)
+        # and re-quantize every stored momentum index from the old codebook
+        # onto the new one. The normalized coefficients are dequantized with
+        # the codebook that WROTE them, so the momentum survives the swap with
+        # only nearest-codeword rounding error; m_magnitude is unchanged
+        # (coefficients stay normalized to [-1, 1]).
+        old_codebook = self._gefen_codebook
+        if old_codebook is None:
+            return
+        new_codebook = self._learn_gefen_exact_codebook(
+            reuse_existing_periods=True, compute_mse_logging=False
+        )
+        if new_codebook is None:
+            return
+        for pgroup in self.param_groups:
+            for p in pgroup["params"]:
+                pstate = self.state.get(p)
+                if not pstate or "m_codebook" not in pstate:
+                    continue
+                coeffs = gefen_dequantize_unpacked_indices(
+                    old_codebook, pstate["m_codebook"], old_codebook
+                )
+                indices = gefen_nearest_codebook_indices(new_codebook, coeffs)
+                gefen_set_unpacked_indices(pstate["m_codebook"], indices)
+        self._gefen_codebook = new_codebook
 
     def _resuming_from_checkpoint(self) -> bool:
         # On resume every param's state has a restored automatic_period; on a
@@ -1809,6 +1955,15 @@ class Gefen(torch.optim.Optimizer):
     def step(self, closure=None):
         self._maybe_refresh_gefen_codebook()
         self._maybe_save_gefen_grad_histogram()
+        # Periodic codebook re-learn (opt-in): every N steps, refit the exact-DP
+        # codebook to the current gradient distribution and re-quantize the
+        # stored momentum indices onto it (see _refresh_codebook_with_requant).
+        if (
+            self._codebook_refresh_every
+            and self._gefen_global_step > 0
+            and self._gefen_global_step % self._codebook_refresh_every == 0
+        ):
+            self._refresh_codebook_with_requant()
 
         loss = None
         if closure is not None:
@@ -1837,6 +1992,12 @@ class Gefen(torch.optim.Optimizer):
             for p in group["params"]:
                 grad = p.grad
                 if grad is None:
+                    continue
+                # Factored-v routing (opt-in): 2D params keep their quantized
+                # momentum but step through the decomposed factored-second-
+                # moment path instead of any fused/merged vmean path.
+                if self._factored_v_2d and p.ndim == 2:
+                    self._step_automatic_factored(group, name, p, grad)
                     continue
                 if (
                     batch_nonfused

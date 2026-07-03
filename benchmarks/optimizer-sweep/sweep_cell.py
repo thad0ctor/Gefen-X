@@ -96,6 +96,18 @@ ap.add_argument("--no-muon-normuon", dest="muon_normuon", action="store_false",
 ap.add_argument("--muon-cautious", action="store_true",
                 help="GefenMuonHybrid: cautious masking of the Muon update "
                      "(zero coords whose sign disagrees with the gradient)")
+# --- plain-Gefen loss-lever flags (gefen_fused / gefen_nonfused only) ---
+ap.add_argument("--gefen-period-one-substrings", default="",
+                help="comma-separated name substrings routed to period==1 "
+                     "(per-element 2nd moment + magnitude), e.g. 'embed,lm_head'")
+ap.add_argument("--gefen-force-1d-period-one", action="store_true",
+                help="Gefen: per-element 2nd moment on all 1D params (norms/biases)")
+ap.add_argument("--gefen-factored-v", action="store_true",
+                help="Gefen: Adafactor-style factored (row x col) 2nd moment on 2D "
+                     "params via the decomposed step (speed-agnostic experiment)")
+ap.add_argument("--gefen-codebook-refresh", type=int, default=0,
+                help="Gefen: re-learn the codebook from current grads every N steps "
+                     "(0=off, learn once and freeze)")
 ap.add_argument("--ns-schedule", default=None,
                 help="GefenMuon NS schedule: standard/tuned3/tuned4 (default tuned3 in hybrid)")
 ap.add_argument("--no-decay-substrings", default="",
@@ -252,12 +264,29 @@ elif args.opt == "adamw8bit":
 elif args.opt == "adamw4bit":
     from torchao.optim import AdamW4bit
     opt = AdamW4bit(m.parameters(), lr=lr)
-elif args.opt == "gefen_fused":
+elif args.opt in ("gefen_fused", "gefen_nonfused"):
     from gefen import Gefen
-    opt = Gefen(m.parameters(), lr=lr, fused=True)
-elif args.opt == "gefen_nonfused":
-    from gefen import Gefen
-    opt = Gefen(m.parameters(), lr=lr, fused=False)
+    _gefen_kwargs = dict(lr=lr, fused=(args.opt == "gefen_fused"))
+    _p1_subs = tuple(
+        s.strip() for s in args.gefen_period_one_substrings.split(",") if s.strip()
+    )
+    _lever_kwargs = {}
+    if _p1_subs:
+        _lever_kwargs["period_one_substrings"] = _p1_subs
+    if args.gefen_force_1d_period_one:
+        _lever_kwargs["force_1d_period_one"] = True
+    if args.gefen_factored_v:
+        _lever_kwargs["factored_v_2d"] = True
+    if args.gefen_codebook_refresh:
+        _lever_kwargs["codebook_refresh_every"] = args.gefen_codebook_refresh
+    if _lever_kwargs:
+        # Substring routing and per-param verbosity need real names; the plain
+        # control keeps the historical bare-tensor construction so its
+        # trajectory stays byte-identical to the published runs.
+        opt = Gefen(list(m.named_parameters()), **_gefen_kwargs, **_lever_kwargs)
+        print(f"[gefen] lever kwargs: {_lever_kwargs}", flush=True)
+    else:
+        opt = Gefen(m.parameters(), **_gefen_kwargs)
 elif args.opt == "gefen_muon":
     from gefen import GefenMuonHybrid
     try:
