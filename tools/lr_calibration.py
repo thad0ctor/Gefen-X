@@ -5,9 +5,13 @@ Why this exists
 The Gefen family applies *different per-update scaling* depending on the path a
 parameter takes:
 
-  * plain ``Gefen`` (AdamW-like): update = m_hat / (sqrt(vmean_hat) + eps), where
-    ``vmean`` is a **block-mean** of grad^2 (Gefen's partitioning), not AdamW's
-    per-element second moment.
+  * plain ``Gefen`` (AdamW-like): update = m_hat / (sqrt(v_hat) + eps). With
+    the ``factored_v_2d=True`` default, ``v_hat`` on 2D params is the
+    Adafactor-style per-element reconstruction ``v_row * v_col / mean(v_row)``
+    (fair LR ~0.6x AdamW); with ``factored_v_2d=False`` (and always on 1D
+    params) it is the legacy **block-mean** ``vmean`` of grad^2, whose fair LR
+    is lower (~0.1-0.4x AdamW). Everything here MEASURES the real update, so
+    both modes are handled without special cases.
   * ``GefenMuon``: the update is Newton-Schulz orthogonalized (singular values
     ~1), then multiplied by ``_adjust_lr``'s shape ratio:
         - None / "original":   sqrt(max(1, rows/cols))     (Muon-native)

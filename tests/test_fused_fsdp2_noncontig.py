@@ -54,8 +54,11 @@ def case_A():
 
     before_nc = p_nc.detach().clone()
 
-    opt_c = Gefen([p_c], lr=LR, fused=True)
-    opt_nc = Gefen([p_nc], lr=LR, fused=True)
+    # Pin the legacy block-vmean path: this test covers the STANDARD fused
+    # kernels' non-contiguous copyback, which the factored-v default would
+    # otherwise reroute (its own suite covers the factored path).
+    opt_c = Gefen([p_c], lr=LR, fused=True, factored_v_2d=False)
+    opt_nc = Gefen([p_nc], lr=LR, fused=True, factored_v_2d=False)
 
     # identical grads -> identical learned codebook/period -> identical update.
     # opt.step() learns the codebook on the first step (required for fused path).
@@ -79,7 +82,15 @@ def case_B():
     from torch.distributed.tensor import DTensor, Shard, init_device_mesh
 
     os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
-    os.environ.setdefault("MASTER_PORT", "29555")
+    # Bind-then-release a free port instead of hardcoding one: a fixed port
+    # collides with any unrelated torchrun/elastic agent alive on the host
+    # (observed: EADDRINUSE against a long-lived pt_elastic on 29555).
+    if "MASTER_PORT" not in os.environ:
+        import socket
+
+        with socket.socket() as _s:
+            _s.bind(("127.0.0.1", 0))
+            os.environ["MASTER_PORT"] = str(_s.getsockname()[1])
     os.environ.setdefault("RANK", "0")
     os.environ.setdefault("WORLD_SIZE", "1")
     if not dist.is_initialized():
@@ -107,14 +118,14 @@ def case_B():
         grad_dt = DTensor.from_local(grad.clone(), mesh, [Shard(0)], run_check=False)
         p.grad = grad_dt
 
-        opt = Gefen([p], lr=LR, fused=True)
+        opt = Gefen([p], lr=LR, fused=True, factored_v_2d=False)
         opt.step()
 
         updated_local = p.to_local()
 
         # --- plain-tensor oracle: same single fused step on a contiguous param ---
         p_ref = torch.nn.Parameter(init.clone())
-        opt_ref = Gefen([p_ref], lr=LR, fused=True)
+        opt_ref = Gefen([p_ref], lr=LR, fused=True, factored_v_2d=False)
         p_ref.grad = grad.clone()
         opt_ref.step()
 

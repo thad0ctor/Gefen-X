@@ -102,9 +102,15 @@ ap.add_argument("--gefen-period-one-substrings", default="",
                      "(per-element 2nd moment + magnitude), e.g. 'embed,lm_head'")
 ap.add_argument("--gefen-force-1d-period-one", action="store_true",
                 help="Gefen: per-element 2nd moment on all 1D params (norms/biases)")
-ap.add_argument("--gefen-factored-v", action="store_true",
-                help="Gefen: Adafactor-style factored (row x col) 2nd moment on 2D "
-                     "params via the decomposed step (speed-agnostic experiment)")
+ap.add_argument("--gefen-factored-v", dest="gefen_factored_v",
+                action="store_true", default=None,
+                help="Gefen: force ON the Adafactor-style factored (row x col) "
+                     "2nd moment on 2D params. Omit both flags to follow the "
+                     "shipped Gefen default (currently ON).")
+ap.add_argument("--no-gefen-factored-v", dest="gefen_factored_v",
+                action="store_false",
+                help="Gefen: force OFF factored-v (the legacy block-shared "
+                     "2nd moment; its fair LR is lower, ~2e-5 at these scales)")
 ap.add_argument("--gefen-codebook-refresh", type=int, default=0,
                 help="Gefen: re-learn the codebook from current grads every N steps "
                      "(0=off, learn once and freeze)")
@@ -275,8 +281,10 @@ elif args.opt in ("gefen_fused", "gefen_nonfused"):
         _lever_kwargs["period_one_substrings"] = _p1_subs
     if args.gefen_force_1d_period_one:
         _lever_kwargs["force_1d_period_one"] = True
-    if args.gefen_factored_v:
-        _lever_kwargs["factored_v_2d"] = True
+    # Like ns_schedule/normuon on the muon side: only override factored_v_2d
+    # when a flag was given, so the harness reflects the shipped default.
+    if args.gefen_factored_v is not None:
+        _lever_kwargs["factored_v_2d"] = args.gefen_factored_v
     if args.gefen_codebook_refresh:
         _lever_kwargs["codebook_refresh_every"] = args.gefen_codebook_refresh
     if _lever_kwargs:
@@ -417,6 +425,18 @@ res = {
     "tag": args.tag, "opt": args.opt, "variant": args.variant or args.opt,
     "lr": lr, "seed": args.seed,
     "muon_adjust": (args.muon_adjust if args.opt == "gefen_muon" else None),
+    "gefen_flags": (
+        {
+            "factored_v_2d": (
+                args.gefen_factored_v
+                if args.gefen_factored_v is not None
+                else True
+            ),
+            "factored_v_2d_explicit": args.gefen_factored_v is not None,
+        }
+        if args.opt in ("gefen_fused", "gefen_nonfused")
+        else None
+    ),
     "muon_flags": (
         {
             "muon_lr": args.muon_lr, "backup_lr": args.backup_lr,

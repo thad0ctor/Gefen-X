@@ -475,7 +475,7 @@ class Gefen(torch.optim.Optimizer):
         force_1d_period_one: bool = False,
         force_2d_period_one: bool = False,
         period_one_substrings: Tuple[str, ...] = (),
-        factored_v_2d: bool = False,
+        factored_v_2d: bool = True,
         codebook_refresh_every: int = 0,
         stochastic_round: bool = False,
         verbose: bool = False,
@@ -581,12 +581,19 @@ class Gefen(torch.optim.Optimizer):
         self._period_one_substrings = tuple(
             s.lower() for s in period_one_substrings
         )
-        # Adafactor-style factored second moment for 2D params (opt-in,
-        # speed/memory experiment): keep the quantized momentum machinery
-        # unchanged but replace the block-shared vmean with row/col fp32 EMAs
-        # of grad^2 whose outer product reconstructs a per-element second
-        # moment at (rows + cols) state instead of numel. Affected params step
-        # through a decomposed (non-fused) update with an elementwise stepsize.
+        # Adafactor-style factored second moment for 2D params (ON BY
+        # DEFAULT -- the AdamW-parity configuration): keep the quantized
+        # momentum machinery unchanged but replace the block-shared vmean with
+        # row/col fp32 EMAs of grad^2 whose outer product reconstructs a
+        # per-element second moment at (rows + cols) state instead of numel.
+        # Closes the ~0.06 eval-loss gap to fused AdamW at ~1.01 B/param and
+        # baseline peak VRAM for ~6-8% throughput; its fair LR is ~0.6x the
+        # AdamW LR (higher than block-vmean Gefen's ~0.4x). Set
+        # factored_v_2d=False for the legacy block-shared second moment (and
+        # its lower fair LR). On the fused CUDA path the stepsize is computed
+        # in-kernel; elsewhere a decomposed fallback applies. NOTE: sharded
+        # (DTensor/FSDP2) 2D params currently fall back to the block-vmean
+        # path regardless (local-shard row/col statistics would be wrong).
         self._factored_v_2d = factored_v_2d
         # Re-learn the exact-DP codebook from the CURRENT gradients every N
         # steps (0 = off, the default: learn once on step 1 and freeze). The
@@ -958,14 +965,32 @@ class Gefen(torch.optim.Optimizer):
             state["v_col"] = torch.zeros(
                 p.shape[1], dtype=torch.float32, device=p.device
             )
+            state["factored_step"] = 0
 
         automatic_period = state["automatic_period"]
         grad_view = self._automatic_view(flat_grad, automatic_period)
 
+        # Resume compatibility: a checkpoint saved with factored_v_2d off (or
+        # from before the flag existed) restores "step"/momentum state but no
+        # row/col EMAs. Initialize them lazily; the EMA bias correction uses
+        # the param's own step count, so the first post-resume steps behave
+        # like a fresh EMA warm-up on those tensors (convergence-neutral).
+        if "v_row" not in state:
+            state["v_row"] = torch.zeros(
+                p.shape[0], dtype=torch.float32, device=p.device
+            )
+            state["v_col"] = torch.zeros(
+                p.shape[1], dtype=torch.float32, device=p.device
+            )
+            state["factored_step"] = 0
+
         rows, cols = p.shape
         state["step"] += 1
+        state["factored_step"] += 1
+        # bc1 corrects the (possibly checkpoint-restored, older) momentum EMA;
+        # bc2 must correct the factored v EMA's own age.
         bias_correction_1 = 1 - beta1 ** state["step"]
-        bias_correction_2 = 1 - beta2 ** state["step"]
+        bias_correction_2 = 1 - beta2 ** state["factored_step"]
 
         if (
             self._use_fused_gefen_automatic_step()
@@ -1543,6 +1568,16 @@ class Gefen(torch.optim.Optimizer):
 
         automatic_period = state["automatic_period"]
         grad_view = self._automatic_view(flat_grad, automatic_period)
+
+        # Resume compatibility: a checkpoint written with factored_v_2d on has
+        # no vmean for 2D params; recreate it (EMA warm-up) if the flag was
+        # turned off across the resume.
+        if "vmean" not in state:
+            state["vmean"] = torch.zeros_like(
+                grad_view[:, 0:1],
+                dtype=torch.float32,
+                memory_format=torch.preserve_format,
+            )
 
         # Tier-1: well-occupied (v1-regime) params take the fully-fused kernel,
         # which folds the vmean EMA + per-block stepsize math (and, after K3,

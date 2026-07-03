@@ -93,14 +93,50 @@ def check_state_and_flag_hygiene():
     assert st["v_row"].dtype == torch.float32 and st["v_row"].shape == (768,)
     assert st["v_col"].dtype == torch.float32 and st["v_col"].shape == (512,)
     assert "vmean" not in st, "factored param must not carry block vmean"
-    # flags-off must not create factored state
+    # factored_v_2d is DEFAULT-ON: default construction carries factored
+    # state; the explicit opt-out restores the legacy block-vmean state.
     torch.manual_seed(3)
     p = nn.Parameter((torch.randn(64, 32, device="cuda") * 0.02).bfloat16())
     opt2 = Gefen([("w", p)], lr=1e-3, fused=True)
     p.grad = torch.randn(64, 32, device="cuda").bfloat16() * 1e-3
     opt2.step()
     st2 = next(iter(opt2.state.values()))
-    assert "v_row" not in st2 and "vmean" in st2
+    assert "v_row" in st2 and "vmean" not in st2, "default must be factored"
+    torch.manual_seed(3)
+    p3 = nn.Parameter((torch.randn(64, 32, device="cuda") * 0.02).bfloat16())
+    opt3 = Gefen([("w", p3)], lr=1e-3, fused=True, factored_v_2d=False)
+    p3.grad = torch.randn(64, 32, device="cuda").bfloat16() * 1e-3
+    opt3.step()
+    st3 = next(iter(opt3.state.values()))
+    assert "v_row" not in st3 and "vmean" in st3
+    return True
+
+
+def check_pre_factored_checkpoint_resume():
+    """A checkpoint saved with factored_v_2d=False must resume under the
+    factored default: v_row/v_col init lazily and the v bias correction uses
+    the EMA's own age (factored_step), not the restored global step."""
+    torch.manual_seed(5)
+    p = nn.Parameter((torch.randn(96, 64, device="cuda") * 0.02).bfloat16())
+    opt_old = Gefen([("w", p)], lr=1e-3, fused=True, factored_v_2d=False)
+    torch.manual_seed(6)
+    for _ in range(5):
+        p.grad = torch.randn(96, 64, device="cuda").bfloat16() * 1e-3
+        opt_old.step()
+    sd = opt_old.state_dict()
+
+    torch.manual_seed(5)
+    p2 = nn.Parameter((torch.randn(96, 64, device="cuda") * 0.02).bfloat16())
+    opt_new = Gefen([("w", p2)], lr=1e-3, fused=True)  # factored default
+    opt_new.load_state_dict(sd)
+    torch.manual_seed(7)
+    for _ in range(3):
+        p2.grad = torch.randn(96, 64, device="cuda").bfloat16() * 1e-3
+        opt_new.step()
+    st = next(iter(opt_new.state.values()))
+    assert st["v_row"].shape == (96,) and st["factored_step"] == 3
+    assert st["step"] == 8, st["step"]
+    assert torch.isfinite(p2).all()
     return True
 
 
@@ -114,6 +150,7 @@ def run():
         ("single_step_adjacency", check_single_step_adjacency),
         ("transient_memory_bounded", check_transient_memory_bounded),
         ("state_and_flag_hygiene", check_state_and_flag_hygiene),
+        ("pre_factored_checkpoint_resume", check_pre_factored_checkpoint_resume),
     ]
     ok = True
     for name, fn in checks:
@@ -145,6 +182,10 @@ if pytest is not None:
     @_skip
     def test_state_and_flag_hygiene():
         assert check_state_and_flag_hygiene()
+
+    @_skip
+    def test_pre_factored_checkpoint_resume():
+        assert check_pre_factored_checkpoint_resume()
 
 
 if __name__ == "__main__":
