@@ -1110,13 +1110,19 @@ __global__ void gefen_factored_stats_kernel(
 
     const int64_t col0 =
         static_cast<int64_t>(blockIdx.x) * GEFEN_FACTORED_TILE_COLS;
-    const int64_t row0 =
-        static_cast<int64_t>(blockIdx.y) * GEFEN_FACTORED_TILE_ROWS;
     const int warp = threadIdx.x >> 5;
     const int lane = threadIdx.x & 31;
-
-    // Each warp owns rows row0+warp, row0+warp+warps_per_block, ...
     const int warps_per_block = blockDim.x >> 5;
+
+    // Grid-stride over row tiles: gridDim.y is capped at 65535 by the host
+    // launch (the CUDA grid.y limit), so tall tensors (> 65535 * TILE_ROWS
+    // rows) are covered by striding. The shared col partials for this fixed
+    // col0 accumulate across all strided row tiles and flush once at the end.
+    const int64_t row_tile_stride =
+        static_cast<int64_t>(gridDim.y) * GEFEN_FACTORED_TILE_ROWS;
+    for (int64_t row0 = static_cast<int64_t>(blockIdx.y) * GEFEN_FACTORED_TILE_ROWS;
+         row0 < rows; row0 += row_tile_stride) {
+    // Each warp owns rows row0+warp, row0+warp+warps_per_block, ...
     for (int64_t r = row0 + warp; r < row0 + GEFEN_FACTORED_TILE_ROWS && r < rows;
          r += warps_per_block) {
         const int64_t row_base = r * cols;
@@ -1144,9 +1150,11 @@ __global__ void gefen_factored_stats_kernel(
             atomicAdd(&row_sq[r], row_acc);
         }
     }
+    }
     __syncthreads();
 
-    // One global atomic per column per tile.
+    // One global atomic per column per CUDA block (accumulated across all of
+    // this block's strided row tiles).
     for (int i = threadIdx.x; i < GEFEN_FACTORED_TILE_COLS; i += blockDim.x) {
         const int64_t c = col0 + i;
         if (c < cols && s_col[i] != 0.0f) {
@@ -1729,8 +1737,13 @@ void gefen_factored_update_cuda(
     {
         const int64_t grid_x =
             (cols + GEFEN_FACTORED_TILE_COLS - 1) / GEFEN_FACTORED_TILE_COLS;
-        const int64_t grid_y =
+        int64_t grid_y =
             (rows + GEFEN_FACTORED_TILE_ROWS - 1) / GEFEN_FACTORED_TILE_ROWS;
+        // CUDA caps gridDim.y at 65535; taller tensors are covered by the
+        // kernel's y-grid-stride loop.
+        if (grid_y > 65535) {
+            grid_y = 65535;
+        }
         const dim3 grid(static_cast<unsigned int>(grid_x),
                         static_cast<unsigned int>(grid_y));
         const size_t shmem =

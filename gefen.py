@@ -1564,20 +1564,27 @@ class Gefen(torch.optim.Optimizer):
                 dtype=torch.float32,
                 memory_format=torch.preserve_format,
             )
+            state["vmean_step"] = 0
             self._print_v_period(param_name, p, state["vmean"])
 
         automatic_period = state["automatic_period"]
         grad_view = self._automatic_view(flat_grad, automatic_period)
 
         # Resume compatibility: a checkpoint written with factored_v_2d on has
-        # no vmean for 2D params; recreate it (EMA warm-up) if the flag was
-        # turned off across the resume.
+        # no vmean for 2D params; recreate it if the flag was turned off across
+        # the resume, with its own fresh age so the bias correction below
+        # treats it as a warm-up EMA rather than a mature one.
         if "vmean" not in state:
             state["vmean"] = torch.zeros_like(
                 grad_view[:, 0:1],
                 dtype=torch.float32,
                 memory_format=torch.preserve_format,
             )
+            state["vmean_step"] = 0
+        elif "vmean_step" not in state:
+            # Checkpoint from before the counter existed: its vmean is exactly
+            # as old as the param step, so backfill (keeps bc2 bit-identical).
+            state["vmean_step"] = state["step"]
 
         # Tier-1: well-occupied (v1-regime) params take the fully-fused kernel,
         # which folds the vmean EMA + per-block stepsize math (and, after K3,
@@ -1599,6 +1606,7 @@ class Gefen(torch.optim.Optimizer):
             self._automatic_vmean_update(state["vmean"], grad_view, beta2)
 
         state["step"] += 1
+        state["vmean_step"] += 1
 
         # Under FSDP2 the parameter is a sharded DTensor; every in-place write
         # below (weight decay, fused kernel, non-fused add_) must land on the
@@ -1611,7 +1619,10 @@ class Gefen(torch.optim.Optimizer):
         )
 
         bias_correction_1 = 1 - beta1 ** state["step"]
-        bias_correction_2 = 1 - beta2 ** state["step"]
+        # bc2 corrects the vmean EMA by its OWN age: on fresh runs and normal
+        # resumes vmean_step == step (bit-identical); it differs only when
+        # vmean was lazily recreated after a factored->legacy toggle.
+        bias_correction_2 = 1 - beta2 ** state["vmean_step"]
 
         if use_full_fused:
             # K1+K2+K3: vmean EMA, per-block stepsize, and weight decay are all
@@ -1814,6 +1825,7 @@ class Gefen(torch.optim.Optimizer):
             local_numel,
             period,
             state["step"],
+            state.get("vmean_step", state["step"]),
             group["beta1"],
             group["beta2"],
             float(lr),
@@ -1896,14 +1908,21 @@ class Gefen(torch.optim.Optimizer):
         automatic_vmean_update(merged_vmean, merged_grad, beta2, use_fused=False)
 
         for _, _, p, _ in items:
-            self.state[p]["step"] += 1
+            pstate = self.state[p]
+            pstate["step"] += 1
+            # Backfill for pre-counter checkpoints (vmean as old as step),
+            # then advance the vmean age; the batch key groups by it, so one
+            # state's correction is valid for the whole batch.
+            if "vmean_step" not in pstate:
+                pstate["vmean_step"] = pstate["step"] - 1
+            pstate["vmean_step"] += 1
         step_count = first_state["step"]
 
         if weight_decay > 0.0:
             torch._foreach_mul_(params, 1 - lr * weight_decay)
 
         bias_correction_1 = 1 - beta1 ** step_count
-        bias_correction_2 = 1 - beta2 ** step_count
+        bias_correction_2 = 1 - beta2 ** first_state["vmean_step"]
         h = (merged_vmean.sqrt() / math.sqrt(bias_correction_2)).add_(eps)
         stepsize = (1 / bias_correction_1) / h
 

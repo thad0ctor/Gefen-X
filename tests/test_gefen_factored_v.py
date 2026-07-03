@@ -51,6 +51,7 @@ def check_kernel_vs_fallback_aggregate():
     rel_max = ((pk - pf).abs().max() / pf.abs().max()).item()
     print(f"  6-step kernel-vs-fallback rel diff: mean {rel_mean:.2e} max {rel_max:.2e}")
     assert torch.isfinite(pk).all()
+    assert torch.isfinite(pf).all()
     assert rel_mean < 2e-3, rel_mean
     assert rel_max < 5e-2, rel_max
     return True
@@ -112,6 +113,27 @@ def check_state_and_flag_hygiene():
     return True
 
 
+def check_tall_matrix_grid_stride():
+    """rows > 65535 * TILE_ROWS exceeds CUDA's grid.y with one tile per
+    block-row; the stats kernel must cover the tail via its y-grid-stride.
+    Validate row/col sums against a torch reference on a skinny tall param."""
+    rows, cols = 600_000, 8  # > 524_280 rows forces the strided path
+    torch.manual_seed(9)
+    p = nn.Parameter((torch.randn(rows, cols, device="cuda") * 0.02).bfloat16())
+    opt = Gefen([("w", p)], lr=1e-3, fused=True)
+    g = torch.randn(rows, cols, device="cuda").bfloat16() * 1e-3
+    p.grad = g.clone()
+    opt.step()
+    st = next(iter(opt.state.values()))
+    beta2 = 0.999
+    ref_row = g.float().square().mean(dim=1) * (1 - beta2)
+    ref_col = g.float().square().mean(dim=0) * (1 - beta2)
+    assert torch.allclose(st["v_row"], ref_row, rtol=1e-4, atol=1e-12)
+    assert torch.allclose(st["v_col"], ref_col, rtol=1e-4, atol=1e-12)
+    assert torch.isfinite(p).all()
+    return True
+
+
 def check_pre_factored_checkpoint_resume():
     """A checkpoint saved with factored_v_2d=False must resume under the
     factored default: v_row/v_col init lazily and the v bias correction uses
@@ -151,6 +173,7 @@ def run():
         ("transient_memory_bounded", check_transient_memory_bounded),
         ("state_and_flag_hygiene", check_state_and_flag_hygiene),
         ("pre_factored_checkpoint_resume", check_pre_factored_checkpoint_resume),
+        ("tall_matrix_grid_stride", check_tall_matrix_grid_stride),
     ]
     ok = True
     for name, fn in checks:
@@ -186,6 +209,10 @@ if pytest is not None:
     @_skip
     def test_pre_factored_checkpoint_resume():
         assert check_pre_factored_checkpoint_resume()
+
+    @_skip
+    def test_tall_matrix_grid_stride():
+        assert check_tall_matrix_grid_stride()
 
 
 if __name__ == "__main__":
