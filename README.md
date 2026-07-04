@@ -126,6 +126,9 @@ You can run these yourself — see [`benchmarks/`](benchmarks/README.md) for wha
 - **Learning rate (each at its own fair optimum):** AdamW family `5e-5`; Gefen `3e-5`; Gefen-Muon `5e-5` with the recommended hybrid config.
 - **Optimizers:** `adamw_bf16` = torch fused AdamW · `adamw8bit` = bitsandbytes · `adamw4bit` = torchao · `gefen_fused` = `Gefen(fused=True)` · `gefen_muon` = `GefenMuonHybrid(..., fused=True)` (Muon on 2D hidden matrices, Gefen on everything else). **Both Gefen runs use the fused CUDA kernels** (`fused=True`).
 
+<details>
+<summary><b>Full results table</b> (per-optimizer numbers)</summary>
+
 | Model | Optimizer | LR | Eval loss | tok/s | Peak VRAM (GiB) | Opt-state B/param |
 |---|---|---|---|---|---|---|
 | Qwen3-0.6B | adamw_bf16 | 5e-5 | 1.431 | 5599 | 6.95 | 4.00 |
@@ -140,6 +143,8 @@ You can run these yourself — see [`benchmarks/`](benchmarks/README.md) for wha
 | Qwen3-1.7B | **gefen_muon** | 5e-5 | 1.240 | 1280 | 9.20 | **1.01** |
 
 > Both Gefen rows use the optimizers' shipped defaults, each at its own best learning rate. Older (pre-default) behaviors are still available behind flags — see the lever sections below for what each default does and how to switch it off.
+
+</details>
 
 ![Qwen3-1.7B optimizer comparison](docs/benchmarks/quad_qwen1p7b.png)
 ![Qwen3-0.6B optimizer comparison](docs/benchmarks/quad_qwen0p6b.png)
