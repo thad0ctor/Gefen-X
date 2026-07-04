@@ -9,6 +9,7 @@
  - **New: matches AdamW's loss out of the box** at about a quarter of its optimizer memory (default `factored_v_2d`).
    See [Benchmarks](#benchmarks) and [the factored-v lever](#quality-lever-factored-second-moment-on-2d-params-factored_v_2d).
  - **Works on modern decoders** (Qwen3, Llama-3, Mistral). Upstream loses its memory advantage on these architectures (≈9 B/param — worse than AdamW); this fork keeps the intended ≈1 B/param.
+ - **Validated on 2026 VLMs and media-gen models** — Gemma 4, Qwen3-VL, Mistral 3, MiniCPM-V 4.6, SDXL, FLUX.1/FLUX.2, ACE-Step 1.5 — with real full-fine-tune smoke tests on 24 GB GPUs. See the [compatibility matrix](COMPATIBILITY.md).
  - **≈2× faster `opt.step()`** via fused CUDA kernels, with identical results.
  - **Whole-model Muon option** (`GefenMuonHybrid`) at the same ≈1 B/param memory and AdamW-level loss.
  - **Reliable checkpoint save/resume and FSDP2 support** — broken or absent in the shipped release.
