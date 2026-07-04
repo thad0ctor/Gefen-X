@@ -22,8 +22,8 @@ Two modes:
 - **`method="range_test"` (fast, rough):** a Leslie-Smith LR ramp. Cheap, but **only a bracketing aid** — across models it was run-to-run noisy and sometimes several-× off for the Gefen family. Use it to center the sweep grid, not as a final number.
 
 ### What the finder shows about Gefen LRs (RTX 5090 / Alpaca, 3 models)
-- **Plain `Gefen` (the `factored_v_2d=True` default)** wants **≈0.6× your AdamW LR** (measured fair optimum `3e-5` vs AdamW's `5e-5` on Qwen3-0.6B/1.7B). With the legacy block-shared second moment (`factored_v_2d=False`) the optimum is lower and roughly model-independent, **≈1e-5–2e-5, ~0.1–0.4× AdamW** — the pre-factored measurements below were taken in that mode. Either way, prefer the finder over static heuristics.
-- **`GefenMuonHybrid`** roughly **reuses your AdamW LR** (~1×), with `adjust_lr_fn="match_rms_adamw"`.
+- **Plain `Gefen` (the `factored_v_2d=True` default)** wants **≈0.6× your AdamW LR** (measured fair optimum `3e-5` vs AdamW's `5e-5` on Qwen3-0.6B/1.7B). With the legacy block-shared second moment (`factored_v_2d=False`) the optimum is lower and roughly model-independent, **≈1e-5–2e-5, ≈0.1–0.4× AdamW** — the pre-factored measurements below were taken in that mode. Either way, prefer the finder over static heuristics.
+- **`GefenMuonHybrid`** roughly **reuses your AdamW LR** (≈1×), with `adjust_lr_fn="match_rms_adamw"`.
 
 ## Running it (env, dataset, GPUs)
 
@@ -59,7 +59,7 @@ python -m gefen.tools.find_lr \
 # [find_lr] device cuda:0 <- LRs ['1.0e-05', '3.0e-04']  ... etc
 # -> RECOMMENDED base LR for gefen: <number>   (identical to the sequential pick)
 ```
-Measured: a 5-LR `gefen` sweep on Qwen3-0.6B took **202 s on 1 GPU vs 56 s across 3** (~3.6×), same best LR. Workers load the model from `--model` per process (CUDA needs `spawn`; the in-memory `find_lr(model, ...)` API stays single-device). Each LR arm is one short fine-tune, so the wall time is set by the busiest GPU (`ceil(#LRs / #GPUs)` arms). A single `--devices`/`--device` falls back to the sequential path. **Note: `--devices` replicates the full model on every GPU — each card must hold the whole model. For a model too big for one GPU, use `--shard` below.**
+Measured: a 5-LR `gefen` sweep on Qwen3-0.6B took **202 s on 1 GPU vs 56 s across 3** (≈3.6×), same best LR. Workers load the model from `--model` per process (CUDA needs `spawn`; the in-memory `find_lr(model, ...)` API stays single-device). Each LR arm is one short fine-tune, so the wall time is set by the busiest GPU (`ceil(#LRs / #GPUs)` arms). A single `--devices`/`--device` falls back to the sequential path. **Note: `--devices` replicates the full model on every GPU — each card must hold the whole model. For a model too big for one GPU, use `--shard` below.**
 
 **Model-sharded sweep** (`--devices … --shard`, FSDP2). Splits ONE model across the selected GPUs via `fully_shard`; LR arms run sequentially, each arm sharded. Works for `gefen`, `adamw`, and `hybrid` (the Muon path all-gathers the full matrix per step, runs Newton-Schulz, then slices the update back to each rank's shard):
 ```bash
@@ -69,7 +69,7 @@ python -m gefen.tools.find_lr \
 # [find_lr][shard] lr 3.00e-05 -> eval ...  (rank0 shard 0.63x, peak ~5.3 GiB/rank) ...
 # -> RECOMMENDED base LR for gefen (sharded): <number>
 ```
-Each LR spins up a torch.distributed (nccl) group across the GPUs, shards the model, fine-tunes `sweep_steps`, evals (rank 0), and tears the group down before the next LR. Per-rank params drop to ~1/N of the model (≈0.63× on 2 GPUs in practice — tied embeddings / small unwrapped modules don't shard evenly), so per-GPU memory is a fraction of the full model. Arms are sequential, so wall time ≈ `#LRs × per-arm time`. Validated for `gefen` and `hybrid` on a heterogeneous 3090+5090 pair and a homogeneous dual-RTX-6000 pair.
+Each LR spins up a torch.distributed (nccl) group across the GPUs, shards the model, fine-tunes `sweep_steps`, evals (rank 0), and tears the group down before the next LR. Per-rank params drop to ≈1/N of the model (≈0.63× on 2 GPUs in practice — tied embeddings / small unwrapped modules don't shard evenly), so per-GPU memory is a fraction of the full model. Arms are sequential, so wall time ≈ `#LRs × per-arm time`. Validated for `gefen` and `hybrid` on a heterogeneous 3090+5090 pair and a homogeneous dual-RTX-6000 pair.
 
 **Environment redirection** (`--venv` / `--cuda-home`). If you launch from an interpreter whose CUDA doesn't match (the kernel build needs an `nvcc` matching `torch.version.cuda`), point the CLI at the right venv and toolkit and it **re-execs** itself there before importing the kernels:
 ```bash
@@ -98,7 +98,7 @@ These are diagnostics for *understanding* update magnitudes — useful, but see 
 
 ## Honest finding: matching AdamW *magnitude* is the wrong objective for Muon
 
-`calibrate_vs_adamw` shows that `match_rms_adamw`'s flat `k=0.2` produces Muon updates **below** AdamW's magnitude (q/o_proj ~2.2× under, median ~1.3×). It is tempting to "fix" this by scaling the Muon updates up to match AdamW. We tried that (a per-type prior and an auto-calibration window) and validated it on real-dataset fine-tuning (tatsu-lab/alpaca, held-out eval): **it did not help and slightly hurt** — the original `match_rms_adamw` (k=0.2) tracked/beat AdamW, while the magnitude-matched variants were worse on train and eval.
+`calibrate_vs_adamw` shows that `match_rms_adamw`'s flat `k=0.2` produces Muon updates **below** AdamW's magnitude (q/o_proj ≈2.2× under, median ≈1.3×). It is tempting to "fix" this by scaling the Muon updates up to match AdamW. We tried that (a per-type prior and an auto-calibration window) and validated it on real-dataset fine-tuning (tatsu-lab/alpaca, held-out eval): **it did not help and slightly hurt** — the original `match_rms_adamw` (k=0.2) tracked/beat AdamW, while the magnitude-matched variants were worse on train and eval.
 
 Conclusion: the *measurement* is correct, but Muon's benefit is the orthogonalized update **direction**, not magnitude parity. So **`match_rms_adamw` stays the recommended default** for the hybrid, and the magnitude-matching machinery is intentionally **not shipped** (only the diagnostic probes that revealed this remain here). It may matter for heavier/from-scratch training — untested.
 

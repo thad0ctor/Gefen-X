@@ -154,7 +154,7 @@ Written to `--out`:
   value is recorded in each result line (`muon_flags.normuon` /
   `normuon_explicit`).
 - **`gefen_fused`/`gefen_nonfused` run the plain defaults**; the opt-in loss
-  levers (`--gefen-factored-v` — the AdamW-parity config, fair LR ~0.6×
+  levers (`--gefen-factored-v` — the AdamW-parity config, fair LR ≈0.6×
   AdamW's — plus `--gefen-period-one-substrings`, `--gefen-force-1d-period-one`
   and `--gefen-codebook-refresh`) are off unless passed, so the published rows
   stay reproducible.

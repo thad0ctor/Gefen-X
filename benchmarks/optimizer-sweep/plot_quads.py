@@ -72,25 +72,49 @@ def main():
             vals = [mrows[o][key] for o in opts]
             colors = [COLOR.get(o, "#888888") for o in opts]
             bi = best_idx(vals, direction)
-            bars = ax.bar(range(len(opts)), vals, color=colors,
-                          edgecolor="black", linewidth=0.6, width=0.66)
-            bars[bi].set_edgecolor("#1a7a1a")
-            bars[bi].set_linewidth(2.4)
             ax.set_xticks(range(len(opts)))
             ax.set_xticklabels([LABEL.get(o, o) for o in opts], fontsize=9.5)
             ax.set_ylabel(unit, fontsize=10)
             arrow = "lower is better" if direction == "lower" else "higher is better"
-            ax.set_title(f"{title}   ({arrow})", fontsize=12, fontweight="bold")
             finite = [v for v in vals if math.isfinite(v)]
-            vmax = max(finite) if finite else 1.0
-            ax.set_ylim(0, vmax * 1.18)
-            for i, (b, v) in enumerate(zip(bars, vals)):
-                txt = (f"{v:.3f}" if key == "final_eval_loss"
-                       else (f"{v:.0f}" if key == "tok_per_s" else f"{v:.2f}"))
-                star = "  *" if i == bi else ""
-                ax.text(b.get_x() + b.get_width() / 2, v + vmax * 0.015, txt + star,
-                        ha="center", va="bottom", fontsize=9.5,
-                        fontweight="bold" if i == bi else "normal")
+
+            if key == "final_eval_loss":
+                # Converged losses differ by <1%, so a zero-based bar axis hides
+                # the story. Use points on a zoomed axis, with the documented
+                # single-eval noise band (+/-0.007) shaded around the best value
+                # so "statistical tie" is visible at a glance.
+                noise = 0.007
+                ax.axhspan(vals[bi] - noise, vals[bi] + noise,
+                           color="#1a7a1a", alpha=0.08, zorder=0)
+                ax.scatter(range(len(opts)), vals, s=170, c=colors,
+                           edgecolors="black", linewidths=0.8, zorder=3)
+                ax.scatter([bi], [vals[bi]], s=170, c=[colors[bi]],
+                           edgecolors="#1a7a1a", linewidths=2.6, zorder=4)
+                lo, hi = min(finite), max(finite)
+                pad = max((hi - lo) * 0.25, noise * 1.5)
+                ax.set_ylim(lo - pad, hi + pad)
+                ax.set_xlim(-0.6, len(opts) - 0.4)
+                ax.set_title(f"{title}   ({arrow} . zoomed . shaded = eval noise)",
+                             fontsize=12, fontweight="bold")
+                for i, v in enumerate(vals):
+                    star = "  *" if i == bi else ""
+                    ax.text(i, v + pad * 0.13, f"{v:.3f}{star}",
+                            ha="center", va="bottom", fontsize=9.5,
+                            fontweight="bold" if i == bi else "normal")
+            else:
+                bars = ax.bar(range(len(opts)), vals, color=colors,
+                              edgecolor="black", linewidth=0.6, width=0.66)
+                bars[bi].set_edgecolor("#1a7a1a")
+                bars[bi].set_linewidth(2.4)
+                ax.set_title(f"{title}   ({arrow})", fontsize=12, fontweight="bold")
+                vmax = max(finite) if finite else 1.0
+                ax.set_ylim(0, vmax * 1.18)
+                for i, (b, v) in enumerate(zip(bars, vals)):
+                    txt = f"{v:.0f}" if key == "tok_per_s" else f"{v:.2f}"
+                    star = "  *" if i == bi else ""
+                    ax.text(b.get_x() + b.get_width() / 2, v + vmax * 0.015, txt + star,
+                            ha="center", va="bottom", fontsize=9.5,
+                            fontweight="bold" if i == bi else "normal")
             ax.grid(axis="y", alpha=0.25)
             ax.set_axisbelow(True)
 
