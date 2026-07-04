@@ -6,10 +6,9 @@
 
 **Fork Highlights:**
 
- - **Matches AdamW's loss out of the box** while using about a quarter of its optimizer memory — see [Benchmarks](#benchmarks).
+ - **New: matches AdamW's loss out of the box.** The default `factored_v_2d` second moment closes the historical ≈0.06 loss gap to AdamW while keeping about a quarter of its optimizer memory — see [Benchmarks](#benchmarks) and [the factored-v lever](#quality-lever-factored-second-moment-on-2d-params-factored_v_2d).
  - **Works on modern decoders** (Qwen3, Llama-3, Mistral). Upstream loses its memory advantage on these architectures (≈9 B/param — worse than AdamW); this fork keeps the intended ≈1 B/param.
  - **≈2× faster `opt.step()`** via fused CUDA kernels, with identical results.
- - **Adds a whole-model Muon option** (`GefenMuonHybrid`) — Muon-style training with the same ≈1 B/param optimizer memory, tuned to AdamW-level loss, with faster orthogonalization schedules and multi-GPU sharding built in.
  - **Reliable checkpoint save/resume and FSDP2 support** — broken or absent in the shipped release.
  - **Hardened against crashes** (device/dtype guards, bounds checks, race fixes) with a bit-exact test suite.
 
@@ -20,11 +19,11 @@
 
 | Capability | Upstream v1.1.1 | This fork |
 |---|---|---|
+| Loss vs AdamW | trails AdamW by ≈0.06 | **matches AdamW** via the default `factored_v_2d` — [details](#quality-lever-factored-second-moment-on-2d-params-factored_v_2d) |
 | Modern decoders (Qwen3 / Llama-3 / Mistral — SwiGLU + grouped-query attention) | uses *more* optimizer memory than AdamW on these | keeps the full ≈8× memory saving |
 | Learning rate on those architectures | no guidance — silently over-steps | documented ≈0.6× AdamW, so quality matches AdamW |
 | Optimizer-step speed | baseline | ≈2× faster `opt.step()` (fused kernels), identical results |
 | Peak memory during the step | large transient spikes | much lower peak — room for bigger models / batches |
-| Loss vs AdamW | trails AdamW by ≈0.06 | **matches AdamW** via the default `factored_v_2d` — [details](#quality-lever-factored-second-moment-on-2d-params-factored_v_2d) |
 | Sharded multi-GPU training (FSDP2) | breaks with the fast path | works — for plain Gefen *and* Muon |
 | Whole-model Muon | 2D weight matrices only | `GefenMuonHybrid` trains the entire model |
 | Muon step efficiency | generic momentum hack + redundant dequant gather | single-pass bit-exact momentum kernel |
