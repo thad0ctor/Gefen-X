@@ -158,6 +158,16 @@ GEFEN_CODEBOOK_SEARCH_CHUNK = 1 << 23
 GEFEN_DEQUANT_GATHER_CHUNK = 1 << 23
 
 
+# Feed the one-time exact-codebook histogram in element chunks of this size
+# (rounded down to a block-period multiple). Per-block histogram counts are
+# independent, so chunked accumulation is bit-exact, but the upcast is the
+# whole-tensor `flat.float()` (4N bytes at once) without it -- a >2G-element
+# grad (Gemma 4's per-layer embedding table) allocates 8.75 GiB of fp32 and
+# OOMs a 24 GB card during the very first step. 256M elems -> 1 GiB ceiling;
+# runs once per codebook (re)build, so launch overhead is irrelevant here.
+GEFEN_EXACT_HISTOGRAM_CHUNK = 1 << 28
+
+
 # Stream the whole non-fused momentum update + parameter apply (dequant -> lerp ->
 # per-block magnitude -> normalize -> re-quantize -> reconstruct -> scale -> p.add_)
 # in row (block) chunks of about this many elements. The stock non-fused path ran
@@ -357,41 +367,47 @@ def learn_gefen_exact_codebook_from_grad_periods(
 
     histogram_bins = num_codebooks * 16
     bin_width = 2.0 / float(histogram_bins)
-    bin_counts_cpu = torch.zeros(histogram_bins, dtype=torch.float32, device="cpu")
+    # Accumulate counts as int64 and cast to float32 once at assembly: repeated
+    # fp32 adds round for bins past 2^24 counts, so chunked accumulation could
+    # otherwise drift from the whole-tensor form's single cast.
+    bin_counts_cpu = torch.zeros(histogram_bins, dtype=torch.int64, device="cpu")
     total_numel = 0
 
     prev_mode = torch.get_deterministic_debug_mode()
     torch.set_deterministic_debug_mode(0)
     try:
         for _, flat, period, _ in grad_periods:
-            flat_float = flat.float()
-            if use_fused_histogram and flat_float.device.type == "cuda":
-                from gefen.kernels.exact_histogram_fused import (
-                    gefen_exact_histogram_cuda,
-                )
+            flat_1d = flat.reshape(-1)
+            chunk_elems = max(1, GEFEN_EXACT_HISTOGRAM_CHUNK // period) * period
+            for start in range(0, flat_1d.numel(), chunk_elems):
+                flat_float = flat_1d[start : start + chunk_elems].float()
+                if use_fused_histogram and flat_float.device.type == "cuda":
+                    from gefen.kernels.exact_histogram_fused import (
+                        gefen_exact_histogram_cuda,
+                    )
 
-                local_counts_cuda = torch.zeros(
-                    histogram_bins, dtype=torch.int64, device=flat_float.device
-                )
-                gefen_exact_histogram_cuda(flat_float, period, local_counts_cuda)
-                bin_counts_cpu.add_(local_counts_cuda.cpu().to(torch.float32))
-                total_numel += flat_float.numel()
-            else:
-                blocks = automatic_partition_view(flat_float, period)
-                absmax = blocks.abs().amax(dim=1, keepdim=True)
-                normalized = torch.where(
-                    absmax > 0, blocks / absmax, torch.zeros_like(blocks)
-                )
-                normalized_flat = normalized.reshape(-1)
-                bin_indices = torch.floor((normalized_flat + 1.0) / bin_width).to(
-                    torch.long
-                )
-                bin_indices = bin_indices.clamp(0, histogram_bins - 1)
-                local_counts = torch.bincount(
-                    bin_indices, minlength=histogram_bins
-                ).float()
-                bin_counts_cpu.add_(local_counts.cpu())
-                total_numel += normalized_flat.numel()
+                    local_counts_cuda = torch.zeros(
+                        histogram_bins, dtype=torch.int64, device=flat_float.device
+                    )
+                    gefen_exact_histogram_cuda(flat_float, period, local_counts_cuda)
+                    bin_counts_cpu.add_(local_counts_cuda.cpu())
+                    total_numel += flat_float.numel()
+                else:
+                    blocks = automatic_partition_view(flat_float, period)
+                    absmax = blocks.abs().amax(dim=1, keepdim=True)
+                    normalized = torch.where(
+                        absmax > 0, blocks / absmax, torch.zeros_like(blocks)
+                    )
+                    normalized_flat = normalized.reshape(-1)
+                    bin_indices = torch.floor((normalized_flat + 1.0) / bin_width).to(
+                        torch.long
+                    )
+                    bin_indices = bin_indices.clamp(0, histogram_bins - 1)
+                    local_counts = torch.bincount(
+                        bin_indices, minlength=histogram_bins
+                    )
+                    bin_counts_cpu.add_(local_counts.cpu())
+                    total_numel += normalized_flat.numel()
     finally:
         torch.set_deterministic_debug_mode(prev_mode)
 
@@ -402,6 +418,7 @@ def learn_gefen_exact_codebook_from_grad_periods(
         -1.0, 1.0, steps=histogram_bins + 1, dtype=torch.float32
     )
     bin_centers_cpu = 0.5 * (bin_edges_cpu[:-1] + bin_edges_cpu[1:])
+    bin_counts_cpu = bin_counts_cpu.to(torch.float32)
     active_bins_cpu = bin_counts_cpu > 0
     histogram_stats = {
         "bin_edges": bin_edges_cpu,
@@ -631,6 +648,7 @@ class Gefen(torch.optim.Optimizer):
 
         self._printed_optimizer_memory = False
         self._gefen_codebook = None
+        self._gefen_codebook_by_device = {}
         self._gefen_global_step = 0
         self._printed_gefen_materialization = False
 
@@ -700,9 +718,25 @@ class Gefen(torch.optim.Optimizer):
             "Expected at least one parameter when choosing the Gefen codebook device."
         )
 
+    def _gefen_codebook_on(self, device: torch.device) -> Optional[torch.Tensor]:
+        # Params can live on several devices (HF `device_map` sharding puts
+        # whole layers on different GPUs). The codebook is learned once on one
+        # device; hand each step a cached per-device copy instead of tripping
+        # the kernels' same-device guards. Assignment sites must clear the
+        # cache (_gefen_codebook_by_device) so stale copies never survive a
+        # codebook refresh or checkpoint load.
+        codebook = self._gefen_codebook
+        if codebook is None or codebook.device == device:
+            return codebook
+        cached = self._gefen_codebook_by_device.get(device)
+        if cached is None:
+            cached = codebook.to(device)
+            self._gefen_codebook_by_device[device] = cached
+        return cached
+
     def _gefen_nearest_indices(self, normalized_vals: torch.Tensor) -> torch.Tensor:
 
-        codebook = self._gefen_codebook
+        codebook = self._gefen_codebook_on(normalized_vals.device)
         if codebook is None:
             raise ValueError(
                 "Expected Gefen codebook to be initialized before nearest-index lookup."
@@ -714,7 +748,7 @@ class Gefen(torch.optim.Optimizer):
     ) -> torch.Tensor:
 
         stored = state["m_codebook"]
-        codebook = self._gefen_codebook
+        codebook = self._gefen_codebook_on(like_tensor.device)
         if codebook is None:
             raise ValueError(
                 "Expected Gefen codebook to be initialized before dequantizing m coefficients."
@@ -913,6 +947,7 @@ class Gefen(torch.optim.Optimizer):
         )
         if codebook is not None:
             self._gefen_codebook = codebook
+            self._gefen_codebook_by_device.clear()
 
     def _step_automatic_factored(
         self, group, param_name: str, p: torch.Tensor, grad: torch.Tensor
@@ -1003,7 +1038,7 @@ class Gefen(torch.optim.Optimizer):
             # per-element stepsize V_ij ~= r_i * c_j / mean(r) is computed in
             # registers in phase 2 -- no host-side reduction pass, no host
             # sync, no full-size temporaries anywhere in the step.
-            codebook = self._gefen_codebook
+            codebook = self._gefen_codebook_on(p.device)
             if codebook is None:
                 raise ValueError(
                     "Expected Gefen codebook to be initialized before the "
@@ -1087,12 +1122,16 @@ class Gefen(torch.optim.Optimizer):
                 pstate = self.state.get(p)
                 if not pstate or "m_codebook" not in pstate:
                     continue
+                stored_device = pstate["m_codebook"].device
+                old_codebook_local = self._gefen_codebook_on(stored_device)
+                new_codebook_local = new_codebook.to(stored_device)
                 coeffs = gefen_dequantize_unpacked_indices(
-                    old_codebook, pstate["m_codebook"], old_codebook
+                    old_codebook_local, pstate["m_codebook"], old_codebook_local
                 )
-                indices = gefen_nearest_codebook_indices(new_codebook, coeffs)
+                indices = gefen_nearest_codebook_indices(new_codebook_local, coeffs)
                 gefen_set_unpacked_indices(pstate["m_codebook"], indices)
         self._gefen_codebook = new_codebook
+        self._gefen_codebook_by_device.clear()
 
     def _resuming_from_checkpoint(self) -> bool:
         # On resume every param's state has a restored automatic_period; on a
@@ -1110,6 +1149,7 @@ class Gefen(torch.optim.Optimizer):
             device = self._gefen_codebook_device()
             if self._gefen_codebook.device != device:
                 self._gefen_codebook = self._gefen_codebook.to(device)
+                self._gefen_codebook_by_device.clear()
             return
 
         # No codebook yet. On a fresh run this learns it and predicts periods.
@@ -1197,7 +1237,7 @@ class Gefen(torch.optim.Optimizer):
         self, p, state, grad_view, beta1, stepsize, lr
     ) -> None:
 
-        codebook = self._gefen_codebook
+        codebook = self._gefen_codebook_on(p.device)
         if codebook is None:
             raise ValueError(
                 "Expected Gefen codebook to be initialized before fused update."
@@ -1221,7 +1261,7 @@ class Gefen(torch.optim.Optimizer):
         # state (m_codebook / m_magnitude) by one EMA step and returns the DENSE
         # quantized momentum for Newton-Schulz in a single kernel pass -- no lr==0
         # dummy-stepsize parameter write, and no second full-size codebook gather.
-        codebook = self._gefen_codebook
+        codebook = self._gefen_codebook_on(grad_view.device)
         if codebook is None:
             raise ValueError(
                 "Expected Gefen codebook to be initialized before quantized momentum update."
@@ -1264,7 +1304,7 @@ class Gefen(torch.optim.Optimizer):
         # exactly as PyTorch casts the scalar operands of the host div_/mul_.
         # PyTorch lowers `h.div_(sqrt(bc2))` to a multiply by float32(1/sqrt(bc2))
         # (a true divide differs by up to ~2 ULP), so pass the reciprocal directly.
-        codebook = self._gefen_codebook
+        codebook = self._gefen_codebook_on(p.device)
         if codebook is None:
             raise ValueError(
                 "Expected Gefen codebook to be initialized before fused update."
@@ -1308,7 +1348,7 @@ class Gefen(torch.optim.Optimizer):
         # stepsize/weight-decay passes are skipped. The scalar reciprocals are
         # precomputed as Python doubles and cast in-kernel exactly as PyTorch
         # casts the operands of the host div_/mul_ (see the v1-full path).
-        codebook = self._gefen_codebook
+        codebook = self._gefen_codebook_on(p.device)
         if codebook is None:
             raise ValueError(
                 "Expected Gefen codebook to be initialized before fused update."
@@ -1365,7 +1405,7 @@ class Gefen(torch.optim.Optimizer):
                 )
             )
 
-        codebook = self._gefen_codebook
+        codebook = self._gefen_codebook_on(grad_view.device)
         if codebook is None:
             raise ValueError(
                 "Expected Gefen codebook to be initialized before the momentum update."
@@ -1462,7 +1502,7 @@ class Gefen(torch.optim.Optimizer):
                 )
             )
 
-        codebook = self._gefen_codebook
+        codebook = self._gefen_codebook_on(grad_view.device)
         if codebook is None:
             raise ValueError(
                 "Expected Gefen codebook to be initialized before reconstructing quantized m."
@@ -2033,6 +2073,7 @@ class Gefen(torch.optim.Optimizer):
         # _maybe_refresh_gefen_codebook returns early and skips the restored-period
         # fallback.
         self._gefen_codebook = gefen_codebook
+        self._gefen_codebook_by_device.clear()
 
         # Map saved param ids -> live param objects exactly as the base class
         # does, then restore each aux tensor from its pristine saved copy.
