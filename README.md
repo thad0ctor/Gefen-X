@@ -9,6 +9,7 @@
  - **Matches AdamW's loss out of the box** while using about a quarter of its optimizer memory — see [Benchmarks](#benchmarks).
  - **Works on modern decoders** (Qwen3, Llama-3, Mistral). Upstream loses its memory advantage on these architectures (≈9 B/param — worse than AdamW); this fork keeps the intended ≈1 B/param.
  - **≈2× faster `opt.step()`** via fused CUDA kernels, with identical results.
+ - **Adds a whole-model Muon option** (`GefenMuonHybrid`) — Muon-style training with the same ≈1 B/param optimizer memory, tuned to AdamW-level loss, with faster orthogonalization schedules and multi-GPU sharding built in.
  - **Reliable checkpoint save/resume and FSDP2 support** — broken or absent in the shipped release.
  - **Hardened against crashes** (device/dtype guards, bounds checks, race fixes) with a bit-exact test suite.
 
