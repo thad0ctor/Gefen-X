@@ -39,6 +39,7 @@
 All measured numbers live in [Benchmarks](#benchmarks) and the lever sections below.
 
 </details>
+
  
 ## Installation
 
@@ -109,6 +110,7 @@ Gefen's compressed optimizer state takes slightly larger effective steps than Ad
 Measured on a Qwen3-4B full fine-tune: at its own ≈0.6× optimum Gefen ties AdamW at 300 and 800 steps with AdamW-like run-to-run spread; forced up to an AdamW-scale LR it lands ≈0.3–0.4 worse with ≈5× the spread.
 
 </details>
+
 ## Benchmarks
 
 Optimizer comparison on a full fine-tune, **with each optimizer at its own fair learning-rate optimum** (from a per-optimizer LR sweep), 2000 steps.
