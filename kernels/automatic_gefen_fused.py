@@ -223,6 +223,58 @@ def automatic_gefen_fused_full_update_cuda(
     )
 
 
+def gefen_factored_update_cuda(
+    p: torch.Tensor,
+    grad_view: torch.Tensor,
+    m_sign: torch.Tensor,
+    m_magnitude: torch.Tensor,
+    v_row: torch.Tensor,
+    v_col: torch.Tensor,
+    codebook: torch.Tensor,
+    cols: int,
+    beta1: float,
+    beta2: float,
+    lr: float,
+    eps: float,
+    inv_bias_correction_2: float,
+    inv_bias_correction_1: float,
+    weight_decay_factor: float,
+    stochastic_round: bool = False,
+    rng_seed: int = 0,
+) -> None:
+    """Factored-second-moment (Adafactor-style) fused update for a 2D param.
+    Phase 1 computes the per-block absmax AND the raw row/col grad^2 sums in
+    ONE pass; the ``v_row``/``v_col`` EMAs are advanced IN PLACE device-side
+    (pass the state tensors directly) and their mean never leaves the device.
+    Phase 2 applies with the per-element stepsize
+    V_ij ~= v_row[i] * v_col[j] / mean(v_row) computed in registers; weight
+    decay is folded via ``weight_decay_factor`` like the v2-full path."""
+    grad_c = grad_view if grad_view.is_contiguous() else grad_view.contiguous()
+    cb_c = codebook if codebook.is_contiguous() else codebook.contiguous()
+
+    module = _load_extension()
+    module.gefen_factored_update_cuda(
+        p,
+        grad_c,
+        m_sign,
+        m_magnitude,
+        v_row,
+        v_col,
+        cb_c,
+        _codebook_search_lut(cb_c),
+        cols,
+        beta1,
+        beta2,
+        lr,
+        eps,
+        inv_bias_correction_2,
+        inv_bias_correction_1,
+        weight_decay_factor,
+        stochastic_round,
+        rng_seed,
+    )
+
+
 def gefen_quantized_momentum_update_cuda(
     grad_view: torch.Tensor,
     m_sign: torch.Tensor,

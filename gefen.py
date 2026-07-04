@@ -24,6 +24,9 @@ from gefen.kernels.automatic_gefen_fused import (
 from gefen.kernels.automatic_gefen_fused import (
     gefen_quantized_momentum_update_cuda as _gefen_quantized_momentum_update_cuda,
 )
+from gefen.kernels.automatic_gefen_fused import (
+    gefen_factored_update_cuda as _gefen_factored_update_cuda,
+)
 from gefen.kernels.automatic_gefen_fused import _should_use_v2
 
 # Optional explicit override for the period-search backend ("cuda_kernel" / "cpu"
@@ -471,6 +474,9 @@ class Gefen(torch.optim.Optimizer):
         fused: bool = True,
         force_1d_period_one: bool = False,
         force_2d_period_one: bool = False,
+        period_one_substrings: Tuple[str, ...] = (),
+        factored_v_2d: bool = True,
+        codebook_refresh_every: int = 0,
         stochastic_round: bool = False,
         verbose: bool = False,
     ):
@@ -564,6 +570,44 @@ class Gefen(torch.optim.Optimizer):
         # magnitude on a vocab x hidden tensor), so this is an opt-in loss/memory
         # trade, not free like force_1d_period_one (1D tensors are tiny).
         self._force_2d_period_one = force_2d_period_one
+        # Name-substring routing to period==1 (per-element 2nd moment +
+        # momentum magnitude, AdamW-like fidelity) for SELECTED params only --
+        # the surgical form of the force_*_period_one flags. E.g.
+        # ("embed", "lm_head") gives the vocab projections per-element state
+        # (the most AdamW-divergent tensors under block-shared vmean, per the
+        # hybrid backup_2d_period_one finding) without paying per-element
+        # memory on every hidden matrix. Matching is case-insensitive substring
+        # over the parameter name.
+        self._period_one_substrings = tuple(
+            s.lower() for s in period_one_substrings
+        )
+        # Adafactor-style factored second moment for 2D params (ON BY
+        # DEFAULT -- the AdamW-parity configuration): keep the quantized
+        # momentum machinery unchanged but replace the block-shared vmean with
+        # row/col fp32 EMAs of grad^2 whose outer product reconstructs a
+        # per-element second moment at (rows + cols) state instead of numel.
+        # Closes the ~0.06 eval-loss gap to fused AdamW at ~1.01 B/param and
+        # baseline peak VRAM for ~6-8% throughput; its fair LR is ~0.6x the
+        # AdamW LR (higher than block-vmean Gefen's ~0.4x). Set
+        # factored_v_2d=False for the legacy block-shared second moment (and
+        # its lower fair LR). On the fused CUDA path the stepsize is computed
+        # in-kernel; elsewhere a decomposed fallback applies. NOTE: sharded
+        # (DTensor/FSDP2) 2D params currently fall back to the block-vmean
+        # path regardless (local-shard row/col statistics would be wrong).
+        self._factored_v_2d = factored_v_2d
+        # Re-learn the exact-DP codebook from the CURRENT gradients every N
+        # steps (0 = off, the default: learn once on step 1 and freeze). The
+        # stored momentum indices are re-quantized from the old codebook onto
+        # the new one, so the momentum state survives the swap with only
+        # nearest-codeword rounding error. Tests whether the frozen step-1
+        # codebook goes stale as the gradient distribution shifts.
+        if codebook_refresh_every < 0:
+            raise ValueError(
+                "codebook_refresh_every must be >= 0 but is: {}".format(
+                    codebook_refresh_every
+                )
+            )
+        self._codebook_refresh_every = codebook_refresh_every
         # When set, momentum->codebook quantization uses unbiased stochastic
         # rounding (seeded per optimizer step) instead of deterministic nearest.
         # This cancels the systematic bias that nearest-rounding the EMA momentum
@@ -702,6 +746,10 @@ class Gefen(torch.optim.Optimizer):
             return 1
         if self._force_2d_period_one and param.ndim == 2:
             return 1
+        if self._period_one_substrings:
+            lname = str(param_name).lower()
+            if any(sub in lname for sub in self._period_one_substrings):
+                return 1
         return self._predict_period_from_grad_sq(param_name, param, grad)
 
     def _predict_period_from_grad_sq(
@@ -865,6 +913,186 @@ class Gefen(torch.optim.Optimizer):
         )
         if codebook is not None:
             self._gefen_codebook = codebook
+
+    def _step_automatic_factored(
+        self, group, param_name: str, p: torch.Tensor, grad: torch.Tensor
+    ) -> None:
+        # Adafactor-style factored second moment for a 2D param (opt-in via
+        # factored_v_2d). The quantized-momentum machinery is byte-identical to
+        # the merged non-fused path (_automatic_momentum_update_merged); only
+        # the second moment differs: instead of the block-shared vmean EMA, we
+        # keep fp32 row/col EMAs of grad^2 and reconstruct a per-element
+        # V ~= outer(R, C) / mean(R) each step (Shazeer & Stern 2018), giving
+        # per-element stepsize fidelity at (rows + cols) state. On the fused
+        # CUDA path the stepsize is computed in-kernel (no full-size
+        # temporaries); elsewhere a decomposed whole-tensor fallback applies.
+        if hasattr(grad, "to_local"):
+            grad = grad.to_local()
+        if hasattr(grad, "wait"):
+            grad = grad.wait()
+        state = self.state[p]
+        beta1 = group["beta1"]
+        beta2 = group["beta2"]
+        lr = group["lr"]
+        eps = group["eps"]
+
+        flat_grad = grad.reshape(-1)
+        if flat_grad.numel() == 0:
+            return
+
+        if "step" not in state:
+            if "automatic_period" in state:
+                automatic_period = state["automatic_period"]
+            elif flat_grad.numel() == 1:
+                automatic_period = 1
+            else:
+                automatic_period = self._resolve_automatic_period(
+                    param_name, p, grad
+                )
+            if flat_grad.numel() % automatic_period != 0:
+                raise ValueError(
+                    "Automatic partition period {} does not divide parameter {} with numel {}".format(
+                        automatic_period, param_name, flat_grad.numel()
+                    )
+                )
+            state["automatic_period"] = automatic_period
+            state["step"] = 0
+            grad_view = self._automatic_view(flat_grad, automatic_period)
+            self._init_gefen_state(state, grad_view)
+            state["v_row"] = torch.zeros(
+                p.shape[0], dtype=torch.float32, device=p.device
+            )
+            state["v_col"] = torch.zeros(
+                p.shape[1], dtype=torch.float32, device=p.device
+            )
+            state["factored_step"] = 0
+
+        automatic_period = state["automatic_period"]
+        grad_view = self._automatic_view(flat_grad, automatic_period)
+
+        # Resume compatibility: a checkpoint saved with factored_v_2d off (or
+        # from before the flag existed) restores "step"/momentum state but no
+        # row/col EMAs. Initialize them lazily; the EMA bias correction uses
+        # the param's own step count, so the first post-resume steps behave
+        # like a fresh EMA warm-up on those tensors (convergence-neutral).
+        if "v_row" not in state:
+            state["v_row"] = torch.zeros(
+                p.shape[0], dtype=torch.float32, device=p.device
+            )
+            state["v_col"] = torch.zeros(
+                p.shape[1], dtype=torch.float32, device=p.device
+            )
+            state["factored_step"] = 0
+
+        rows, cols = p.shape
+        state["step"] += 1
+        state["factored_step"] += 1
+        # bc1 corrects the (possibly checkpoint-restored, older) momentum EMA;
+        # bc2 must correct the factored v EMA's own age.
+        bias_correction_1 = 1 - beta1 ** state["step"]
+        bias_correction_2 = 1 - beta2 ** state["factored_step"]
+
+        if (
+            self._use_fused_gefen_automatic_step()
+            and p.is_cuda
+            and p.is_contiguous()
+        ):
+            # Fused path. Phase 1 of the kernel computes the per-block absmax
+            # AND the raw row/col grad^2 sums in ONE pass over grad + m_sign;
+            # the v_row/v_col EMAs advance in place device-side and the
+            # per-element stepsize V_ij ~= r_i * c_j / mean(r) is computed in
+            # registers in phase 2 -- no host-side reduction pass, no host
+            # sync, no full-size temporaries anywhere in the step.
+            codebook = self._gefen_codebook
+            if codebook is None:
+                raise ValueError(
+                    "Expected Gefen codebook to be initialized before the "
+                    "factored update."
+                )
+            weight_decay_factor = 1.0 - lr * group["weight_decay"]
+            _gefen_factored_update_cuda(
+                p,
+                grad_view,
+                state["m_codebook"],
+                state["m_magnitude"],
+                state["v_row"],
+                state["v_col"],
+                codebook,
+                cols,
+                beta1,
+                beta2,
+                lr,
+                eps,
+                1.0 / bias_correction_2,
+                1.0 / bias_correction_1,
+                weight_decay_factor,
+                self._stochastic_round,
+                self._gefen_global_step,
+            )
+            return
+
+        # Decomposed fallback (CPU / fused disabled). Row/col mean-square EMAs
+        # over bounded fp32 row-chunks (one chunk serves both reductions, so
+        # the transient stays ~a few chunk sizes), then whole-tensor torch ops.
+        grad2d = grad.detach()
+        row_ms = torch.empty(rows, dtype=torch.float32, device=p.device)
+        col_sq = torch.zeros(cols, dtype=torch.float32, device=p.device)
+        rows_per_chunk = max(1, (1 << 20) // max(1, cols))
+        for r0 in range(0, rows, rows_per_chunk):
+            r1 = min(r0 + rows_per_chunk, rows)
+            chunk_sq = grad2d[r0:r1].float().square_()
+            row_ms[r0:r1] = chunk_sq.sum(dim=1)
+            col_sq += chunk_sq.sum(dim=0)
+        row_ms.div_(cols)
+        col_sq.div_(rows)
+        state["v_row"].mul_(beta2).add_(row_ms, alpha=1 - beta2)
+        state["v_col"].mul_(beta2).add_(col_sq, alpha=1 - beta2)
+
+        # Decomposed fallback (CPU / fused disabled): whole-tensor torch ops.
+        # The kernel above is the canonical numerics; this matches it within
+        # float tolerance (different op association), not bit-for-bit.
+        v_hat = torch.outer(state["v_row"], state["v_col"]).div_(
+            state["v_row"].mean().clamp_(min=torch.finfo(torch.float32).tiny)
+        )
+        denom = v_hat.div_(bias_correction_2).sqrt_().add_(eps)
+        stepsize = denom.reciprocal_().mul_(1.0 / bias_correction_1)
+
+        # Quantized momentum advance, identical math to the merged non-fused
+        # path; returns the reconstructed fp32 momentum (codebook * magnitude).
+        shared_m = self._automatic_momentum_update_merged(state, grad_view, beta1)
+
+        if group["weight_decay"] > 0.0:
+            p.mul_(1 - lr * group["weight_decay"])
+        update = shared_m.view(p.shape).mul_(stepsize).mul_(lr)
+        p.add_(-update)
+
+    def _refresh_codebook_with_requant(self) -> None:
+        # Re-learn the exact-DP codebook from the CURRENT step's gradients
+        # (periods reused -- block geometry is baked into the per-param state)
+        # and re-quantize every stored momentum index from the old codebook
+        # onto the new one. The normalized coefficients are dequantized with
+        # the codebook that WROTE them, so the momentum survives the swap with
+        # only nearest-codeword rounding error; m_magnitude is unchanged
+        # (coefficients stay normalized to [-1, 1]).
+        old_codebook = self._gefen_codebook
+        if old_codebook is None:
+            return
+        new_codebook = self._learn_gefen_exact_codebook(
+            reuse_existing_periods=True, compute_mse_logging=False
+        )
+        if new_codebook is None:
+            return
+        for pgroup in self.param_groups:
+            for p in pgroup["params"]:
+                pstate = self.state.get(p)
+                if not pstate or "m_codebook" not in pstate:
+                    continue
+                coeffs = gefen_dequantize_unpacked_indices(
+                    old_codebook, pstate["m_codebook"], old_codebook
+                )
+                indices = gefen_nearest_codebook_indices(new_codebook, coeffs)
+                gefen_set_unpacked_indices(pstate["m_codebook"], indices)
+        self._gefen_codebook = new_codebook
 
     def _resuming_from_checkpoint(self) -> bool:
         # On resume every param's state has a restored automatic_period; on a
@@ -1336,10 +1564,27 @@ class Gefen(torch.optim.Optimizer):
                 dtype=torch.float32,
                 memory_format=torch.preserve_format,
             )
+            state["vmean_step"] = 0
             self._print_v_period(param_name, p, state["vmean"])
 
         automatic_period = state["automatic_period"]
         grad_view = self._automatic_view(flat_grad, automatic_period)
+
+        # Resume compatibility: a checkpoint written with factored_v_2d on has
+        # no vmean for 2D params; recreate it if the flag was turned off across
+        # the resume, with its own fresh age so the bias correction below
+        # treats it as a warm-up EMA rather than a mature one.
+        if "vmean" not in state:
+            state["vmean"] = torch.zeros_like(
+                grad_view[:, 0:1],
+                dtype=torch.float32,
+                memory_format=torch.preserve_format,
+            )
+            state["vmean_step"] = 0
+        elif "vmean_step" not in state:
+            # Checkpoint from before the counter existed: its vmean is exactly
+            # as old as the param step, so backfill (keeps bc2 bit-identical).
+            state["vmean_step"] = state["step"]
 
         # Tier-1: well-occupied (v1-regime) params take the fully-fused kernel,
         # which folds the vmean EMA + per-block stepsize math (and, after K3,
@@ -1361,6 +1606,7 @@ class Gefen(torch.optim.Optimizer):
             self._automatic_vmean_update(state["vmean"], grad_view, beta2)
 
         state["step"] += 1
+        state["vmean_step"] += 1
 
         # Under FSDP2 the parameter is a sharded DTensor; every in-place write
         # below (weight decay, fused kernel, non-fused add_) must land on the
@@ -1373,7 +1619,10 @@ class Gefen(torch.optim.Optimizer):
         )
 
         bias_correction_1 = 1 - beta1 ** state["step"]
-        bias_correction_2 = 1 - beta2 ** state["step"]
+        # bc2 corrects the vmean EMA by its OWN age: on fresh runs and normal
+        # resumes vmean_step == step (bit-identical); it differs only when
+        # vmean was lazily recreated after a factored->legacy toggle.
+        bias_correction_2 = 1 - beta2 ** state["vmean_step"]
 
         if use_full_fused:
             # K1+K2+K3: vmean EMA, per-block stepsize, and weight decay are all
@@ -1576,6 +1825,7 @@ class Gefen(torch.optim.Optimizer):
             local_numel,
             period,
             state["step"],
+            state.get("vmean_step", state["step"]),
             group["beta1"],
             group["beta2"],
             float(lr),
@@ -1658,14 +1908,21 @@ class Gefen(torch.optim.Optimizer):
         automatic_vmean_update(merged_vmean, merged_grad, beta2, use_fused=False)
 
         for _, _, p, _ in items:
-            self.state[p]["step"] += 1
+            pstate = self.state[p]
+            pstate["step"] += 1
+            # Backfill for pre-counter checkpoints (vmean as old as step),
+            # then advance the vmean age; the batch key groups by it, so one
+            # state's correction is valid for the whole batch.
+            if "vmean_step" not in pstate:
+                pstate["vmean_step"] = pstate["step"] - 1
+            pstate["vmean_step"] += 1
         step_count = first_state["step"]
 
         if weight_decay > 0.0:
             torch._foreach_mul_(params, 1 - lr * weight_decay)
 
         bias_correction_1 = 1 - beta1 ** step_count
-        bias_correction_2 = 1 - beta2 ** step_count
+        bias_correction_2 = 1 - beta2 ** first_state["vmean_step"]
         h = (merged_vmean.sqrt() / math.sqrt(bias_correction_2)).add_(eps)
         stepsize = (1 / bias_correction_1) / h
 
@@ -1809,6 +2066,15 @@ class Gefen(torch.optim.Optimizer):
     def step(self, closure=None):
         self._maybe_refresh_gefen_codebook()
         self._maybe_save_gefen_grad_histogram()
+        # Periodic codebook re-learn (opt-in): every N steps, refit the exact-DP
+        # codebook to the current gradient distribution and re-quantize the
+        # stored momentum indices onto it (see _refresh_codebook_with_requant).
+        if (
+            self._codebook_refresh_every
+            and self._gefen_global_step > 0
+            and self._gefen_global_step % self._codebook_refresh_every == 0
+        ):
+            self._refresh_codebook_with_requant()
 
         loss = None
         if closure is not None:
@@ -1837,6 +2103,19 @@ class Gefen(torch.optim.Optimizer):
             for p in group["params"]:
                 grad = p.grad
                 if grad is None:
+                    continue
+                # Factored-v routing (opt-in): plain 2D params keep their
+                # quantized momentum but step through the factored-second-
+                # moment path (in-kernel elementwise stepsize on the fused
+                # path) instead of any vmean path. Sharded (DTensor) params
+                # fall through to the standard path: local-shard row/col
+                # statistics would be wrong under sharding.
+                if (
+                    self._factored_v_2d
+                    and p.ndim == 2
+                    and not hasattr(p, "placements")
+                ):
+                    self._step_automatic_factored(group, name, p, grad)
                     continue
                 if (
                     batch_nonfused

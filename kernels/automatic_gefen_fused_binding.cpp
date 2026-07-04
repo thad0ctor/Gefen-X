@@ -78,6 +78,27 @@ void gefen_quantized_momentum_update_cuda(
     int64_t rng_seed
 );
 
+void gefen_factored_update_cuda(
+    at::Tensor p,
+    at::Tensor grad_view,
+    at::Tensor m_sign,
+    at::Tensor m_magnitude,
+    at::Tensor v_row,
+    at::Tensor v_col,
+    at::Tensor codebook,
+    at::Tensor lut,
+    int64_t cols,
+    double beta1,
+    double beta2,
+    double lr,
+    double eps,
+    double inv_bias_correction_2,
+    double inv_bias_correction_1,
+    double weight_decay_factor,
+    bool stochastic_round,
+    int64_t rng_seed
+);
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def(
         "automatic_gefen_fused_update_cuda",
@@ -148,6 +169,30 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         py::arg("lr"),
         py::arg("eps"),
         py::arg("inv_sqrt_bias_correction_2"),
+        py::arg("inv_bias_correction_1"),
+        py::arg("weight_decay_factor"),
+        py::arg("stochastic_round") = false,
+        py::arg("rng_seed") = 0
+    );
+    m.def(
+        "gefen_factored_update_cuda",
+        &gefen_factored_update_cuda,
+        "Factored-second-moment (Adafactor-style row x col) fused Gefen update "
+        "for 2D params: per-element stepsize computed in registers (CUDA)",
+        py::arg("p"),
+        py::arg("grad_view"),
+        py::arg("m_sign"),
+        py::arg("m_magnitude"),
+        py::arg("v_row"),
+        py::arg("v_col"),
+        py::arg("codebook"),
+        py::arg("lut"),
+        py::arg("cols"),
+        py::arg("beta1"),
+        py::arg("beta2"),
+        py::arg("lr"),
+        py::arg("eps"),
+        py::arg("inv_bias_correction_2"),
         py::arg("inv_bias_correction_1"),
         py::arg("weight_decay_factor"),
         py::arg("stochastic_round") = false,

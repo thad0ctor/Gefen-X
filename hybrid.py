@@ -214,6 +214,14 @@ class GefenMuonHybrid(torch.optim.Optimizer):
                                  weight_decay=backup_weight_decay, fused=fused,
                                  force_1d_period_one=backup_1d_period_one,
                                  force_2d_period_one=backup_2d_period_one,
+                                 # Pin the plain-Gefen factored-v default OFF for
+                                 # the backup half: the hybrid's validated recipe
+                                 # (split LR + period-one levers) was measured
+                                 # with block-vmean on embed/LM-head, and
+                                 # factored-v x muon-backup is an untested
+                                 # combination. Revisit deliberately, not by
+                                 # default drift.
+                                 factored_v_2d=False,
                                  stochastic_round=stochastic_round,
                                  verbose=verbose)
         else:
@@ -227,6 +235,7 @@ class GefenMuonHybrid(torch.optim.Optimizer):
                     fused=fused,
                     force_1d_period_one=backup_1d_period_one,
                     force_2d_period_one=backup_2d_period_one,
+                    factored_v_2d=False,  # see the pinned-off note above
                     stochastic_round=stochastic_round,
                     verbose=verbose,
                 )

@@ -153,6 +153,11 @@ Written to `--out`:
   output, on by default). Pass `--no-muon-normuon` to disable it; the effective
   value is recorded in each result line (`muon_flags.normuon` /
   `normuon_explicit`).
+- **`gefen_fused`/`gefen_nonfused` run the plain defaults**; the opt-in loss
+  levers (`--gefen-factored-v` — the AdamW-parity config, fair LR ~0.6×
+  AdamW's — plus `--gefen-period-one-substrings`, `--gefen-force-1d-period-one`
+  and `--gefen-codebook-refresh`) are off unless passed, so the published rows
+  stay reproducible.
 - **Muon is slower per step** — the Newton-Schulz orthogonalization adds work,
   so `gefen_muon` trades throughput for its update geometry.
 - **Throughput is per-GPU.** Compare optimizers *within* a model (same GPU

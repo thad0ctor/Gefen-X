@@ -22,7 +22,7 @@ Two modes:
 - **`method="range_test"` (fast, rough):** a Leslie-Smith LR ramp. Cheap, but **only a bracketing aid** — across models it was run-to-run noisy and sometimes several-× off for the Gefen family. Use it to center the sweep grid, not as a final number.
 
 ### What the finder shows about Gefen LRs (RTX 5090 / Alpaca, 3 models)
-- **Plain `Gefen`** wants a **low, roughly model-independent LR ≈ 1e-5**, i.e. **~0.1–0.4× your AdamW LR** (lower). The static "≈0.6–0.8×" head-dim heuristic overestimates this and varies by model — prefer the finder.
+- **Plain `Gefen` (the `factored_v_2d=True` default)** wants **≈0.6× your AdamW LR** (measured fair optimum `3e-5` vs AdamW's `5e-5` on Qwen3-0.6B/1.7B). With the legacy block-shared second moment (`factored_v_2d=False`) the optimum is lower and roughly model-independent, **≈1e-5–2e-5, ~0.1–0.4× AdamW** — the pre-factored measurements below were taken in that mode. Either way, prefer the finder over static heuristics.
 - **`GefenMuonHybrid`** roughly **reuses your AdamW LR** (~1×), with `adjust_lr_fn="match_rms_adamw"`.
 
 ## Running it (env, dataset, GPUs)
