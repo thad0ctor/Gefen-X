@@ -6,7 +6,8 @@
 
 **Fork Highlights:**
 
- - **New: matches AdamW's loss out of the box.** The default `factored_v_2d` second moment closes the historical ≈0.06 loss gap to AdamW while keeping about a quarter of its optimizer memory — see [Benchmarks](#benchmarks) and [the factored-v lever](#quality-lever-factored-second-moment-on-2d-params-factored_v_2d).
+ - **New: matches AdamW's loss out of the box** at about a quarter of its optimizer memory (default `factored_v_2d`).
+   See [Benchmarks](#benchmarks) and [the factored-v lever](#quality-lever-factored-second-moment-on-2d-params-factored_v_2d).
  - **Works on modern decoders** (Qwen3, Llama-3, Mistral). Upstream loses its memory advantage on these architectures (≈9 B/param — worse than AdamW); this fork keeps the intended ≈1 B/param.
  - **≈2× faster `opt.step()`** via fused CUDA kernels, with identical results.
  - **Whole-model Muon option** (`GefenMuonHybrid`) at the same ≈1 B/param memory and AdamW-level loss.
