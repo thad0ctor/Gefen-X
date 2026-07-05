@@ -14,44 +14,57 @@ template <typename scalar_t, bool input_is_squared>
 __global__ void average_within_block_variance_kernel(
     const scalar_t* __restrict__ values,
     int64_t period,
+    int64_t num_blocks,
     float* __restrict__ out_sum_var
 ) {
     extern __shared__ float shared[];
     float* shared_sum_x = shared;
     float* shared_sum_x2 = shared + blockDim.x;
 
-    const int64_t logical_block = static_cast<int64_t>(blockIdx.x);
-    const int64_t start = logical_block * period;
+    // Grid-stride over logical blocks: num_blocks (= numel / period) can
+    // exceed the 2^31-1 grid.x launch limit when a >2G-element tensor (e.g.
+    // Gemma 4 per-layer embeddings) is probed with a small period.
+    float block_accum = 0.0f;
+    for (int64_t logical_block = static_cast<int64_t>(blockIdx.x);
+         logical_block < num_blocks;
+         logical_block += static_cast<int64_t>(gridDim.x)) {
+        const int64_t start = logical_block * period;
 
-    float local_sum_x = 0.0f;
-    float local_sum_x2 = 0.0f;
-    for (int64_t offset = threadIdx.x; offset < period; offset += blockDim.x) {
-        const float value = static_cast<float>(values[start + offset]);
-        const float x = input_is_squared ? value : value * value;
-        local_sum_x += x;
-        local_sum_x2 += x * x;
-    }
+        float local_sum_x = 0.0f;
+        float local_sum_x2 = 0.0f;
+        for (int64_t offset = threadIdx.x; offset < period; offset += blockDim.x) {
+            const float value = static_cast<float>(values[start + offset]);
+            const float x = input_is_squared ? value : value * value;
+            local_sum_x += x;
+            local_sum_x2 += x * x;
+        }
 
-    shared_sum_x[threadIdx.x] = local_sum_x;
-    shared_sum_x2[threadIdx.x] = local_sum_x2;
-    __syncthreads();
+        shared_sum_x[threadIdx.x] = local_sum_x;
+        shared_sum_x2[threadIdx.x] = local_sum_x2;
+        __syncthreads();
 
-    for (unsigned int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
-        if (threadIdx.x < stride) {
-            shared_sum_x[threadIdx.x] += shared_sum_x[threadIdx.x + stride];
-            shared_sum_x2[threadIdx.x] += shared_sum_x2[threadIdx.x + stride];
+        for (unsigned int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+            if (threadIdx.x < stride) {
+                shared_sum_x[threadIdx.x] += shared_sum_x[threadIdx.x + stride];
+                shared_sum_x2[threadIdx.x] += shared_sum_x2[threadIdx.x + stride];
+            }
+            __syncthreads();
+        }
+
+        if (threadIdx.x == 0) {
+            const float mean_x = shared_sum_x[0] / static_cast<float>(period);
+            float var_x = shared_sum_x2[0] / static_cast<float>(period);
+            var_x -= mean_x * mean_x;
+            if (var_x < 0.0f) {
+                var_x = 0.0f;
+            }
+            block_accum += var_x;
         }
         __syncthreads();
     }
 
     if (threadIdx.x == 0) {
-        const float mean_x = shared_sum_x[0] / static_cast<float>(period);
-        float var_x = shared_sum_x2[0] / static_cast<float>(period);
-        var_x -= mean_x * mean_x;
-        if (var_x < 0.0f) {
-            var_x = 0.0f;
-        }
-        atomicAdd(out_sum_var, var_x);
+        atomicAdd(out_sum_var, block_accum);
     }
 }
 
@@ -97,13 +110,26 @@ at::Tensor average_within_block_variance_cuda(
         return result;
     }
 
-    int threads = next_power_of_two(static_cast<int>(period));
-    if (threads > 256) {
-        threads = 256;
-    } else if (threads < 32) {
-        threads = 32;
+    // threads caps at 256, so skip next_power_of_two for large periods — its
+    // int shift overflows once period exceeds 2^30.
+    int threads = 256;
+    if (period < 256) {
+        threads = next_power_of_two(static_cast<int>(period));
+        if (threads < 32) {
+            threads = 32;
+        }
     }
-    const dim3 grid(static_cast<unsigned int>(logical_blocks));
+    // Below the 2^31-1 grid.x limit, launch exactly one CUDA block per logical
+    // block — the historical geometry, kept so existing tensor sizes see the
+    // same accumulation pattern. Only the overflow regime (>2G-element tensors
+    // probed with small periods, which previously crashed outright) drops to a
+    // grid-strided cap; 2^22 blocks keep every SM saturated without paying the
+    // scheduler for billions of near-empty blocks.
+    constexpr int64_t kGridLimit = (int64_t(1) << 31) - 1;
+    constexpr int64_t kOverflowGridBlocks = int64_t(1) << 22;
+    const int64_t grid_blocks =
+        logical_blocks <= kGridLimit ? logical_blocks : kOverflowGridBlocks;
+    const dim3 grid(static_cast<unsigned int>(grid_blocks));
     const dim3 block(static_cast<unsigned int>(threads));
     const size_t shared_bytes = static_cast<size_t>(threads) * 2 * sizeof(float);
 
@@ -117,12 +143,14 @@ at::Tensor average_within_block_variance_cuda(
                 average_within_block_variance_kernel<scalar_t, true><<<grid, block, shared_bytes>>>(
                     values.data_ptr<scalar_t>(),
                     period,
+                    logical_blocks,
                     result.data_ptr<float>()
                 );
             } else {
                 average_within_block_variance_kernel<scalar_t, false><<<grid, block, shared_bytes>>>(
                     values.data_ptr<scalar_t>(),
                     period,
+                    logical_blocks,
                     result.data_ptr<float>()
                 );
             }
