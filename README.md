@@ -62,6 +62,10 @@ The package is pure-Python at install time, the fused kernels (CUDA required) ar
 
 Verified with **PyTorch 2.12 (cu133) / Python 3.12**. Optional baselines used in the benchmark: `bitsandbytes` (AdamW-8bit),`torchao` (AdamW-4bit).
 
+## Compatibility
+
+Validated with full-parameter fine-tune smoke tests on 24 GB GPUs across modern LLMs/VLMs and media-generation models — Gemma 4, Qwen3-VL, Mistral 3, MiniCPM-V 4.6, SDXL, FLUX.1-dev (12B via FSDP2), FLUX.2-klein, and ACE-Step 1.5. Per-model results, method, and hardware footprints: **[COMPATIBILITY.md](COMPATIBILITY.md)**.
+
 ## Quick Start
 
 ```python
