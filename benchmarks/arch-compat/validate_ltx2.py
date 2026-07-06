@@ -139,7 +139,8 @@ def run(args, rec):
     opt = gefen.Gefen(named, lr=args.lr) if args.optimizer == "gefen" \
         else torch.optim.AdamW([p for _, p in named], lr=args.lr)
 
-    torch.cuda.reset_peak_memory_stats()
+    for i in range(torch.cuda.device_count()):
+        torch.cuda.reset_peak_memory_stats(i)  # model is sharded across devices
     losses = []
     t0 = time.time()
     for step in range(args.steps):

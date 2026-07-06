@@ -17,22 +17,21 @@ These are the scripts behind the matrix in [`COMPATIBILITY.md`](../../COMPATIBIL
 | `validate_diffusion.py` | Diffusion / flow denoisers via `diffusers` (UNet or transformer), single GPU |
 | `validate_fsdp.py` | Either family sharded with torch FSDP2 (`fully_shard`) for models too big for one card |
 
-## Coverage tiers
+## Methods
 
-Pick the most faithful tier a model fits in. The tier is recorded in each result
-as `method` so the matrix can label rows honestly.
+Each run records a `method` (matching the value in `COMPATIBILITY.md`):
 
-1. **`full-param`** — every native parameter tensor is trained, single GPU.
-   The default and strongest claim.
-2. **`full-param FSDP2 xN` / `device_map`** — same full-parameter training,
-   sharded across N GPUs (`validate_fsdp.py`, or `validate_llm.py --device-map auto`).
-   Same claim as tier 1, just distributed.
-3. **`qlora`** — 4-bit NF4 frozen base + LoRA adapters (`validate_llm.py --qlora`).
-   Fallback for models that do not fit full-parameter even sharded. **Weaker
-   claim**: Gefen only optimizes the 2-D adapter matrices, not the architecture's
-   native tensors (patch embeds, convs, MoE experts). Use it to show an arch
-   *loads, runs fwd/bwd, and trains on Gefen*, not that Gefen handles its full
-   parameter set. Label these rows distinctly.
+| `method` | Flag | What trains |
+|---|---|---|
+| `full-param` | (default) | every native parameter tensor, single GPU |
+| `full-param FSDP2` | `validate_fsdp.py` | same, sharded across GPUs via `fully_shard` |
+| `device_map` | `--device-map auto` | same, model-parallel across GPUs / CPU offload |
+| `lora` | `--lora` | bf16 base frozen + LoRA adapters |
+| `qlora` | `--qlora` | 4-bit NF4 base frozen + LoRA adapters |
+
+`lora`/`qlora` are the fallback for models too large to full-fine-tune even
+sharded: only the 2-D adapters are trained, so they are a weaker claim than the
+full-parameter methods.
 
 ## Examples
 
@@ -58,7 +57,7 @@ CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=1,2,4,5,7 \
 CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=1,2,4,5,7 torchrun \
   --nproc_per_node=5 validate_fsdp.py --kind causal-lm --model <hf-id> --steps 40
 
-# QLoRA fallback (weaker claim; see tiers above)
+# QLoRA fallback (weaker claim; see Methods above)
 CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=2 \
   python validate_llm.py --model <hf-id> --qlora --attn eager --steps 60
 ```

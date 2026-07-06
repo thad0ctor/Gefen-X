@@ -163,6 +163,10 @@ def build_diffusion(args, rank, mesh):
     # denoiser class the same way but shard. Simplest robust path: load full on
     # rank, shard, then broadcast — done by loading normally then wrapping.
     setup = vdiff.ARCHES[args.arch]
+    # NOTE: this loads the full denoiser on each rank before sharding, so the
+    # model must fit one card's load; FSDP2 then reduces the *training* footprint
+    # (grads + optimizer). For denoisers too large to load on one card, use the
+    # empty-init + broadcast path in build_causal_lm instead.
     denoiser, loss_fn = setup(args.model, "cuda", torch.bfloat16, args.res, {})
     nblk = _shard_blocks(denoiser, mesh)
     denoiser.train()
