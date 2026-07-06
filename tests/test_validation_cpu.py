@@ -42,7 +42,7 @@ def test_lazy_package_exports():
     for name in gefen.__all__:
         assert getattr(gefen, name) is not None
     with pytest.raises(AttributeError):
-        gefen.NotAThing
+        getattr(gefen, "NotAThing")
 
 
 # ---------------------------------------------------------------------------
@@ -230,7 +230,7 @@ def test_validate_split_errors():
         validate_split([("a", a)], [("b", b), ("b2", b)])
     with pytest.raises(ValueError, match="BOTH"):
         validate_split([("a", a)], [("a_again", a)])
-    with pytest.raises(ValueError, match="[Dd]uplicate parameter name"):
+    with pytest.raises(ValueError, match=r"[Dd]uplicate parameter name"):
         validate_split([("shared", a)], [("SHARED", b)])
 
 
