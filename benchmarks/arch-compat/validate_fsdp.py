@@ -151,24 +151,34 @@ def build_causal_lm(args, rank, mesh):
 
 
 def build_diffusion(args, rank, mesh):
-    # reuse validate_diffusion's arch input builders on an empty-init sharded model
+    # empty-init + shard + broadcast-load so no rank materializes the full
+    # denoiser (same pattern as build_causal_lm), then build the fixed random
+    # batch / loss_fn on the sharded model via validate_diffusion's arch setup.
     import importlib.util
+
+    from accelerate import init_empty_weights
+    from huggingface_hub import snapshot_download
 
     spec = importlib.util.spec_from_file_location(
         "vdiff", os.path.join(os.path.dirname(__file__), "validate_diffusion.py")
     )
     vdiff = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(vdiff)
-    # the single-GPU setup loads + moves to cuda; for FSDP we instead build the
-    # denoiser class the same way but shard. Simplest robust path: load full on
-    # rank, shard, then broadcast — done by loading normally then wrapping.
-    setup = vdiff.ARCHES[args.arch]
-    # NOTE: this loads the full denoiser on each rank before sharding, so the
-    # model must fit one card's load; FSDP2 then reduces the *training* footprint
-    # (grads + optimizer). For denoisers too large to load on one card, use the
-    # empty-init + broadcast path in build_causal_lm instead.
-    denoiser, loss_fn = setup(args.model, "cuda", torch.bfloat16, args.res, {})
+
+    ModelClass, subfolder = vdiff.fsdp_denoiser_class(args.arch)
+    load_dir = args.model if os.path.isdir(args.model) else snapshot_download(args.model)
+
+    cfg = ModelClass.load_config(os.path.join(load_dir, subfolder))
+    with init_empty_weights():
+        denoiser = ModelClass.from_config(cfg)
+    denoiser = denoiser.to(torch.bfloat16)
     nblk = _shard_blocks(denoiser, mesh)
+    denoiser.to_empty(device="cuda")
+    _load_full_state(denoiser, load_dir, rank, subfolder=subfolder)
+
+    _, loss_fn = vdiff.ARCHES[args.arch](
+        args.model, "cuda", torch.bfloat16, args.res, {}, denoiser=denoiser
+    )
     denoiser.train()
     if hasattr(denoiser, "enable_gradient_checkpointing"):
         denoiser.enable_gradient_checkpointing()

@@ -102,15 +102,16 @@ def setup_sd3(model, device, dtype, res, rec):
     return denoiser, loss_fn
 
 
-def setup_zimage(model, device, dtype, res, rec):
+def setup_zimage(model, device, dtype, res, rec, denoiser=None):
     # Z-Image: Scalable Single-Stream DiT (S3-DiT), Qwen3 text encoder + SigLIP.
     # forward(x, t, cap_feats, ...): x is a [B,C,H,W] latent (patchified inside),
     # cap_feats are the Qwen3 caption embeddings. SigLIP feats are optional.
     from diffusers import ZImageTransformer2DModel
 
-    denoiser = ZImageTransformer2DModel.from_pretrained(
-        model, subfolder="transformer", torch_dtype=dtype
-    ).to(device)
+    if denoiser is None:  # FSDP passes an already empty-init'd + sharded model
+        denoiser = ZImageTransformer2DModel.from_pretrained(
+            model, subfolder="transformer", torch_dtype=dtype
+        ).to(device)
     cfg = denoiser.config
     ch = cfg.in_channels
     lat = res // 8  # Flux VAE x8; the DiT patchifies (patch_size=2) internally
@@ -134,13 +135,14 @@ def setup_zimage(model, device, dtype, res, rec):
     return denoiser, loss_fn
 
 
-def setup_anima(model, device, dtype, res, rec):
+def setup_anima(model, device, dtype, res, rec, denoiser=None):
     # Anima reuses CosmosTransformer3DModel (video DiT) for still images.
     from diffusers import CosmosTransformer3DModel
 
-    denoiser = CosmosTransformer3DModel.from_pretrained(
-        model, subfolder="transformer", torch_dtype=dtype
-    ).to(device)
+    if denoiser is None:
+        denoiser = CosmosTransformer3DModel.from_pretrained(
+            model, subfolder="transformer", torch_dtype=dtype
+        ).to(device)
     cfg = denoiser.config
     ch = cfg.in_channels
     lat = res // 8  # Cosmos patchifies internally; feed the raw VAE latent grid
@@ -172,12 +174,13 @@ def setup_anima(model, device, dtype, res, rec):
     return denoiser, loss_fn
 
 
-def setup_ltx(model, device, dtype, res, rec):
+def setup_ltx(model, device, dtype, res, rec, denoiser=None):
     from diffusers import LTXVideoTransformer3DModel
 
-    denoiser = LTXVideoTransformer3DModel.from_pretrained(
-        model, subfolder="transformer", torch_dtype=dtype
-    ).to(device)
+    if denoiser is None:
+        denoiser = LTXVideoTransformer3DModel.from_pretrained(
+            model, subfolder="transformer", torch_dtype=dtype
+        ).to(device)
     cfg = denoiser.config
     ch = cfg.in_channels
     lat = res // 32
@@ -217,6 +220,28 @@ ARCHES = {
     "ltx": setup_ltx,
     "ltx2": setup_ltx,  # LTX-2 uses the same transformer family; overridden if it diverges
 }
+
+
+def fsdp_denoiser_class(arch):
+    """(diffusers model class, subfolder) for archs that can be empty-init'd and
+    sharded — the transformer-subfolder denoisers with random conditioning.
+    sdxl/sd3 load a full pipeline for conditioning and stay single-GPU."""
+    from diffusers import (
+        CosmosTransformer3DModel,
+        LTXVideoTransformer3DModel,
+        ZImageTransformer2DModel,
+    )
+
+    table = {
+        "zimage": (ZImageTransformer2DModel, "transformer"),
+        "anima": (CosmosTransformer3DModel, "transformer"),
+        "ltx": (LTXVideoTransformer3DModel, "transformer"),
+        "ltx2": (LTXVideoTransformer3DModel, "transformer"),
+    }
+    if arch not in table:
+        raise ValueError(f"--kind diffusion --arch {arch} is single-GPU only; "
+                         f"FSDP2 supports {sorted(table)}")
+    return table[arch]
 
 
 def main():
