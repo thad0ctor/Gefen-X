@@ -1,4 +1,5 @@
 #include <c10/cuda/CUDAGuard.h>
+#include <c10/cuda/CUDAStream.h>
 #include <c10/cuda/CUDAMacros.h>
 #include <cuda.h>
 #include <cuda_runtime.h>
@@ -155,7 +156,7 @@ void automatic_vmean_update_cuda(
             at::kHalf, at::kBFloat16, grad_view.scalar_type(),
             "automatic_vmean_update_period1", [&] {
                 automatic_vmean_update_period1_kernel<scalar_t>
-                    <<<static_cast<unsigned int>(nblocks), threads>>>(
+                    <<<static_cast<unsigned int>(nblocks), threads, 0, c10::cuda::getCurrentCUDAStream()>>>(
                         vmean.data_ptr<float>(),
                         grad_view.data_ptr<scalar_t>(),
                         num_blocks,
@@ -176,7 +177,7 @@ void automatic_vmean_update_cuda(
         grad_view.scalar_type(),
         "automatic_vmean_update_cuda",
         [&] {
-            automatic_vmean_update_kernel<scalar_t><<<grid, block, shared_bytes>>>(
+            automatic_vmean_update_kernel<scalar_t><<<grid, block, shared_bytes, c10::cuda::getCurrentCUDAStream()>>>(
                 vmean.data_ptr<float>(),
                 grad_view.data_ptr<scalar_t>(),
                 period,

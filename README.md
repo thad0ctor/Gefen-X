@@ -271,6 +271,7 @@ optimizer = GefenMuonHybrid(
 | `normuon` | `True` | free per-neuron 2nd moment on the NS output; small consistent loss win — [details](#quality-lever-per-neuron-2nd-moment-on-the-newton-schulz-output-normuon) | `False` to disable |
 | `backup_2d_period_one` | `False` | per-element 2nd moment on the embedding/LM head — matches AdamW's loss at extra memory — [details](#experimental-lever-match-adamw-2nd-moment-on-embed--lm-head-backup_2d_period_one) | turn on to close the last loss gap at 1.7B+ |
 | `stochastic_round` | `False` | unbiased rounding for the 8-bit momentum (free, loss-neutral) | optional |
+| `capturable` | `False` | CUDA-graph-capturable `step()`, like `torch.optim`'s `capturable` — [details](COMPATIBILITY.md#cuda-graphs--torchcompile-capturable) | turn on to capture `step()` in a `torch.cuda.CUDAGraph` |
 
 It supports `step()`, `zero_grad()`, `state_dict()`/`load_state_dict()`, and LR schedulers (e.g. `torch.optim.lr_scheduler.StepLR(optimizer, ...)`) like any optimizer. Because its constructor takes two parameter lists rather than a single iterable, build it yourself and hand it to the Hugging Face `Trainer` via `optimizers=` (not `optimizer_cls_and_kwargs`):
 
@@ -404,6 +405,10 @@ Measured at Qwen3-1.7B across two seeds: the gap to AdamW goes from ≈+0.02 to 
 ![Gefen-Muon — per-element 2nd moment on embed/LM-head closes the AdamW gap](docs/benchmarks/muon_l5_loss_qwen1p7b.png)
 
 A related opt-in, `stochastic_round=True`, switches the 8-bit momentum to unbiased rounding. It's free and validated but measured loss-neutral, so it stays optional.
+
+## CUDA Graphs & torch.compile (`capturable`)
+
+All three optimizers accept `capturable=True` (same meaning as `torch.optim`'s argument): `opt.step()` can then be captured in a `torch.cuda.CUDAGraph` or wrapped in `torch.compile(mode="reduce-overhead")` at no step-time cost — and the compiled hybrid step is about 10% faster than eager. Usage, caveats, and measured numbers: [COMPATIBILITY.md](COMPATIBILITY.md#cuda-graphs--torchcompile-capturable).
 
 ## Experimental Lever: sharded Newton-Schulz under FSDP2 (`sharded_mode`)
 

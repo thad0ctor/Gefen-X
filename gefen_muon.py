@@ -257,20 +257,26 @@ def _cautious_mask_(update: torch.Tensor, grad: torch.Tensor) -> torch.Tensor:
     return update
 
 
+def _adjust_lr_ratio(
+    adjust_lr_fn: Optional[str], param_shape: torch.Size
+) -> float:
+    # The lr-adjustment ratio is a static function of the (fixed) param shape,
+    # so it is always a python constant -- safe to bake into a CUDA graph.
+    rows, cols = param_shape[:2]
+    if adjust_lr_fn is None or adjust_lr_fn == "original":
+        return math.sqrt(max(1, rows / cols))
+    elif adjust_lr_fn == "match_rms_adamw":
+        return 0.2 * math.sqrt(max(rows, cols))
+    return 1.0
+
+
 def _adjust_lr(
     lr: float, adjust_lr_fn: Optional[str], param_shape: torch.Size
 ) -> float:
 
     if isinstance(lr, torch.Tensor):
         lr = lr.item()
-    rows, cols = param_shape[:2]
-    if adjust_lr_fn is None or adjust_lr_fn == "original":
-        adjusted_ratio = math.sqrt(max(1, rows / cols))
-    elif adjust_lr_fn == "match_rms_adamw":
-        adjusted_ratio = 0.2 * math.sqrt(max(rows, cols))
-    else:
-        adjusted_ratio = 1.0
-    return lr * adjusted_ratio
+    return lr * _adjust_lr_ratio(adjust_lr_fn, param_shape)
 
 
 class GefenMuon(Gefen):
@@ -297,6 +303,7 @@ class GefenMuon(Gefen):
         normuon_beta2: float = 0.95,
         normuon_eps: float = 1e-8,
         cautious: bool = False,
+        capturable: bool = False,
         verbose: bool = False,
     ) -> None:
         if isinstance(lr, torch.Tensor) and lr.numel() != 1:
@@ -403,6 +410,7 @@ class GefenMuon(Gefen):
             weight_decay=weight_decay,
             fused=fused,
             stochastic_round=stochastic_round,
+            capturable=capturable,
             verbose=verbose,
         )
 
@@ -645,7 +653,7 @@ class GefenMuon(Gefen):
                 )
 
             state["automatic_period"] = automatic_period
-            state["step"] = 0
+            state["step"] = self._new_step_counter(grad.device)
             self._init_gefen_muon_state(
                 state, self._automatic_view(flat_grad, automatic_period)
             )
@@ -653,10 +661,16 @@ class GefenMuon(Gefen):
         automatic_period = state["automatic_period"]
         grad_view = self._automatic_view(flat_grad, automatic_period)
 
-        if self._use_fused_gefen_automatic_step():
+        if self._fused_kernels_available():
             # The Muon momentum kernel reads grad + quantized state and emits the
             # dense quantized momentum; it never touches p, so no full-matrix
-            # scratch is needed under sharding.
+            # scratch is needed under sharding. Unlike the Gefen update kernels,
+            # its only host scalar argument is the CONSTANT momentum beta, so it
+            # stays enabled under capturable -- constants bake into a CUDA graph
+            # safely, and the per-step stochastic-round seed (when
+            # stochastic_round=True) flows through the device seed tensor
+            # (Gefen._sr_seed_on) rather than a host argument a graph would
+            # freeze.
             momentum_update = self._fused_quantized_momentum_update(
                 state,
                 grad_view,
@@ -716,7 +730,7 @@ class GefenMuon(Gefen):
                 ortho.shape[0], 1, dtype=torch.float32, device=ortho.device
             )
             state["normuon_v"] = v
-            state["normuon_step"] = 0
+            state["normuon_step"] = self._new_step_counter(ortho.device)
         row_norm = torch.linalg.vector_norm(
             ortho, dim=1, keepdim=True, dtype=torch.float32
         )
@@ -768,6 +782,33 @@ class GefenMuon(Gefen):
         approx: bool,
     ) -> None:
         lr = group["lr"]
+        if self.capturable:
+            # Graph-capturable apply: never .item() the lr (a D2H sync, and a
+            # captured graph would freeze the read value anyway). The
+            # adjust_lr ratio is a static function of the fixed param shape,
+            # so it stays a python constant; a TENSOR lr flows through the
+            # update math on device -- update it in place between replays to
+            # drive an LR schedule. A float lr bakes into the graph. alpha=
+            # only accepts host scalars, so the update is scaled by a tensor
+            # multiply instead.
+            adjusted_lr = _adjust_lr_ratio(group["adjust_lr_fn"], p.shape) * lr
+            if is_sharded:
+                p_local = p.to_local()
+                if group["weight_decay"] > 0.0:
+                    p_local.mul_(1 - lr * group["weight_decay"])
+                if p_local.numel() > 0:
+                    local_update = update if approx else self._shard_like(update, p)
+                    # Scale in p's dtype (fp32), matching the promotion the
+                    # non-capturable p.add_(update, alpha=...) form performs;
+                    # a bare `update * adjusted_lr` would multiply in the NS
+                    # output's bf16 and visibly lose precision.
+                    p_local.sub_(local_update.to(dtype=p_local.dtype) * adjusted_lr)
+            else:
+                if group["weight_decay"] > 0.0:
+                    p.mul_(1 - lr * group["weight_decay"])
+                p.sub_(update.to(dtype=p.dtype) * adjusted_lr)
+            return
+
         # p.shape is the GLOBAL shape for a DTensor, which is exactly what the
         # rows/cols LR ratio wants -- keep it unchanged under sharding.
         # Resolve a tensor LR (tensor-LR / capturable scheduler) to a python float
@@ -969,6 +1010,7 @@ class GefenMuon(Gefen):
 
     @torch.no_grad()
     def step(self, closure=None):
+        self._assert_capturable_if_capturing()
         loss = None
         if closure is not None:
             with torch.enable_grad():
@@ -999,5 +1041,11 @@ class GefenMuon(Gefen):
         if distributed_items:
             self._step_distributed(distributed_items)
 
+        # Capturable stochastic rounding: advance the per-device seed tensors
+        # on device (the momentum kernel reads them; see Gefen._sr_seed_on).
+        if self.capturable and self._stochastic_round:
+            self._advance_sr_seeds()
         self._gefen_global_step += 1
+        if self.capturable and not torch.compiler.is_compiling():
+            self._mark_state_static_for_compile()
         return loss

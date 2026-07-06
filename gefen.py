@@ -28,6 +28,8 @@ from gefen.kernels.automatic_gefen_fused import (
     gefen_factored_update_cuda as _gefen_factored_update_cuda,
 )
 from gefen.kernels.automatic_gefen_fused import _should_use_v2
+from gefen.kernels.automatic_gefen_fused import _CAPT_V1_FULL_TINY_NUMEL
+from gefen.kernels.automatic_gefen_fused import _codebook_search_lut
 
 # Optional explicit override for the period-search backend ("cuda_kernel" / "cpu"
 # / "gpu"). None (default) means resolve per call from each tensor's own device
@@ -495,6 +497,7 @@ class Gefen(torch.optim.Optimizer):
         factored_v_2d: bool = True,
         codebook_refresh_every: int = 0,
         stochastic_round: bool = False,
+        capturable: bool = False,
         verbose: bool = False,
     ):
         if fused and not torch.cuda.is_available():
@@ -625,11 +628,40 @@ class Gefen(torch.optim.Optimizer):
                 )
             )
         self._codebook_refresh_every = codebook_refresh_every
+        # CUDA-graph capturability (mirrors torch.optim's ``capturable``
+        # argument). When True, everything that VARIES across steps -- the
+        # per-param step counters and the bias corrections derived from them --
+        # lives in device tensors, and the step avoids host<->device syncs, so
+        # ``optimizer.step()`` can be captured in a ``torch.cuda.CUDAGraph`` and
+        # replayed. Constants (betas, eps, momentum) may stay python scalars:
+        # they are baked into the graph and never change. A tensor ``lr`` is
+        # consumed directly on device (update it in place between replays for
+        # LR schedules); a float ``lr`` is baked at capture time. The fused
+        # update kernels stay engaged: under capturable they read their
+        # per-step-varying scalars (lr, bias-correction reciprocals, weight-
+        # decay factor) from a small per-param fp32 device buffer that is
+        # refreshed in place with tensor ops each step, instead of from host
+        # kernel arguments a graph would freeze at capture time. Codebook
+        # learning and the period search are host-driven and run on the FIRST
+        # step -- do the standard graph warmup steps before capturing.
+        self.capturable = capturable
+        if capturable and codebook_refresh_every:
+            raise ValueError(
+                "capturable=True is incompatible with codebook_refresh_every>0: "
+                "the periodic codebook re-learn is host-driven and cannot run "
+                "inside a replayed CUDA graph."
+            )
         # When set, momentum->codebook quantization uses unbiased stochastic
         # rounding (seeded per optimizer step) instead of deterministic nearest.
         # This cancels the systematic bias that nearest-rounding the EMA momentum
         # accumulates over a long horizon. Default False is bit-identical to the
         # prior behavior (the kernels take the same parity-preserving fast path).
+        # Under capturable=True the per-step seed lives in a per-device 0-dim
+        # int64 tensor advanced on device once per step (see _sr_seed_on), so a
+        # captured/replayed CUDA graph dithers with a fresh seed every replay
+        # instead of freezing the host seed at its capture-time value; eager
+        # capturable steps read the SAME tensor, so a replay at step k
+        # bit-matches the eager capturable step k.
         # Only the fused CUDA automatic-step kernels honor this flag; the
         # non-fused / CPU quantizers use deterministic nearest rounding. Warn (do
         # not hard-error -- mirroring fp8_ns's portable-config behavior) so
@@ -649,6 +681,33 @@ class Gefen(torch.optim.Optimizer):
         self._printed_optimizer_memory = False
         self._gefen_codebook = None
         self._gefen_codebook_by_device = {}
+        # Per-device codebook-search LUTs for the COMPILED capturable step:
+        # populated (and marked static) by _mark_state_static_for_compile, so
+        # traced frames can hand the fused custom ops a prebuilt LUT instead
+        # of building one lazily inside the op body (an in-op allocation that
+        # cudagraph-trees recording rejects whenever the codebook input gets
+        # copied into the graph pool). Cleared with _gefen_codebook_by_device.
+        self._gefen_codebook_lut_by_device = {}
+        # Capturable stochastic rounding: ONE 0-dim int64 device tensor per
+        # device holding the per-step rounding seed (a device-side mirror of
+        # _gefen_global_step). Created lazily by _sr_seed_on and advanced on
+        # device once per step by _advance_sr_seeds, so a captured CUDA graph
+        # replays fresh seeds. Not serialized: load_state_dict clears the dict
+        # and the seeds rebuild from the restored gefen_global_step.
+        self._sr_seed_by_device = {}
+        # Batched capturable refresh (capturable=True only): per-device stacked
+        # buffers that hold every registered param's step counters ([2, N]
+        # fp32; row 0 = the bc2 counter, row 1 = step) and kernel-scalar rows
+        # ([N, 4] fp32) as the backing store of the per-param state views, so
+        # ONE short vectorized op chain per step replaces the ~10 microscopic
+        # per-param launches of counter increments + scalar-refresh chains.
+        # None until the first post-init capturable step builds it; see
+        # _capt_build_stacks / _capt_batched_refresh.
+        self._capt_stacks = None
+        # Identity fingerprint of the last _mark_state_static_for_compile
+        # pass; lets the per-step call skip the O(#tensors) re-marking when
+        # nothing it would mark has changed. See _static_mark_signature.
+        self._static_mark_sig = None
         self._gefen_global_step = 0
         self._printed_gefen_materialization = False
 
@@ -695,8 +754,622 @@ class Gefen(torch.optim.Optimizer):
     def _use_fused_automatic_vmean(self) -> bool:
         return self.fused and FUSE_AUTOMATIC_VMEAN_UPDATE
 
-    def _use_fused_gefen_automatic_step(self) -> bool:
+    def _fused_kernels_available(self) -> bool:
+        # Whether the fused automatic-step CUDA kernels can run at all,
+        # REGARDLESS of capturable. GefenMuon uses this for its momentum kernel,
+        # whose only scalar argument (the constant momentum beta) is
+        # capture-safe to bake into a graph.
         return self.fused and FUSE_GEFEN_AUTOMATIC_STEP
+
+    def _use_fused_gefen_automatic_step(self) -> bool:
+        # The fused update kernels stay on under capturable=True: the per-step-
+        # varying scalars (lr / bias-correction reciprocals / weight-decay
+        # factor) are then delivered through a small per-param fp32 DEVICE
+        # buffer (state["_capt_scalars"], refreshed in place with tensor ops
+        # each step) instead of host kernel arguments, so a captured CUDA graph
+        # replays fresh values rather than freezing the capture-time ones.
+        return self._fused_kernels_available()
+
+    def _assert_capturable_if_capturing(self) -> None:
+        # Mirror torch.optim's capturable contract: capturing step() in a CUDA
+        # graph without capturable=True would silently freeze the host-side
+        # step counters / bias corrections at their capture-time values, so
+        # fail loudly instead.
+        if (
+            not self.capturable
+            and torch.cuda.is_available()
+            and torch.cuda.is_current_stream_capturing()
+        ):
+            raise RuntimeError(
+                "Attempting CUDA graph capture of {}.step() but capturable=False. "
+                "Construct the optimizer with capturable=True to make step() "
+                "graph-safe.".format(type(self).__name__)
+            )
+
+    def _static_mark_signature(self):
+        # Cheap identity fingerprint of every object the static-marking pass
+        # would touch (C-level sum/map/chain loops: ~155us per steady-state
+        # call on a ~250-param model, vs ~380us for the marking pass it
+        # replaces -- measured on the 386M bench census). Every event that
+        # creates or replaces a marked tensor changes it: lazy state init /
+        # scratch buffers (entry counts + id sums), a batched-refresh stack
+        # rebuild (new backing buffers AND a new stacks dict), a codebook
+        # refresh / per-device copy (all assignment sites replace the tensor,
+        # never mutate in place, and clear the by-device dicts), a checkpoint
+        # load (wholesale-new state tensors + cleared LUT dict), and grads
+        # rebound to fresh tensors by the training loop. Marking itself only
+        # sets idempotent per-tensor attributes, so skipping it while the
+        # fingerprint is unchanged is behavior-preserving.
+        acc = 0
+        n_params = 0
+        for group in self.param_groups:
+            params = group["params"]
+            n_params += len(params)
+            acc += sum(map(id, params))
+            acc ^= sum(id(p.grad) for p in params)
+        state = self.state
+        acc += sum(
+            map(id, chain.from_iterable(map(dict.values, state.values())))
+        )
+        stacks = self._capt_stacks
+        return (
+            acc,
+            n_params,
+            len(state),
+            sum(map(len, state.values())),
+            id(self._gefen_codebook),
+            tuple(map(id, self._gefen_codebook_by_device.values())),
+            tuple(map(id, self._gefen_codebook_lut_by_device.values())),
+            # Capturable SR seeds: created lazily (first SR kernel call on a
+            # device), so their appearance must re-run the marking pass.
+            tuple(map(id, self._sr_seed_by_device.values())),
+            id(stacks),
+        )
+
+    @torch._dynamo.disable
+    def _mark_state_static_for_compile(self) -> None:
+        # torch.compile(mode="reduce-overhead") wraps the step in CUDA graphs
+        # (cudagraph trees). The params and every persistent state tensor are
+        # mutated in place each step; unless their ADDRESSES are marked static
+        # -- exactly what torch.optim does for its compiled optimizers -- the
+        # runtime treats them as rotating graph-pool outputs and the second
+        # compiled call fails with "accessing tensor output of CUDAGraphs that
+        # has been overwritten by a subsequent run". Called at the end of every
+        # EAGER capturable step (marking is idempotent), so the supported
+        # pattern -- run the first step(s) eagerly (codebook learning is
+        # host-driven anyway), then compile -- sees every state tensor marked,
+        # including lazily created scratch buffers. In steady state the
+        # identity-fingerprint guard below skips the O(#tensors) re-walk;
+        # any tensor creation/replacement changes the fingerprint and re-runs
+        # the full pass. @torch._dynamo.disable:
+        # mark_static_address is a dynamo API (a "forbidden callable" inside a
+        # traced region), so this helper must stay out of any compiled frame.
+        mark = getattr(torch._dynamo, "mark_static_address", None)
+        if mark is None:  # very old torch: compile support is best-effort
+            return
+        if self._static_mark_signature() == self._static_mark_sig:
+            return
+        # The codebook (and its search LUT) feed every fused-kernel custom
+        # op. Prebuild the per-device LUTs HERE, outside any compiled frame or
+        # cudagraph recording, and mark both static: the compiled step then
+        # passes the LUT to the ops as an explicit argument
+        # (_gefen_codebook_lut_on), so the op bodies never allocate. (Building
+        # the LUT lazily inside an op is not capture-safe: whenever cudagraph
+        # trees decides to copy the codebook input into the graph pool, the
+        # in-op data_ptr cache misses and the rebuilt LUT -- kept alive by the
+        # cache -- trips recording's "allocations not tracked as outputs"
+        # check.)
+        if self._gefen_codebook is not None:
+            mark(self._gefen_codebook)
+            lut = _codebook_search_lut(self._gefen_codebook)
+            mark(lut)
+            self._gefen_codebook_lut_by_device[
+                self._gefen_codebook.device
+            ] = lut
+        for device, cached in self._gefen_codebook_by_device.items():
+            mark(cached)
+            lut = _codebook_search_lut(cached)
+            mark(lut)
+            self._gefen_codebook_lut_by_device[device] = lut
+        # Capturable SR seeds: read by the fused custom ops every step and
+        # mutated in place (device add_) at the step tail, so their addresses
+        # must be static for cudagraph trees like every other state tensor.
+        for seed in self._sr_seed_by_device.values():
+            mark(seed)
+        for group in self.param_groups:
+            for p in group["params"]:
+                mark(p)
+                if p.grad is not None:
+                    mark(p.grad)
+                for value in self.state.get(p, {}).values():
+                    if torch.is_tensor(value):
+                        mark(value)
+        # The batched-refresh stacked buffers are mutated in place every step
+        # (the per-param state views above alias them); mark the backing
+        # tensors static too so cudagraph trees treats their addresses as
+        # stable across compiled steps.
+        if self._capt_stacks:
+            for stack in self._capt_stacks.values():
+                if not stack:
+                    continue
+                for key in ("steps2d", "consts2d", "scal2d", "sqrt_mask"):
+                    value = stack.get(key)
+                    if torch.is_tensor(value):
+                        mark(value)
+        # Recompute AFTER the pass: the LUT prebuild above may have populated
+        # _gefen_codebook_lut_by_device, which the fingerprint includes.
+        self._static_mark_sig = self._static_mark_signature()
+
+    def _kernel_rng_seed(self) -> int:
+        # HOST seed for the kernels' stochastic-rounding hash. Under
+        # capturable the rounding seed flows through the per-device 0-dim
+        # int64 tensor instead (_sr_seed_on; the kernels ignore this host arg
+        # whenever that tensor is passed), so return a CONSTANT rather than
+        # the per-step host counter. This matters for torch.compile(step):
+        # dynamo specializes on python int arguments, so a seed that changes
+        # every step recompiles the kernel-call frames each step until the
+        # recompile limit, then runs them through the guard-miss slow path
+        # forever (measured: the whole compiled-slower-than-eager anomaly).
+        # capturable=False keeps the exact historical per-step host seed
+        # (bit-identical).
+        return 0 if self.capturable else self._gefen_global_step
+
+    def _sr_seed_on(self, device: torch.device):
+        # Device-side stochastic-rounding seed (capturable only): the per-step
+        # seed the SR-capable fused kernels read from device memory, so
+        # captured CUDA graphs replay fresh seeds. One 0-dim int64 tensor per
+        # device, initialized from the CURRENT _gefen_global_step (so
+        # eager-then-capture transitions keep advancing monotonically -- the
+        # value during step k is exactly k, the same seed capturable=False
+        # passes as the host rng_seed) and advanced on device once per step by
+        # _advance_sr_seeds. Returns None on every non-capturable or non-SR
+        # configuration, which keeps the kernels on the bit-identical legacy
+        # host-seed path.
+        if not (self.capturable and self._stochastic_round):
+            return None
+        seed = self._sr_seed_by_device.get(device)
+        if seed is None:
+            seed = torch.full(
+                (), int(self._gefen_global_step),
+                dtype=torch.int64, device=device,
+            )
+            self._sr_seed_by_device[device] = seed
+        return seed
+
+    @torch._dynamo.disable
+    def _advance_sr_seeds(self) -> None:
+        # Advance every per-device rounding seed by one, ON DEVICE, at the
+        # tail of step() -- the device mirror of _advance_gefen_global_step.
+        # Under manual CUDA-graph capture the add_ is recorded on-stream, so
+        # every replay dithers with a fresh seed; under torch.compile the
+        # @torch._dynamo.disable keeps it out of the traced graph (the graph
+        # only READS the static-marked seed tensors) and it runs eagerly right
+        # after the compiled/recorded step, exactly like the batched scalar
+        # refresh runs right before it. Eager capturable behavior is the same
+        # +1 per step.
+        for seed in self._sr_seed_by_device.values():
+            seed.add_(1)
+
+    def _new_step_counter(self, device: torch.device):
+        # Step counters start at 0 as python ints (host math, bit-identical to
+        # the historical behavior). Under capturable they are 0-dim float32
+        # device tensors -- like torch.optim's capturable step -- so the
+        # ``beta ** step`` bias corrections are computed on device and stay
+        # correct across CUDA-graph replays.
+        if self.capturable:
+            return torch.zeros((), dtype=torch.float32, device=device)
+        return 0
+
+    def _refresh_capturable_step_scalars(
+        self, state, group, bc2_step_key: str, sqrt_bc2: bool
+    ) -> torch.Tensor:
+        # Capturable fused stepping: refresh the persistent per-param fp32
+        # device buffer the fused kernels read their PER-STEP-VARYING scalars
+        # from. Layout: [lr, 1/sqrt(bc2) (or 1/bc2 when sqrt_bc2=False, the
+        # factored path), 1/bc1, weight_decay_factor]. Everything is computed
+        # with tensor ops IN PLACE on the persistent buffer -- no new
+        # persistent allocations inside a captured step (the 0-dim/2-elem
+        # intermediates come from the capture pool) -- so a captured CUDA
+        # graph replays fresh values every step.
+        #
+        # Numerics: the bias corrections are computed in float64 on device
+        # (pow -> 1-x -> sqrt -> reciprocal, the exact op chain the host path
+        # runs in python doubles) and only then cast to fp32 by the buffer
+        # copy_, mirroring the host path's double->float cast at kernel launch.
+        #
+        # lr semantics match the rest of capturable: a TENSOR lr flows on
+        # device (update it in place between replays to drive a schedule) and
+        # the weight-decay factor is derived from it on device; a FLOAT lr is
+        # written with a host fill_, whose value a captured graph bakes --
+        # the same baking semantics float lr always had under capture.
+        if "_capt_row" in state:
+            # Batched capturable stepping: this param's [lr, 1/bcX, 1/bc1,
+            # wd_factor] row was already refreshed (elementwise-identically)
+            # by the stacked prologue chain this step -- hand the kernels its
+            # view directly instead of re-running the per-param chain.
+            return state["_capt_scalars"]
+        buf = state.get("_capt_scalars")
+        if buf is None:
+            device = state["step"].device
+            buf = torch.ones(4, dtype=torch.float32, device=device)
+            state["_capt_scalars"] = buf
+            # [beta2, beta1] in float64, ordered to line up with the
+            # [bc2_step, step] stack below.
+            state["_capt_consts"] = torch.tensor(
+                [group["beta2"], group["beta1"]],
+                dtype=torch.float64,
+                device=device,
+            )
+        # bc = [1 - beta2**bc2_step, 1 - beta1**step] in float64.
+        bc = 1.0 - torch.pow(
+            state["_capt_consts"],
+            torch.stack((state[bc2_step_key], state["step"])),
+        )
+        if sqrt_bc2:
+            bc[0:1].sqrt_()
+        # buf[1:3] = [1/(sqrt-or-plain bc2), 1/bc1], cast float64 -> fp32.
+        buf[1:3].copy_(bc.reciprocal_())
+        lr = group["lr"]
+        weight_decay = group["weight_decay"]
+        if torch.is_tensor(lr):
+            buf[0].copy_(lr)
+            if weight_decay:
+                buf[3].copy_(1.0 - lr.double() * weight_decay)
+            else:
+                buf[3].fill_(1.0)
+        else:
+            buf[0].fill_(float(lr))
+            buf[3].fill_(1.0 - float(lr) * weight_decay)
+        return buf
+
+    # ------------------------------------------------------------------
+    # Batched capturable step-scalar refresh
+    #
+    # Under capturable=True every param keeps 0-dim device step counters and a
+    # 4-elem fp32 device buffer the fused kernels read their per-step scalars
+    # from, refreshed with a small tensor-op chain EVERY step. Per param that
+    # is ~8 microscopic launches for the refresh plus 2 counter increments; on
+    # a ~250-param model those ~2500 tiny kernels dominate the capturable
+    # step's GPU time (they are what made captured/compiled stepping slower
+    # than the plain eager step). The machinery below instead keeps each
+    # registered param's counters and scalar buffer as VIEWS into per-device
+    # stacked buffers (steps2d [2, N] fp32, scal2d [N, 4] fp32) and advances /
+    # refreshes ALL rows with one short vectorized chain per step (~10
+    # launches total, independent of N). The chain is elementwise identical
+    # to _refresh_capturable_step_scalars (same float64 pow -> 1-x -> sqrt ->
+    # reciprocal ops, fp32 cast only at the buffer write), so eager,
+    # manually-captured and compiled capturable stepping keep their exact
+    # numerics -- the anti-freeze tests assert the buffer values exactly.
+    #
+    # State-dict semantics are preserved: counter views serialize through
+    # state_dict's _compact pass (non-owning views are cloned into independent
+    # tensors), "_capt_scalars"/"_capt_row" are scratch and stripped from
+    # checkpoints, and load_state_dict tears the stacks down (counters come
+    # back as independent 0-dim tensors); the stacks lazily rebuild on the
+    # next eager capturable step. Registration is validated against the
+    # live stepping set every step and torn down on any mismatch, so grad-set
+    # changes, param device moves and state surgery all fall back to the
+    # bit-identical per-param path instead of desyncing.
+    # ------------------------------------------------------------------
+
+    def _capt_row_info(self, p: torch.Tensor):
+        # Registration/validation predicate for the batched capturable
+        # refresh: (bc2_step_key, sqrt_bc2) when this param steps through a
+        # path whose counters/scalars the batch can own this step, else None.
+        # Mirrors step()'s routing exactly: the factored branch corrects bc2
+        # with factored_step (plain 1/bc2), everything else with vmean_step
+        # (1/sqrt(bc2)).
+        grad = p.grad
+        if grad is None:
+            return None
+        # DTensor/FSDP2 grads and params keep the per-param path (local-shard
+        # unwrap, waits and empty-shard early-outs live in _step_automatic*).
+        if hasattr(grad, "to_local") or hasattr(grad, "wait"):
+            return None
+        if hasattr(p, "placements"):
+            return None
+        if not p.is_cuda or grad.numel() == 0:
+            return None
+        state = self.state.get(p)
+        if not state or "step" not in state:
+            return None  # lazy state init runs this step; register next step
+        if self._factored_v_2d and p.ndim == 2:
+            info = ("factored_step", False)
+        else:
+            info = ("vmean_step", True)
+        bc2 = state.get(info[0])
+        for t in (state["step"], bc2):
+            if (
+                not torch.is_tensor(t)
+                or t.dim() != 0
+                or t.dtype != torch.float32
+                or t.device != p.device
+            ):
+                return None
+        return info
+
+    def _capt_invalidate(self) -> None:
+        # Host-only and idempotent: forget the stacked buffers and unmark
+        # every registered row so per-param increments/refresh resume.
+        stacks = self._capt_stacks
+        self._capt_stacks = None
+        if not stacks:
+            return
+        for stack in stacks.values():
+            if not stack:
+                continue
+            for p in stack["rows"]:
+                state = self.state.get(p)
+                if state is not None:
+                    state.pop("_capt_row", None)
+
+    @torch._dynamo.disable
+    def _capt_build_stacks(self) -> bool:
+        # (Re)build the per-device stacked buffers from the CURRENT stepping
+        # set. Eager-only (allocations + state rebinding are neither capture-
+        # nor trace-safe); callers skip the rebuild under capture/compile and
+        # step per-param instead.
+        self._capt_invalidate()
+        per_dev = {}
+        for group in self.param_groups:
+            for p in group["params"]:
+                info = self._capt_row_info(p)
+                if info is None:
+                    continue
+                d = per_dev.setdefault(
+                    p.device, {"rows": [], "groups": [], "keys": [], "sqrt": []}
+                )
+                d["rows"].append(p)
+                d["groups"].append(group)
+                d["keys"].append(info[0])
+                d["sqrt"].append(info[1])
+        stacks = {}
+        built_any = False
+        for device, d in per_dev.items():
+            groups = d["groups"]
+            # The chain writes ONE lr / weight-decay factor per device stack,
+            # so the rows must share the lr spec: either every group holds the
+            # SAME lr tensor object (in-place schedules flow on device), or
+            # every group holds an equal python float (schedulers that assign
+            # group["lr"] floats keep working -- the refresh reads the live,
+            # per-step-validated value). Heterogeneous specs keep the
+            # per-param path for this device (marked None so validation does
+            # not rebuild-thrash every step).
+            lr0 = groups[0]["lr"]
+            wd0 = groups[0]["weight_decay"]
+            if torch.is_tensor(lr0):
+                homogeneous = all(
+                    g["lr"] is lr0 and g["weight_decay"] == wd0 for g in groups
+                )
+            else:
+                homogeneous = all(
+                    not torch.is_tensor(g["lr"])
+                    and g["lr"] == lr0
+                    and g["weight_decay"] == wd0
+                    for g in groups
+                )
+            if not homogeneous:
+                stacks[device] = None
+                continue
+            rows = d["rows"]
+            n = len(rows)
+            steps2d = torch.empty((2, n), dtype=torch.float32, device=device)
+            steps2d[0].copy_(
+                torch.stack(
+                    [
+                        self.state[p][key].detach()
+                        for p, key in zip(rows, d["keys"])
+                    ]
+                )
+            )
+            steps2d[1].copy_(
+                torch.stack([self.state[p]["step"].detach() for p in rows])
+            )
+            consts2d = torch.tensor(
+                [
+                    [g["beta2"] for g in groups],
+                    [g["beta1"] for g in groups],
+                ],
+                dtype=torch.float64,
+                device=device,
+            )
+            flags = d["sqrt"]
+            if all(flags):
+                sqrt_mode, sqrt_mask = "all", None
+            elif not any(flags):
+                sqrt_mode, sqrt_mask = "none", None
+            else:
+                sqrt_mode = "mixed"
+                sqrt_mask = torch.tensor(flags, dtype=torch.bool, device=device)
+            scal2d = torch.ones((n, 4), dtype=torch.float32, device=device)
+            step_views = []
+            bc2_views = []
+            for i, p in enumerate(rows):
+                state = self.state[p]
+                bc2_view = steps2d[0, i]
+                step_view = steps2d[1, i]
+                state[d["keys"][i]] = bc2_view
+                state["step"] = step_view
+                state["_capt_scalars"] = scal2d[i]
+                state.pop("_capt_consts", None)
+                state["_capt_row"] = i
+                step_views.append(step_view)
+                bc2_views.append(bc2_view)
+            stacks[device] = {
+                "rows": rows,
+                "row_groups": groups,
+                "keys": d["keys"],
+                "steps2d": steps2d,
+                "consts2d": consts2d,
+                "sqrt_mode": sqrt_mode,
+                "sqrt_mask": sqrt_mask,
+                "scal2d": scal2d,
+                "step_views": step_views,
+                "bc2_views": bc2_views,
+                "tensor_lr": torch.is_tensor(lr0),
+                "lr0": lr0,
+            }
+            built_any = True
+        if not built_any:
+            self._capt_stacks = None
+            return False
+        self._capt_stacks = stacks
+        return True
+
+    @torch._dynamo.disable
+    def _capt_batched_prologue(self) -> None:
+        # Validate (or lazily build) the stacked buffers, then run the batched
+        # refresh chain. @torch._dynamo.disable is LOAD-BEARING, for two
+        # reasons:
+        #   1. The refresh chain mutates steps2d / scal2d, whose row VIEWS are
+        #      also inputs of the traced step (the fused kernels read
+        #      state["_capt_scalars"]; the decomposed fallback reads the
+        #      counters). Tracing an in-graph mutation of a base that aliases
+        #      other graph inputs sends AOTAutograd down its synthetic-base
+        #      path, which drops fw_metadata.static_input_indices for the
+        #      WHOLE graph -- cudagraph trees then skips the entire step
+        #      ("skipping cudagraphs due to mutated inputs"; measured, torch
+        #      2.12). Kept outside the trace, a compiled step runs this chain
+        #      eagerly right before the recorded graph replays (fresh values
+        #      every call, ~10 small launches), while the graph itself only
+        #      READS the static-marked row views.
+        #   2. The per-step validation walks every param; traced, each of its
+        #      identity/dict checks becomes a dynamo guard evaluated on every
+        #      compiled call (measured at a large fraction of a millisecond on
+        #      a ~250-param model). Disabled, it is plain eager python whose
+        #      cost hides under the enqueued GPU work.
+        # A manual torch.cuda.graph capture records the refresh kernels
+        # on-stream exactly like the rest of the step (the validation is
+        # host-only; the rebuild is skipped while capturing).
+        if self._capt_batched_ready():
+            self._capt_batched_refresh()
+
+    def _capt_batched_ready(self) -> bool:
+        # Per-step host validation that the stacks still exactly describe this
+        # step's stepping set (params in order, routing keys, counter/scalar
+        # aliasing, lr/wd spec). Any mismatch tears down and -- outside a CUDA
+        # graph capture -- rebuilds; during capture it falls back to the
+        # bit-identical per-param path for this step (a rebuild allocates and
+        # copies, which a capture would bake). Only ever called from the
+        # dynamo-disabled prologue, so none of this shows up as compiled-step
+        # guards.
+        stacks = self._capt_stacks
+        capturing = torch.cuda.is_available() and (
+            torch.cuda.is_current_stream_capturing()
+        )
+        if stacks is None:
+            if capturing:
+                return False
+            return self._capt_build_stacks()
+        counts = {}
+        lr_now = {}
+        ok = True
+        for group in self.param_groups:
+            if not ok:
+                break
+            for p in group["params"]:
+                info = self._capt_row_info(p)
+                if info is None:
+                    continue
+                stack = stacks.get(p.device, False)
+                if stack is None:
+                    # Known heterogeneous-lr device: stays per-param.
+                    continue
+                if stack is False:
+                    ok = False
+                    break
+                i = counts.get(p.device, 0)
+                rows = stack["rows"]
+                state = self.state[p]
+                if (
+                    i >= len(rows)
+                    or rows[i] is not p
+                    or stack["keys"][i] != info[0]
+                    or state.get("_capt_row") != i
+                    or state["step"] is not stack["step_views"][i]
+                    or state.get(info[0]) is not stack["bc2_views"][i]
+                ):
+                    ok = False
+                    break
+                lr = group["lr"]
+                if stack["tensor_lr"]:
+                    if lr is not stack["lr0"]:
+                        ok = False
+                        break
+                elif torch.is_tensor(lr):
+                    ok = False
+                    break
+                lrwd = lr_now.get(p.device)
+                if lrwd is None:
+                    lr_now[p.device] = (lr, group["weight_decay"])
+                elif not stack["tensor_lr"] and (
+                    lr != lrwd[0] or group["weight_decay"] != lrwd[1]
+                ):
+                    ok = False
+                    break
+                elif stack["tensor_lr"] and group["weight_decay"] != lrwd[1]:
+                    ok = False
+                    break
+                counts[p.device] = i + 1
+        if ok:
+            for device, stack in stacks.items():
+                if stack is not None and counts.get(device, 0) != len(
+                    stack["rows"]
+                ):
+                    ok = False
+                    break
+        if ok:
+            return True
+        if capturing:
+            self._capt_invalidate()
+            return False
+        return self._capt_build_stacks()
+
+    def _capt_batched_refresh(self) -> None:
+        # One short vectorized op chain per device stack replaces every
+        # registered param's counter increments + scalar-refresh chain. Only
+        # ever called from the dynamo-disabled prologue (see
+        # _capt_batched_prologue for why it must stay out of traced frames).
+        #
+        # Elementwise identical to the per-param path: the += 1 is the same
+        # in-place fp32 add the per-param counters ran, and the bias
+        # corrections run the exact float64 pow -> 1-x -> sqrt -> reciprocal
+        # chain of _refresh_capturable_step_scalars over the stacked counters,
+        # cast to fp32 only by the buffer column writes. Rows that skip the
+        # sqrt (the factored path corrects with plain 1/bc2) are selected with
+        # a where() over the same float64 values, which changes nothing
+        # elementwise. lr semantics are also preserved per row: a shared
+        # TENSOR lr is copied (and its weight-decay factor derived) on device
+        # every step, so captured graphs replay fresh values; a python-float
+        # lr is written with host fill_s whose values a captured graph bakes,
+        # exactly as the per-param path baked them.
+        for stack in self._capt_stacks.values():
+            if stack is None:
+                continue
+            steps2d = stack["steps2d"]
+            steps2d += 1
+            bc = 1.0 - torch.pow(stack["consts2d"], steps2d)
+            bc2 = bc[0]
+            sqrt_mode = stack["sqrt_mode"]
+            if sqrt_mode == "all":
+                bc2 = bc2.sqrt()
+            elif sqrt_mode == "mixed":
+                bc2 = torch.where(stack["sqrt_mask"], bc2.sqrt(), bc2)
+            scal2d = stack["scal2d"]
+            scal2d[:, 1].copy_(bc2.reciprocal())
+            scal2d[:, 2].copy_(bc[1].reciprocal())
+            group0 = stack["row_groups"][0]
+            lr = group0["lr"]
+            weight_decay = group0["weight_decay"]
+            if torch.is_tensor(lr):
+                scal2d[:, 0].copy_(lr)
+                if weight_decay:
+                    scal2d[:, 3].copy_(1.0 - lr.double() * weight_decay)
+                else:
+                    scal2d[:, 3].fill_(1.0)
+            else:
+                scal2d[:, 0].fill_(float(lr))
+                scal2d[:, 3].fill_(1.0 - float(lr) * weight_decay)
 
     def _automatic_vmean_update(
         self,
@@ -733,6 +1406,15 @@ class Gefen(torch.optim.Optimizer):
             cached = codebook.to(device)
             self._gefen_codebook_by_device[device] = cached
         return cached
+
+    def _gefen_codebook_lut_on(
+        self, device: torch.device
+    ) -> Optional[torch.Tensor]:
+        # Compiled-capturable plumbing: the prebuilt (static-marked) search
+        # LUT for this device, or None before the first eager capturable step
+        # populated it -- the kernel wrappers then fall back to their internal
+        # lazily-built LUT exactly as before.
+        return self._gefen_codebook_lut_by_device.get(device)
 
     def _gefen_nearest_indices(self, normalized_vals: torch.Tensor) -> torch.Tensor:
 
@@ -948,6 +1630,7 @@ class Gefen(torch.optim.Optimizer):
         if codebook is not None:
             self._gefen_codebook = codebook
             self._gefen_codebook_by_device.clear()
+            self._gefen_codebook_lut_by_device.clear()
 
     def _step_automatic_factored(
         self, group, param_name: str, p: torch.Tensor, grad: torch.Tensor
@@ -991,7 +1674,7 @@ class Gefen(torch.optim.Optimizer):
                     )
                 )
             state["automatic_period"] = automatic_period
-            state["step"] = 0
+            state["step"] = self._new_step_counter(p.device)
             grad_view = self._automatic_view(flat_grad, automatic_period)
             self._init_gefen_state(state, grad_view)
             state["v_row"] = torch.zeros(
@@ -1000,7 +1683,7 @@ class Gefen(torch.optim.Optimizer):
             state["v_col"] = torch.zeros(
                 p.shape[1], dtype=torch.float32, device=p.device
             )
-            state["factored_step"] = 0
+            state["factored_step"] = self._new_step_counter(p.device)
 
         automatic_period = state["automatic_period"]
         grad_view = self._automatic_view(flat_grad, automatic_period)
@@ -1017,15 +1700,14 @@ class Gefen(torch.optim.Optimizer):
             state["v_col"] = torch.zeros(
                 p.shape[1], dtype=torch.float32, device=p.device
             )
-            state["factored_step"] = 0
+            state["factored_step"] = self._new_step_counter(p.device)
 
         rows, cols = p.shape
-        state["step"] += 1
-        state["factored_step"] += 1
-        # bc1 corrects the (possibly checkpoint-restored, older) momentum EMA;
-        # bc2 must correct the factored v EMA's own age.
-        bias_correction_1 = 1 - beta1 ** state["step"]
-        bias_correction_2 = 1 - beta2 ** state["factored_step"]
+        # Rows registered with the batched capturable prologue had BOTH
+        # counters advanced by its single stacked add_ already this step.
+        if "_capt_row" not in state:
+            state["step"] += 1
+            state["factored_step"] += 1
 
         if (
             self._use_fused_gefen_automatic_step()
@@ -1044,6 +1726,42 @@ class Gefen(torch.optim.Optimizer):
                     "Expected Gefen codebook to be initialized before the "
                     "factored update."
                 )
+            if self.capturable:
+                # Capturable: the per-step-varying scalars flow through the
+                # device buffer ([lr, 1/bc2, 1/bc1, wd_factor]; the kernel
+                # ignores the matching host args, passed as inert values), so
+                # a captured graph replays fresh values and never syncs on a
+                # tensor lr.
+                step_scalars = self._refresh_capturable_step_scalars(
+                    state, group, "factored_step", sqrt_bc2=False
+                )
+                _gefen_factored_update_cuda(
+                    p,
+                    grad_view,
+                    state["m_codebook"],
+                    state["m_magnitude"],
+                    state["v_row"],
+                    state["v_col"],
+                    codebook,
+                    cols,
+                    beta1,
+                    beta2,
+                    0.0,  # lr: read from step_scalars[0]
+                    eps,
+                    1.0,  # 1/bc2: read from step_scalars[1]
+                    1.0,  # 1/bc1: read from step_scalars[2]
+                    1.0,  # wd factor: read from step_scalars[3]
+                    self._stochastic_round,
+                    self._kernel_rng_seed(),
+                    step_scalars=step_scalars,
+                    codebook_lut=self._gefen_codebook_lut_on(p.device),
+                    seed_dev=self._sr_seed_on(p.device),
+                )
+                return
+            # bc1 corrects the (possibly checkpoint-restored, older) momentum
+            # EMA; bc2 must correct the factored v EMA's own age.
+            bias_correction_1 = 1 - beta1 ** state["step"]
+            bias_correction_2 = 1 - beta2 ** state["factored_step"]
             weight_decay_factor = 1.0 - lr * group["weight_decay"]
             _gefen_factored_update_cuda(
                 p,
@@ -1062,9 +1780,16 @@ class Gefen(torch.optim.Optimizer):
                 1.0 / bias_correction_1,
                 weight_decay_factor,
                 self._stochastic_round,
-                self._gefen_global_step,
+                self._kernel_rng_seed(),
             )
             return
+
+        # bc1 corrects the (possibly checkpoint-restored, older) momentum EMA;
+        # bc2 must correct the factored v EMA's own age. Under capturable these
+        # are 0-dim device tensors (tensor step counters) consumed by the
+        # decomposed tensor-op math below.
+        bias_correction_1 = 1 - beta1 ** state["step"]
+        bias_correction_2 = 1 - beta2 ** state["factored_step"]
 
         # Decomposed fallback (CPU / fused disabled). Row/col mean-square EMAs
         # over bounded fp32 row-chunks (one chunk serves both reductions, so
@@ -1132,6 +1857,7 @@ class Gefen(torch.optim.Optimizer):
                 gefen_set_unpacked_indices(pstate["m_codebook"], indices)
         self._gefen_codebook = new_codebook
         self._gefen_codebook_by_device.clear()
+        self._gefen_codebook_lut_by_device.clear()
 
     def _resuming_from_checkpoint(self) -> bool:
         # On resume every param's state has a restored automatic_period; on a
@@ -1150,6 +1876,7 @@ class Gefen(torch.optim.Optimizer):
             if self._gefen_codebook.device != device:
                 self._gefen_codebook = self._gefen_codebook.to(device)
                 self._gefen_codebook_by_device.clear()
+                self._gefen_codebook_lut_by_device.clear()
             return
 
         # No codebook yet. On a fresh run this learns it and predicts periods.
@@ -1280,7 +2007,8 @@ class Gefen(torch.optim.Optimizer):
             momentum_out,
             beta1,
             self._stochastic_round,
-            self._gefen_global_step,
+            self._kernel_rng_seed(),
+            seed_dev=self._sr_seed_on(grad_view.device),
         )
         return momentum_out
 
@@ -1296,6 +2024,7 @@ class Gefen(torch.optim.Optimizer):
         bias_correction_1,
         bias_correction_2,
         weight_decay_factor,
+        step_scalars=None,
     ) -> None:
         # Tier-1 fully-fused v1 path: the kernel computes the vmean EMA and the
         # per-block stepsize in-kernel, so the separate vmean kernel and the host
@@ -1304,11 +2033,22 @@ class Gefen(torch.optim.Optimizer):
         # exactly as PyTorch casts the scalar operands of the host div_/mul_.
         # PyTorch lowers `h.div_(sqrt(bc2))` to a multiply by float32(1/sqrt(bc2))
         # (a true divide differs by up to ~2 ULP), so pass the reciprocal directly.
+        # Under capturable (step_scalars is a device tensor) the kernel reads
+        # [lr, 1/sqrt(bc2), 1/bc1, wd_factor] from device memory instead and the
+        # host scalars are inert placeholders (never .item()-sync a tensor lr).
         codebook = self._gefen_codebook_on(p.device)
         if codebook is None:
             raise ValueError(
                 "Expected Gefen codebook to be initialized before fused update."
             )
+        if step_scalars is None:
+            lr_arg = lr
+            inv_sqrt_bc2 = 1.0 / math.sqrt(bias_correction_2)
+            inv_bc1 = 1.0 / bias_correction_1
+        else:
+            lr_arg = 0.0
+            inv_sqrt_bc2 = 1.0
+            inv_bc1 = 1.0
         _automatic_gefen_fused_full_update_cuda(
             p,
             grad_view,
@@ -1319,13 +2059,20 @@ class Gefen(torch.optim.Optimizer):
             False,
             beta1,
             beta2,
-            lr,
+            lr_arg,
             eps,
-            1.0 / math.sqrt(bias_correction_2),
-            1.0 / bias_correction_1,
+            inv_sqrt_bc2,
+            inv_bc1,
             weight_decay_factor,
             self._stochastic_round,
-            self._gefen_global_step,
+            self._kernel_rng_seed(),
+            step_scalars=step_scalars,
+            codebook_lut=(
+                self._gefen_codebook_lut_on(p.device)
+                if step_scalars is not None
+                else None
+            ),
+            seed_dev=self._sr_seed_on(p.device),
         )
 
     def _automatic_gefen_fused_update_v2_full(
@@ -1340,6 +2087,7 @@ class Gefen(torch.optim.Optimizer):
         bias_correction_1,
         bias_correction_2,
         weight_decay_factor,
+        step_scalars=None,
     ) -> None:
         # Tier-1 fully-fused v2 (two-phase) path for occupancy-flexible params:
         # the magnitude phase also accumulates Sum(grad^2), a tiny finalize forms
@@ -1348,11 +2096,22 @@ class Gefen(torch.optim.Optimizer):
         # stepsize/weight-decay passes are skipped. The scalar reciprocals are
         # precomputed as Python doubles and cast in-kernel exactly as PyTorch
         # casts the operands of the host div_/mul_ (see the v1-full path).
+        # Under capturable (step_scalars is a device tensor) the kernels read
+        # [lr, 1/sqrt(bc2), 1/bc1, wd_factor] from device memory instead and the
+        # host scalars are inert placeholders (never .item()-sync a tensor lr).
         codebook = self._gefen_codebook_on(p.device)
         if codebook is None:
             raise ValueError(
                 "Expected Gefen codebook to be initialized before fused update."
             )
+        if step_scalars is None:
+            lr_arg = lr
+            inv_sqrt_bc2 = 1.0 / math.sqrt(bias_correction_2)
+            inv_bc1 = 1.0 / bias_correction_1
+        else:
+            lr_arg = 0.0
+            inv_sqrt_bc2 = 1.0
+            inv_bc1 = 1.0
         _automatic_gefen_fused_update_v2_full_cuda(
             p,
             grad_view,
@@ -1363,13 +2122,20 @@ class Gefen(torch.optim.Optimizer):
             False,
             beta1,
             beta2,
-            lr,
+            lr_arg,
             eps,
-            1.0 / math.sqrt(bias_correction_2),
-            1.0 / bias_correction_1,
+            inv_sqrt_bc2,
+            inv_bc1,
             weight_decay_factor,
             self._stochastic_round,
-            self._gefen_global_step,
+            self._kernel_rng_seed(),
+            step_scalars=step_scalars,
+            codebook_lut=(
+                self._gefen_codebook_lut_on(p.device)
+                if step_scalars is not None
+                else None
+            ),
+            seed_dev=self._sr_seed_on(p.device),
         )
 
     def _automatic_momentum_update(
@@ -1595,7 +2361,7 @@ class Gefen(torch.optim.Optimizer):
                 )
 
             state["automatic_period"] = automatic_period
-            state["step"] = 0
+            state["step"] = self._new_step_counter(p.device)
             grad_view = self._automatic_view(flat_grad, automatic_period)
             self._init_gefen_state(state, grad_view)
 
@@ -1604,7 +2370,7 @@ class Gefen(torch.optim.Optimizer):
                 dtype=torch.float32,
                 memory_format=torch.preserve_format,
             )
-            state["vmean_step"] = 0
+            state["vmean_step"] = self._new_step_counter(p.device)
             self._print_v_period(param_name, p, state["vmean"])
 
         automatic_period = state["automatic_period"]
@@ -1620,11 +2386,16 @@ class Gefen(torch.optim.Optimizer):
                 dtype=torch.float32,
                 memory_format=torch.preserve_format,
             )
-            state["vmean_step"] = 0
+            state["vmean_step"] = self._new_step_counter(p.device)
         elif "vmean_step" not in state:
             # Checkpoint from before the counter existed: its vmean is exactly
             # as old as the param step, so backfill (keeps bc2 bit-identical).
-            state["vmean_step"] = state["step"]
+            # A capturable (tensor) step must be CLONED -- assigning the same
+            # 0-dim tensor would alias the two counters and double-increment.
+            step = state["step"]
+            state["vmean_step"] = (
+                step.clone() if torch.is_tensor(step) else step
+            )
 
         # Tier-1: well-occupied (v1-regime) params take the fully-fused kernel,
         # which folds the vmean EMA + per-block stepsize math (and, after K3,
@@ -1637,6 +2408,18 @@ class Gefen(torch.optim.Optimizer):
         route_v2 = _should_use_v2(
             grad_view.shape[0], automatic_period, grad_view.device
         )
+        if (
+            route_v2
+            and self.capturable
+            and flat_grad.numel() <= _CAPT_V1_FULL_TINY_NUMEL
+        ):
+            # Capturable-only: tiny params are launch-bound, so the ONE-kernel
+            # v1-full path beats the 4-5-launch v2-full path inside a
+            # captured/replayed graph regardless of occupancy. Not applied to
+            # capturable=False (v1-full and v2-full differ at ulp level in the
+            # vmean reduction order, and the non-capturable path is under a
+            # bit-exact-vs-history contract). See _CAPT_V1_FULL_TINY_NUMEL.
+            route_v2 = False
         use_full_fused = fused_step and not route_v2
         use_v2_full = fused_step and route_v2
 
@@ -1645,8 +2428,11 @@ class Gefen(torch.optim.Optimizer):
         if not (use_full_fused or use_v2_full):
             self._automatic_vmean_update(state["vmean"], grad_view, beta2)
 
-        state["step"] += 1
-        state["vmean_step"] += 1
+        # Rows registered with the batched capturable prologue had BOTH
+        # counters advanced by its single stacked add_ already this step.
+        if "_capt_row" not in state:
+            state["step"] += 1
+            state["vmean_step"] += 1
 
         # Under FSDP2 the parameter is a sharded DTensor; every in-place write
         # below (weight decay, fused kernel, non-fused add_) must land on the
@@ -1658,20 +2444,39 @@ class Gefen(torch.optim.Optimizer):
             else p
         )
 
-        bias_correction_1 = 1 - beta1 ** state["step"]
-        # bc2 corrects the vmean EMA by its OWN age: on fresh runs and normal
-        # resumes vmean_step == step (bit-identical); it differs only when
-        # vmean was lazily recreated after a factored->legacy toggle.
-        bias_correction_2 = 1 - beta2 ** state["vmean_step"]
+        if self.capturable and (use_full_fused or use_v2_full):
+            # Capturable fused stepping: the per-step-varying scalars flow
+            # through the persistent device buffer (refreshed in place with
+            # tensor ops -- capture-safe), the kernels ignore the matching
+            # host args, and the host bias corrections are skipped entirely
+            # (they would either sync on the tensor step counters or freeze
+            # in a captured graph).
+            step_scalars = self._refresh_capturable_step_scalars(
+                state, group, "vmean_step", sqrt_bc2=True
+            )
+            bias_correction_1 = None
+            bias_correction_2 = None
+        else:
+            step_scalars = None
+            bias_correction_1 = 1 - beta1 ** state["step"]
+            # bc2 corrects the vmean EMA by its OWN age: on fresh runs and
+            # normal resumes vmean_step == step (bit-identical); it differs
+            # only when vmean was lazily recreated after a factored->legacy
+            # toggle.
+            bias_correction_2 = 1 - beta2 ** state["vmean_step"]
 
         if use_full_fused:
             # K1+K2+K3: vmean EMA, per-block stepsize, and weight decay are all
             # computed inside the fused kernel. weight_decay_factor == 1 - lr*wd
             # mirrors the host p.mul_(1 - lr*wd) pass (an exact identity when
-            # wd == 0). The kernel flat-indexes p and requires it contiguous; a
-            # non-contiguous shard is updated on a contiguous copy that is copied
-            # back to preserve the in-place semantics.
-            weight_decay_factor = 1.0 - lr * group["weight_decay"]
+            # wd == 0); under capturable it is computed on device into the
+            # scalar buffer instead. The kernel flat-indexes p and requires it
+            # contiguous; a non-contiguous shard is updated on a contiguous
+            # copy that is copied back to preserve the in-place semantics.
+            weight_decay_factor = (
+                1.0 if step_scalars is not None
+                else 1.0 - lr * group["weight_decay"]
+            )
             if p_local.is_contiguous():
                 self._automatic_gefen_fused_full_update(
                     p_local,
@@ -1684,6 +2489,7 @@ class Gefen(torch.optim.Optimizer):
                     bias_correction_1,
                     bias_correction_2,
                     weight_decay_factor,
+                    step_scalars=step_scalars,
                 )
             else:
                 p_contig = p_local.contiguous()
@@ -1698,6 +2504,7 @@ class Gefen(torch.optim.Optimizer):
                     bias_correction_1,
                     bias_correction_2,
                     weight_decay_factor,
+                    step_scalars=step_scalars,
                 )
                 p_local.copy_(p_contig)
             return
@@ -1707,7 +2514,10 @@ class Gefen(torch.optim.Optimizer):
             # per-block stepsize and weight decay are folded into the v2 kernels
             # (see _automatic_gefen_fused_update_v2_full). Same contiguity
             # handling as the v1-full branch.
-            weight_decay_factor = 1.0 - lr * group["weight_decay"]
+            weight_decay_factor = (
+                1.0 if step_scalars is not None
+                else 1.0 - lr * group["weight_decay"]
+            )
             if p_local.is_contiguous():
                 self._automatic_gefen_fused_update_v2_full(
                     p_local,
@@ -1720,6 +2530,7 @@ class Gefen(torch.optim.Optimizer):
                     bias_correction_1,
                     bias_correction_2,
                     weight_decay_factor,
+                    step_scalars=step_scalars,
                 )
             else:
                 p_contig = p_local.contiguous()
@@ -1734,6 +2545,7 @@ class Gefen(torch.optim.Optimizer):
                     bias_correction_1,
                     bias_correction_2,
                     weight_decay_factor,
+                    step_scalars=step_scalars,
                 )
                 p_local.copy_(p_contig)
             return
@@ -1765,7 +2577,12 @@ class Gefen(torch.optim.Optimizer):
             state["stepsize"] = stepsize
             state["_h_buf"] = h
         torch.sqrt(vmean, out=h)
-        h.div_(math.sqrt(bias_correction_2)).add_(eps)
+        if torch.is_tensor(bias_correction_2):
+            # Capturable: bc2 is a 0-dim device tensor, so take its sqrt on
+            # device (math.sqrt would force a host sync).
+            h.div_(bias_correction_2.sqrt()).add_(eps)
+        else:
+            h.div_(math.sqrt(bias_correction_2)).add_(eps)
         torch.reciprocal(h, out=stepsize)
         stepsize.mul_(1.0 / bias_correction_1)
 
@@ -2003,8 +2820,20 @@ class Gefen(torch.optim.Optimizer):
         # stepsize/_h_buf are per-step scratch buffers (recomputed from vmean every
         # step); they live in self.state only to be reused across steps, so strip
         # them from the serialized dict instead of bloating every checkpoint. Build
-        # fresh per-param dicts so live self.state is left untouched.
-        scratch_keys = ("stepsize", "_h_buf")
+        # fresh per-param dicts so live self.state is left untouched. The
+        # capturable device-scalar buffer and its beta constants are likewise
+        # scratch (fully refreshed from step counters + group hypers every step)
+        # and must not survive a checkpoint across a capturable/hyper toggle.
+        scratch_keys = (
+            "stepsize",
+            "_h_buf",
+            "_capt_scalars",
+            "_capt_consts",
+            # Batched-refresh registration marker (a host int): scratch like
+            # the buffers it indexes into; leaking it into a checkpoint would
+            # falsely mark restored params as batch-covered.
+            "_capt_row",
+        )
 
         def _compact(value):
             # K4 rebinds m_magnitude onto a [2, num_blocks, 1] scratch buffer via
@@ -2062,8 +2891,21 @@ class Gefen(torch.optim.Optimizer):
         # names, so any future aux tensor is preserved too.
         saved_state = state_dict.get("state", {}) or {}
 
+        # The base load replaces self.state wholesale, so every counter/scalar
+        # view the batched capturable refresh installed is gone; drop the
+        # stacked buffers with them (the next eager capturable step rebuilds
+        # and re-aliases lazily).
+        self._capt_invalidate()
+
         super().load_state_dict(state_dict)
         self._gefen_global_step = gefen_global_step
+        # Capturable SR seeds are optimizer-level scratch (a device mirror of
+        # gefen_global_step): drop them so the first post-load SR kernel call
+        # rebuilds them from the restored counter. (Under manual graph-replay
+        # training the host counter -- like every host-side value -- reflects
+        # host step() calls, not replays; checkpoint semantics are unchanged
+        # from the pre-SR capturable behavior.)
+        self._sr_seed_by_device.clear()
 
         # Restoring the frozen codebook keeps _maybe_refresh_gefen_codebook a
         # no-op on the first resume step, so the restored automatic_period values
@@ -2074,6 +2916,10 @@ class Gefen(torch.optim.Optimizer):
         # fallback.
         self._gefen_codebook = gefen_codebook
         self._gefen_codebook_by_device.clear()
+        self._gefen_codebook_lut_by_device.clear()
+        # The identity fingerprint would catch the wholesale state swap anyway;
+        # reset it explicitly so the first post-load capturable step re-marks.
+        self._static_mark_sig = None
 
         # Map saved param ids -> live param objects exactly as the base class
         # does, then restore each aux tensor from its pristine saved copy.
@@ -2103,8 +2949,40 @@ class Gefen(torch.optim.Optimizer):
                 )
                 live_state[key] = saved_value.to(device=device, dtype=saved_value.dtype)
 
+        # Normalize the step counters to this optimizer's capturable mode, so
+        # checkpoints are portable across the toggle in either direction (torch
+        # .optim casts its `step` state the same way): python ints when
+        # capturable=False (the bit-identical legacy host math), 0-dim float32
+        # tensors on the param's device when capturable=True.
+        counter_keys = ("step", "vmean_step", "factored_step", "normuon_step")
+        for group in self.param_groups:
+            for p in group["params"]:
+                pstate = self.state.get(p)
+                if not pstate:
+                    continue
+                for key in counter_keys:
+                    if key not in pstate:
+                        continue
+                    value = pstate[key]
+                    if self.capturable:
+                        if not torch.is_tensor(value):
+                            pstate[key] = torch.full(
+                                (), float(value), dtype=torch.float32, device=p.device
+                            )
+                        elif (
+                            value.device != p.device
+                            or value.dtype != torch.float32
+                            or value.dim() != 0
+                        ):
+                            pstate[key] = value.to(
+                                device=p.device, dtype=torch.float32
+                            ).reshape(())
+                    elif torch.is_tensor(value):
+                        pstate[key] = int(value.item())
+
     @torch.no_grad()
     def step(self, closure=None):
+        self._assert_capturable_if_capturing()
         self._maybe_refresh_gefen_codebook()
         self._maybe_save_gefen_grad_histogram()
         # Periodic codebook re-learn (opt-in): every N steps, refit the exact-DP
@@ -2122,15 +3000,30 @@ class Gefen(torch.optim.Optimizer):
             with torch.enable_grad():
                 loss = closure()
 
+        # Batched capturable refresh: advance every registered param's device
+        # step counters and refresh every param's [lr, 1/bcX, 1/bc1, wd]
+        # kernel-scalar row with one short vectorized op chain over per-device
+        # stacked buffers, instead of ~10 microscopic launches per param.
+        # Elementwise-identical math (see _capt_batched_refresh); runs after
+        # the closure so the stepping set (which params carry grads) is final.
+        if self.capturable:
+            self._capt_batched_prologue()
+
         # The fused path has its own batched CUDA kernel per param; only the
         # non-fused Python-loop path benefits from foreach/merged batching.
         # Gate on BOTH fused flags: the merged path hard-codes use_fused=False for
         # the vmean update, so it must not engage while fused vmean is still on
         # (e.g. FUSE_GEFEN_AUTOMATIC_STEP off but FUSE_AUTOMATIC_VMEAN_UPDATE on),
         # which would otherwise change the vmean math vs the per-param path.
+        # The merged path additionally computes ONE shared bias correction from
+        # the first param's host-int step (math.sqrt on it under the hood), so
+        # it is skipped under capturable: each param then steps through the
+        # per-param tensor-op path with its own device step counter, and the
+        # extra launches are exactly what a captured graph amortizes.
         batch_nonfused = (
             not self._use_fused_gefen_automatic_step()
             and not self._use_fused_automatic_vmean()
+            and not self.capturable
         )
 
         # Collect parameters that share block geometry + hyperparameters so they
@@ -2178,5 +3071,24 @@ class Gefen(torch.optim.Optimizer):
             else:
                 self._dispatch_nonfused_batch(items)
 
-        self._gefen_global_step += 1
+        # Capturable stochastic rounding: advance the per-device seed tensors
+        # ON DEVICE at the step tail (the device mirror of the host counter
+        # bump below). Recorded on-stream by a manual capture -- so replays
+        # dither with fresh seeds -- and kept out of traced frames by the
+        # helper's @torch._dynamo.disable.
+        if self.capturable and self._stochastic_round:
+            self._advance_sr_seeds()
+        self._advance_gefen_global_step()
+        if self.capturable and not torch.compiler.is_compiling():
+            self._mark_state_static_for_compile()
         return loss
+
+    @torch._dynamo.disable
+    def _advance_gefen_global_step(self) -> None:
+        # Kept out of compiled frames on purpose: dynamo guards on the exact
+        # value of a python int it reads, so an in-trace `+= 1` on this
+        # per-step host counter would recompile the whole compiled step every
+        # step. @torch._dynamo.disable makes the increment a single opaque
+        # call at the very tail of step() instead (one cheap graph break
+        # after all device work). Eager behavior is unchanged.
+        self._gefen_global_step += 1

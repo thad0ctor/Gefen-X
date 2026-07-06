@@ -1,9 +1,11 @@
 #include <c10/cuda/CUDAGuard.h>
+#include <c10/cuda/CUDAStream.h>
 #include <c10/cuda/CUDAMacros.h>
 #include <cuda.h>
 #include <cuda_runtime.h>
 #include <ATen/ATen.h>
 #include <ATen/Dispatch.h>
+#include <c10/util/Optional.h>
 
 #include <atomic>
 #include <cmath>
@@ -131,8 +133,11 @@ __device__ __forceinline__ uint8_t nearest_codebook_index(
 // curand setup, is reproducible run-to-run for a fixed (seed, idx), and costs a
 // handful of integer ops -- negligible against the per-element global-memory
 // codebook gather + binary search already in the quantize loop. The seed is the
-// optimizer's global step (varied each step on the host) so the stochastic
-// rounding decorrelates across steps, which is what debiases the EMA trajectory.
+// optimizer's step count -- delivered as a host kernel argument on the default
+// path, or read from a device-side step tensor (rng_seed_dev, advanced in
+// place once per step) under capturable so captured CUDA graphs replay fresh
+// seeds -- so the stochastic rounding decorrelates across steps, which is what
+// debiases the EMA trajectory.
 __device__ __forceinline__ float gefen_sr_uniform(
     uint64_t rng_seed, int64_t element_idx
 ) {
@@ -481,8 +486,32 @@ __global__ void automatic_gefen_fused_full_update_kernel(
     float inv_bias_correction_1,
     float weight_decay_factor,
     bool stochastic_round,
-    uint64_t rng_seed
+    uint64_t rng_seed,
+    const int64_t* __restrict__ rng_seed_dev,
+    const float* __restrict__ step_scalars
 ) {
+    // Capturable mode: the per-STEP-varying scalars live in device memory (a
+    // tiny fp32 buffer refreshed by the host with tensor ops each step) so a
+    // captured CUDA graph replays fresh values instead of the host kernel args
+    // frozen at capture time. Layout: [lr, 1/sqrt(bc2), 1/bc1, wd_factor],
+    // already-fp32 values, so the math below stays fp32 either way (the host
+    // path casts python doubles to float at launch). nullptr keeps the legacy
+    // host-scalar behavior bit-identically.
+    if (step_scalars != nullptr) {
+        lr = __ldg(&step_scalars[0]);
+        inv_sqrt_bias_correction_2 = __ldg(&step_scalars[1]);
+        inv_bias_correction_1 = __ldg(&step_scalars[2]);
+        weight_decay_factor = __ldg(&step_scalars[3]);
+    }
+    // Capturable stochastic rounding: the per-step seed likewise lives in
+    // device memory (a 0-dim int64 step tensor advanced in place once per
+    // optimizer step), so graph replays dither with a FRESH seed instead of
+    // the host rng_seed frozen at capture time. nullptr keeps the legacy
+    // host-seed path bit-identically.
+    if (stochastic_round && rng_seed_dev != nullptr) {
+        rng_seed = static_cast<uint64_t>(
+            __ldg(reinterpret_cast<const long long*>(rng_seed_dev)));
+    }
     // Shared layout: [codebook_size codebook][tpr*rows max][tpr*rows sumsq],
     // where tpr = blockDim.x (threads per row) and rows = blockDim.y.
     extern __shared__ float smem[];
@@ -824,8 +853,16 @@ __global__ void gefen_momentum_emit_flat_kernel(
     int64_t total_numel,
     float beta1,
     bool stochastic_round,
-    uint64_t rng_seed
+    uint64_t rng_seed,
+    const int64_t* __restrict__ rng_seed_dev
 ) {
+    // Capturable stochastic rounding: read the per-step seed from device
+    // memory (a 0-dim int64 step tensor advanced once per optimizer step) so
+    // graph replays dither with a fresh seed. nullptr == legacy host seed.
+    if (stochastic_round && rng_seed_dev != nullptr) {
+        rng_seed = static_cast<uint64_t>(
+            __ldg(reinterpret_cast<const long long*>(rng_seed_dev)));
+    }
     extern __shared__ float s_codebook[];
     for (int i = threadIdx.x; i < codebook_size; i += blockDim.x) {
         s_codebook[i] = codebook[i];
@@ -995,8 +1032,16 @@ __global__ void gefen_finalize_vmean_stepsize_kernel(
     float beta2,
     float eps,
     float inv_sqrt_bias_correction_2,
-    float inv_bias_correction_1
+    float inv_bias_correction_1,
+    const float* __restrict__ step_scalars
 ) {
+    // Capturable mode: read the per-step bias-correction reciprocals from the
+    // device buffer ([lr, 1/sqrt(bc2), 1/bc1, wd]; slots 1 and 2 are consumed
+    // here) so graph replays see fresh values. nullptr == legacy host scalars.
+    if (step_scalars != nullptr) {
+        inv_sqrt_bias_correction_2 = __ldg(&step_scalars[1]);
+        inv_bias_correction_1 = __ldg(&step_scalars[2]);
+    }
     const int64_t stride = static_cast<int64_t>(gridDim.x) * blockDim.x;
     for (int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
          i < num_blocks; i += stride) {
@@ -1032,8 +1077,25 @@ __global__ void gefen_update_flat_full_kernel(
     float lr,
     float weight_decay_factor,
     bool stochastic_round,
-    uint64_t rng_seed
+    uint64_t rng_seed,
+    const int64_t* __restrict__ rng_seed_dev,
+    const float* __restrict__ step_scalars
 ) {
+    // Capturable mode: read lr and the weight-decay factor from the device
+    // buffer ([lr, 1/sqrt(bc2), 1/bc1, wd]; slots 0 and 3 are consumed here --
+    // the bias-correction slots feed the finalize kernel) so graph replays see
+    // fresh values. nullptr == legacy host scalars.
+    if (step_scalars != nullptr) {
+        lr = __ldg(&step_scalars[0]);
+        weight_decay_factor = __ldg(&step_scalars[3]);
+    }
+    // Capturable stochastic rounding: read the per-step seed from device
+    // memory (a 0-dim int64 step tensor advanced once per optimizer step) so
+    // graph replays dither with a fresh seed. nullptr == legacy host seed.
+    if (stochastic_round && rng_seed_dev != nullptr) {
+        rng_seed = static_cast<uint64_t>(
+            __ldg(reinterpret_cast<const long long*>(rng_seed_dev)));
+    }
     extern __shared__ float s_codebook[];
     for (int i = threadIdx.x; i < codebook_size; i += blockDim.x) {
         s_codebook[i] = codebook[i];
@@ -1182,7 +1244,10 @@ __global__ void gefen_update_flat_factored_kernel(
     const float* __restrict__ new_magnitude,
     const float* __restrict__ v_row,
     const float* __restrict__ v_col,
-    const float* __restrict__ mean_v_row,  // [1], device-computed
+    const float* __restrict__ mean_v_row,  // [1], device-computed (see below)
+    int64_t mean_sum_rows,  // 0: mean_v_row IS the mean; >0: it is
+                            // Sum(v_row) and the mean is sum/rows (capturable
+                            // path, accumulated by the EMA launch)
     const float* __restrict__ codebook,
     const int16_t* __restrict__ lut,
     int lut_buckets,
@@ -1197,15 +1262,48 @@ __global__ void gefen_update_flat_factored_kernel(
     float inv_bias_correction_1,
     float weight_decay_factor,
     bool stochastic_round,
-    uint64_t rng_seed
+    uint64_t rng_seed,
+    const int64_t* __restrict__ rng_seed_dev,
+    const float* __restrict__ step_scalars,
+    float* __restrict__ mag_writeback
 ) {
+    // Capturable mode: the per-step-varying scalars live in device memory so a
+    // captured graph replays fresh values instead of the frozen host args.
+    // Layout: [lr, 1/bc2, 1/bc1, wd_factor] (note slot 1 is 1/bc2, NOT
+    // 1/sqrt(bc2), on this factored path). nullptr == legacy host scalars.
+    //
+    // mag_writeback (capturable only): the persistent m_magnitude state, which
+    // this kernel then updates IN PLACE (one write per gefen block) instead of
+    // the host launching a separate m_magnitude.copy_(new_magnitude) afterward
+    // -- on a many-param model those per-param copy launches are a measurable
+    // slice of a replayed graph. Safe because in that mode `old_magnitude`
+    // points at the scratch STAGED COPY of the old magnitudes (written by the
+    // EMA launch before this kernel), so no thread reads the buffer being
+    // overwritten. nullptr == legacy flow (old_magnitude IS m_magnitude; the
+    // host set_()s the state onto new_magnitude afterwards, zero launches).
+    if (step_scalars != nullptr) {
+        lr = __ldg(&step_scalars[0]);
+        inv_bias_correction_2 = __ldg(&step_scalars[1]);
+        inv_bias_correction_1 = __ldg(&step_scalars[2]);
+        weight_decay_factor = __ldg(&step_scalars[3]);
+    }
+    // Capturable stochastic rounding: read the per-step seed from device
+    // memory (a 0-dim int64 step tensor advanced once per optimizer step) so
+    // graph replays dither with a fresh seed. nullptr == legacy host seed.
+    if (stochastic_round && rng_seed_dev != nullptr) {
+        rng_seed = static_cast<uint64_t>(
+            __ldg(reinterpret_cast<const long long*>(rng_seed_dev)));
+    }
     extern __shared__ float s_codebook[];
     for (int i = threadIdx.x; i < codebook_size; i += blockDim.x) {
         s_codebook[i] = codebook[i];
     }
     __syncthreads();
-    const float inv_mean_r =
-        1.0f / fmaxf(__ldg(mean_v_row), 1.1754944e-38f);
+    float mean_r = __ldg(mean_v_row);
+    if (mean_sum_rows > 0) {
+        mean_r = __fdiv_rn(mean_r, static_cast<float>(mean_sum_rows));
+    }
+    const float inv_mean_r = 1.0f / fmaxf(mean_r, 1.1754944e-38f);
     const int64_t stride = static_cast<int64_t>(gridDim.x) * blockDim.x;
     for (int64_t idx = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
          idx < total_numel; idx += stride) {
@@ -1213,6 +1311,11 @@ __global__ void gefen_update_flat_factored_kernel(
         const int64_t row = idx / cols;
         const int64_t col = idx - row * cols;
         const float new_mag = new_magnitude[block_idx];
+        if (mag_writeback != nullptr && idx == block_idx * period) {
+            // Exactly one element per gefen block writes the new magnitude
+            // into the persistent state (see the arg comment above).
+            mag_writeback[block_idx] = new_mag;
+        }
         const float updated = updated_momentum(
             grad_view, m_sign, s_codebook, old_magnitude[block_idx], idx, beta1);
         float normalized_value = 0.0f;
@@ -1241,6 +1344,148 @@ __global__ void gefen_update_flat_factored_kernel(
             }
         }
     }
+}
+
+// Fused v_row/v_col EMA advance for the factored launcher: one launch replaces
+// the six aten launches of
+//     v_row.mul_(beta2).add_(row_sq.div_(cols), 1 - beta2);
+//     v_col.mul_(beta2).add_(col_sq.div_(rows), 1 - beta2);
+// BIT-IDENTICALLY. The aten chain lowers, per element, to exactly
+//     t  = x * (1.0f / (float)n)      (div-by-scalar is a reciprocal multiply
+//                                      with the reciprocal formed in fp32)
+//     vb = v * (float)beta2           (rounded to memory by mul_)
+//     v' = fmaf((float)(1-beta2), t, vb)   (CUDAFunctor_add's a + alpha*b,
+//                                      contracted to a single fma by nvcc)
+// and the intrinsics below pin that exact rounding sequence (verified
+// elementwise-equal against the aten chain over randomized magnitudes from
+// denormal to 1e10, including the fma-vs-mul+add distinction, which DOES
+// differ). Both vectors ride one grid: [0, rows) -> v_row, [rows, rows+cols)
+// -> v_col.
+//
+// The optional tail range [rows+cols, rows+cols+mag_blocks) additionally
+// stages a verbatim copy of the old per-block magnitudes (mag_src ->
+// mag_copy) for the capturable factored path: the phase-2 kernel then reads
+// the old magnitudes from the copy and writes the new ones straight into the
+// persistent m_magnitude state, eliminating the separate per-param
+// m_magnitude.copy_ launch. The copy rides this (already tiny) launch for
+// free; mag_blocks == 0 skips it.
+//
+// vrow_sum (optional, capturable only): a zero-initialized 1-elem accumulator
+// that receives Sum(v_row_new) via one block-reduced atomicAdd per CUDA block.
+// The phase-2 kernel derives mean(v_row) from it in registers, replacing the
+// per-param at::mean launch. The atomicAdd ordering makes the sum run-to-run
+// nondeterministic at ulp level -- the same class of nondeterminism the stats
+// kernel's row/col grad^2 atomics already have -- which is why the
+// capturable=False path keeps at::mean (bit-exact history) and does not pass
+// this pointer.
+__global__ void gefen_factored_v_ema_kernel(
+    float* __restrict__ v_row,
+    float* __restrict__ v_col,
+    const float* __restrict__ row_sq,
+    const float* __restrict__ col_sq,
+    int64_t rows,
+    int64_t cols,
+    float beta2,
+    float alpha,
+    float inv_cols,
+    float inv_rows,
+    const float* __restrict__ mag_src,
+    float* __restrict__ mag_copy,
+    int64_t mag_blocks,
+    float* __restrict__ vrow_sum
+) {
+    extern __shared__ float s_partials[];
+    float local_sum = 0.0f;
+    const int64_t total = rows + cols + mag_blocks;
+    for (int64_t i = blockIdx.x * static_cast<int64_t>(blockDim.x) + threadIdx.x;
+         i < total;
+         i += static_cast<int64_t>(gridDim.x) * blockDim.x) {
+        if (i < rows) {
+            const float t = __fmul_rn(row_sq[i], inv_cols);
+            const float vb = __fmul_rn(v_row[i], beta2);
+            const float v_new = __fmaf_rn(alpha, t, vb);
+            v_row[i] = v_new;
+            local_sum += v_new;
+        } else if (i < rows + cols) {
+            const int64_t j = i - rows;
+            const float t = __fmul_rn(col_sq[j], inv_rows);
+            const float vb = __fmul_rn(v_col[j], beta2);
+            v_col[j] = __fmaf_rn(alpha, t, vb);
+        } else {
+            const int64_t b = i - rows - cols;
+            mag_copy[b] = mag_src[b];
+        }
+    }
+    if (vrow_sum != nullptr) {
+        // Block-reduce the v_row partial sums; ONE global atomic per block.
+        s_partials[threadIdx.x] = local_sum;
+        __syncthreads();
+        for (int offset = blockDim.x >> 1; offset > 0; offset >>= 1) {
+            if (threadIdx.x < static_cast<unsigned int>(offset)) {
+                s_partials[threadIdx.x] += s_partials[threadIdx.x + offset];
+            }
+            __syncthreads();
+        }
+        if (threadIdx.x == 0 && s_partials[0] != 0.0f) {
+            atomicAdd(vrow_sum, s_partials[0]);
+        }
+    }
+}
+
+// Validate + unwrap the optional capturable device-scalar buffer. The kernels
+// read 4 fp32 values ([lr, inv(_sqrt)_bc2, inv_bc1, wd_factor]) straight from
+// this pointer, so it must be a contiguous fp32 CUDA tensor with >= 4 elements
+// on p's device. nullopt / undefined -> nullptr (legacy host-scalar path).
+const float* resolve_step_scalars_ptr(
+    const c10::optional<at::Tensor>& step_scalars,
+    const at::Tensor& p
+) {
+    if (!step_scalars.has_value() || !step_scalars->defined()) {
+        return nullptr;
+    }
+    const at::Tensor& ss = *step_scalars;
+    if (!ss.is_cuda() || ss.device() != p.device()) {
+        throw std::invalid_argument(
+            "Expected step_scalars on the same CUDA device as p.");
+    }
+    if (!ss.is_contiguous() || ss.scalar_type() != at::kFloat) {
+        throw std::invalid_argument(
+            "Expected step_scalars to be contiguous float32.");
+    }
+    if (ss.numel() < 4) {
+        throw std::invalid_argument(
+            "Expected step_scalars to have at least 4 elements.");
+    }
+    return ss.data_ptr<float>();
+}
+
+// Validate + unwrap the optional device-side stochastic-rounding seed. The
+// kernels read ONE int64 from this pointer at launch (the optimizer's step
+// count, advanced in place once per step by the capturable python path), so it
+// must be a contiguous int64 CUDA tensor with >= 1 element on the reference
+// tensor's device. nullopt / undefined -> nullptr (legacy host-seed path,
+// bit-identical).
+const int64_t* resolve_seed_dev_ptr(
+    const c10::optional<at::Tensor>& seed_dev,
+    const at::Tensor& ref
+) {
+    if (!seed_dev.has_value() || !seed_dev->defined()) {
+        return nullptr;
+    }
+    const at::Tensor& sd = *seed_dev;
+    if (!sd.is_cuda() || sd.device() != ref.device()) {
+        throw std::invalid_argument(
+            "Expected seed_dev on the same CUDA device as the updated tensor.");
+    }
+    if (!sd.is_contiguous() || sd.scalar_type() != at::kLong) {
+        throw std::invalid_argument(
+            "Expected seed_dev to be a contiguous int64 tensor.");
+    }
+    if (sd.numel() < 1) {
+        throw std::invalid_argument(
+            "Expected seed_dev to have at least 1 element.");
+    }
+    return sd.data_ptr<int64_t>();
 }
 
 }  // namespace
@@ -1335,7 +1580,7 @@ void automatic_gefen_fused_update_cuda(
         p.scalar_type(),
         "automatic_gefen_fused_update_cuda",
         [&] {
-            automatic_gefen_fused_update_kernel<scalar_t><<<grid, block, shared_bytes>>>(
+            automatic_gefen_fused_update_kernel<scalar_t><<<grid, block, shared_bytes, c10::cuda::getCurrentCUDAStream()>>>(
                 p.data_ptr<scalar_t>(),
                 grad_view.data_ptr<scalar_t>(),
                 m_sign.data_ptr<uint8_t>(),
@@ -1371,11 +1616,22 @@ void automatic_gefen_fused_full_update_cuda(
     double inv_bias_correction_1,
     double weight_decay_factor,
     bool stochastic_round,
-    int64_t rng_seed
+    int64_t rng_seed,
+    c10::optional<at::Tensor> step_scalars,
+    c10::optional<at::Tensor> seed_dev
 ) {
     if (!p.is_cuda() || !grad_view.is_cuda() || !m_sign.is_cuda() || !m_magnitude.is_cuda() || !vmean.is_cuda() || !codebook.is_cuda()) {
         throw std::invalid_argument("Expected all tensors to be on CUDA.");
     }
+    // Optional capturable device-scalar buffer: when present the kernel reads
+    // the per-step-varying scalars (lr / bias-correction reciprocals / weight-
+    // decay factor) from it instead of the host args, so a captured CUDA graph
+    // replays fresh values. Null -> bit-identical legacy host-scalar path.
+    const float* step_scalars_dev = resolve_step_scalars_ptr(step_scalars, p);
+    // Optional capturable device-side stochastic-rounding seed: when present
+    // (and stochastic_round is set) the kernel reads the seed from it instead
+    // of the host rng_seed, so replays dither with fresh per-step seeds.
+    const int64_t* seed_dev_ptr = resolve_seed_dev_ptr(seed_dev, p);
     // Optional search LUT (empty tensor -> full-range binary search). Built on
     // the host once per (frozen) codebook; int16 [buckets + 1] on p's device.
     const bool use_lut = lut.numel() > 0;
@@ -1479,7 +1735,7 @@ void automatic_gefen_fused_full_update_cuda(
         p.scalar_type(),
         "automatic_gefen_fused_full_update_cuda",
         [&] {
-            automatic_gefen_fused_full_update_kernel<scalar_t><<<grid, block, shared_bytes>>>(
+            automatic_gefen_fused_full_update_kernel<scalar_t><<<grid, block, shared_bytes, c10::cuda::getCurrentCUDAStream()>>>(
                 p.data_ptr<scalar_t>(),
                 grad_view.data_ptr<scalar_t>(),
                 m_sign.data_ptr<uint8_t>(),
@@ -1500,7 +1756,9 @@ void automatic_gefen_fused_full_update_cuda(
                 static_cast<float>(inv_bias_correction_1),
                 static_cast<float>(weight_decay_factor),
                 stochastic_round,
-                static_cast<uint64_t>(rng_seed)
+                static_cast<uint64_t>(rng_seed),
+                seed_dev_ptr,
+                step_scalars_dev
             );
         }
     );
@@ -1581,7 +1839,7 @@ void automatic_gefen_fused_update_v2_cuda(
                 int64_t nblocks = (total_numel + threads - 1) / threads;
                 if (nblocks > flat_blocks_cap) nblocks = flat_blocks_cap;
                 if (nblocks < 1) nblocks = 1;
-                gefen_magnitude_flat_kernel<scalar_t><<<static_cast<unsigned int>(nblocks), threads, codebook_bytes>>>(
+                gefen_magnitude_flat_kernel<scalar_t><<<static_cast<unsigned int>(nblocks), threads, codebook_bytes, c10::cuda::getCurrentCUDAStream()>>>(
                     grad_view.data_ptr<scalar_t>(), m_sign.data_ptr<uint8_t>(),
                     m_magnitude.data_ptr<float>(), codebook.data_ptr<float>(),
                     new_magnitude.data_ptr<float>(), codebook_size, period, total_numel,
@@ -1595,7 +1853,7 @@ void automatic_gefen_fused_update_v2_cuda(
                 if (blocks_per_row < 1) blocks_per_row = 1;
                 const int64_t grid = num_blocks * blocks_per_row;
                 const size_t shmem = static_cast<size_t>(threads) * sizeof(float) + codebook_bytes;
-                gefen_magnitude_split_kernel<scalar_t><<<static_cast<unsigned int>(grid), threads, shmem>>>(
+                gefen_magnitude_split_kernel<scalar_t><<<static_cast<unsigned int>(grid), threads, shmem, c10::cuda::getCurrentCUDAStream()>>>(
                     grad_view.data_ptr<scalar_t>(), m_sign.data_ptr<uint8_t>(),
                     m_magnitude.data_ptr<float>(), codebook.data_ptr<float>(),
                     new_magnitude.data_ptr<float>(), codebook_size, period, num_blocks, blocks_per_row,
@@ -1611,7 +1869,7 @@ void automatic_gefen_fused_update_v2_cuda(
             int64_t nblocks = (total_numel + threads - 1) / threads;
             if (nblocks > flat_blocks_cap) nblocks = flat_blocks_cap;
             if (nblocks < 1) nblocks = 1;
-            gefen_update_flat_kernel<scalar_t><<<static_cast<unsigned int>(nblocks), threads, codebook_bytes>>>(
+            gefen_update_flat_kernel<scalar_t><<<static_cast<unsigned int>(nblocks), threads, codebook_bytes, c10::cuda::getCurrentCUDAStream()>>>(
                 p.data_ptr<scalar_t>(), grad_view.data_ptr<scalar_t>(), m_sign.data_ptr<uint8_t>(),
                 m_magnitude.data_ptr<float>(), new_magnitude.data_ptr<float>(),
                 stepsize.data_ptr<float>(), codebook.data_ptr<float>(), codebook_size,
@@ -1640,7 +1898,9 @@ void gefen_factored_update_cuda(
     double inv_bias_correction_1,
     double weight_decay_factor,
     bool stochastic_round,
-    int64_t rng_seed
+    int64_t rng_seed,
+    c10::optional<at::Tensor> step_scalars,
+    c10::optional<at::Tensor> seed_dev
 ) {
     // Factored-second-moment (Adafactor-style) fused update for 2D params.
     // Phase 1 is the combined stats kernel: ONE pass over grad + m_sign
@@ -1692,6 +1952,13 @@ void gefen_factored_update_cuda(
         throw std::invalid_argument("Expected grad_view dtype to match p.");
     }
 
+    // Optional capturable device-scalar buffer ([lr, 1/bc2, 1/bc1, wd]); null
+    // -> bit-identical legacy host-scalar path.
+    const float* step_scalars_dev = resolve_step_scalars_ptr(step_scalars, p);
+    // Optional capturable device-side stochastic-rounding seed (read by the
+    // phase-2 quantize kernel); null -> legacy host-seed path.
+    const int64_t* seed_dev_ptr = resolve_seed_dev_ptr(seed_dev, p);
+
     c10::cuda::CUDAGuard device_guard(p.device());
 
     const int64_t num_blocks = grad_view.size(0);
@@ -1720,7 +1987,37 @@ void gefen_factored_update_cuda(
         return;
     }
 
-    auto new_magnitude = at::zeros_like(m_magnitude);
+    // One pooled zero-filled scratch serves new_magnitude (atomicMax target),
+    // row_sq and col_sq (atomicAdd targets): a single fill launch instead of
+    // three per-tensor at::zeros fills -- the per-param launch count is what
+    // bounds this step (the fills are ~1 us of GPU each but ~2-3 us of enqueue
+    // apiece). Zero-init semantics are unchanged, so this is bit-identical.
+    // The non-capturable tail set_()s m_magnitude onto the new_magnitude view,
+    // which keeps the whole (rows+cols floats larger) pool storage alive until
+    // the next step -- a few KB per 2D param; state_dict's _compact already
+    // clones such non-owning views on serialization.
+    //
+    // Capturable (in-place magnitude writeback, see the phase-2 arg comment):
+    // the pool grows by num_blocks + 1 floats -- a staged copy of the OLD
+    // magnitudes (filled by the EMA launch, read by phase 2, so phase 2 can
+    // write the new magnitudes straight into the persistent m_magnitude and
+    // the per-param copy_ launch disappears from the captured graph) plus a
+    // 1-elem Sum(v_row) accumulator (block-reduced atomicAdd in the EMA
+    // launch, consumed as mean = sum/rows in phase-2 registers, so the
+    // per-param at::mean launch disappears too).
+    const bool inplace_mag = step_scalars_dev != nullptr;
+    auto scratch = at::zeros(
+        {num_blocks + rows + cols + (inplace_mag ? num_blocks + 1 : 0)},
+        m_magnitude.options());
+    auto new_magnitude = scratch.narrow(0, 0, num_blocks).view({num_blocks, 1});
+    auto row_sq = scratch.narrow(0, num_blocks, rows);
+    auto col_sq = scratch.narrow(0, num_blocks + rows, cols);
+    float* old_mag_copy = inplace_mag
+        ? scratch.data_ptr<float>() + num_blocks + rows + cols
+        : nullptr;
+    float* vrow_sum = inplace_mag
+        ? scratch.data_ptr<float>() + 2 * num_blocks + rows + cols
+        : nullptr;
 
     const int codebook_size = static_cast<int>(codebook.numel());
     const int threads = 256;
@@ -1732,8 +2029,6 @@ void gefen_factored_update_cuda(
     // per-block absmax AND the raw row/col sum-of-squares for the Adafactor
     // EMAs -- the separate magnitude launch and the host-side chunked grad^2
     // reduction are both gone.
-    auto row_sq = at::zeros({rows}, m_magnitude.options());
-    auto col_sq = at::zeros({cols}, m_magnitude.options());
     {
         const int64_t grid_x =
             (cols + GEFEN_FACTORED_TILE_COLS - 1) / GEFEN_FACTORED_TILE_COLS;
@@ -1751,7 +2046,7 @@ void gefen_factored_update_cuda(
         AT_DISPATCH_FLOATING_TYPES_AND2(
             at::kHalf, at::kBFloat16, p.scalar_type(),
             "gefen_factored_stats", [&] {
-                gefen_factored_stats_kernel<scalar_t><<<grid, threads, shmem>>>(
+                gefen_factored_stats_kernel<scalar_t><<<grid, threads, shmem, c10::cuda::getCurrentCUDAStream()>>>(
                     grad_view.data_ptr<scalar_t>(), m_sign.data_ptr<uint8_t>(),
                     m_magnitude.data_ptr<float>(), codebook.data_ptr<float>(),
                     new_magnitude.data_ptr<float>(), row_sq.data_ptr<float>(),
@@ -1761,13 +2056,41 @@ void gefen_factored_update_cuda(
         C10_CUDA_KERNEL_LAUNCH_CHECK();
     }
 
-    // EMA advance + mean, all as tiny device ops (no host sync): the caller's
-    // v_row/v_col are updated in place from the raw sums.
-    v_row.mul_(beta2).add_(
-        row_sq.div_(static_cast<double>(cols)), 1.0 - beta2);
-    v_col.mul_(beta2).add_(
-        col_sq.div_(static_cast<double>(rows)), 1.0 - beta2);
-    auto mean_v_row = v_row.mean().reshape({1}).contiguous();
+    // EMA advance as ONE tiny device launch (no host sync): the caller's
+    // v_row/v_col are updated in place from the raw sums. Bit-identical to the
+    // former aten chain v.mul_(beta2).add_(sq.div_(n), 1-beta2) -- see the
+    // kernel comment for the pinned rounding sequence. Non-capturable keeps
+    // the mean on at::mean (its reduction order is bit-preserved); under
+    // capturable the same launch also stages the old-magnitude copy for
+    // phase 2's in-place magnitude writeback AND accumulates Sum(v_row) for
+    // phase 2's in-register mean, so neither a copy_ nor an at::mean launch
+    // remains in the captured graph.
+    {
+        const int64_t total_rc =
+            rows + cols + (inplace_mag ? num_blocks : 0);
+        int64_t ema_blocks = (total_rc + threads - 1) / threads;
+        if (ema_blocks > flat_blocks_cap) ema_blocks = flat_blocks_cap;
+        if (ema_blocks < 1) ema_blocks = 1;
+        const size_t ema_shmem = inplace_mag
+            ? static_cast<size_t>(threads) * sizeof(float)
+            : 0;
+        gefen_factored_v_ema_kernel<<<static_cast<unsigned int>(ema_blocks), threads, ema_shmem, c10::cuda::getCurrentCUDAStream()>>>(
+            v_row.data_ptr<float>(), v_col.data_ptr<float>(),
+            row_sq.data_ptr<float>(), col_sq.data_ptr<float>(),
+            rows, cols, static_cast<float>(beta2),
+            static_cast<float>(1.0 - beta2),
+            1.0f / static_cast<float>(static_cast<double>(cols)),
+            1.0f / static_cast<float>(static_cast<double>(rows)),
+            inplace_mag ? m_magnitude.data_ptr<float>() : nullptr,
+            old_mag_copy,
+            inplace_mag ? num_blocks : 0,
+            vrow_sum);
+        C10_CUDA_KERNEL_LAUNCH_CHECK();
+    }
+    at::Tensor mean_v_row;
+    if (!inplace_mag) {
+        mean_v_row = v_row.mean().reshape({1}).contiguous();
+    }
 
 
     // Phase 2: quantize + parameter update with the in-register factored
@@ -1778,10 +2101,13 @@ void gefen_factored_update_cuda(
             int64_t nblocks = (total_numel + threads - 1) / threads;
             if (nblocks > flat_blocks_cap) nblocks = flat_blocks_cap;
             if (nblocks < 1) nblocks = 1;
-            gefen_update_flat_factored_kernel<scalar_t><<<static_cast<unsigned int>(nblocks), threads, codebook_bytes>>>(
+            gefen_update_flat_factored_kernel<scalar_t><<<static_cast<unsigned int>(nblocks), threads, codebook_bytes, c10::cuda::getCurrentCUDAStream()>>>(
                 p.data_ptr<scalar_t>(), grad_view.data_ptr<scalar_t>(), m_sign.data_ptr<uint8_t>(),
-                m_magnitude.data_ptr<float>(), new_magnitude.data_ptr<float>(),
-                v_row.data_ptr<float>(), v_col.data_ptr<float>(), mean_v_row.data_ptr<float>(),
+                inplace_mag ? old_mag_copy : m_magnitude.data_ptr<float>(),
+                new_magnitude.data_ptr<float>(),
+                v_row.data_ptr<float>(), v_col.data_ptr<float>(),
+                inplace_mag ? vrow_sum : mean_v_row.data_ptr<float>(),
+                inplace_mag ? rows : static_cast<int64_t>(0),
                 codebook.data_ptr<float>(),
                 use_lut ? lut.data_ptr<int16_t>() : nullptr,
                 use_lut ? static_cast<int>(lut.numel() - 1) : 0,
@@ -1790,11 +2116,83 @@ void gefen_factored_update_cuda(
                 static_cast<float>(inv_bias_correction_2),
                 static_cast<float>(inv_bias_correction_1),
                 static_cast<float>(weight_decay_factor),
-                stochastic_round, static_cast<uint64_t>(rng_seed));
+                stochastic_round, static_cast<uint64_t>(rng_seed),
+                seed_dev_ptr,
+                step_scalars_dev,
+                inplace_mag ? m_magnitude.data_ptr<float>() : nullptr);
         });
     C10_CUDA_KERNEL_LAUNCH_CHECK();
 
-    m_magnitude.set_(new_magnitude);
+    if (!inplace_mag) {
+        // Legacy (non-capturable) flow, byte-for-byte unchanged: rebind the
+        // state onto the freshly written scratch -- a host-side set_(), zero
+        // launches. A CUDA graph cannot replay a set_(), which is why the
+        // capturable path instead had phase 2 write the new magnitudes
+        // straight into the persistent m_magnitude (reading the old values
+        // from the scratch copy staged by the EMA launch), keeping replays on
+        // stable addresses with no extra copy launch.
+        m_magnitude.set_(new_magnitude);
+    }
+}
+
+void gefen_factored_v_ema_cuda(
+    at::Tensor v_row,
+    at::Tensor v_col,
+    at::Tensor row_sq,
+    at::Tensor col_sq,
+    double beta2
+) {
+    // Test/inspection entry for the fused factored-v EMA advance (the factored
+    // launcher calls the same kernel inline). Updates v_row/v_col in place:
+    //     v_row = v_row*beta2 + (row_sq/cols)*(1-beta2)   (cols = v_col.numel())
+    //     v_col = v_col*beta2 + (col_sq/rows)*(1-beta2)   (rows = v_row.numel())
+    // bit-identical to the aten chain it replaced; the parity test pins that.
+    if (!v_row.is_cuda() || !v_col.is_cuda() || !row_sq.is_cuda() || !col_sq.is_cuda()) {
+        throw std::invalid_argument("Expected all tensors to be on CUDA.");
+    }
+    if (v_col.device() != v_row.device() || row_sq.device() != v_row.device() ||
+        col_sq.device() != v_row.device()) {
+        throw std::invalid_argument("Expected all tensors on the same device.");
+    }
+    if (!v_row.is_contiguous() || !v_col.is_contiguous() ||
+        !row_sq.is_contiguous() || !col_sq.is_contiguous()) {
+        throw std::invalid_argument("Expected all tensors to be contiguous.");
+    }
+    if (v_row.scalar_type() != at::kFloat || v_col.scalar_type() != at::kFloat ||
+        row_sq.scalar_type() != at::kFloat || col_sq.scalar_type() != at::kFloat) {
+        throw std::invalid_argument("Expected all tensors to have dtype float32.");
+    }
+    const int64_t rows = v_row.numel();
+    const int64_t cols = v_col.numel();
+    if (row_sq.numel() != rows || col_sq.numel() != cols) {
+        throw std::invalid_argument(
+            "Expected row_sq/col_sq numel to match v_row/v_col.");
+    }
+    if (rows == 0 && cols == 0) {
+        return;
+    }
+    if (rows == 0 || cols == 0) {
+        throw std::invalid_argument(
+            "Expected both v_row and v_col to be non-empty.");
+    }
+
+    c10::cuda::CUDAGuard device_guard(v_row.device());
+    const int threads = 256;
+    const int sm_count = cached_sm_count(v_row.get_device());
+    const int64_t flat_blocks_cap = static_cast<int64_t>(sm_count) * 32;
+    const int64_t total_rc = rows + cols;
+    int64_t ema_blocks = (total_rc + threads - 1) / threads;
+    if (ema_blocks > flat_blocks_cap) ema_blocks = flat_blocks_cap;
+    if (ema_blocks < 1) ema_blocks = 1;
+    gefen_factored_v_ema_kernel<<<static_cast<unsigned int>(ema_blocks), threads, 0, c10::cuda::getCurrentCUDAStream()>>>(
+        v_row.data_ptr<float>(), v_col.data_ptr<float>(),
+        row_sq.data_ptr<float>(), col_sq.data_ptr<float>(),
+        rows, cols, static_cast<float>(beta2),
+        static_cast<float>(1.0 - beta2),
+        1.0f / static_cast<float>(static_cast<double>(cols)),
+        1.0f / static_cast<float>(static_cast<double>(rows)),
+        nullptr, nullptr, 0, nullptr);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
 void gefen_quantized_momentum_update_cuda(
@@ -1805,12 +2203,16 @@ void gefen_quantized_momentum_update_cuda(
     at::Tensor momentum_out,
     double beta1,
     bool stochastic_round,
-    int64_t rng_seed
+    int64_t rng_seed,
+    c10::optional<at::Tensor> seed_dev
 ) {
     if (!grad_view.is_cuda() || !m_sign.is_cuda() || !m_magnitude.is_cuda() ||
         !codebook.is_cuda() || !momentum_out.is_cuda()) {
         throw std::invalid_argument("Expected all tensors to be on CUDA.");
     }
+    // Optional capturable device-side stochastic-rounding seed (read by the
+    // phase-2 emit kernel); null -> legacy host-seed path.
+    const int64_t* seed_dev_ptr = resolve_seed_dev_ptr(seed_dev, grad_view);
     if (grad_view.device() != momentum_out.device() || m_sign.device() != momentum_out.device() ||
         m_magnitude.device() != momentum_out.device() || codebook.device() != momentum_out.device()) {
         throw std::invalid_argument("Expected all tensors on the same device.");
@@ -1882,7 +2284,7 @@ void gefen_quantized_momentum_update_cuda(
                 int64_t nblocks = (total_numel + threads - 1) / threads;
                 if (nblocks > flat_blocks_cap) nblocks = flat_blocks_cap;
                 if (nblocks < 1) nblocks = 1;
-                gefen_magnitude_flat_kernel<scalar_t><<<static_cast<unsigned int>(nblocks), threads, codebook_bytes>>>(
+                gefen_magnitude_flat_kernel<scalar_t><<<static_cast<unsigned int>(nblocks), threads, codebook_bytes, c10::cuda::getCurrentCUDAStream()>>>(
                     grad_view.data_ptr<scalar_t>(), m_sign.data_ptr<uint8_t>(),
                     m_magnitude.data_ptr<float>(), codebook.data_ptr<float>(),
                     new_magnitude.data_ptr<float>(), codebook_size, period, total_numel,
@@ -1895,7 +2297,7 @@ void gefen_quantized_momentum_update_cuda(
                 if (blocks_per_row < 1) blocks_per_row = 1;
                 const int64_t grid = num_blocks * blocks_per_row;
                 const size_t shmem = static_cast<size_t>(threads) * sizeof(float) + codebook_bytes;
-                gefen_magnitude_split_kernel<scalar_t><<<static_cast<unsigned int>(grid), threads, shmem>>>(
+                gefen_magnitude_split_kernel<scalar_t><<<static_cast<unsigned int>(grid), threads, shmem, c10::cuda::getCurrentCUDAStream()>>>(
                     grad_view.data_ptr<scalar_t>(), m_sign.data_ptr<uint8_t>(),
                     m_magnitude.data_ptr<float>(), codebook.data_ptr<float>(),
                     new_magnitude.data_ptr<float>(), codebook_size, period, num_blocks, blocks_per_row,
@@ -1911,12 +2313,13 @@ void gefen_quantized_momentum_update_cuda(
             int64_t nblocks = (total_numel + threads - 1) / threads;
             if (nblocks > flat_blocks_cap) nblocks = flat_blocks_cap;
             if (nblocks < 1) nblocks = 1;
-            gefen_momentum_emit_flat_kernel<scalar_t><<<static_cast<unsigned int>(nblocks), threads, codebook_bytes>>>(
+            gefen_momentum_emit_flat_kernel<scalar_t><<<static_cast<unsigned int>(nblocks), threads, codebook_bytes, c10::cuda::getCurrentCUDAStream()>>>(
                 grad_view.data_ptr<scalar_t>(), m_sign.data_ptr<uint8_t>(),
                 m_magnitude.data_ptr<float>(), new_magnitude.data_ptr<float>(),
                 codebook.data_ptr<float>(), momentum_out.data_ptr<scalar_t>(), codebook_size,
                 period, total_numel, static_cast<float>(beta1),
-                stochastic_round, static_cast<uint64_t>(rng_seed));
+                stochastic_round, static_cast<uint64_t>(rng_seed),
+                seed_dev_ptr);
         });
     C10_CUDA_KERNEL_LAUNCH_CHECK();
 
@@ -1940,11 +2343,20 @@ void automatic_gefen_fused_update_v2_full_cuda(
     double inv_bias_correction_1,
     double weight_decay_factor,
     bool stochastic_round,
-    int64_t rng_seed
+    int64_t rng_seed,
+    c10::optional<at::Tensor> step_scalars,
+    c10::optional<at::Tensor> seed_dev
 ) {
     if (packed_indices) {
         throw std::invalid_argument("v2 fused update does not support packed indices.");
     }
+    // Optional capturable device-scalar buffer ([lr, 1/sqrt(bc2), 1/bc1, wd]):
+    // the finalize kernel reads slots 1-2, the phase-2 update reads slots 0/3.
+    // Null -> bit-identical legacy host-scalar path.
+    const float* step_scalars_dev = resolve_step_scalars_ptr(step_scalars, p);
+    // Optional capturable device-side stochastic-rounding seed (read by the
+    // phase-2 quantize kernel); null -> legacy host-seed path.
+    const int64_t* seed_dev_ptr = resolve_seed_dev_ptr(seed_dev, p);
     // Optional search LUT (empty tensor -> full-range binary search), used by
     // the phase-2 quantize kernel. Same contract as the v1-full path.
     const bool use_lut = lut.numel() > 0;
@@ -2043,7 +2455,7 @@ void automatic_gefen_fused_update_v2_full_cuda(
                 int64_t nblocks = (total_numel + threads - 1) / threads;
                 if (nblocks > flat_blocks_cap) nblocks = flat_blocks_cap;
                 if (nblocks < 1) nblocks = 1;
-                gefen_magnitude_sumsq_flat_kernel<scalar_t><<<static_cast<unsigned int>(nblocks), threads, codebook_bytes>>>(
+                gefen_magnitude_sumsq_flat_kernel<scalar_t><<<static_cast<unsigned int>(nblocks), threads, codebook_bytes, c10::cuda::getCurrentCUDAStream()>>>(
                     grad_view.data_ptr<scalar_t>(), m_sign.data_ptr<uint8_t>(),
                     m_magnitude.data_ptr<float>(), codebook.data_ptr<float>(),
                     new_magnitude.data_ptr<float>(), sumsq.data_ptr<float>(),
@@ -2057,7 +2469,7 @@ void automatic_gefen_fused_update_v2_full_cuda(
                 const int64_t grid = num_blocks * blocks_per_row;
                 // Two per-thread reduction buffers (max, sum) plus the codebook.
                 const size_t shmem = 2 * static_cast<size_t>(threads) * sizeof(float) + codebook_bytes;
-                gefen_magnitude_sumsq_split_kernel<scalar_t><<<static_cast<unsigned int>(grid), threads, shmem>>>(
+                gefen_magnitude_sumsq_split_kernel<scalar_t><<<static_cast<unsigned int>(grid), threads, shmem, c10::cuda::getCurrentCUDAStream()>>>(
                     grad_view.data_ptr<scalar_t>(), m_sign.data_ptr<uint8_t>(),
                     m_magnitude.data_ptr<float>(), codebook.data_ptr<float>(),
                     new_magnitude.data_ptr<float>(), sumsq.data_ptr<float>(),
@@ -2072,11 +2484,12 @@ void automatic_gefen_fused_update_v2_full_cuda(
         int64_t fblocks = (num_blocks + fthreads - 1) / fthreads;
         if (fblocks > flat_blocks_cap) fblocks = flat_blocks_cap;
         if (fblocks < 1) fblocks = 1;
-        gefen_finalize_vmean_stepsize_kernel<<<static_cast<unsigned int>(fblocks), fthreads>>>(
+        gefen_finalize_vmean_stepsize_kernel<<<static_cast<unsigned int>(fblocks), fthreads, 0, c10::cuda::getCurrentCUDAStream()>>>(
             vmean.data_ptr<float>(), sumsq.data_ptr<float>(), num_blocks, period,
             static_cast<float>(beta2), static_cast<float>(eps),
             static_cast<float>(inv_sqrt_bias_correction_2),
-            static_cast<float>(inv_bias_correction_1));
+            static_cast<float>(inv_bias_correction_1),
+            step_scalars_dev);
         C10_CUDA_KERNEL_LAUNCH_CHECK();
     }
 
@@ -2087,7 +2500,7 @@ void automatic_gefen_fused_update_v2_full_cuda(
             int64_t nblocks = (total_numel + threads - 1) / threads;
             if (nblocks > flat_blocks_cap) nblocks = flat_blocks_cap;
             if (nblocks < 1) nblocks = 1;
-            gefen_update_flat_full_kernel<scalar_t><<<static_cast<unsigned int>(nblocks), threads, codebook_bytes>>>(
+            gefen_update_flat_full_kernel<scalar_t><<<static_cast<unsigned int>(nblocks), threads, codebook_bytes, c10::cuda::getCurrentCUDAStream()>>>(
                 p.data_ptr<scalar_t>(), grad_view.data_ptr<scalar_t>(), m_sign.data_ptr<uint8_t>(),
                 m_magnitude.data_ptr<float>(), new_magnitude.data_ptr<float>(),
                 sumsq.data_ptr<float>(), codebook.data_ptr<float>(),
@@ -2096,10 +2509,23 @@ void automatic_gefen_fused_update_v2_full_cuda(
                 codebook_size,
                 period, total_numel, static_cast<float>(beta1), static_cast<float>(lr),
                 static_cast<float>(weight_decay_factor),
-                stochastic_round, static_cast<uint64_t>(rng_seed));
+                stochastic_round, static_cast<uint64_t>(rng_seed),
+                seed_dev_ptr,
+                step_scalars_dev);
         });
     C10_CUDA_KERNEL_LAUNCH_CHECK();
 
+    if (step_scalars_dev != nullptr) {
+        // Capturable path: set_() is a HOST-side storage rebind, which a CUDA
+        // graph cannot replay -- after capture the state tensor would stay
+        // pointed at the capture-time scratch while the kernels keep reading
+        // the (stale, never-again-updated) pre-capture pointer. Copy the new
+        // magnitudes back into the persistent state buffer on-stream instead,
+        // so replays read/write stable addresses. ([num_blocks, 1] D2D copy --
+        // tiny next to the update kernels.)
+        m_magnitude.copy_(new_magnitude);
+        return;
+    }
     // Repoint m_magnitude at the just-computed magnitudes instead of copying them
     // back. copy_ was a full-size D2D memcpy + its own launch every step per
     // param; set_ is a metadata-only storage rebind (no kernel launch, no copy)

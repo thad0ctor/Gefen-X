@@ -97,6 +97,7 @@ class GefenMuonHybrid(torch.optim.Optimizer):
         normuon_beta2=0.95,
         normuon_eps=1e-8,
         cautious=False,
+        capturable=False,
         verbose=False,
     ):
         muon_named_params = list(muon_named_params)
@@ -167,6 +168,7 @@ class GefenMuonHybrid(torch.optim.Optimizer):
                 normuon_beta2=normuon_beta2,
                 normuon_eps=normuon_eps,
                 cautious=cautious,
+                capturable=capturable,
                 verbose=verbose,
             )
             if muon_named_params
@@ -223,6 +225,7 @@ class GefenMuonHybrid(torch.optim.Optimizer):
                                  # default drift.
                                  factored_v_2d=False,
                                  stochastic_round=stochastic_round,
+                                 capturable=capturable,
                                  verbose=verbose)
         else:
             self.backup = (
@@ -237,6 +240,7 @@ class GefenMuonHybrid(torch.optim.Optimizer):
                     force_2d_period_one=backup_2d_period_one,
                     factored_v_2d=False,  # see the pinned-off note above
                     stochastic_round=stochastic_round,
+                    capturable=capturable,
                     verbose=verbose,
                 )
                 if backup_named_params
