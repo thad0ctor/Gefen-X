@@ -125,6 +125,11 @@ def _should_use_v2(num_blocks: int, period: int, device: torch.device) -> bool:
         return _GEFEN_UPDATE_V2_ENV.lower() not in {"0", "false", "no", "off"}
     if period <= _V2_PERIOD_MAX:
         return True
+    if device.type != "cuda":
+        # Callers only act on the answer when the fused CUDA path is active;
+        # never touch the CUDA runtime for a CPU/other-device param (it would
+        # initialize (or crash on) CUDA on CPU-only hosts).
+        return False
     return num_blocks < _V2_BLOCKS_PER_SM * _sm_count(device)
 
 

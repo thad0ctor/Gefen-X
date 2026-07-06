@@ -19,6 +19,7 @@ classifiers = [
   "Programming Language :: Python :: 3.9",
   "Programming Language :: Python :: 3.10",
   "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
   "License :: OSI Approved :: MIT License",
   "Operating System :: POSIX :: Linux",
   "Topic :: Scientific/Engineering :: Artificial Intelligence"
@@ -30,14 +31,18 @@ dependencies = [
   "torch"
 ]
 
+[project.optional-dependencies]
+test = ["pytest"]
+
 [project.urls]
 Repository = "https://github.com/ndvbd/Gefen"
 Issues = "https://github.com/ndvbd/Gefen/issues"
 
 [tool.setuptools]
 include-package-data = true
-packages = ["gefen", "gefen.kernels"]
+packages = ["gefen", "gefen.kernels", "gefen.tools"]
 
 [tool.setuptools.package-dir]
 gefen = "."
 "gefen.kernels" = "kernels"
+"gefen.tools" = "tools"
