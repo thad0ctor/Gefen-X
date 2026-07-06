@@ -10,7 +10,8 @@ Every measured value is **peak VRAM** (`torch.cuda.max_memory_allocated`), in Gi
 
 - **Batch:** a short, two-sequence step (a memorization smoke workload).
 - **Precision:** bf16 weights and gradients.
-- **Gradient checkpointing:** on.
+- **Gradient checkpointing:** **on** — this is why the numbers are a clean floor; with it off, peak VRAM is far higher and dominated by activations rather than optimizer state.
+- **CPU / disk offload:** **off** — all weights, gradients, and optimizer state stay resident on the GPU(s); nothing is offloaded to host RAM or disk.
 - **Optimizer:** Gefen with its defaults (`fused=True`, `factored_v_2d=True`) for the Gefen columns; `torch.optim.AdamW` (bf16 state) for the AdamW column. LoRA/QLoRA adapters are stepped by Gefen.
 
 Because the batch and sequence length are small and gradient checkpointing is on, **activation memory is negligible here** — the numbers isolate what scales with model size: weights + gradients + optimizer state. Treat them as the memory *floor*; real training adds activation memory on top, which grows with batch size × sequence length (see [Estimating other sizes](#estimating-other-sizes)). Measured on Qwen models (dense 0.6B–72B and Qwen3 30B/35B MoE) on RTX PRO 6000 (96 GB) cards.
