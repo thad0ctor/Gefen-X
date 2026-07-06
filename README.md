@@ -66,6 +66,8 @@ Verified with **PyTorch 2.12 (cu133) / Python 3.12**. Optional baselines used in
 
 Validated with full-parameter fine-tune smoke tests on 24 GB GPUs across modern LLMs/VLMs and media-generation models — Gemma 4, Qwen3-VL, Mistral 3, MiniCPM-V 4.6, LFM2.5 (+VL), SDXL, Stable Diffusion 3.5, FLUX.1-dev (12B via FSDP2), FLUX.2-klein, Z-Image (6B via FSDP2), Anima, and ACE-Step 1.5 — and on 20-30B MoEs (GPT-OSS-20B, GLM-4.7-Flash) via LoRA adapter training. Per-model results, method, and hardware footprints: **[COMPATIBILITY.md](COMPATIBILITY.md)**.
 
+**Sizing a GPU?** [Hardware Requirements](docs/hardware.md) gives measured peak VRAM per model size and method (full fine-tune with Gefen vs AdamW, LoRA, QLoRA), plus a per-card rule of thumb for other sizes.
+
 ## Quick Start
 
 ```python
