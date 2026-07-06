@@ -49,7 +49,7 @@ def main():
 
     from train import apply_template
 
-    device = "cuda"
+    device = "cuda" if torch.cuda.is_available() else "cpu"
     tok = AutoTokenizer.from_pretrained(args.model)
     if tok.pad_token is None:
         tok.pad_token = tok.eos_token

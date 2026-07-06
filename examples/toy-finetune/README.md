@@ -31,7 +31,7 @@ Qwen3-0.6B, one epoch on an RTX 3090, 200 held-out test questions:
 | Model | Format compliance | Solve rate |
 |---|---|---|
 | Base model (control) | 0% | 0% |
-| Fine-tuned | 94.0% | 44.5% |
+| Fine-tuned | 95.0% | 44.5% |
 
 Solve rate means the block's `Answer:` matches the gold GSM8K answer exactly. The few compliance misses are answers that run past the generation cap on the hardest problems.
 
@@ -51,9 +51,9 @@ Same question after fine-tuning:
 
 > ```
 > [GEFEN_REPLY]
-> Explanation: Ricardo gets 5 x 22 = 110 tomatoes.
-> He gets 8 x 4 = 32 eggplants.
-> So, he gets 110 + 32 = 142 fruits.
+> Explanation: Ricardo gets 5 x 22 = 110 tomatoes from his tomato plants.
+> He gets 8 x 4 = 32 eggplants from his eggplant plants.
+> So, he gets 110 + 32 = 142 fruits from his plants.
 > Answer: 142
 > [/GEFEN_REPLY]
 > ```
@@ -64,9 +64,9 @@ Same script, one flag — `train.py` prints peak VRAM and optimizer-state size a
 
 | `--optimizer` | Optimizer state | Peak VRAM | Train time | Compliance | Solve rate |
 |---|---|---|---|---|---|
-| `gefen` | 0.57 GiB | 16.1 GiB | 3.8 min | 94.0% | 44.5% |
-| `hybrid` (GefenMuonHybrid) | 0.57 GiB | 16.1 GiB | 6.7 min | 94.5% | 48.5% |
-| `adamw` | 2.22 GiB | 17.8 GiB | 3.7 min | 93.5% | 43.0% |
+| `gefen` | 0.57 GiB | 16.2 GiB | 3.7 min | 95.0% | 44.5% |
+| `hybrid` (GefenMuonHybrid) | 0.57 GiB | 16.2 GiB | 6.7 min | 91.5% | 46.0% |
+| `adamw` | 2.22 GiB | 17.8 GiB | 3.7 min | 96.0% | 44.5% |
 
 Each optimizer defaults to its fair learning rate (AdamW `5e-5`, Gefen `3e-5`, hybrid `5e-5`); override with `--lr`. The memory gap grows with model size — see [hardware requirements](../../docs/hardware.md).
 

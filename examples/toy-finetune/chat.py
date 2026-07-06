@@ -23,7 +23,7 @@ def main():
 
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
-    device = "cuda"
+    device = "cuda" if torch.cuda.is_available() else "cpu"
     tok = AutoTokenizer.from_pretrained(args.model)
     model = AutoModelForCausalLM.from_pretrained(
         args.model, dtype=torch.bfloat16, attn_implementation="sdpa"
@@ -53,7 +53,7 @@ def main():
         gen_kwargs = dict(
             do_sample=args.temperature > 0,
             max_new_tokens=args.max_new_tokens,
-            pad_token_id=tok.pad_token_id or tok.eos_token_id,
+            pad_token_id=tok.pad_token_id if tok.pad_token_id is not None else tok.eos_token_id,
         )
         if args.temperature > 0:
             gen_kwargs["temperature"] = args.temperature

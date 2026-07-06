@@ -53,8 +53,15 @@ def load_examples(path, tok, seq_len):
         for line in f:
             messages = json.loads(line)["messages"]
             prompt_ids = apply_template(tok, messages[:-1], add_generation_prompt=True)
-            reply_ids = tok(messages[-1]["content"], add_special_tokens=False).input_ids
-            reply_ids = reply_ids + [tok.eos_token_id]
+            full_ids = apply_template(tok, messages, add_generation_prompt=False)
+            if full_ids[: len(prompt_ids)] == prompt_ids and len(full_ids) > len(prompt_ids):
+                # reply as the template itself encodes it, terminator included
+                reply_ids = full_ids[len(prompt_ids):]
+            else:
+                # template renders history differently from the generation prompt:
+                # fall back to raw reply text + EOS
+                reply_ids = tok(messages[-1]["content"], add_special_tokens=False).input_ids
+                reply_ids = [*reply_ids, tok.eos_token_id]
             if len(prompt_ids) + len(reply_ids) > seq_len:
                 skipped += 1
                 continue
@@ -129,7 +136,7 @@ def main():
 
     lr = args.lr if args.lr is not None else DEFAULT_LR[args.optimizer]
     out_dir = args.out_dir or os.path.join("runs", args.optimizer + ("-lora" if args.lora else ""))
-    device = "cuda"
+    device = "cuda" if torch.cuda.is_available() else "cpu"
     torch.manual_seed(args.seed)
     rng = random.Random(args.seed)
 
@@ -183,7 +190,8 @@ def main():
 
     steps_per_epoch = math.ceil(len(examples) / args.batch_size / args.grad_accum)
     total_steps = steps_per_epoch * args.epochs
-    torch.cuda.reset_peak_memory_stats()
+    if device == "cuda":
+        torch.cuda.reset_peak_memory_stats()
     step, tokens_seen, t0 = 0, 0, time.time()
     recent = []
     for epoch in range(args.epochs):
@@ -226,7 +234,7 @@ def main():
         "final_loss": round(torch.stack(recent).mean().item(), 4),
         "train_time_s": round(time.time() - t0, 1),
         "tokens_per_s": round(tokens_seen / (time.time() - t0)),
-        "peak_vram_GiB": round(torch.cuda.max_memory_allocated() / 2**30, 2),
+        "peak_vram_GiB": round(torch.cuda.max_memory_allocated() / 2**30, 2) if device == "cuda" else 0.0,
         "optimizer_state_GiB": round(optimizer_state_bytes(opt) / 2**30, 3),
     }
     print(json.dumps(summary, indent=2))
