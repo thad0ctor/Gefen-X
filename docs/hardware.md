@@ -64,7 +64,7 @@ Full fine-tuning holds three things per parameter, plus activations. Backing the
 
 AdamW keeps two moment buffers plus a transient step workspace; Gefen replaces the moments with a quantized codebook (≈ 1 B/param). The classic mixed-precision AdamW recipe with **fp32** optimizer state is heavier still (≈ 8 B/param of state alone), so on that comparison Gefen's advantage is larger than the ≈2× shown here.
 
-```
+```text
 full-FT floor (GiB) ≈ params_in_billions × bytes_per_param × 0.93
                     Gefen ≈ params_B × 5     AdamW ≈ params_B × 10
 LoRA floor (GiB)  ≈ params_B × 2      (frozen bf16 base dominates)
