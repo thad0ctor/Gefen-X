@@ -28,7 +28,7 @@ Because the batch and sequence length are small and gradient checkpointing is on
 | 27B | 121 ᵉ | 241 ᵉ | 51.4 | **22.6** |
 | 30B-A3B (MoE) | 142 ᵉ | 284 ᵉ | 57.1 | 27 ᵉ |
 | 35B-A3B (MoE) | 156 ᵉ | 312 ᵉ | 64.8 | 30 ᵉ |
-| 72B | 339 ᵉ | 677 ᵉ | 138 ᵈ | **45.5** |
+| 72B | 339 ᵉ | 677 ᵉ | 138 ᵈ | 45.5 |
 
 Values in GiB. **Bold** = fits a single **24 GB** card (3090 / 4090), with a little headroom left for activations. Plain values fit a larger single card (48 / 80 / 96 GB). Markers: **ᶠ** measured under FSDP2 on 2×96 GB (single-card OOM — see next table); **ᵈ** LoRA base sharded across 2×96 GB (`device_map`); **ᵉ** estimated from the per-parameter floor below (full fine-tune above 14B overflows even a 96 GB card, and MoE QLoRA hits a PEFT expert-upcast limit — use FSDP2 or the estimate). All other cells are single-GPU measurements.
 
