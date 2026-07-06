@@ -1,4 +1,5 @@
 #include <c10/cuda/CUDAGuard.h>
+#include <c10/cuda/CUDAStream.h>
 #include <c10/cuda/CUDAMacros.h>
 #include <cuda.h>
 #include <cuda_runtime.h>
@@ -140,14 +141,14 @@ at::Tensor average_within_block_variance_cuda(
         "average_within_block_variance_cuda",
         [&] {
             if (input_is_squared) {
-                average_within_block_variance_kernel<scalar_t, true><<<grid, block, shared_bytes>>>(
+                average_within_block_variance_kernel<scalar_t, true><<<grid, block, shared_bytes, c10::cuda::getCurrentCUDAStream()>>>(
                     values.data_ptr<scalar_t>(),
                     period,
                     logical_blocks,
                     result.data_ptr<float>()
                 );
             } else {
-                average_within_block_variance_kernel<scalar_t, false><<<grid, block, shared_bytes>>>(
+                average_within_block_variance_kernel<scalar_t, false><<<grid, block, shared_bytes, c10::cuda::getCurrentCUDAStream()>>>(
                     values.data_ptr<scalar_t>(),
                     period,
                     logical_blocks,

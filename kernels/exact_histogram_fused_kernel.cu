@@ -1,4 +1,5 @@
 #include <c10/cuda/CUDAGuard.h>
+#include <c10/cuda/CUDAStream.h>
 #include <c10/cuda/CUDAMacros.h>
 #include <cuda.h>
 #include <cuda_runtime.h>
@@ -147,7 +148,7 @@ void gefen_exact_histogram_cuda(
         grad_flat.scalar_type(),
         "gefen_exact_histogram_cuda",
         [&] {
-            gefen_exact_histogram_kernel<scalar_t><<<grid, block>>>(
+            gefen_exact_histogram_kernel<scalar_t><<<grid, block, 0, c10::cuda::getCurrentCUDAStream()>>>(
                 grad_flat.data_ptr<scalar_t>(),
                 period,
                 num_blocks,

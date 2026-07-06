@@ -1,5 +1,8 @@
 #include <pybind11/pybind11.h>
+#include <pybind11/stl.h>
 #include <torch/extension.h>
+
+#include <c10/util/Optional.h>
 
 namespace py = pybind11;
 
@@ -44,7 +47,9 @@ void automatic_gefen_fused_full_update_cuda(
     double inv_bias_correction_1,
     double weight_decay_factor,
     bool stochastic_round,
-    int64_t rng_seed
+    int64_t rng_seed,
+    c10::optional<at::Tensor> step_scalars,
+    c10::optional<at::Tensor> seed_dev
 );
 
 void automatic_gefen_fused_update_v2_full_cuda(
@@ -64,7 +69,9 @@ void automatic_gefen_fused_update_v2_full_cuda(
     double inv_bias_correction_1,
     double weight_decay_factor,
     bool stochastic_round,
-    int64_t rng_seed
+    int64_t rng_seed,
+    c10::optional<at::Tensor> step_scalars,
+    c10::optional<at::Tensor> seed_dev
 );
 
 void gefen_quantized_momentum_update_cuda(
@@ -75,7 +82,8 @@ void gefen_quantized_momentum_update_cuda(
     at::Tensor momentum_out,
     double beta1,
     bool stochastic_round,
-    int64_t rng_seed
+    int64_t rng_seed,
+    c10::optional<at::Tensor> seed_dev
 );
 
 void gefen_factored_update_cuda(
@@ -96,7 +104,17 @@ void gefen_factored_update_cuda(
     double inv_bias_correction_1,
     double weight_decay_factor,
     bool stochastic_round,
-    int64_t rng_seed
+    int64_t rng_seed,
+    c10::optional<at::Tensor> step_scalars,
+    c10::optional<at::Tensor> seed_dev
+);
+
+void gefen_factored_v_ema_cuda(
+    at::Tensor v_row,
+    at::Tensor v_col,
+    at::Tensor row_sq,
+    at::Tensor col_sq,
+    double beta2
 );
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
@@ -149,7 +167,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         py::arg("inv_bias_correction_1"),
         py::arg("weight_decay_factor"),
         py::arg("stochastic_round") = false,
-        py::arg("rng_seed") = 0
+        py::arg("rng_seed") = 0,
+        py::arg("step_scalars") = py::none(),
+        py::arg("seed_dev") = py::none()
     );
     m.def(
         "automatic_gefen_fused_update_v2_full_cuda",
@@ -172,7 +192,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         py::arg("inv_bias_correction_1"),
         py::arg("weight_decay_factor"),
         py::arg("stochastic_round") = false,
-        py::arg("rng_seed") = 0
+        py::arg("rng_seed") = 0,
+        py::arg("step_scalars") = py::none(),
+        py::arg("seed_dev") = py::none()
     );
     m.def(
         "gefen_factored_update_cuda",
@@ -196,7 +218,20 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         py::arg("inv_bias_correction_1"),
         py::arg("weight_decay_factor"),
         py::arg("stochastic_round") = false,
-        py::arg("rng_seed") = 0
+        py::arg("rng_seed") = 0,
+        py::arg("step_scalars") = py::none(),
+        py::arg("seed_dev") = py::none()
+    );
+    m.def(
+        "gefen_factored_v_ema_cuda",
+        &gefen_factored_v_ema_cuda,
+        "Fused in-place v_row/v_col EMA advance for the factored update "
+        "(bit-identical to v.mul_(beta2).add_(sq.div_(n), 1-beta2)) (CUDA)",
+        py::arg("v_row"),
+        py::arg("v_col"),
+        py::arg("row_sq"),
+        py::arg("col_sq"),
+        py::arg("beta2")
     );
     m.def(
         "gefen_quantized_momentum_update_cuda",
@@ -210,6 +245,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         py::arg("momentum_out"),
         py::arg("beta1"),
         py::arg("stochastic_round") = false,
-        py::arg("rng_seed") = 0
+        py::arg("rng_seed") = 0,
+        py::arg("seed_dev") = py::none()
     );
 }

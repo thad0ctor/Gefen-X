@@ -1,4 +1,5 @@
 import os
+import warnings
 from typing import Optional
 
 import torch
@@ -21,6 +22,18 @@ _EXTENSION_MODULE = None
 # bit-identical either way, so a misroute costs only speed, never correctness.
 _V2_PERIOD_MAX = 16  # period <= 16 underfills the warp (threads = next_pow2)
 _V2_BLOCKS_PER_SM = 2  # below 2 blocks/SM the single-pass kernel can't fill SMs
+
+# Capturable-only tiny-param override for the FULL-update routing (see
+# Gefen._step_automatic): a param this small is launch-bound, not
+# occupancy-bound -- the v1-full path is ONE kernel while the v2-full path is
+# 4-5 launches (zero-fill + two phases + finalize + the capturable magnitude
+# copy), so inside a replayed/captured graph v1 wins on node count no matter
+# how badly it underfills the SMs. v1-full and v2-full are NOT bit-identical
+# (the in-kernel vmean grad^2 sums reduce in different orders -- measured
+# ulp-level vmean/p diffs, m_sign identical), so the override applies ONLY
+# under capturable=True, where there is no bit-exact-vs-history contract;
+# capturable=False keeps the historical routing bit-for-bit.
+_CAPT_V1_FULL_TINY_NUMEL = 1 << 14
 _GEFEN_UPDATE_V2_ENV = os.environ.get("GEFEN_UPDATE_V2")
 _SM_COUNT_BY_DEVICE: dict = {}
 
@@ -38,9 +51,18 @@ _LUT_CACHE: dict = {}
 
 
 def _codebook_search_lut(codebook: torch.Tensor) -> torch.Tensor:
-    key = (id(codebook), codebook._version, codebook.device)
+    # Keyed by data_ptr, NOT id(): the torch-custom-op boundary (compiled
+    # steps route the fused calls through torch.ops.gefen.*) rewraps tensors
+    # in fresh Python objects per call, so an id() key would miss every time
+    # and rebuild the LUT per param per step -- and the rebuild allocations
+    # would land inside the cudagraph pool during reduce-overhead recording,
+    # which cudagraph trees rejects ("not tracked as outputs"). The cache
+    # entry keeps a reference to the codebook tensor, so its storage (and
+    # data_ptr) cannot be freed and reused while the entry lives; a codebook
+    # refresh bumps _version or lands in new storage, changing the key.
+    key = (codebook.data_ptr(), codebook._version, codebook.device)
     cached = _LUT_CACHE.get(key)
-    if cached is not None and cached[0] is codebook:
+    if cached is not None:
         return cached[1]
     # Entry buckets are monotone because the codebook is sorted ascending (the
     # kernels' binary search already relies on that). Count entries per bucket
@@ -171,6 +193,246 @@ def automatic_gefen_fused_update_cuda(
     )
 
 
+def _fused_full_update_impl(
+    p: torch.Tensor,
+    grad_view: torch.Tensor,
+    m_sign: torch.Tensor,
+    m_magnitude: torch.Tensor,
+    vmean: torch.Tensor,
+    codebook: torch.Tensor,
+    packed_indices: bool,
+    beta1: float,
+    beta2: float,
+    lr: float,
+    eps: float,
+    inv_sqrt_bias_correction_2: float,
+    inv_bias_correction_1: float,
+    weight_decay_factor: float,
+    stochastic_round: bool = False,
+    rng_seed: int = 0,
+    step_scalars: Optional[torch.Tensor] = None,
+    codebook_lut: Optional[torch.Tensor] = None,
+    seed_dev: Optional[torch.Tensor] = None,
+) -> None:
+    grad_c = grad_view if grad_view.is_contiguous() else grad_view.contiguous()
+    cb_c = codebook if codebook.is_contiguous() else codebook.contiguous()
+
+    module = _load_extension()
+    module.automatic_gefen_fused_full_update_cuda(
+        p,
+        grad_c,
+        m_sign,
+        m_magnitude,
+        vmean,
+        cb_c,
+        codebook_lut if codebook_lut is not None
+        else _codebook_search_lut(cb_c),
+        packed_indices,
+        beta1,
+        beta2,
+        lr,
+        eps,
+        inv_sqrt_bias_correction_2,
+        inv_bias_correction_1,
+        weight_decay_factor,
+        stochastic_round,
+        rng_seed,
+        step_scalars,
+        seed_dev,
+    )
+
+
+def _factored_update_impl(
+    p: torch.Tensor,
+    grad_view: torch.Tensor,
+    m_sign: torch.Tensor,
+    m_magnitude: torch.Tensor,
+    v_row: torch.Tensor,
+    v_col: torch.Tensor,
+    codebook: torch.Tensor,
+    cols: int,
+    beta1: float,
+    beta2: float,
+    lr: float,
+    eps: float,
+    inv_bias_correction_2: float,
+    inv_bias_correction_1: float,
+    weight_decay_factor: float,
+    stochastic_round: bool = False,
+    rng_seed: int = 0,
+    step_scalars: Optional[torch.Tensor] = None,
+    codebook_lut: Optional[torch.Tensor] = None,
+    seed_dev: Optional[torch.Tensor] = None,
+) -> None:
+    grad_c = grad_view if grad_view.is_contiguous() else grad_view.contiguous()
+    cb_c = codebook if codebook.is_contiguous() else codebook.contiguous()
+
+    module = _load_extension()
+    module.gefen_factored_update_cuda(
+        p,
+        grad_c,
+        m_sign,
+        m_magnitude,
+        v_row,
+        v_col,
+        cb_c,
+        codebook_lut if codebook_lut is not None
+        else _codebook_search_lut(cb_c),
+        cols,
+        beta1,
+        beta2,
+        lr,
+        eps,
+        inv_bias_correction_2,
+        inv_bias_correction_1,
+        weight_decay_factor,
+        stochastic_round,
+        rng_seed,
+        step_scalars,
+        seed_dev,
+    )
+
+
+def _quantized_momentum_update_impl(
+    grad_view: torch.Tensor,
+    m_sign: torch.Tensor,
+    m_magnitude: torch.Tensor,
+    codebook: torch.Tensor,
+    momentum_out: torch.Tensor,
+    beta1: float,
+    stochastic_round: bool = False,
+    rng_seed: int = 0,
+    seed_dev: Optional[torch.Tensor] = None,
+) -> None:
+    grad_c = grad_view if grad_view.is_contiguous() else grad_view.contiguous()
+    cb_c = codebook if codebook.is_contiguous() else codebook.contiguous()
+
+    module = _load_extension()
+    module.gefen_quantized_momentum_update_cuda(
+        grad_c, m_sign, m_magnitude, cb_c, momentum_out, beta1,
+        stochastic_round, rng_seed, seed_dev
+    )
+
+
+def _fused_update_v2_full_impl(
+    p: torch.Tensor,
+    grad_view: torch.Tensor,
+    m_sign: torch.Tensor,
+    m_magnitude: torch.Tensor,
+    vmean: torch.Tensor,
+    codebook: torch.Tensor,
+    packed_indices: bool,
+    beta1: float,
+    beta2: float,
+    lr: float,
+    eps: float,
+    inv_sqrt_bias_correction_2: float,
+    inv_bias_correction_1: float,
+    weight_decay_factor: float,
+    stochastic_round: bool = False,
+    rng_seed: int = 0,
+    step_scalars: Optional[torch.Tensor] = None,
+    codebook_lut: Optional[torch.Tensor] = None,
+    seed_dev: Optional[torch.Tensor] = None,
+) -> None:
+    grad_c = grad_view if grad_view.is_contiguous() else grad_view.contiguous()
+    cb_c = codebook if codebook.is_contiguous() else codebook.contiguous()
+
+    module = _load_extension()
+    module.automatic_gefen_fused_update_v2_full_cuda(
+        p,
+        grad_c,
+        m_sign,
+        m_magnitude,
+        vmean,
+        cb_c,
+        codebook_lut if codebook_lut is not None
+        else _codebook_search_lut(cb_c),
+        packed_indices,
+        beta1,
+        beta2,
+        lr,
+        eps,
+        inv_sqrt_bias_correction_2,
+        inv_bias_correction_1,
+        weight_decay_factor,
+        stochastic_round,
+        rng_seed,
+        step_scalars,
+        seed_dev,
+    )
+
+
+def _compile_op_fake(*args, **kwargs) -> None:
+    # The registered ops return nothing and only mutate their tensor arguments
+    # in place (declared via mutates_args), so fake-tensor propagation has
+    # nothing to compute.
+    return None
+
+
+def _register_compile_ops() -> bool:
+    # torch.compile support: dynamo cannot trace the raw pybind kernel entry
+    # points, so a compiled optimizer step graph-breaks at EVERY per-param
+    # kernel call (~hundreds of breaks per step). Registering the wrappers as
+    # torch custom ops (namespace ``gefen``) lets dynamo keep them in the
+    # graph as opaque mutable ops: the whole step traces into one graph that
+    # cudagraph trees can capture end to end. Only the CAPTURABLE entry points
+    # are routed through the ops (see the ``step_scalars is not None`` gates
+    # in the public wrappers): the non-capturable factored/v2-full kernels
+    # rebind ``m_magnitude``'s storage with set_(), which would violate the
+    # custom-op in-place mutation contract (and non-capturable step() is not
+    # the supported torch.compile surface anyway). The momentum op always
+    # copies in place, so it is compile-safe in both modes.
+    custom_op = getattr(torch.library, "custom_op", None)
+    if custom_op is None:  # very old torch: compile support is best-effort
+        return False
+    try:
+        for name, fn, mutates in (
+            (
+                "fused_full_update",
+                _fused_full_update_impl,
+                ("p", "m_sign", "m_magnitude", "vmean"),
+            ),
+            (
+                "factored_update",
+                _factored_update_impl,
+                ("p", "m_sign", "m_magnitude", "v_row", "v_col"),
+            ),
+            (
+                "quantized_momentum_update",
+                _quantized_momentum_update_impl,
+                ("m_sign", "m_magnitude", "momentum_out"),
+            ),
+            (
+                "fused_update_v2_full",
+                _fused_update_v2_full_impl,
+                ("p", "m_sign", "m_magnitude", "vmean"),
+            ),
+        ):
+            opdef = custom_op("gefen::" + name, fn, mutates_args=mutates)
+            opdef.register_fake(_compile_op_fake)
+    except Exception as exc:  # noqa: BLE001 -- any registration failure (old
+        # torch, schema drift, dispatcher quirks) must degrade to the eager
+        # pybind path, never crash import. Not fatal (eager/capture paths
+        # don't need the ops), but never silent either: without them a
+        # compiled step graph-breaks at every pybind kernel call, so surface
+        # the reason instead of masking it.
+        warnings.warn(
+            "gefen: torch.library custom-op registration failed ({}: {}); "
+            "torch.compile(step) will graph-break at each fused kernel call "
+            "and fall back to the eager pybind path.".format(
+                type(exc).__name__, exc
+            ),
+            RuntimeWarning,
+            stacklevel=2,
+        )
+        return False
+    return True
+
+
+_COMPILE_OPS_REGISTERED = _register_compile_ops()
+
+
 def automatic_gefen_fused_full_update_cuda(
     p: torch.Tensor,
     grad_view: torch.Tensor,
@@ -188,6 +450,9 @@ def automatic_gefen_fused_full_update_cuda(
     weight_decay_factor: float,
     stochastic_round: bool = False,
     rng_seed: int = 0,
+    step_scalars: Optional[torch.Tensor] = None,
+    codebook_lut: Optional[torch.Tensor] = None,
+    seed_dev: Optional[torch.Tensor] = None,
 ) -> None:
     """Single-kernel v1 update that folds the vmean (2nd-moment) EMA and the
     per-block stepsize/bias-correction math into the fused update (Tier-1 K1+K2).
@@ -197,29 +462,43 @@ def automatic_gefen_fused_full_update_cuda(
     ``stochastic_round`` (default False) switches the momentum->codebook
     quantization from deterministic nearest to unbiased stochastic rounding
     (seeded by ``rng_seed``, the optimizer step); False is bit-identical to the
-    prior kernel."""
-    grad_c = grad_view if grad_view.is_contiguous() else grad_view.contiguous()
-    cb_c = codebook if codebook.is_contiguous() else codebook.contiguous()
+    prior kernel.
 
-    module = _load_extension()
-    module.automatic_gefen_fused_full_update_cuda(
-        p,
-        grad_c,
-        m_sign,
-        m_magnitude,
-        vmean,
-        cb_c,
-        _codebook_search_lut(cb_c),
-        packed_indices,
-        beta1,
-        beta2,
-        lr,
-        eps,
-        inv_sqrt_bias_correction_2,
-        inv_bias_correction_1,
-        weight_decay_factor,
-        stochastic_round,
-        rng_seed,
+    ``step_scalars`` (capturable mode): a contiguous fp32 device tensor
+    ``[lr, 1/sqrt(bc2), 1/bc1, weight_decay_factor]``; when given, the kernel
+    reads the per-step-varying scalars from it (the matching host args are
+    ignored), so a captured CUDA graph replays fresh values. ``None`` is the
+    bit-identical legacy host-scalar path.
+
+    ``seed_dev`` (capturable stochastic rounding): a 0-dim (or [1]) int64
+    device tensor holding the per-step rounding seed; when given (and
+    ``stochastic_round`` is set) the kernel reads the seed from it and ignores
+    the host ``rng_seed``, so a captured CUDA graph dithers with a fresh seed
+    each replay. ``None`` is the bit-identical legacy host-seed path."""
+    if (
+        step_scalars is not None
+        and codebook_lut is not None
+        and _COMPILE_OPS_REGISTERED
+        # registration flag first: it is False on torch builds too old to
+        # have torch.compiler.is_compiling, whose evaluation would raise
+        and torch.compiler.is_compiling()
+    ):
+        # Traced step: keep the kernel in the graph as a custom op so dynamo
+        # does not graph-break on the pybind call (eager runs the identical
+        # impl directly, without the dispatcher hop).
+        torch.ops.gefen.fused_full_update(
+            p, grad_view, m_sign, m_magnitude, vmean, codebook,
+            packed_indices, beta1, beta2, lr, eps,
+            inv_sqrt_bias_correction_2, inv_bias_correction_1,
+            weight_decay_factor, stochastic_round, rng_seed, step_scalars,
+            codebook_lut, seed_dev,
+        )
+        return
+    _fused_full_update_impl(
+        p, grad_view, m_sign, m_magnitude, vmean, codebook, packed_indices,
+        beta1, beta2, lr, eps, inv_sqrt_bias_correction_2,
+        inv_bias_correction_1, weight_decay_factor, stochastic_round,
+        rng_seed, step_scalars, codebook_lut, seed_dev,
     )
 
 
@@ -241,6 +520,9 @@ def gefen_factored_update_cuda(
     weight_decay_factor: float,
     stochastic_round: bool = False,
     rng_seed: int = 0,
+    step_scalars: Optional[torch.Tensor] = None,
+    codebook_lut: Optional[torch.Tensor] = None,
+    seed_dev: Optional[torch.Tensor] = None,
 ) -> None:
     """Factored-second-moment (Adafactor-style) fused update for a 2D param.
     Phase 1 computes the per-block absmax AND the raw row/col grad^2 sums in
@@ -248,30 +530,42 @@ def gefen_factored_update_cuda(
     (pass the state tensors directly) and their mean never leaves the device.
     Phase 2 applies with the per-element stepsize
     V_ij ~= v_row[i] * v_col[j] / mean(v_row) computed in registers; weight
-    decay is folded via ``weight_decay_factor`` like the v2-full path."""
-    grad_c = grad_view if grad_view.is_contiguous() else grad_view.contiguous()
-    cb_c = codebook if codebook.is_contiguous() else codebook.contiguous()
+    decay is folded via ``weight_decay_factor`` like the v2-full path.
 
-    module = _load_extension()
-    module.gefen_factored_update_cuda(
-        p,
-        grad_c,
-        m_sign,
-        m_magnitude,
-        v_row,
-        v_col,
-        cb_c,
-        _codebook_search_lut(cb_c),
-        cols,
-        beta1,
-        beta2,
-        lr,
-        eps,
-        inv_bias_correction_2,
-        inv_bias_correction_1,
-        weight_decay_factor,
-        stochastic_round,
-        rng_seed,
+    ``step_scalars`` (capturable mode): a contiguous fp32 device tensor
+    ``[lr, 1/bc2, 1/bc1, weight_decay_factor]`` (slot 1 is 1/bc2, NOT
+    1/sqrt(bc2), on this factored path); when given, the kernel reads the
+    per-step-varying scalars from it (the matching host args are ignored) and
+    the new magnitudes are copied -- not storage-rebound -- back into
+    ``m_magnitude`` so a captured CUDA graph replays against stable state
+    addresses. ``None`` is the bit-identical legacy host-scalar path.
+
+    ``seed_dev`` (capturable stochastic rounding): 0-dim/[1] int64 device
+    tensor with the per-step rounding seed; overrides the host ``rng_seed``
+    when given (see ``automatic_gefen_fused_full_update_cuda``)."""
+    if (
+        step_scalars is not None
+        and codebook_lut is not None
+        and _COMPILE_OPS_REGISTERED
+        # registration flag first: it is False on torch builds too old to
+        # have torch.compiler.is_compiling, whose evaluation would raise
+        and torch.compiler.is_compiling()
+    ):
+        # Traced step: custom op keeps the kernel in the graph (no break).
+        # Capturable only: the None-step_scalars path rebinds m_magnitude's
+        # storage (set_), which a custom op's mutation contract cannot express.
+        torch.ops.gefen.factored_update(
+            p, grad_view, m_sign, m_magnitude, v_row, v_col, codebook, cols,
+            beta1, beta2, lr, eps, inv_bias_correction_2,
+            inv_bias_correction_1, weight_decay_factor, stochastic_round,
+            rng_seed, step_scalars, codebook_lut, seed_dev,
+        )
+        return
+    _factored_update_impl(
+        p, grad_view, m_sign, m_magnitude, v_row, v_col, codebook, cols,
+        beta1, beta2, lr, eps, inv_bias_correction_2, inv_bias_correction_1,
+        weight_decay_factor, stochastic_round, rng_seed, step_scalars,
+        codebook_lut, seed_dev,
     )
 
 
@@ -284,6 +578,7 @@ def gefen_quantized_momentum_update_cuda(
     beta1: float,
     stochastic_round: bool = False,
     rng_seed: int = 0,
+    seed_dev: Optional[torch.Tensor] = None,
 ) -> None:
     """Muon-specific quantized-momentum update: advance the quantized momentum
     state (m_sign / m_magnitude) AND emit the dense quantized momentum
@@ -294,14 +589,26 @@ def gefen_quantized_momentum_update_cuda(
 
     ``stochastic_round`` (default False) switches momentum->codebook quantization
     to unbiased stochastic rounding (seeded by ``rng_seed``); False is
-    bit-identical to the prior kernel."""
-    grad_c = grad_view if grad_view.is_contiguous() else grad_view.contiguous()
-    cb_c = codebook if codebook.is_contiguous() else codebook.contiguous()
+    bit-identical to the prior kernel.
 
-    module = _load_extension()
-    module.gefen_quantized_momentum_update_cuda(
-        grad_c, m_sign, m_magnitude, cb_c, momentum_out, beta1,
-        stochastic_round, rng_seed
+    ``seed_dev`` (capturable stochastic rounding): 0-dim/[1] int64 device
+    tensor with the per-step rounding seed; overrides the host ``rng_seed``
+    when given (see ``automatic_gefen_fused_full_update_cuda``)."""
+    # registration flag first: False on torch builds too old to have
+    # torch.compiler.is_compiling, whose evaluation would raise -- and this
+    # wrapper runs on the DEFAULT (non-capturable) path too.
+    if _COMPILE_OPS_REGISTERED and torch.compiler.is_compiling():
+        # Traced step: custom op keeps the kernel in the graph (no break).
+        # This kernel always copies m_magnitude in place, so it is safe in
+        # both capturable and non-capturable modes.
+        torch.ops.gefen.quantized_momentum_update(
+            grad_view, m_sign, m_magnitude, codebook, momentum_out, beta1,
+            stochastic_round, rng_seed, seed_dev,
+        )
+        return
+    _quantized_momentum_update_impl(
+        grad_view, m_sign, m_magnitude, codebook, momentum_out, beta1,
+        stochastic_round, rng_seed, seed_dev,
     )
 
 
@@ -322,6 +629,9 @@ def automatic_gefen_fused_update_v2_full_cuda(
     weight_decay_factor: float,
     stochastic_round: bool = False,
     rng_seed: int = 0,
+    step_scalars: Optional[torch.Tensor] = None,
+    codebook_lut: Optional[torch.Tensor] = None,
+    seed_dev: Optional[torch.Tensor] = None,
 ) -> None:
     """Two-phase (v2) fully-fused update for occupancy-flexible (few-block /
     tiny-period) params: folds the vmean (2nd-moment) EMA, the per-block stepsize
@@ -331,27 +641,40 @@ def automatic_gefen_fused_update_v2_full_cuda(
 
     ``stochastic_round`` (default False) switches momentum->codebook quantization
     to unbiased stochastic rounding (seeded by ``rng_seed``); False is
-    bit-identical to the prior kernel."""
-    grad_c = grad_view if grad_view.is_contiguous() else grad_view.contiguous()
-    cb_c = codebook if codebook.is_contiguous() else codebook.contiguous()
+    bit-identical to the prior kernel.
 
-    module = _load_extension()
-    module.automatic_gefen_fused_update_v2_full_cuda(
-        p,
-        grad_c,
-        m_sign,
-        m_magnitude,
-        vmean,
-        cb_c,
-        _codebook_search_lut(cb_c),
-        packed_indices,
-        beta1,
-        beta2,
-        lr,
-        eps,
-        inv_sqrt_bias_correction_2,
-        inv_bias_correction_1,
-        weight_decay_factor,
-        stochastic_round,
-        rng_seed,
+    ``step_scalars`` (capturable mode): a contiguous fp32 device tensor
+    ``[lr, 1/sqrt(bc2), 1/bc1, weight_decay_factor]``; when given, the kernels
+    read the per-step-varying scalars from it (the matching host args are
+    ignored) and the new magnitudes are copied -- not storage-rebound -- back
+    into ``m_magnitude`` so a captured CUDA graph replays against stable state
+    addresses. ``None`` is the bit-identical legacy host-scalar path.
+
+    ``seed_dev`` (capturable stochastic rounding): 0-dim/[1] int64 device
+    tensor with the per-step rounding seed; overrides the host ``rng_seed``
+    when given (see ``automatic_gefen_fused_full_update_cuda``)."""
+    if (
+        step_scalars is not None
+        and codebook_lut is not None
+        and _COMPILE_OPS_REGISTERED
+        # registration flag first: it is False on torch builds too old to
+        # have torch.compiler.is_compiling, whose evaluation would raise
+        and torch.compiler.is_compiling()
+    ):
+        # Traced step: custom op keeps the kernel in the graph (no break).
+        # Capturable only: the None-step_scalars path rebinds m_magnitude's
+        # storage (set_), which a custom op's mutation contract cannot express.
+        torch.ops.gefen.fused_update_v2_full(
+            p, grad_view, m_sign, m_magnitude, vmean, codebook,
+            packed_indices, beta1, beta2, lr, eps,
+            inv_sqrt_bias_correction_2, inv_bias_correction_1,
+            weight_decay_factor, stochastic_round, rng_seed, step_scalars,
+            codebook_lut, seed_dev,
+        )
+        return
+    _fused_update_v2_full_impl(
+        p, grad_view, m_sign, m_magnitude, vmean, codebook, packed_indices,
+        beta1, beta2, lr, eps, inv_sqrt_bias_correction_2,
+        inv_bias_correction_1, weight_decay_factor, stochastic_round,
+        rng_seed, step_scalars, codebook_lut, seed_dev,
     )
