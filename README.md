@@ -6,10 +6,11 @@
 
 **Fork Highlights:**
 
+ - **Fine-tuning, not just pre-training** — upstream Gefen was validated for pre-training; this fork makes it a drop-in optimizer for fine-tuning: full fine-tune (FFT), LoRA, and QLoRA, with a [VRAM sizing guide](docs/hardware.md).
  - **New: matches AdamW's loss out of the box** at about a quarter of its optimizer memory (default `factored_v_2d`).
    See [Benchmarks](#benchmarks) and [the factored-v lever](#quality-lever-factored-second-moment-on-2d-params-factored_v_2d).
  - **Works on modern decoders** (Qwen3, Llama-3, Mistral). Upstream loses its memory advantage on these architectures (≈9 B/param — worse than AdamW); this fork keeps the intended ≈1 B/param.
- - **Validated on 2026 VLMs and media-gen models** — Gemma 4, Qwen3-VL, Mistral 3, MiniCPM-V 4.6, LFM2.5, SDXL, Stable Diffusion 3.5, FLUX.1/FLUX.2, Z-Image, Anima, LTX-2 (19B video+audio), ACE-Step 1.5 — with real full-fine-tune smoke tests on 24 GB GPUs; 20-30B MoEs (GPT-OSS, GLM-4.7-Flash) were validated via LoRA fallback. See the [compatibility matrix](COMPATIBILITY.md).
+ - **Validated across 2026 architectures** — two dozen modern LLMs, VLMs, and image/video/audio media-gen models full-fine-tuned on 24 GB GPUs, plus 20-30B MoEs via LoRA. See the [compatibility matrix](COMPATIBILITY.md).
  - **≈2× faster `opt.step()`** via fused CUDA kernels, with identical results.
  - **Whole-model Muon option** (`GefenMuonHybrid`) at the same ≈1 B/param memory and AdamW-level loss.
  - **Reliable checkpoint save/resume and FSDP2 support** — broken or absent in the shipped release.
@@ -22,6 +23,7 @@
 
 | Capability | Upstream v1.1.1 | This fork |
 |---|---|---|
+| Training regime | pre-training | fine-tuning — full fine-tune, LoRA & QLoRA, validated across model families and [sized per model](docs/hardware.md) |
 | Loss vs AdamW | trails AdamW by ≈0.06 | **matches AdamW** via the default `factored_v_2d` — [details](#quality-lever-factored-second-moment-on-2d-params-factored_v_2d) |
 | Modern decoders (Qwen3 / Llama-3 / Mistral — SwiGLU + grouped-query attention) | uses *more* optimizer memory than AdamW on these | keeps the full ≈8× memory saving |
 | Learning rate on those architectures | no guidance — silently over-steps | documented ≈0.6× AdamW, so quality matches AdamW |
@@ -65,6 +67,8 @@ Verified with **PyTorch 2.12 (cu133) / Python 3.12**. Optional baselines used in
 ## Compatibility
 
 Validated with full-parameter fine-tune smoke tests on 24 GB GPUs across modern LLMs/VLMs and media-generation models — Gemma 4, Qwen3-VL, Mistral 3, MiniCPM-V 4.6, LFM2.5 (+VL), SDXL, Stable Diffusion 3.5, FLUX.1-dev (12B via FSDP2), FLUX.2-klein, Z-Image (6B via FSDP2), Anima, and ACE-Step 1.5 — and on 20-30B MoEs (GPT-OSS-20B, GLM-4.7-Flash) via LoRA adapter training. Per-model results, method, and hardware footprints: **[COMPATIBILITY.md](COMPATIBILITY.md)**.
+
+**Sizing a GPU?** [Hardware Requirements](docs/hardware.md) gives measured peak VRAM per model size and method (full fine-tune with Gefen vs AdamW, LoRA, QLoRA), plus a per-card rule of thumb for other sizes.
 
 ## Quick Start
 
