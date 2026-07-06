@@ -237,8 +237,6 @@ The recommended and tested setup is to install the CUDA build environment with c
 
 If you do not use conda, install CUDA Toolkit {conda_cuda} by any method supported by your operating system or package manager, then set CUDA_HOME to that toolkit before rebuilding.
 """.format(
-        major=major,
-        minor=minor,
         conda_label=conda_label,
         conda_cuda=conda_cuda,
         conda_gcc=conda_gcc,

@@ -22,12 +22,12 @@ concurrency:
 
 jobs:
   cpu:
-    name: CPU smoke (py${{ matrix.python-version }})
+    name: CPU tests (py${{ matrix.python-version }})
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
-        python-version: ["3.9", "3.10", "3.11"]
+        python-version: ["3.9", "3.10", "3.11", "3.12"]
     steps:
       - uses: actions/checkout@v4
 
@@ -42,10 +42,10 @@ jobs:
           # CPU-only torch wheel: the CUDA wheel is ~2GB and pointless here.
           pip install torch --index-url https://download.pytorch.org/whl/cpu
           # torch is already satisfied, so this only pulls numba/numpy/ninja + gefen.
-          pip install .
+          pip install .[test]
 
       - name: Byte-compile all sources
-        run: python -m compileall -q gefen.py gefen_muon.py hybrid.py partitioning.py quantization.py kernels
+        run: python -m compileall -q gefen.py gefen_muon.py hybrid.py params.py partitioning.py quantization.py kernels tools
 
       - name: Import smoke (no CUDA required)
         # Run from a clean dir so the installed package is imported, not the source tree.
@@ -62,6 +62,14 @@ jobs:
           print("import OK ->", loaded)
           PY
 
+      - name: CPU test suite
+        # Run from a clean dir: the repo root's gefen.py would shadow the
+        # installed gefen package on sys.path. CUDA-dependent tests skip
+        # themselves; the CPU-runnable ones (validation, CPU step paths,
+        # checkpoint round-trip, partitioning/quantization, LR tools) run.
+        working-directory: ${{ runner.temp }}
+        run: python -m pytest "$GITHUB_WORKSPACE/tests" -q -ra
+
   gpu-tests:
     name: GPU kernel parity tests
     # Only when explicitly requested via the Actions tab. Skipped on push/PR so the
@@ -74,9 +82,10 @@ jobs:
       - name: Install package (CUDA torch expected on the runner)
         run: |
           python -m pip install --upgrade pip
-          pip install .
+          pip install .[test]
 
-      - name: Run CUDA parity tests
-        run: |
-          python tests/test_fused_update_v2_parity.py
-          python tests/test_fused_fsdp2_noncontig.py
+      - name: Run full test suite (CUDA)
+        # Same shadowing caveat as the CPU job: run from outside the repo root.
+        # Multi-GPU / FSDP2 cases skip themselves when the runner has one GPU.
+        working-directory: ${{ runner.temp }}
+        run: python -m pytest "$GITHUB_WORKSPACE/tests" -q -ra

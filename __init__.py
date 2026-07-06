@@ -25,4 +25,10 @@ def __getattr__(name):
         from . import params
 
         return getattr(params, name)
+    if name == "kernels":
+        # NOT `from . import kernels`: its fromlist handling re-enters this
+        # __getattr__ before the submodule import runs, recursing forever.
+        import importlib
+
+        return importlib.import_module(".kernels", __name__)
     raise AttributeError("module {!r} has no attribute {!r}".format(__name__, name))

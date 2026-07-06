@@ -231,8 +231,6 @@ def exact_dp(
     prefix_wx[1:] = torch.cumsum(weights64 * centers64, dim=0)
     prefix_wx2[1:] = torch.cumsum(weights64 * centers64.square(), dim=0)
 
-    complexity_upper_bound = num_points * num_points * num_codebooks
-
     try:
         exact_dp_kernel = _get_exact_dp_numba_kernel()
     except ModuleNotFoundError:
