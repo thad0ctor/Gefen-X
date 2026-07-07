@@ -131,7 +131,7 @@ Optimizer comparison on a full fine-tune, **with each optimizer at its own fair 
 You can run these yourself — see [`benchmarks/`](benchmarks/README.md) for what each suite measures and how to reproduce the tables/plots (`bash benchmarks/optimizer-sweep/run.sh` regenerates this comparison, with the recommended Gefen-Muon config applied by default).
 
 **Testing environment**
-- **Hardware:** NVIDIA RTX 3090 (Ampere, sm_86), single GPU per run.
+- **Hardware:** NVIDIA RTX 3090 for Qwen3-1.7B and RTX 3090 Ti for Qwen3-0.6B (Ampere, sm_86), single GPU per run; compare optimizers within a model, not tok/s across models.
 - **Software:** PyTorch 2.12.0 (cu133), Python 3.12; Gefen fused CUDA kernels JIT-built for sm_86.
 - **Models:** Qwen3-0.6B and Qwen3-1.7B — full fine-tune (all weights trained, no adapters).
 - **Regime:** bf16 master weights, gradient checkpointing, sequence length 2048, micro-batch 1, Alpaca greedy-packed to 2048-token blocks, 2000 steps, identical data order across optimizers, 32-example held-out eval.
@@ -144,16 +144,16 @@ You can run these yourself — see [`benchmarks/`](benchmarks/README.md) for wha
 
 | Model | Optimizer | LR | Eval loss | tok/s | Peak VRAM (GiB) | Opt-state B/param |
 |---|---|---|---|---|---|---|
-| Qwen3-0.6B | adamw_bf16 | 5e-5 | 1.431 | 5599 | 6.95 | 4.00 |
-| Qwen3-0.6B | adamw8bit | 5e-5 | 1.481 | 5258 | 5.87 | 2.03 |
-| Qwen3-0.6B | adamw4bit | 5e-5 | 1.464 | 4977 | 6.32 | 1.06 |
-| Qwen3-0.6B | **gefen_fused** | 3e-5 | **1.422** | 5252 | **5.30** | **1.01** |
-| Qwen3-0.6B | **gefen_muon** | 5e-5 | 1.425 | 3543 | **5.30** | **1.01** |
-| Qwen3-1.7B | adamw_bf16 | 5e-5 | **1.221** | 2961 | 14.00 | 4.00 |
-| Qwen3-1.7B | adamw8bit | 5e-5 | 1.234 | 2724 | 10.84 | 2.03 |
-| Qwen3-1.7B | adamw4bit | 5e-5 | 1.251 | 2562 | 15.11 | 1.06 |
-| Qwen3-1.7B | **gefen_fused** | 3e-5 | **1.221** | 2722 | **9.21** | **1.01** |
-| Qwen3-1.7B | **gefen_muon** | 5e-5 | 1.240 | 1280 | 9.20 | **1.01** |
+| Qwen3-0.6B | adamw_bf16 | 5e-5 | 1.429 | 5380 | 6.95 | 4.00 |
+| Qwen3-0.6B | adamw8bit | 5e-5 | 1.474 | 5245 | 5.87 | 2.03 |
+| Qwen3-0.6B | adamw4bit | 5e-5 | 1.472 | 4967 | 6.32 | 1.06 |
+| Qwen3-0.6B | **gefen_fused** | 3e-5 | **1.422** | 5355 | **5.30** | **1.01** |
+| Qwen3-0.6B | **gefen_muon** | 5e-5 | 1.423 | 3556 | **5.30** | **1.01** |
+| Qwen3-1.7B | adamw_bf16 | 5e-5 | **1.222** | 2975 | 14.00 | 4.00 |
+| Qwen3-1.7B | adamw8bit | 5e-5 | 1.232 | 2707 | 10.84 | 2.03 |
+| Qwen3-1.7B | adamw4bit | 5e-5 | 1.240 | 2622 | 15.11 | 1.06 |
+| Qwen3-1.7B | **gefen_fused** | 3e-5 | **1.225** | 2887 | **9.21** | **1.01** |
+| Qwen3-1.7B | **gefen_muon** | 5e-5 | 1.239 | 1307 | 9.20 | **1.01** |
 
 > Both Gefen rows use the optimizers' shipped defaults, each at its own best learning rate. Older (pre-default) behaviors are still available behind flags — see the lever sections below for what each default does and how to switch it off.
 
@@ -164,19 +164,19 @@ You can run these yourself — see [`benchmarks/`](benchmarks/README.md) for wha
 
 **Loss curves** — loss over the 2000 steps. For each optimizer (distinguished by **color**), there are two lines: **solid = held-out eval loss** (the 32-example validation set, logged every 50 steps — this is the comparison metric in the table above) and **dashed = train-loss EMA** (exponential moving average of the training loss). 
 
-**Gefen-fused (with the `factored_v_2d` default) sits on the AdamW cluster at both scales** — best-in-table at 0.6B (1.422, −0.009 below the best AdamW) and a statistical tie at 1.7B (1.2207 vs 1.2206; the documented single-eval noise is ±0.005–0.007). Gefen-Muon sits on the same cluster (0.6B 1.425; 1.7B 1.240, +0.019).
+**Gefen-fused (with the `factored_v_2d` default) sits on the AdamW cluster at both scales** — best-in-table at 0.6B (1.4215, −0.008 below the best AdamW) and a statistical tie at 1.7B (1.2247 vs 1.2223; the documented single-eval noise is ±0.005–0.007). Gefen-Muon sits on the same cluster (0.6B 1.423; 1.7B 1.239, +0.017).
 
 ![Qwen3-1.7B loss curves](docs/benchmarks/loss_curve_qwen1p7b.png)
 ![Qwen3-0.6B loss curves](docs/benchmarks/loss_curve_qwen0p6b.png)
 
-**Throughput vs peak VRAM** — the speed/memory frontier (upper-left = faster *and* lighter is better). Gefen-fused holds the lowest-VRAM column at ≈0.92–0.94× the fused-AdamW throughput (the factored second moment costs ≈6–8% vs the legacy mode); AdamW-4-bit is worst on *both* axes despite its small optimizer state (torchao transient buffers). 
+**Throughput vs peak VRAM** — the speed/memory frontier (upper-left = faster *and* lighter is better). Gefen-fused holds the lowest-VRAM column at ≈0.97–1.00× the fused-AdamW throughput (a tie at 0.6B, ≈0.97× at 1.7B); AdamW-4-bit is worst on *both* axes despite its small optimizer state (torchao transient buffers). 
 
 Gefen-Muon shares Gefen-fused's lowest-VRAM column but sits far lower on throughput — the Newton-Schulz orthogonalization makes it the slowest optimizer.
 
 ![Qwen3-1.7B throughput vs VRAM](docs/benchmarks/tput_vram_qwen1p7b.png)
 ![Qwen3-0.6B throughput vs VRAM](docs/benchmarks/tput_vram_qwen0p6b.png)
 
-**Gefen-fused** is the recommended configuration: **AdamW-level loss with the lowest peak VRAM and the lowest optimizer state in the table**, at ≈0.93× AdamW's speed. (AdamW-4-bit's optimizer state is also small, but its peak VRAM is the *highest* in the table because of its transient buffers — Gefen is the real memory winner.)
+**Gefen-fused** is the recommended configuration: **AdamW-level loss with the lowest peak VRAM and the lowest optimizer state in the table**, at ≈0.97–1.00× AdamW's speed. (AdamW-4-bit's optimizer state is also small, but its peak VRAM is the *highest* in the table because of its transient buffers — Gefen is the real memory winner.)
 
 **Gefen-Muon** reaches the same loss level at the same memory footprint, but at roughly half the speed (Muon's orthogonalization step is expensive). Choose it if you specifically want Muon-style updates; otherwise Gefen-fused gives the same quality faster.
 
@@ -331,7 +331,7 @@ optim_args:
 
 ## Quality Lever: factored second moment on 2D params (`factored_v_2d`)
 
-> **On by default** — this is what makes plain Gefen match AdamW's loss. Set `factored_v_2d=False` for the legacy behavior: slightly faster (≈6–8%), about 0.06 worse eval loss, and a lower best learning rate (`2e-5` instead of `3e-5` at the benchmarked scales).
+> **On by default** — this is what makes plain Gefen match AdamW's loss. Set `factored_v_2d=False` for the legacy behavior: slightly faster (≈2% end-to-end at 1.7B), about 0.06 worse eval loss, and a lower best learning rate (`2e-5` instead of `3e-5` at the benchmarked scales).
 
 Gefen historically shared one adaptive step size across each *block* of parameters, where AdamW keeps one per parameter — that granularity difference was the ≈0.06 loss gap. `factored_v_2d` gives every parameter of a weight matrix its own step size by tracking just one statistic per row and one per column (the [Adafactor](https://arxiv.org/abs/1804.04235) idea) and combining them on the fly inside the update kernel. The stored state is only rows + columns per matrix, so the ≈1 B/param memory story is unchanged.
 
@@ -341,9 +341,9 @@ opt = Gefen(model.named_parameters(), lr=0.6 * ADAMW_LR, fused=True)  # factored
 
 | | **Gefen (default)** | AdamW bf16 | Gefen legacy (`factored_v_2d=False`) |
 |---|---|---|---|
-| Qwen3-0.6B eval loss | **1.422** | 1.431 | 1.497 |
-| Qwen3-1.7B eval loss | **1.221** | 1.221 | 1.288 |
-| Qwen3-1.7B tok/s | 2722 | 2961 | ≈2950 |
+| Qwen3-0.6B eval loss | **1.422** | 1.429 | 1.497 |
+| Qwen3-1.7B eval loss | **1.225** | 1.222 | 1.288 |
+| Qwen3-1.7B tok/s | 2887 | 2975 | ≈2950 |
 | Optimizer state | **1.01 B/param** | 4.00 | 1.01 |
 
 ![Gefen factored-v ablation — eval loss vs AdamW, factored-v on vs off](docs/benchmarks/gefen_factored_v_loss.png)

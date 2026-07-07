@@ -1134,14 +1134,63 @@ __global__ void gefen_update_flat_full_kernel(
 // (a) the updated-momentum absmax per gefen block (atomic max, order-free) and
 // (b) the row/col sum-of-squares of the RAW gradient for the Adafactor EMAs.
 // Layout: each CUDA block owns a (TR rows x TC cols) matrix tile; warp w scans
-// row (tile_row + w) in lane-strided column segments, so every global read is
-// coalesced. Row sums reduce via warp shuffles (one atomicAdd per row per
-// tile); col sums accumulate in shared partials (one atomicAdd per col per
-// tile). The atomicAdd accumulation makes v_row/v_col run-to-run
-// nondeterministic at sub-ULP scale -- the same documented, convergence-
-// neutral property as the v2-full atomic vmean.
+// row (tile_row + w), each lane owning LC CONTIGUOUS columns so the grad and
+// m_sign reads are 16-byte / 8-byte vector loads (one 512B transaction per
+// warp) instead of per-element scalar loads. Row sums reduce via warp
+// shuffles (one atomicAdd per row per tile); col sums accumulate in shared
+// partials (one atomicAdd per col per tile). The atomicAdd accumulation makes
+// v_row/v_col run-to-run nondeterministic at sub-ULP scale -- the same
+// documented, convergence-neutral property as the v2-full atomic vmean.
+//
+// The per-block magnitude absmax accumulates in a REGISTER while the lane
+// stays inside one gefen block (one idx/period divide per lane per row strip,
+// advanced by exact integer carries) and flushes with a single warp-reduced
+// atomic per strip when every lane still holds the same block -- the common
+// case, since the period search picks huge blocks (often numel/2). A block
+// boundary inside a lane's strip flushes that lane early; mixed-block strips
+// flush per lane. absmax is order-independent, so the flushing schedule
+// cannot change the result: bit-identical to the per-element atomic form.
 #define GEFEN_FACTORED_TILE_COLS 256
 #define GEFEN_FACTORED_TILE_ROWS 8
+#define GEFEN_FACTORED_LANE_COLS 8
+
+// 8-element vector copy for the chunked factored kernels: single 16B load for
+// 2-byte dtypes, two 16B loads for fp32, per-element fallback otherwise
+// (double is rejected at dispatch but keep it correct). Callers guarantee
+// 16B alignment of src.
+template <typename scalar_t>
+__device__ __forceinline__ void gefen_load_vec8(
+    const scalar_t* __restrict__ src, scalar_t* dst
+) {
+    if constexpr (sizeof(scalar_t) == 2) {
+        *reinterpret_cast<uint4*>(dst) = *reinterpret_cast<const uint4*>(src);
+    } else if constexpr (sizeof(scalar_t) == 4) {
+        reinterpret_cast<uint4*>(dst)[0] = reinterpret_cast<const uint4*>(src)[0];
+        reinterpret_cast<uint4*>(dst)[1] = reinterpret_cast<const uint4*>(src)[1];
+    } else {
+        #pragma unroll
+        for (int k = 0; k < 8; ++k) {
+            dst[k] = src[k];
+        }
+    }
+}
+
+template <typename scalar_t>
+__device__ __forceinline__ void gefen_store_vec8(
+    scalar_t* __restrict__ dst, const scalar_t* src
+) {
+    if constexpr (sizeof(scalar_t) == 2) {
+        *reinterpret_cast<uint4*>(dst) = *reinterpret_cast<const uint4*>(src);
+    } else if constexpr (sizeof(scalar_t) == 4) {
+        reinterpret_cast<uint4*>(dst)[0] = reinterpret_cast<const uint4*>(src)[0];
+        reinterpret_cast<uint4*>(dst)[1] = reinterpret_cast<const uint4*>(src)[1];
+    } else {
+        #pragma unroll
+        for (int k = 0; k < 8; ++k) {
+            dst[k] = src[k];
+        }
+    }
+}
 
 template <typename scalar_t>
 __global__ void gefen_factored_stats_kernel(
@@ -1170,6 +1219,13 @@ __global__ void gefen_factored_stats_kernel(
     }
     __syncthreads();
 
+    const float beta1c = 1.0f - beta1;
+    // Vector loads additionally need 16B/8B-aligned base pointers; fresh
+    // optimizer-state allocations always are, but a caller handing in offset
+    // views must degrade to the scalar path, not misalign.
+    const bool ptrs_aligned =
+        (reinterpret_cast<uintptr_t>(grad_view) & 15) == 0 &&
+        (reinterpret_cast<uintptr_t>(m_sign) & 7) == 0;
     const int64_t col0 =
         static_cast<int64_t>(blockIdx.x) * GEFEN_FACTORED_TILE_COLS;
     const int warp = threadIdx.x >> 5;
@@ -1188,21 +1244,77 @@ __global__ void gefen_factored_stats_kernel(
     for (int64_t r = row0 + warp; r < row0 + GEFEN_FACTORED_TILE_ROWS && r < rows;
          r += warps_per_block) {
         const int64_t row_base = r * cols;
+        const int64_t c_lo =
+            col0 + static_cast<int64_t>(lane) * GEFEN_FACTORED_LANE_COLS;
         float row_acc = 0.0f;
-        for (int64_t c = col0 + lane; c < col0 + GEFEN_FACTORED_TILE_COLS && c < cols;
-             c += 32) {
-            const int64_t idx = row_base + c;
-            const float g = static_cast<float>(grad_view[idx]);
+        // Running per-block magnitude max: ONE divide per lane per strip;
+        // the block index then advances by integer carries. blk < 0 marks a
+        // fully out-of-bounds lane (edge tile past the last column).
+        int64_t blk = -1;
+        int64_t pin = 0;
+        float blk_max = 0.0f;
+        if (c_lo < cols) {
+            const int64_t idx0 = row_base + c_lo;
+            blk = idx0 / period;
+            pin = idx0 - blk * period;
+        }
+        // Vector path needs the whole lane strip in bounds AND 16B-aligned
+        // (row_base % 8 can be nonzero when cols % 8 != 0).
+        const bool full = ptrs_aligned &&
+                          (c_lo + GEFEN_FACTORED_LANE_COLS <= cols) &&
+                          (((row_base + c_lo) & 7) == 0);
+        float g_f[GEFEN_FACTORED_LANE_COLS];
+        uint8_t s_in[GEFEN_FACTORED_LANE_COLS];
+        if (full) {
+            alignas(16) scalar_t g_v[GEFEN_FACTORED_LANE_COLS];
+            gefen_load_vec8(&grad_view[row_base + c_lo], g_v);
+            const uint2 sv =
+                *reinterpret_cast<const uint2*>(&m_sign[row_base + c_lo]);
+            const uint8_t* ss = reinterpret_cast<const uint8_t*>(&sv);
+            #pragma unroll
+            for (int k = 0; k < GEFEN_FACTORED_LANE_COLS; ++k) {
+                g_f[k] = static_cast<float>(g_v[k]);
+                s_in[k] = ss[k];
+            }
+        } else {
+            #pragma unroll
+            for (int k = 0; k < GEFEN_FACTORED_LANE_COLS; ++k) {
+                if (c_lo + k < cols) {
+                    g_f[k] = static_cast<float>(grad_view[row_base + c_lo + k]);
+                    s_in[k] = m_sign[row_base + c_lo + k];
+                }
+            }
+        }
+        float old_mag = (blk >= 0) ? old_magnitude[blk] : 0.0f;
+        #pragma unroll
+        for (int k = 0; k < GEFEN_FACTORED_LANE_COLS; ++k) {
+            if (!full && c_lo + k >= cols) {
+                break;
+            }
+            const float g = g_f[k];
             const float g2 = g * g;
             row_acc += g2;
-            atomicAdd(&s_col[static_cast<int>(c - col0)], g2);
-            // Per-gefen-block absmax of the updated momentum (same math and
-            // atomic as gefen_magnitude_flat_kernel).
-            const int64_t block_idx = idx / period;
-            const float coeff = s_codebook[static_cast<int>(m_sign[idx])];
-            const float updated =
-                beta1 * (old_magnitude[block_idx] * coeff) + (1.0f - beta1) * g;
-            atomic_max_nonneg(&new_magnitude[block_idx], fabsf(updated));
+            // Swizzled [k][lane] layout: at unrolled step k every lane hits
+            // a distinct bank (slot = k*32 + lane); the natural lane-major
+            // layout (slot = lane*8 + k) would be an 8-way bank conflict per
+            // instruction. The flush below undoes the swizzle.
+            atomicAdd(&s_col[k * 32 + lane], g2);
+            // Same per-element updated-momentum math as before; only the max
+            // accumulation site changed (register, flushed below).
+            const float coeff = s_codebook[static_cast<int>(s_in[k])];
+            const float updated = beta1 * (old_mag * coeff) + beta1c * g;
+            blk_max = fmaxf(blk_max, fabsf(updated));
+            if (++pin == period) {
+                // Gefen-block boundary inside the strip: flush this lane.
+                atomic_max_nonneg(&new_magnitude[blk], blk_max);
+                blk_max = 0.0f;
+                pin = 0;
+                ++blk;
+                if (k + 1 < GEFEN_FACTORED_LANE_COLS &&
+                    (full || c_lo + k + 1 < cols)) {
+                    old_mag = old_magnitude[blk];
+                }
+            }
         }
         // Warp-reduce the row partial; one global atomic per row per tile.
         for (int offset = 16; offset > 0; offset >>= 1) {
@@ -1211,6 +1323,25 @@ __global__ void gefen_factored_stats_kernel(
         if (lane == 0) {
             atomicAdd(&row_sq[r], row_acc);
         }
+        // Magnitude flush. All 32 lanes reach here (the strip loops rejoin
+        // and the row loop bound is warp-uniform). Fast path: every lane
+        // still holds the SAME gefen block -> warp-reduce the max, one
+        // atomic per warp-strip. NaN handling matches atomic_max_nonneg:
+        // fmaxf returns the non-NaN operand, so a NaN |updated| can never
+        // win the reduction, exactly as it can never win the CAS.
+        const int64_t blk_lo = __shfl_sync(0xffffffffu, blk, 0);
+        const bool uniform = __all_sync(0xffffffffu, blk == blk_lo && blk >= 0);
+        if (uniform) {
+            float m = blk_max;
+            for (int offset = 16; offset > 0; offset >>= 1) {
+                m = fmaxf(m, __shfl_down_sync(0xffffffffu, m, offset));
+            }
+            if (lane == 0) {
+                atomic_max_nonneg(&new_magnitude[blk_lo], m);
+            }
+        } else if (blk >= 0) {
+            atomic_max_nonneg(&new_magnitude[blk], blk_max);
+        }
     }
     }
     __syncthreads();
@@ -1218,7 +1349,12 @@ __global__ void gefen_factored_stats_kernel(
     // One global atomic per column per CUDA block (accumulated across all of
     // this block's strided row tiles).
     for (int i = threadIdx.x; i < GEFEN_FACTORED_TILE_COLS; i += blockDim.x) {
-        const int64_t c = col0 + i;
+        // Undo the [k][lane] swizzle: slot i = k*32 + lane holds column
+        // col0 + lane*LC + k.
+        const int k = i >> 5;
+        const int ln = i & 31;
+        const int64_t c =
+            col0 + static_cast<int64_t>(ln) * GEFEN_FACTORED_LANE_COLS + k;
         if (c < cols && s_col[i] != 0.0f) {
             atomicAdd(&col_sq[c], s_col[i]);
         }
@@ -1235,8 +1371,22 @@ __global__ void gefen_factored_stats_kernel(
 // L1/L2 via __ldg. This kernel is the canonical numerics for factored_v_2d --
 // the decomposed python fallback matches it within float tolerance, not
 // bit-for-bit (different op associations).
+//
+// Chunked layout: each thread owns GEFEN_UPD_CHUNK (8) CONTIGUOUS elements
+// per grid-stride iteration, so (a) the two per-element int64 divisions of
+// the flat form (idx/period, idx/cols -- ~40+ cycles each, the dominant ALU
+// cost at the huge periods the search picks) collapse to ONE divmod pair per
+// chunk advanced by exact integer carries, and (b) grad/p/m_sign move as
+// 16B/8B vector transactions. Per-element float ops and their order are
+// UNCHANGED, and the SR hash still keys on the exact global element index,
+// so every output (p, m_sign, magnitude writeback) is bit-identical to the
+// flat form for both rounding modes. Tails and unaligned bases take an
+// in-kernel scalar fallback. __launch_bounds__(256) pins the block size the
+// host launches (helps the register allocator; the kernel uses ~73 regs).
+#define GEFEN_UPD_CHUNK 8
+
 template <typename scalar_t>
-__global__ void gefen_update_flat_factored_kernel(
+__global__ __launch_bounds__(256) void gefen_update_flat_factored_kernel(
     scalar_t* __restrict__ p,
     const scalar_t* __restrict__ grad_view,
     uint8_t* __restrict__ m_sign,
@@ -1304,43 +1454,156 @@ __global__ void gefen_update_flat_factored_kernel(
         mean_r = __fdiv_rn(mean_r, static_cast<float>(mean_sum_rows));
     }
     const float inv_mean_r = 1.0f / fmaxf(mean_r, 1.1754944e-38f);
-    const int64_t stride = static_cast<int64_t>(gridDim.x) * blockDim.x;
-    for (int64_t idx = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-         idx < total_numel; idx += stride) {
-        const int64_t block_idx = idx / period;
-        const int64_t row = idx / cols;
-        const int64_t col = idx - row * cols;
-        const float new_mag = new_magnitude[block_idx];
-        if (mag_writeback != nullptr && idx == block_idx * period) {
-            // Exactly one element per gefen block writes the new magnitude
-            // into the persistent state (see the arg comment above).
-            mag_writeback[block_idx] = new_mag;
+    const float beta1c = 1.0f - beta1;
+    const bool ptrs_aligned =
+        (reinterpret_cast<uintptr_t>(p) & 15) == 0 &&
+        (reinterpret_cast<uintptr_t>(grad_view) & 15) == 0 &&
+        (reinterpret_cast<uintptr_t>(m_sign) & 7) == 0;
+
+    const int64_t chunk_stride =
+        static_cast<int64_t>(gridDim.x) * blockDim.x * GEFEN_UPD_CHUNK;
+    for (int64_t base =
+             (static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x) *
+             GEFEN_UPD_CHUNK;
+         base < total_numel; base += chunk_stride) {
+        // base is a multiple of GEFEN_UPD_CHUNK, so a fully in-bounds chunk
+        // is 16B/8B aligned whenever the base pointers are.
+        const bool full =
+            ptrs_aligned && (base + GEFEN_UPD_CHUNK <= total_numel);
+        // ONE divmod pair per chunk; exact integer carries below replace the
+        // per-element divisions.
+        int64_t row = base / cols;
+        int64_t col = base - row * cols;
+        int64_t blk = base / period;
+        int64_t pin = base - blk * period;  // position inside the gefen block
+
+        float g_f[GEFEN_UPD_CHUNK];
+        uint8_t sign_in[GEFEN_UPD_CHUNK];
+        alignas(16) scalar_t p_v[GEFEN_UPD_CHUNK];
+        if (full) {
+            alignas(16) scalar_t g_v[GEFEN_UPD_CHUNK];
+            gefen_load_vec8(&grad_view[base], g_v);
+            const uint2 sv = *reinterpret_cast<const uint2*>(&m_sign[base]);
+            const uint8_t* ss = reinterpret_cast<const uint8_t*>(&sv);
+            if (lr != 0.0f) {
+                gefen_load_vec8(&p[base], p_v);
+            }
+            #pragma unroll
+            for (int k = 0; k < GEFEN_UPD_CHUNK; ++k) {
+                g_f[k] = static_cast<float>(g_v[k]);
+                sign_in[k] = ss[k];
+            }
+        } else {
+            #pragma unroll
+            for (int k = 0; k < GEFEN_UPD_CHUNK; ++k) {
+                if (base + k < total_numel) {
+                    g_f[k] = static_cast<float>(grad_view[base + k]);
+                    sign_in[k] = m_sign[base + k];
+                    if (lr != 0.0f) {
+                        p_v[k] = p[base + k];
+                    }
+                }
+            }
         }
-        const float updated = updated_momentum(
-            grad_view, m_sign, s_codebook, old_magnitude[block_idx], idx, beta1);
-        float normalized_value = 0.0f;
-        if (new_mag > 0.0f) {
-            normalized_value = updated / new_mag;
+
+        uint8_t sign_out[GEFEN_UPD_CHUNK];
+        alignas(16) scalar_t p_out[GEFEN_UPD_CHUNK];
+        float old_mag = old_magnitude[blk];
+        float new_mag = new_magnitude[blk];
+        float vr = __ldg(&v_row[row]);
+        #pragma unroll
+        for (int k = 0; k < GEFEN_UPD_CHUNK; ++k) {
+            if (!full && base + k >= total_numel) {
+                break;
+            }
+            if (mag_writeback != nullptr && pin == 0) {
+                // Exactly one element per gefen block writes the new
+                // magnitude into the persistent state (see the arg comment
+                // above); pin == 0 is the chunked form of
+                // idx == block_idx * period.
+                mag_writeback[blk] = new_mag;
+            }
+            // Per-element math: identical ops in identical order to the flat
+            // form (updated_momentum inlined on the preloaded values).
+            const float coeff = s_codebook[static_cast<int>(sign_in[k])];
+            const float current_m = old_mag * coeff;
+            const float updated = beta1 * current_m + beta1c * g_f[k];
+            float normalized_value = 0.0f;
+            if (new_mag > 0.0f) {
+                normalized_value = updated / new_mag;
+            }
+            const uint8_t quantized_index = quantize_codebook_index_lut(
+                normalized_value, s_codebook, codebook_size, lut, lut_buckets,
+                stochastic_round, rng_seed, base + k);
+            sign_out[k] = quantized_index;
+            if (lr != 0.0f) {
+                const float v_hat = __fmul_rn(
+                    __fmul_rn(vr, __ldg(&v_col[col])), inv_mean_r);
+                float h = __fsqrt_rn(__fmul_rn(v_hat, inv_bias_correction_2));
+                h = __fadd_rn(h, eps);
+                const float stepsize_val =
+                    __fmul_rn(__frcp_rn(h), inv_bias_correction_1);
+                const float quantized_value =
+                    s_codebook[static_cast<int>(quantized_index)] * new_mag;
+                const float update_value =
+                    __fmul_rn(__fmul_rn(quantized_value, stepsize_val), lr);
+                const float p_f = static_cast<float>(p_v[k]);
+                if (weight_decay_factor == 1.0f) {
+                    p_out[k] = static_cast<scalar_t>(
+                        __fsub_rn(p_f, update_value));
+                } else {
+                    const float decayed = static_cast<float>(
+                        static_cast<scalar_t>(
+                            __fmul_rn(p_f, weight_decay_factor)));
+                    p_out[k] = static_cast<scalar_t>(
+                        __fsub_rn(decayed, update_value));
+                }
+            }
+            // Exact integer carries replace the per-element divisions. The
+            // reloads fire only when a next element exists IN THIS CHUNK (the
+            // k+1 bound covers the chunk end -- without it the tensor's final
+            // full chunk would express reads of v_row[rows] /
+            // *_magnitude[num_blocks], dead loads that only compiler DCE
+            // removed); the in-bounds check covers tail chunks.
+            if (++col == cols) {
+                col = 0;
+                ++row;
+                if (k + 1 < GEFEN_UPD_CHUNK &&
+                    (full || base + k + 1 < total_numel)) {
+                    vr = __ldg(&v_row[row]);
+                }
+            }
+            if (++pin == period) {
+                pin = 0;
+                ++blk;
+                if (k + 1 < GEFEN_UPD_CHUNK &&
+                    (full || base + k + 1 < total_numel)) {
+                    old_mag = old_magnitude[blk];
+                    new_mag = new_magnitude[blk];
+                }
+            }
         }
-        const uint8_t quantized_index = quantize_codebook_index_lut(
-            normalized_value, s_codebook, codebook_size, lut, lut_buckets,
-            stochastic_round, rng_seed, idx);
-        m_sign[idx] = quantized_index;
-        if (lr != 0.0f) {
-            const float v_hat = __fmul_rn(
-                __fmul_rn(__ldg(&v_row[row]), __ldg(&v_col[col])), inv_mean_r);
-            float h = __fsqrt_rn(__fmul_rn(v_hat, inv_bias_correction_2));
-            h = __fadd_rn(h, eps);
-            const float stepsize_val =
-                __fmul_rn(__frcp_rn(h), inv_bias_correction_1);
-            const float quantized_value = s_codebook[static_cast<int>(quantized_index)] * new_mag;
-            const float update_value = __fmul_rn(__fmul_rn(quantized_value, stepsize_val), lr);
-            if (weight_decay_factor == 1.0f) {
-                p[idx] = static_cast<scalar_t>(__fsub_rn(static_cast<float>(p[idx]), update_value));
-            } else {
-                const float decayed = static_cast<float>(
-                    static_cast<scalar_t>(__fmul_rn(static_cast<float>(p[idx]), weight_decay_factor)));
-                p[idx] = static_cast<scalar_t>(__fsub_rn(decayed, update_value));
+
+        if (full) {
+            uint2 so;
+            uint8_t* sp = reinterpret_cast<uint8_t*>(&so);
+            #pragma unroll
+            for (int k = 0; k < GEFEN_UPD_CHUNK; ++k) {
+                sp[k] = sign_out[k];
+            }
+            *reinterpret_cast<uint2*>(&m_sign[base]) = so;
+            if (lr != 0.0f) {
+                gefen_store_vec8(&p[base], p_out);
+            }
+        } else {
+            #pragma unroll
+            for (int k = 0; k < GEFEN_UPD_CHUNK; ++k) {
+                if (base + k < total_numel) {
+                    m_sign[base + k] = sign_out[k];
+                    if (lr != 0.0f) {
+                        p[base + k] = p_out[k];
+                    }
+                }
             }
         }
     }
@@ -2094,11 +2357,14 @@ void gefen_factored_update_cuda(
 
 
     // Phase 2: quantize + parameter update with the in-register factored
-    // per-element stepsize.
+    // per-element stepsize. Grid sized to chunks (GEFEN_UPD_CHUNK contiguous
+    // elements per thread), still capped to a resident grid.
     AT_DISPATCH_FLOATING_TYPES_AND2(
         at::kHalf, at::kBFloat16, p.scalar_type(),
         "gefen_factored_update", [&] {
-            int64_t nblocks = (total_numel + threads - 1) / threads;
+            const int64_t chunk_span =
+                static_cast<int64_t>(threads) * GEFEN_UPD_CHUNK;
+            int64_t nblocks = (total_numel + chunk_span - 1) / chunk_span;
             if (nblocks > flat_blocks_cap) nblocks = flat_blocks_cap;
             if (nblocks < 1) nblocks = 1;
             gefen_update_flat_factored_kernel<scalar_t><<<static_cast<unsigned int>(nblocks), threads, codebook_bytes, c10::cuda::getCurrentCUDAStream()>>>(

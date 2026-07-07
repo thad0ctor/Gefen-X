@@ -36,7 +36,8 @@ default set run by `run.sh` is `adamw_bf16 adamw8bit adamw4bit gefen_fused
 gefen_muon` — pass `--no-muon` to drop the (slow) Newton-Schulz `gefen_muon`.
 
 The fair default LRs (175-step fair-sweep optima): AdamW family `5e-5`,
-`gefen_fused` / `gefen_nonfused` `2e-5`, `gefen_muon` `5e-5` (with
+`gefen_fused` / `gefen_nonfused` `3e-5` (the shipped `factored_v_2d` default;
+the legacy block-shared mode's fair LR is `2e-5`), `gefen_muon` `5e-5` (with
 `--muon-adjust match_rms_adamw`). Pass `--lr-sweep` to re-derive each
 optimizer's optimum on your hardware instead of using these defaults.
 
@@ -153,11 +154,12 @@ Written to `--out`:
   output, on by default). Pass `--no-muon-normuon` to disable it; the effective
   value is recorded in each result line (`muon_flags.normuon` /
   `normuon_explicit`).
-- **`gefen_fused`/`gefen_nonfused` run the plain defaults**; the opt-in loss
-  levers (`--gefen-factored-v` — the AdamW-parity config, fair LR ≈0.6×
-  AdamW's — plus `--gefen-period-one-substrings`, `--gefen-force-1d-period-one`
-  and `--gefen-codebook-refresh`) are off unless passed, so the published rows
-  stay reproducible.
+- **`gefen_fused`/`gefen_nonfused` run the shipped defaults** (which include
+  `factored_v_2d`, the AdamW-parity second moment, fair LR ≈0.6× AdamW's);
+  the remaining opt-in levers (`--gefen-period-one-substrings`,
+  `--gefen-force-1d-period-one`, `--gefen-codebook-refresh`, and
+  `--no-gefen-factored-v` for the legacy mode) are off unless passed, so the
+  published rows stay reproducible.
 - **Muon is slower per step** — the Newton-Schulz orthogonalization adds work,
   so `gefen_muon` trades throughput for its update geometry.
 - **Throughput is per-GPU.** Compare optimizers *within* a model (same GPU
