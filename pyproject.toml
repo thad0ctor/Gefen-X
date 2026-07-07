@@ -30,18 +30,20 @@ classifiers = [
   "Operating System :: POSIX :: Linux",
   "Topic :: Scientific/Engineering :: Artificial Intelligence"
 ]
-# Hard runtime deps only. The code needs FSDP2 / public DTensor namespace
-# (torch.distributed.tensor), so torch>=2.5. numba + ninja are optional (see
-# the `perf` extra): numba has a pure-Python fallback in quantization.py and
-# ninja is only used for the CUDA JIT build.
+# Hard runtime deps. The code needs FSDP2 / public DTensor namespace
+# (torch.distributed.tensor), so torch>=2.5. numba is required: it compiles the
+# exact-DP codebook solver, and the pure-Python fallback in quantization.py is
+# too slow (O(bins^2 * codebooks)) for real training. ninja is optional (CUDA
+# JIT builds are faster with it, but torch can build without) -> the `perf` extra.
 dependencies = [
   "numpy>=1.24",
-  "torch>=2.5"
+  "torch>=2.5",
+  "numba"
 ]
 
 [project.optional-dependencies]
-# Compiled numba codebook solver + ninja for faster CUDA kernel JIT builds.
-perf = ["numba", "ninja"]
+# ninja speeds up the CUDA kernel JIT build (optional; torch builds without it).
+perf = ["ninja"]
 test = ["pytest"]
 
 [project.urls]

@@ -12,7 +12,7 @@ pip install torch --index-url https://download.pytorch.org/whl/cpu
 pip install -e ".[test]"
 ```
 
-Add the `perf` extra (`pip install -e ".[perf,test]"`) if you want the compiled numba codebook solver and ninja-backed kernel builds. Both are optional at runtime.
+Add the `perf` extra (`pip install -e ".[perf,test]"`) for ninja-backed CUDA kernel builds (faster JIT; optional — torch builds without it).
 
 ## Running the tests
 
