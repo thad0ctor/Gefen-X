@@ -11,11 +11,25 @@ These are the scripts behind the matrix in [`COMPATIBILITY.md`](../../COMPATIBIL
 
 ## Scripts
 
+Smoke tests (memorize a fixed batch):
+
 | Script | Covers |
 |---|---|
 | `validate_llm.py` | LLMs / VLMs via `transformers` (`AutoModelForCausalLM` / `AutoModelForImageTextToText`) |
 | `validate_diffusion.py` | Diffusion / flow denoisers via `diffusers` (UNet or transformer), single GPU |
 | `validate_fsdp.py` | Either family sharded with torch FSDP2 (`fully_shard`) for models too big for one card |
+| `validate_vision.py` | torchvision classifiers + detectors, transformers DETR-family detectors, ultralytics YOLO, RF-DETR (`--arch all`) |
+| `validate_audio.py` | torchaudio (Wav2Vec2, Conformer, Tacotron2) + transformers audio (Dia) speech models (`--arch all`) |
+
+Real-dataset training (held-out accuracy / mAP vs AdamW):
+
+| Script | Covers |
+|---|---|
+| `validate_mnist_cnn.py` | official PyTorch MNIST CNN — real training, test accuracy over seeds (`--optimizers adamw,gefen,hybrid`) |
+| `validate_cifar10.py` | ResNet-18 (CIFAR stem) on real CIFAR-10, test accuracy |
+| `validate_speechcommands.py` | M5 raw-waveform Conv1d recognizer on real Speech Commands v2, test accuracy |
+| `train_yolo_coco.py` | ultralytics YOLO11n fine-tuned on COCO128, mAP — Gefen injected via the trainer's `build_optimizer` |
+| `train_rfdetr_coco.py` | RF-DETR Nano on COCO128 (COCO-format converter built in), mAP — Gefen injected via the Lightning module's `configure_optimizers`, reusing RF-DETR's layer-wise LR |
 
 ## Methods
 
