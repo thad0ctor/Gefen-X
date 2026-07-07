@@ -1,12 +1,12 @@
 # Architecture Compatibility
 
-Validation of the Gefen optimizer (`fused=True`, `factored_v_2d=True` — the defaults) across a broad range of model architecture families. Each entry is a real fine-tune smoke test: a fixed small batch is trained for 40–300 steps and must show a sharp, finite loss drop (memorization). GPUs are 24 GB (RTX 3090) unless the Hardware column says otherwise.
+Validation of the Gefen optimizer (`fused=True`, `factored_v_2d=True` — the defaults) across a broad range of model architecture families. Each family is validated the way that best fits it: models with a standard training task are trained end to end on a real dataset and their accuracy or mAP is compared against AdamW; models without one run a fixed-batch smoke test — a small batch trained for 40–300 steps that must show a sharp, finite loss drop (memorization). Both confirm the same thing: Gefen's fused step drives every parameter tensor the architecture produces. GPUs are 24 GB (RTX 3090) unless a Hardware column or note says otherwise.
 
-> **Scope.** This is not an attempt to validate every model. It deliberately samples a wide range of architecture *families* — dense and Mixture-of-Experts LLMs, vision-language models, image / video / audio diffusion and flow-matching DiTs, and state-space (Mamba-hybrid) models — to show that Gefen's optimizer path handles the parameter tensor shapes, ranks, and dtypes each family produces. Breadth of architectures is the goal; exhaustive coverage of individual checkpoints is not.
+> **Scope.** This is not an attempt to validate every model. It deliberately samples a wide range of architecture *families* — dense and Mixture-of-Experts LLMs, vision-language models, convolutional image classifiers and object detectors, image / video / audio diffusion and flow-matching DiTs, state-space (Mamba-hybrid) models, and speech recognition / text-to-speech models — to show that Gefen's optimizer path handles the parameter tensor shapes, ranks, and dtypes each family produces. Breadth of architectures is the goal; exhaustive coverage of individual checkpoints is not.
 
 ## Matrix
 
-| Model | Kind | Method | Result | Loss (first → last) | Peak VRAM | Hardware |
+| Model | Kind | Method | Result | Loss (first → last, Δ%) | Peak VRAM | Hardware |
 |---|---|---|---|---|---|---|
 | LFM2.5-1.2B-Instruct | LLM | full-param | ✅ PASS | 5.52 → 0.029 (−99.5%) | 6.0 GiB | 1×24 GB |
 | Qwen3.5-0.8B | LLM | full-param | ✅ PASS | 4.64 → 0.0005 (−100%) | 4.5 GiB | 1×24 GB |
@@ -35,11 +35,53 @@ Validation of the Gefen optimizer (`fused=True`, `factored_v_2d=True` — the de
 
 Parameter ranks exercised: 1-D through 5-D — norms/biases, linears, Conv1d/patch embeds, Conv2d (SDXL UNet, vision towers), Mamba conv/SSM tensors, the 5-D Qwen3-VL patch embed. All route through Gefen's flattened block partitioning without special-casing.
 
+## Vision
+
+CNN classifiers and object detectors. Models with a standard task are trained on a real dataset (test accuracy / COCO mAP vs AdamW); the rest memorize a fixed batch, with loss shown as `first → last (Δ%)` (the first→last reduction, must exceed 30% with no NaN/Inf). Gefen `fused=True` defaults.
+
+| Model | Kind | Check | Result (accuracy / mAP / loss Δ%) |
+|---|---|---|---|
+| CNN (2-conv, PyTorch example) | CNN | MNIST, test acc (3 seeds) | Gefen 98.96% · AdamW 99.04% · hybrid 99.20% |
+| ResNet-18 | CNN — residual | CIFAR-10, test acc (20 ep) | Gefen 91.82% · AdamW 91.94% · hybrid 91.40% |
+| ResNet-50 | CNN — residual | memorize fixed batch | ✅ 2.73 → 0.00 (−100%) |
+| ConvNeXt-Tiny | CNN — modern conv | memorize fixed batch | ✅ 2.55 → 0.00 (−100%) |
+| EfficientNet-B0 | CNN — MBConv | memorize fixed batch | ✅ 3.65 → 0.36 (−90%) |
+| MobileNetV3-Large | CNN — inverted residual | memorize fixed batch | ✅ 2.30 → 0.00 (−100%) |
+| DenseNet-121 | CNN — dense | memorize fixed batch | ✅ 2.29 → 0.00 (−100%) |
+| RegNet-Y-1.6GF | CNN — grouped | memorize fixed batch | ✅ 2.44 → 0.00 (−100%) |
+| ViT-B/16 | vision transformer | memorize fixed batch | ✅ 2.30 → 0.00 (−100%) |
+| Swin-T | vision transformer — windowed | memorize fixed batch | ✅ 2.23 → 1.55 (−31%) |
+| YOLO11n | detector — YOLO (ultralytics) | COCO128, mAP@50-95 / @50 (40 ep) | Gefen 0.702 / 0.882 · AdamW 0.680 / 0.872 |
+| RF-DETR Nano | detector — DETR (roboflow) | COCO128 person, mAP@50-95 / @50 (30 ep) | Gefen 0.726 / 0.909 · AdamW 0.701 / 0.910 |
+| Faster R-CNN (R50-FPN) | detector — two-stage conv | memorize fixed batch | ✅ 2.54 → 1.64 (−36%) |
+| RetinaNet (R50-FPN) | detector — one-stage conv | memorize fixed batch | ✅ 1.82 → 0.96 (−47%) |
+| SSD300-VGG16 | detector — one-stage conv | memorize fixed batch | ✅ 101.7 → 1.82 (−98%) |
+| FCOS (R50-FPN) | detector — anchor-free conv | memorize fixed batch | ✅ 3.03 → 1.49 (−51%) |
+| RT-DETR | detector — DETR transformer | memorize fixed batch | ✅ 46.0 → 15.7 (−66%) |
+| YOLOS | detector — ViT transformer | memorize fixed batch | ✅ 5.37 → 1.69 (−69%) |
+| Deformable-DETR | detector — deformable transformer | memorize fixed batch | ✅ 8.01 → 0.60 (−92%) |
+
+## Audio
+
+Speech recognition and text-to-speech. Speech Commands is trained on the real dataset (test accuracy vs AdamW); the rest memorize a fixed batch, with loss shown as `first → last (Δ%)`.
+
+| Model | Kind | Check | Result (accuracy / loss Δ%) |
+|---|---|---|---|
+| M5 raw-waveform Conv1d | speech recognition — Conv1d | Speech Commands v2, test acc (12 ep) | Gefen 83.64% · AdamW 84.86% · hybrid 85.57% |
+| Wav2Vec2 | ASR — conv + transformer (CTC) | memorize fixed batch | ✅ 5312 → 975 (−82%) |
+| HuBERT | ASR — conv + transformer (CTC) | memorize fixed batch | ✅ 5281 → 1649 (−69%) |
+| Conformer | speech encoder — conv + attention | memorize fixed batch | ✅ 37.7 → 2.11 (−94%) |
+| Tacotron2 | TTS — conv + LSTM + attention | memorize fixed batch | ✅ 4.76 → 1.56 (−67%) |
+| Dia | TTS — transformer, audio codebooks | memorize fixed batch | ✅ 7.37 → 2.66 (−64%) |
+
+Real-dataset recipes: MNIST is the paper's recipe (batch 64, 4 epochs, StepLR γ=0.7, lr 1e-3), accuracy averaged over three seeds; CIFAR-10 is ResNet-18 with a CIFAR stem; Speech Commands is the M5 Conv1d recognizer; YOLO11n fine-tunes the pretrained detector; RF-DETR trains a person detector and reuses its layer-wise learning rates so the pretrained DINOv2 backbone stays at a low LR while the head trains fast. Gefen peak VRAM was at or below AdamW throughout (e.g. CIFAR-10 ResNet-18: 0.71 vs 0.77 GiB). Smoke tests ran on one RTX 5090; the detectors trained on one RTX PRO 6000 (Blackwell). Recipes: [`benchmarks/arch-compat/`](benchmarks/arch-compat/) (`validate_mnist_cnn.py`, `validate_cifar10.py`, `validate_speechcommands.py`, `validate_vision.py`, `validate_audio.py`, `train_yolo_coco.py`, `train_rfdetr_coco.py`).
+
 ## Method
 
-- Fixed batch, N optimizer steps; PASS if the loss falls more than 30% with no NaN/Inf. Peak VRAM from `torch.cuda.max_memory_allocated`.
+- **Real-dataset rows** report held-out test accuracy or COCO mAP after a full training run — a convergence comparison against AdamW at matched model / data / LR / schedule / epochs.
+- **Smoke-test rows** train a fixed batch for N optimizer steps and report the loss as `first → last (Δ%)`, where Δ% is the reduction from the first step's loss to the last (`(first − last) / first`); PASS if it exceeds 30% with no NaN/Inf. Peak VRAM from `torch.cuda.max_memory_allocated`.
 - The **Method** column: `full-param` trains every native parameter tensor; `full-param FSDP2` / `device_map` shard that same full-parameter training for models over one card; `LoRA` covers models too large to full-fine-tune even sharded — a weaker claim, since only the adapter matrices are trained.
-- **Versions**: torch 2.12.0+cu133, transformers 5.10.2 (≥ 5.11 for PaddleOCR-VL), diffusers 0.39.0. Harness and per-model recipes: [`benchmarks/arch-compat/`](benchmarks/arch-compat/).
+- **Versions**: LLM / VLM / diffusion smokes on torch 2.12.0+cu133, transformers 5.10.2 (≥ 5.11 for PaddleOCR-VL), diffusers 0.39.0. Vision / audio / real-data runs on torch 2.13.0+cu133, torchvision 0.28, torchaudio 2.11, transformers 5.12, ultralytics 8.4, rfdetr 1.8. Harness and per-model recipes: [`benchmarks/arch-compat/`](benchmarks/arch-compat/).
 
 ## CUDA Graphs & torch.compile (`capturable`)
 
