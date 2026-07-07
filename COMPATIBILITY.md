@@ -39,7 +39,7 @@ Parameter ranks exercised: 1-D through 5-D — norms/biases, linears, Conv1d/pat
 
 CNN classifiers and object detectors. Models with a standard task are trained on a real dataset (test accuracy / COCO mAP vs AdamW); the rest memorize a fixed batch, with loss shown as `first → last (Δ%)` (the first→last reduction, must exceed 30% with no NaN/Inf). Gefen `fused=True` defaults.
 
-| Model | Kind | Check | Result |
+| Model | Kind | Check | Result (accuracy / mAP / loss Δ%) |
 |---|---|---|---|
 | CNN (2-conv, PyTorch example) | CNN | MNIST, test acc (3 seeds) | Gefen 98.96% · AdamW 99.04% · hybrid 99.20% |
 | ResNet-18 | CNN — residual | CIFAR-10, test acc (20 ep) | Gefen 91.82% · AdamW 91.94% · hybrid 91.40% |
@@ -65,7 +65,7 @@ CNN classifiers and object detectors. Models with a standard task are trained on
 
 Speech recognition and text-to-speech. Speech Commands is trained on the real dataset (test accuracy vs AdamW); the rest memorize a fixed batch, with loss shown as `first → last (Δ%)`.
 
-| Model | Kind | Check | Result |
+| Model | Kind | Check | Result (accuracy / loss Δ%) |
 |---|---|---|---|
 | M5 raw-waveform Conv1d | speech recognition — Conv1d | Speech Commands v2, test acc (12 ep) | Gefen 83.64% · AdamW 84.86% · hybrid 85.57% |
 | Wav2Vec2 | ASR — conv + transformer (CTC) | memorize fixed batch | ✅ 5312 → 975 (−82%) |
