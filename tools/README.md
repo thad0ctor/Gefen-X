@@ -37,8 +37,7 @@ Two modes:
 
 Selecting multiple GPUs does **not** shard by itself — `--devices` alone replicates the whole model per GPU. Add `--shard` to split one model across them.
 
-Worked example (single GPU):
-# --dataset accepts a HF dataset name OR a local .txt/.json/.jsonl path
+Worked example (single GPU) — `--dataset` accepts a HF dataset name OR a local `.txt`/`.json`/`.jsonl` path:
 ```bash
 python -m gefen.tools.find_lr \
     --model /path/to/Qwen3-1.7B \
@@ -49,8 +48,7 @@ python -m gefen.tools.find_lr \
 # -> RECOMMENDED base LR for gefen: <number>
 ```
 
-**Parallel sweep across GPUs** (`--devices`). Each LR arm is independent, so a sweep fans across GPUs — one (or more) LRs per GPU — for a near-linear speedup, with the **same** lowest-eval selection as the sequential run:
-# --devices spawns one worker per GPU; the LR grid is round-robin'd across them
+**Parallel sweep across GPUs** (`--devices`). Each LR arm is independent, so a sweep fans across GPUs — one (or more) LRs per GPU — for a near-linear speedup, with the **same** lowest-eval selection as the sequential run. `--devices` spawns one worker per GPU and round-robins the LR grid across them:
 ```bash
 python -m gefen.tools.find_lr \
     --model /path/to/Qwen3-1.7B --optimizer gefen --method sweep \
@@ -94,13 +92,7 @@ The re-exec preserves the environment (incl. `PYTHONPATH`, `CUDA_VISIBLE_DEVICES
 | `calibrate_vs_adamw` | per-parameter Gefen-vs-AdamW update-RMS ratio, via a shadow AdamW fed identical gradients |
 | `run_model_calibration.py` | runner that loads a HF model and reports the above per parameter-type (paths via CLI) |
 
-These are diagnostics for *understanding* update magnitudes — useful, but see the finding below before treating any magnitude ratio as an LR prescription.
-
-## Honest finding: matching AdamW *magnitude* is the wrong objective for Muon
-
-`calibrate_vs_adamw` shows that `match_rms_adamw`'s flat `k=0.2` produces Muon updates **below** AdamW's magnitude (q/o_proj ≈2.2× under, median ≈1.3×). It is tempting to "fix" this by scaling the Muon updates up to match AdamW. We tried that (a per-type prior and an auto-calibration window) and validated it on real-dataset fine-tuning (tatsu-lab/alpaca, held-out eval): **it did not help and slightly hurt** — the original `match_rms_adamw` (k=0.2) tracked/beat AdamW, while the magnitude-matched variants were worse on train and eval.
-
-Conclusion: the *measurement* is correct, but Muon's benefit is the orthogonalized update **direction**, not magnitude parity. So **`match_rms_adamw` stays the recommended default** for the hybrid, and the magnitude-matching machinery is intentionally **not shipped** (only the diagnostic probes that revealed this remain here). It may matter for heavier/from-scratch training — untested.
+These diagnostics are for *understanding* update magnitudes, not for setting the LR: keep `adjust_lr_fn="match_rms_adamw"` (the recommended default for the hybrid) — Muon's benefit is the orthogonalized update *direction*, not matching AdamW's update magnitude.
 
 ## Tests
 CPU smoke (no CUDA needed): `tests/test_find_lr.py` (range_test across all four families + non-destructive restore) and `tests/test_lr_calibration.py` (the probes). The real-model finder validation runs on GPU.

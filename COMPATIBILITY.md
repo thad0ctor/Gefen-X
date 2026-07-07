@@ -74,7 +74,7 @@ Same head-to-head setup. ASR rows report Speech Commands keyword accuracy (highe
 | Tacotron2 | TTS — conv + LSTM + attention | LJSpeech val loss ↓ | 0.578 | 0.583 |
 | Dia | TTS — transformer, audio codebooks | LJSpeech val loss ↓ | 4.75 | 4.72 |
 
-Gefen ≈ AdamW on the classifiers, ASR, and TTS, and leads on YOLO11n and RF-DETR; it trails by ~1–7 mAP points on the other detectors and the Conformer at matched LR. That gap is mostly hyperparameter: a per-optimizer LR grid (Gefen's optimum ≈0.6× AdamW's, at 3e-5) shrinks it to ≤0.01 on five of seven detectors — Gefen ahead on RetinaNet and RT-DETR — and ≤0.03 on the rest, e.g. Deformable-DETR's −0.21 at a shared 1e-4 collapses to −0.03. The `Gefen-Muon` hybrid matched or beat AdamW where run.
+Gefen ≈ AdamW on the classifiers, ASR, and TTS, and leads on YOLO11n and RF-DETR; it trails by 1–7 mAP points on the other detectors and the Conformer at matched LR. That gap is mostly hyperparameter: a per-optimizer LR grid (Gefen's optimum ≈0.6× AdamW's, at 3e-5) shrinks it to ≤0.01 on five of seven detectors — Gefen ahead on RetinaNet and RT-DETR — and ≤0.03 on the rest, e.g. Deformable-DETR's −0.21 at a shared 1e-4 collapses to −0.03. The `Gefen-Muon` hybrid matched or beat AdamW where run.
 
 Setup: from scratch — MNIST (paper recipe, 3 seeds), CIFAR-10 ResNet-18; fine-tuned — classifiers→Imagenette, detectors→COCO128, ASR→Speech Commands, TTS→LJSpeech. RTX 5090 + RTX PRO 6000. Harnesses: [`benchmarks/arch-compat/`](benchmarks/arch-compat/).
 
@@ -101,8 +101,9 @@ Measured step times (386M-parameter census, RTX 3090 Ti, tail-100 mean over 500 
 **Manual capture** — run a few real warmup steps first (codebook learning happens on the first step), then capture one `opt.step()` and drive training by refilling the static grad buffers (and the `lr` tensor, for schedules) before each `graph.replay()`:
 
 ```python
-opt = GefenMuonHybrid(*split_params_for_muon(model), lr=torch.tensor(3e-5, device="cuda"),
-                      capturable=True)
+from gefen import GefenMuonHybrid
+
+opt = GefenMuonHybrid(model, lr=torch.tensor(3e-5, device="cuda"), capturable=True)
 ```
 
 **torch.compile** — the fused kernels are registered as torch custom ops, so dynamo traces the whole step into one graph and CUDA-graphs it end to end:
