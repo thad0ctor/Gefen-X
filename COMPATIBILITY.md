@@ -43,23 +43,23 @@ CNN classifiers and object detectors. Models with a standard task are trained on
 |---|---|---|---|
 | CNN (2-conv, PyTorch example) | CNN | MNIST, test acc (3 seeds) | Gefen 98.96% · AdamW 99.04% · hybrid 99.20% |
 | ResNet-18 | CNN — residual | CIFAR-10, test acc (20 ep) | Gefen 91.82% · AdamW 91.94% · hybrid 91.40% |
-| ResNet-50 | CNN — residual | memorize fixed batch | ✅ 2.73 → 0.00 |
-| ConvNeXt-Tiny | CNN — modern conv | memorize fixed batch | ✅ 2.55 → 0.00 |
-| EfficientNet-B0 | CNN — MBConv | memorize fixed batch | ✅ 3.65 → 0.36 |
-| MobileNetV3-Large | CNN — inverted residual | memorize fixed batch | ✅ 2.30 → 0.00 |
-| DenseNet-121 | CNN — dense | memorize fixed batch | ✅ 2.29 → 0.00 |
-| RegNet-Y-1.6GF | CNN — grouped | memorize fixed batch | ✅ 2.44 → 0.00 |
-| ViT-B/16 | vision transformer | memorize fixed batch | ✅ 2.30 → 0.00 |
-| Swin-T | vision transformer — windowed | memorize fixed batch | ✅ 2.23 → 1.55 |
+| ResNet-50 | CNN — residual | memorize fixed batch | ✅ 2.73 → 0.00 (−100%) |
+| ConvNeXt-Tiny | CNN — modern conv | memorize fixed batch | ✅ 2.55 → 0.00 (−100%) |
+| EfficientNet-B0 | CNN — MBConv | memorize fixed batch | ✅ 3.65 → 0.36 (−90%) |
+| MobileNetV3-Large | CNN — inverted residual | memorize fixed batch | ✅ 2.30 → 0.00 (−100%) |
+| DenseNet-121 | CNN — dense | memorize fixed batch | ✅ 2.29 → 0.00 (−100%) |
+| RegNet-Y-1.6GF | CNN — grouped | memorize fixed batch | ✅ 2.44 → 0.00 (−100%) |
+| ViT-B/16 | vision transformer | memorize fixed batch | ✅ 2.30 → 0.00 (−100%) |
+| Swin-T | vision transformer — windowed | memorize fixed batch | ✅ 2.23 → 1.55 (−31%) |
 | YOLO11n | detector — YOLO (ultralytics) | COCO128, mAP@50-95 / @50 (40 ep) | Gefen 0.702 / 0.882 · AdamW 0.680 / 0.872 |
 | RF-DETR Nano | detector — DETR (roboflow) | COCO128 person, mAP@50-95 / @50 (30 ep) | Gefen 0.726 / 0.909 · AdamW 0.701 / 0.910 |
-| Faster R-CNN (R50-FPN) | detector — two-stage conv | memorize fixed batch | ✅ 2.54 → 1.64 |
-| RetinaNet (R50-FPN) | detector — one-stage conv | memorize fixed batch | ✅ 1.82 → 0.96 |
-| SSD300-VGG16 | detector — one-stage conv | memorize fixed batch | ✅ 101.7 → 1.82 |
-| FCOS (R50-FPN) | detector — anchor-free conv | memorize fixed batch | ✅ 3.03 → 1.49 |
-| RT-DETR | detector — DETR transformer | memorize fixed batch | ✅ 46.0 → 15.7 |
-| YOLOS | detector — ViT transformer | memorize fixed batch | ✅ 5.37 → 1.69 |
-| Deformable-DETR | detector — deformable transformer | memorize fixed batch | ✅ 8.01 → 0.60 |
+| Faster R-CNN (R50-FPN) | detector — two-stage conv | memorize fixed batch | ✅ 2.54 → 1.64 (−36%) |
+| RetinaNet (R50-FPN) | detector — one-stage conv | memorize fixed batch | ✅ 1.82 → 0.96 (−47%) |
+| SSD300-VGG16 | detector — one-stage conv | memorize fixed batch | ✅ 101.7 → 1.82 (−98%) |
+| FCOS (R50-FPN) | detector — anchor-free conv | memorize fixed batch | ✅ 3.03 → 1.49 (−51%) |
+| RT-DETR | detector — DETR transformer | memorize fixed batch | ✅ 46.0 → 15.7 (−66%) |
+| YOLOS | detector — ViT transformer | memorize fixed batch | ✅ 5.37 → 1.69 (−69%) |
+| Deformable-DETR | detector — deformable transformer | memorize fixed batch | ✅ 8.01 → 0.60 (−92%) |
 
 ## Audio
 
@@ -68,18 +68,18 @@ Speech recognition and text-to-speech. Speech Commands is trained on the real da
 | Model | Kind | Check | Result |
 |---|---|---|---|
 | M5 raw-waveform Conv1d | speech recognition — Conv1d | Speech Commands v2, test acc (12 ep) | Gefen 83.64% · AdamW 84.86% · hybrid 85.57% |
-| Wav2Vec2 | ASR — conv + transformer (CTC) | memorize fixed batch | ✅ 5312 → 975 |
-| HuBERT | ASR — conv + transformer (CTC) | memorize fixed batch | ✅ 5281 → 1649 |
-| Conformer | speech encoder — conv + attention | memorize fixed batch | ✅ 37.7 → 2.11 |
-| Tacotron2 | TTS — conv + LSTM + attention | memorize fixed batch | ✅ 4.76 → 1.56 |
-| Dia | TTS — transformer, audio codebooks | memorize fixed batch | ✅ 7.37 → 2.66 |
+| Wav2Vec2 | ASR — conv + transformer (CTC) | memorize fixed batch | ✅ 5312 → 975 (−82%) |
+| HuBERT | ASR — conv + transformer (CTC) | memorize fixed batch | ✅ 5281 → 1649 (−69%) |
+| Conformer | speech encoder — conv + attention | memorize fixed batch | ✅ 37.7 → 2.11 (−94%) |
+| Tacotron2 | TTS — conv + LSTM + attention | memorize fixed batch | ✅ 4.76 → 1.56 (−67%) |
+| Dia | TTS — transformer, audio codebooks | memorize fixed batch | ✅ 7.37 → 2.66 (−64%) |
 
 Real-dataset recipes: MNIST is the paper's recipe (batch 64, 4 epochs, StepLR γ=0.7, lr 1e-3), accuracy averaged over three seeds; CIFAR-10 is ResNet-18 with a CIFAR stem; Speech Commands is the M5 Conv1d recognizer; YOLO11n fine-tunes the pretrained detector; RF-DETR trains a person detector and reuses its layer-wise learning rates so the pretrained DINOv2 backbone stays at a low LR while the head trains fast. Gefen peak VRAM was at or below AdamW throughout (e.g. CIFAR-10 ResNet-18: 0.71 vs 0.77 GiB). Smoke tests ran on one RTX 5090; the detectors trained on one RTX PRO 6000 (Blackwell). Recipes: [`benchmarks/arch-compat/`](benchmarks/arch-compat/) (`validate_mnist_cnn.py`, `validate_cifar10.py`, `validate_speechcommands.py`, `validate_vision.py`, `validate_audio.py`, `train_yolo_coco.py`, `train_rfdetr_coco.py`).
 
 ## Method
 
 - **Real-dataset rows** report held-out test accuracy or COCO mAP after a full training run — a convergence comparison against AdamW at matched model / data / LR / schedule / epochs.
-- **Smoke-test rows** train a fixed batch for N optimizer steps; PASS if the loss falls more than 30% with no NaN/Inf. Peak VRAM from `torch.cuda.max_memory_allocated`.
+- **Smoke-test rows** train a fixed batch for N optimizer steps and report the loss as `first → last (−drop%)`, where the percentage is the reduction from the first step's loss to the last (`(first − last) / first`); PASS if it exceeds 30% with no NaN/Inf. Peak VRAM from `torch.cuda.max_memory_allocated`.
 - The **Method** column: `full-param` trains every native parameter tensor; `full-param FSDP2` / `device_map` shard that same full-parameter training for models over one card; `LoRA` covers models too large to full-fine-tune even sharded — a weaker claim, since only the adapter matrices are trained.
 - **Versions**: LLM / VLM / diffusion smokes on torch 2.12.0+cu133, transformers 5.10.2 (≥ 5.11 for PaddleOCR-VL), diffusers 0.39.0. Vision / audio / real-data runs on torch 2.13.0+cu133, torchvision 0.28, torchaudio 2.11, transformers 5.12, ultralytics 8.4, rfdetr 1.8. Harness and per-model recipes: [`benchmarks/arch-compat/`](benchmarks/arch-compat/).
 
