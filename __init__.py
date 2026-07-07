@@ -1,3 +1,12 @@
+from importlib.metadata import PackageNotFoundError, version
+
+try:
+    # Single-sourced from the installed distribution metadata (name: gefen-x).
+    __version__ = version("gefen-x")
+except PackageNotFoundError:
+    # Importing straight from a source checkout that was never `pip install`ed.
+    __version__ = "0.0.0+unknown"
+
 __all__ = [
     "Gefen",
     "GefenMuon",
@@ -5,6 +14,7 @@ __all__ = [
     "split_params_for_muon",
     "validate_split",
     "kernels",
+    "__version__",
 ]
 
 

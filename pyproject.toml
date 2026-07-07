@@ -1,42 +1,53 @@
 # Python packaging metadata used by pip/build to install Gefen as an importable package.
+# Distribution name is `gefen-x` (this fork); the import name stays `gefen`.
 [build-system]
-requires = ["setuptools>=68", "wheel"]
+requires = ["setuptools>=77", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "gefen"
-version = "1.1.1"
+name = "gefen-x"
+# Single-sourced at runtime via importlib.metadata (see __init__.py __version__).
+version = "0.2.0"
 description = "Gefen optimizer for memory-efficient PyTorch training"
 readme = "README.md"
-requires-python = ">=3.9"
-license = { file = "LICENSE" }
+requires-python = ">=3.10"
+license = "MIT"
+license-files = ["LICENSE"]
 authors = [
-  { name = "Nadav Benedek" }
+  { name = "Nadav Benedek" },
+  { name = "thad0ctor", email = "robert.gilbreth@gmail.com" }
+]
+maintainers = [
+  { name = "thad0ctor", email = "robert.gilbreth@gmail.com" }
 ]
 classifiers = [
   "Programming Language :: Python :: 3",
   "Programming Language :: Python :: 3 :: Only",
-  "Programming Language :: Python :: 3.9",
   "Programming Language :: Python :: 3.10",
   "Programming Language :: Python :: 3.11",
   "Programming Language :: Python :: 3.12",
-  "License :: OSI Approved :: MIT License",
+  "Programming Language :: Python :: 3.13",
   "Operating System :: POSIX :: Linux",
   "Topic :: Scientific/Engineering :: Artificial Intelligence"
 ]
+# Hard runtime deps only. The code needs FSDP2 / public DTensor namespace
+# (torch.distributed.tensor), so torch>=2.5. numba + ninja are optional (see
+# the `perf` extra): numba has a pure-Python fallback in quantization.py and
+# ninja is only used for the CUDA JIT build.
 dependencies = [
-  "ninja",
-  "numpy",
-  "numba",
-  "torch"
+  "numpy>=1.24",
+  "torch>=2.5"
 ]
 
 [project.optional-dependencies]
+# Compiled numba codebook solver + ninja for faster CUDA kernel JIT builds.
+perf = ["numba", "ninja"]
 test = ["pytest"]
 
 [project.urls]
-Repository = "https://github.com/ndvbd/Gefen"
-Issues = "https://github.com/ndvbd/Gefen/issues"
+Homepage = "https://github.com/thad0ctor/Gefen-X"
+Repository = "https://github.com/thad0ctor/Gefen-X"
+Issues = "https://github.com/thad0ctor/Gefen-X/issues"
 
 [tool.setuptools]
 include-package-data = true
@@ -46,3 +57,24 @@ packages = ["gefen", "gefen.kernels", "gefen.tools"]
 gefen = "."
 "gefen.kernels" = "kernels"
 "gefen.tools" = "tools"
+
+[tool.setuptools.package-data]
+# Ship the PEP 561 typing marker in the wheel (CUDA/C++ sources go via MANIFEST.in).
+gefen = ["py.typed"]
+
+[tool.ruff]
+# Non-disruptive: lint only, no reformatting of the existing tree. Line length is
+# generous so the current code is not flagged en masse.
+line-length = 120
+target-version = "py310"
+# Benchmark harness scripts are dev-only helpers, not part of the shipped package.
+extend-exclude = ["benchmarks"]
+
+[tool.ruff.lint]
+# Conservative rule set: pyflakes (F) catches real bugs (undefined names, unused
+# imports) without style churn. Active across the shipped package modules.
+select = ["F"]
+
+[tool.ruff.lint.per-file-ignores]
+# Tests carry intentionally-imported fixtures/helpers.
+"tests/*" = ["F401"]
