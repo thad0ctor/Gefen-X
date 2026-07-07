@@ -6,7 +6,7 @@ Validation of the Gefen optimizer (`fused=True`, `factored_v_2d=True` — the de
 
 ## Matrix
 
-| Model | Kind | Method | Result | Loss (first → last) | Peak VRAM | Hardware |
+| Model | Kind | Method | Result | Loss (first → last, Δ%) | Peak VRAM | Hardware |
 |---|---|---|---|---|---|---|
 | LFM2.5-1.2B-Instruct | LLM | full-param | ✅ PASS | 5.52 → 0.029 (−99.5%) | 6.0 GiB | 1×24 GB |
 | Qwen3.5-0.8B | LLM | full-param | ✅ PASS | 4.64 → 0.0005 (−100%) | 4.5 GiB | 1×24 GB |
@@ -37,7 +37,7 @@ Parameter ranks exercised: 1-D through 5-D — norms/biases, linears, Conv1d/pat
 
 ## Vision
 
-CNN classifiers and object detectors. Models with a standard task are trained on a real dataset (test accuracy / COCO mAP vs AdamW); the rest memorize a fixed batch (first → last loss, must fall >30% with no NaN/Inf). Gefen `fused=True` defaults.
+CNN classifiers and object detectors. Models with a standard task are trained on a real dataset (test accuracy / COCO mAP vs AdamW); the rest memorize a fixed batch, with loss shown as `first → last (Δ%)` (the first→last reduction, must exceed 30% with no NaN/Inf). Gefen `fused=True` defaults.
 
 | Model | Kind | Check | Result |
 |---|---|---|---|
@@ -63,7 +63,7 @@ CNN classifiers and object detectors. Models with a standard task are trained on
 
 ## Audio
 
-Speech recognition and text-to-speech. Speech Commands is trained on the real dataset (test accuracy vs AdamW); the rest memorize a fixed batch.
+Speech recognition and text-to-speech. Speech Commands is trained on the real dataset (test accuracy vs AdamW); the rest memorize a fixed batch, with loss shown as `first → last (Δ%)`.
 
 | Model | Kind | Check | Result |
 |---|---|---|---|
@@ -79,7 +79,7 @@ Real-dataset recipes: MNIST is the paper's recipe (batch 64, 4 epochs, StepLR γ
 ## Method
 
 - **Real-dataset rows** report held-out test accuracy or COCO mAP after a full training run — a convergence comparison against AdamW at matched model / data / LR / schedule / epochs.
-- **Smoke-test rows** train a fixed batch for N optimizer steps and report the loss as `first → last (−drop%)`, where the percentage is the reduction from the first step's loss to the last (`(first − last) / first`); PASS if it exceeds 30% with no NaN/Inf. Peak VRAM from `torch.cuda.max_memory_allocated`.
+- **Smoke-test rows** train a fixed batch for N optimizer steps and report the loss as `first → last (Δ%)`, where Δ% is the reduction from the first step's loss to the last (`(first − last) / first`); PASS if it exceeds 30% with no NaN/Inf. Peak VRAM from `torch.cuda.max_memory_allocated`.
 - The **Method** column: `full-param` trains every native parameter tensor; `full-param FSDP2` / `device_map` shard that same full-parameter training for models over one card; `LoRA` covers models too large to full-fine-tune even sharded — a weaker claim, since only the adapter matrices are trained.
 - **Versions**: LLM / VLM / diffusion smokes on torch 2.12.0+cu133, transformers 5.10.2 (≥ 5.11 for PaddleOCR-VL), diffusers 0.39.0. Vision / audio / real-data runs on torch 2.13.0+cu133, torchvision 0.28, torchaudio 2.11, transformers 5.12, ultralytics 8.4, rfdetr 1.8. Harness and per-model recipes: [`benchmarks/arch-compat/`](benchmarks/arch-compat/).
 
