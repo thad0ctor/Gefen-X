@@ -13,7 +13,7 @@ Usage:
   # --arch all runs every registered detector
 """
 
-import argparse, json, os, sys, time, traceback
+import argparse, itertools, json, os, sys, time, traceback
 
 import torch
 
@@ -88,14 +88,45 @@ def build_optimizer(name, model, lr):
     raise ValueError(name)
 
 
+def find_lr(arch, name, ds, args, device):
+    """Ramp the LR on a throwaway copy of this detector to pick each optimizer's
+    own fair base LR (Gefen's fair LR is typically below AdamW's)."""
+    from gefen.tools.lr_calibration import lr_range_test
+
+    torch.manual_seed(0)
+    model = build_detector(arch).to(device)
+    model.train()
+    loader = torch.utils.data.DataLoader(
+        ds, batch_size=args.batch, shuffle=True, num_workers=4,
+        collate_fn=lambda b: tuple(zip(*b)), drop_last=True,
+    )
+    it = itertools.cycle(loader)
+
+    def closure():
+        imgs, targets = next(it)
+        imgs = [im.to(device) for im in imgs]
+        targets = [{k: v.to(device) for k, v in t.items()} for t in targets]
+        loss = sum(model(imgs, targets).values())
+        loss.backward()
+        return loss
+
+    opt = build_optimizer(name, model, 1e-4)  # LR overridden by the ramp
+    res = lr_range_test(opt, closure, num_iter=args.lrfind_iter,
+                        start_lr=1e-6, end_lr=1e-1)
+    print(f"[{arch}/{name}] lr-find: suggested {res.suggested_lr:.2e} "
+          f"(min-loss {res.min_loss_lr:.2e})")
+    return res.suggested_lr
+
+
 def run_one(arch, name, ds, args, device):
+    lr = find_lr(arch, name, ds, args, device) if args.lr_find else args.lr
     torch.manual_seed(0)
     model = build_detector(arch).to(device)
     loader = torch.utils.data.DataLoader(
         ds, batch_size=args.batch, shuffle=True, num_workers=4,
         collate_fn=lambda b: tuple(zip(*b)),
     )
-    opt = build_optimizer(name, model, args.lr)
+    opt = build_optimizer(name, model, lr)
 
     torch.cuda.reset_peak_memory_stats()
     for epoch in range(args.epochs):
@@ -126,7 +157,7 @@ def run_one(arch, name, ds, args, device):
             metric.update(preds, list(targets))
     res = metric.compute()
     peak = round(torch.cuda.max_memory_allocated() / 2**30, 3)
-    return float(res["map"]), float(res["map_50"]), peak
+    return float(res["map"]), float(res["map_50"]), peak, lr
 
 
 def main():
@@ -135,6 +166,14 @@ def main():
     ap.add_argument("--optimizers", default="adamw,gefen")
     ap.add_argument("--epochs", type=int, default=20)
     ap.add_argument("--lr", type=float, default=1e-4)
+    ap.add_argument("--lr-find", action="store_true",
+                    help="pick each optimizer's own base LR via lr_range_test before training. "
+                         "NOTE: the ramp finder needs a descending loss curve; a COCO-pretrained "
+                         "detector fine-tuned on in-distribution COCO128 starts near its loss "
+                         "minimum, so the ramp only rises and the finder returns a degenerate "
+                         "~start_lr. Use an explicit LR grid (loop --lr) for pretrained fine-tunes; "
+                         "--lr-find is for from-scratch training.")
+    ap.add_argument("--lrfind-iter", type=int, default=60)
     ap.add_argument("--batch", type=int, default=4)
     ap.add_argument("--coco128", default="./coco128")
     ap.add_argument("--out", default="results_tvdet.jsonl")
@@ -148,17 +187,19 @@ def main():
             rec = {
                 "task": "tv-detector", "arch": arch, "dataset": "coco128",
                 "optimizer": name, "epochs": args.epochs, "lr": args.lr,
+                "lr_find": args.lr_find,
                 "gpu": torch.cuda.get_device_name(0), "status": "FAIL", "error": None,
             }
             try:
                 t0 = time.time()
-                m, m50, peak = run_one(arch, name, ds, args, device)
+                m, m50, peak, used_lr = run_one(arch, name, ds, args, device)
+                rec["lr"] = used_lr
                 rec["map50_95"] = round(m, 4)
                 rec["map50"] = round(m50, 4)
                 rec["peak_vram_GiB"] = peak
                 rec["train_s"] = round(time.time() - t0, 1)
                 rec["status"] = "PASS" if m > 0.05 else "FAIL"
-                print(f"[{arch}/{name}] mAP50-95={rec['map50_95']} mAP50={rec['map50']} ({rec['train_s']}s)")
+                print(f"[{arch}/{name}] lr={used_lr:.2e} mAP50-95={rec['map50_95']} mAP50={rec['map50']} ({rec['train_s']}s)")
             except Exception:
                 rec["error"] = traceback.format_exc()[-2000:]
                 print(rec["error"], file=sys.stderr)

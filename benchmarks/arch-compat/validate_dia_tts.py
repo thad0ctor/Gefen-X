@@ -84,7 +84,9 @@ def run_one(name, train, val, processor, model_ctor, args, device):
     model.eval()
     with torch.no_grad():
         losses = [step_loss(val[i:i + bs]).item() for i in range(0, len(val) - bs + 1, bs)]
-    val_loss = sum(losses) / max(len(losses), 1)
+    if not losses:
+        raise RuntimeError(f"no full validation batch available (val={len(val)}, batch={bs})")
+    val_loss = sum(losses) / len(losses)
     peak = round(torch.cuda.max_memory_allocated() / 2**30, 3)
     return val_loss, peak
 

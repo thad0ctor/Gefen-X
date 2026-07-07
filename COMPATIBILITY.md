@@ -37,7 +37,7 @@ Parameter ranks exercised: 1-D through 5-D — norms/biases, linears, Conv1d/pat
 
 ## Vision
 
-Every row is a real training run compared head to head with AdamW at matched model / data / LR / schedule / epochs. Classifiers report held-out accuracy after fine-tuning an ImageNet-pretrained model; detectors report COCO mAP@50-95 / @50 after fine-tuning the COCO-pretrained model. Higher is better. Gefen `fused=True` defaults.
+Every row is a real training run compared head to head with AdamW at matched model / data / LR / schedule / epochs. The MNIST CNN and CIFAR-10 ResNet-18 are trained from scratch; the other classifiers fine-tune ImageNet-pretrained weights on Imagenette; detectors fine-tune COCO-pretrained weights on COCO128 and report mAP@50-95 / @50. Higher is better. Gefen `fused=True` defaults.
 
 | Model | Kind | Task (metric ↑) | Gefen | AdamW |
 |---|---|---|---|---|
@@ -63,7 +63,7 @@ Every row is a real training run compared head to head with AdamW at matched mod
 
 ## Audio
 
-Same head-to-head setup. ASR reports Speech Commands keyword accuracy after fine-tuning the pretrained encoder (higher is better); TTS has no accuracy metric, so it reports held-out LJSpeech validation loss after fine-tuning the pretrained model (lower is better).
+Same head-to-head setup. ASR rows report Speech Commands keyword accuracy (higher is better) — the M5 baseline is trained from scratch, while Wav2Vec2 / HuBERT / Wav2Vec2-Conformer fine-tune pretrained encoders. TTS has no accuracy metric, so it reports held-out LJSpeech validation loss after fine-tuning the pretrained model (lower is better).
 
 | Model | Kind | Task | Gefen | AdamW |
 |---|---|---|---|---|

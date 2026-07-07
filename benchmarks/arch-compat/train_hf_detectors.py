@@ -89,8 +89,46 @@ def run_one(arch, name, items, args, device):
         # multiscale deformable attention when a batch pads to a common size.
         return enc["pixel_values"], enc.get("pixel_mask"), labels, images
 
-    opt = build_optimizer(name, model, args.lr)
     bs = args.batch
+
+    def to_device(batch):
+        pv, pm, labels, _ = make_batch(batch)
+        kw = {"pixel_values": pv.to(device),
+              "labels": [{k: v.to(device) for k, v in t.items()} for t in labels]}
+        if pm is not None:
+            kw["pixel_mask"] = pm.to(device)
+        return kw
+
+    if args.lr_find:
+        # ramp the LR on this (throwaway) model to pick the optimizer's own base
+        # LR, then rebuild fresh pretrained weights to train from.
+        from gefen.tools.lr_calibration import lr_range_test
+
+        model.train()
+
+        def _batches():
+            while True:
+                order = torch.randperm(len(items)).tolist()
+                for i in range(0, len(order) - bs + 1, bs):
+                    yield [items[j] for j in order[i:i + bs]]
+
+        bit = _batches()
+
+        def closure():
+            loss = model(**to_device(next(bit))).loss
+            loss.backward()
+            return loss
+
+        optf = build_optimizer(name, model, 1e-4)
+        res = lr_range_test(optf, closure, num_iter=args.lrfind_iter,
+                            start_lr=1e-6, end_lr=1e-1)
+        lr = res.suggested_lr
+        print(f"[{arch}/{name}] lr-find: suggested {lr:.2e} (min-loss {res.min_loss_lr:.2e})")
+        model = getattr(tf, cls_name).from_pretrained(ckpt).to(device)  # fresh weights
+    else:
+        lr = args.lr
+
+    opt = build_optimizer(name, model, lr)
     idx = list(range(len(items)))
 
     torch.cuda.reset_peak_memory_stats()
@@ -144,7 +182,7 @@ def run_one(arch, name, items, args, device):
             metric.update(preds, tgts)
     res = metric.compute()
     peak = round(torch.cuda.max_memory_allocated() / 2**30, 3)
-    return float(res["map"]), float(res["map_50"]), peak
+    return float(res["map"]), float(res["map_50"]), peak, lr
 
 
 def main():
@@ -153,6 +191,14 @@ def main():
     ap.add_argument("--optimizers", default="adamw,gefen")
     ap.add_argument("--epochs", type=int, default=30)
     ap.add_argument("--lr", type=float, default=1e-4)
+    ap.add_argument("--lr-find", action="store_true",
+                    help="pick each optimizer's own base LR via lr_range_test before training. "
+                         "NOTE: the ramp finder needs a descending loss curve; a COCO-pretrained "
+                         "detector fine-tuned on in-distribution COCO128 starts near its loss "
+                         "minimum, so the ramp only rises and the finder returns a degenerate "
+                         "~start_lr. Use an explicit LR grid (loop --lr) for pretrained fine-tunes; "
+                         "--lr-find is for from-scratch training.")
+    ap.add_argument("--lrfind-iter", type=int, default=60)
     ap.add_argument("--batch", type=int, default=4)
     ap.add_argument("--coco128", default="./coco128")
     ap.add_argument("--out", default="results_hfdet.jsonl")
@@ -166,17 +212,19 @@ def main():
             rec = {
                 "task": "hf-detector", "arch": arch, "dataset": "coco128",
                 "optimizer": name, "epochs": args.epochs, "lr": args.lr,
+                "lr_find": args.lr_find,
                 "gpu": torch.cuda.get_device_name(0), "status": "FAIL", "error": None,
             }
             try:
                 t0 = time.time()
-                m, m50, peak = run_one(arch, name, items, args, device)
+                m, m50, peak, used_lr = run_one(arch, name, items, args, device)
+                rec["lr"] = used_lr
                 rec["map50_95"] = round(m, 4)
                 rec["map50"] = round(m50, 4)
                 rec["peak_vram_GiB"] = peak
                 rec["train_s"] = round(time.time() - t0, 1)
                 rec["status"] = "PASS" if m > 0.05 else "FAIL"
-                print(f"[{arch}/{name}] mAP50-95={rec['map50_95']} mAP50={rec['map50']} ({rec['train_s']}s)")
+                print(f"[{arch}/{name}] lr={used_lr:.2e} mAP50-95={rec['map50_95']} mAP50={rec['map50']} ({rec['train_s']}s)")
             except Exception:
                 rec["error"] = traceback.format_exc()[-2000:]
                 print(rec["error"], file=sys.stderr)
