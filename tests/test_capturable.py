@@ -182,10 +182,14 @@ def test_parity_gefen_factored_fused():
     buf = state["_capt_scalars"].cpu()
     assert [buf[i].item() for i in range(4)] == expected, (buf, expected)
 
-    # Params: within the fused factored path's own run-to-run noise.
+    # Params: within the fused factored path's own run-to-run noise. The abs
+    # gate is calibrated to the documented atomicAdd nondeterminism above: the
+    # params sit in the top binade [0.0625, 0.125) where 1 bf16 ULP = 4.88e-4,
+    # and a 2-ULP event (9.77e-4) was observed on a 188-SM Blackwell -- so gate
+    # at 1.5e-3 (>2 ULP with headroom, still far below real numeric drift).
     diff = (got - ref).abs()
     frac_diff = (diff > 0).float().mean().item()
-    assert diff.max().item() <= 5e-4, diff.max().item()
+    assert diff.max().item() <= 1.5e-3, diff.max().item()
     assert frac_diff <= 1e-3, frac_diff
 
 

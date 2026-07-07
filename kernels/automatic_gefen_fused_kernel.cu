@@ -1958,8 +1958,23 @@ void automatic_gefen_fused_update_cuda(
     double beta1,
     double lr
 ) {
+    // Packed 4-bit index mode is unsupported: its only call site always passed
+    // packed_indices=false, and the aligned-down 32-bit CAS in the packed
+    // store can touch memory outside the logical tensor extent. Reject it hard
+    // rather than route into that path.
+    if (packed_indices) {
+        throw std::invalid_argument("packed index mode is unsupported.");
+    }
     if (!p.is_cuda() || !grad_view.is_cuda() || !m_sign.is_cuda() || !m_magnitude.is_cuda() || !stepsize.is_cuda() || !codebook.is_cuda()) {
         throw std::invalid_argument("Expected all tensors to be on CUDA.");
+    }
+    // All tensors are dereferenced on p's device; reject cross-device inputs the
+    // is_cuda() checks above would otherwise let through (CUDAGuard only selects
+    // the launch device, it does not relocate the operands).
+    if (grad_view.device() != p.device() || m_sign.device() != p.device() ||
+        m_magnitude.device() != p.device() || stepsize.device() != p.device() ||
+        codebook.device() != p.device()) {
+        throw std::invalid_argument("Expected all tensors on the same device as p.");
     }
     if (!p.is_contiguous()) {
         throw std::invalid_argument("Expected p to be contiguous.");
@@ -2023,6 +2038,15 @@ void automatic_gefen_fused_update_cuda(
     if (packed_indices && codebook_numel > 16) {
         throw std::invalid_argument("Expected packed codebook size in [1, 16].");
     }
+    if (period <= 0) {
+        throw std::invalid_argument("Expected grad_view to have a positive period.");
+    }
+    // Empty param (num_blocks == 0 -> total_numel == 0): nothing to update, and a
+    // grid.x of 0 is an invalid launch. Bail before the launch. (v1-full already
+    // guards this via its period/total_numel checks.)
+    if (num_blocks == 0) {
+        return;
+    }
     // these two may create additional memory footprint.
     const int threads = choose_threads(period);
     const dim3 grid(static_cast<unsigned int>(num_blocks));
@@ -2031,9 +2055,7 @@ void automatic_gefen_fused_update_cuda(
     const size_t shared_bytes =
         (static_cast<size_t>(threads) + static_cast<size_t>(codebook.numel())) * sizeof(float);
 
-    AT_DISPATCH_FLOATING_TYPES_AND2(
-        at::kHalf,
-        at::kBFloat16,
+    GEFEN_DISPATCH_FLOAT_HALF_BF16(
         p.scalar_type(),
         "automatic_gefen_fused_update_cuda",
         [&] {
@@ -2077,6 +2099,12 @@ void automatic_gefen_fused_full_update_cuda(
     c10::optional<at::Tensor> step_scalars,
     c10::optional<at::Tensor> seed_dev
 ) {
+    // Packed 4-bit index mode is unsupported (see the v1-legacy update): the
+    // only call site always passes false, and the packed store's aligned-down
+    // 32-bit CAS can touch memory outside the logical tensor extent.
+    if (packed_indices) {
+        throw std::invalid_argument("packed index mode is unsupported.");
+    }
     if (!p.is_cuda() || !grad_view.is_cuda() || !m_sign.is_cuda() || !m_magnitude.is_cuda() || !vmean.is_cuda() || !codebook.is_cuda()) {
         throw std::invalid_argument("Expected all tensors to be on CUDA.");
     }
@@ -2169,6 +2197,12 @@ void automatic_gefen_fused_full_update_cuda(
     if (packed_indices && codebook_numel > 16) {
         throw std::invalid_argument("Expected packed codebook size in [1, 16].");
     }
+    // Empty param (num_blocks == 0 -> total_numel == 0): nothing to update, and
+    // grid_blocks would round down to 0 -> dim3 grid(0), an invalid launch. Bail
+    // before building the grid (matches the v1-legacy update path guard).
+    if (num_blocks == 0) {
+        return;
+    }
 
     const int threads = choose_threads(period);
     // Multi-row packing: host ~256 threads (>= 2 warps) per CUDA block by
@@ -2239,6 +2273,14 @@ void automatic_gefen_fused_update_v2_cuda(
     if (!p.is_cuda() || !grad_view.is_cuda() || !m_sign.is_cuda() || !m_magnitude.is_cuda() || !stepsize.is_cuda() || !codebook.is_cuda()) {
         throw std::invalid_argument("Expected all tensors to be on CUDA.");
     }
+    // All tensors are dereferenced on p's device; reject cross-device inputs the
+    // is_cuda() checks above would otherwise let through (CUDAGuard only selects
+    // the launch device, it does not relocate the operands).
+    if (grad_view.device() != p.device() || m_sign.device() != p.device() ||
+        m_magnitude.device() != p.device() || stepsize.device() != p.device() ||
+        codebook.device() != p.device()) {
+        throw std::invalid_argument("Expected all tensors on the same device as p.");
+    }
     if (!p.is_contiguous() || !grad_view.is_contiguous() || !m_sign.is_contiguous() ||
         !m_magnitude.is_contiguous() || !stepsize.is_contiguous() || !codebook.is_contiguous()) {
         throw std::invalid_argument("Expected all tensors to be contiguous.");
@@ -2289,8 +2331,8 @@ void automatic_gefen_fused_update_v2_cuda(
     const size_t codebook_bytes = static_cast<size_t>(codebook_size) * sizeof(float);
 
     // Phase 1: per-block magnitude (absmax of updated momentum).
-    AT_DISPATCH_FLOATING_TYPES_AND2(
-        at::kHalf, at::kBFloat16, p.scalar_type(),
+    GEFEN_DISPATCH_FLOAT_HALF_BF16(
+        p.scalar_type(),
         "gefen_v2_magnitude", [&] {
             if (period <= 2048) {
                 int64_t nblocks = (total_numel + threads - 1) / threads;
@@ -2320,8 +2362,8 @@ void automatic_gefen_fused_update_v2_cuda(
     C10_CUDA_KERNEL_LAUNCH_CHECK();
 
     // Phase 2: quantize + parameter update (elementwise).
-    AT_DISPATCH_FLOATING_TYPES_AND2(
-        at::kHalf, at::kBFloat16, p.scalar_type(),
+    GEFEN_DISPATCH_FLOAT_HALF_BF16(
+        p.scalar_type(),
         "gefen_v2_update", [&] {
             int64_t nblocks = (total_numel + threads - 1) / threads;
             if (nblocks > flat_blocks_cap) nblocks = flat_blocks_cap;
@@ -2500,8 +2542,8 @@ void gefen_factored_update_cuda(
                         static_cast<unsigned int>(grid_y));
         const size_t shmem =
             codebook_bytes + GEFEN_FACTORED_TILE_COLS * sizeof(float);
-        AT_DISPATCH_FLOATING_TYPES_AND2(
-            at::kHalf, at::kBFloat16, p.scalar_type(),
+        GEFEN_DISPATCH_FLOAT_HALF_BF16(
+            p.scalar_type(),
             "gefen_factored_stats", [&] {
                 gefen_factored_stats_kernel<scalar_t><<<grid, threads, shmem, c10::cuda::getCurrentCUDAStream()>>>(
                     grad_view.data_ptr<scalar_t>(), m_sign.data_ptr<uint8_t>(),
@@ -2553,8 +2595,8 @@ void gefen_factored_update_cuda(
     // Phase 2: quantize + parameter update with the in-register factored
     // per-element stepsize. Grid sized to chunks (GEFEN_UPD_CHUNK contiguous
     // elements per thread), still capped to a resident grid.
-    AT_DISPATCH_FLOATING_TYPES_AND2(
-        at::kHalf, at::kBFloat16, p.scalar_type(),
+    GEFEN_DISPATCH_FLOAT_HALF_BF16(
+        p.scalar_type(),
         "gefen_factored_update", [&] {
             const int64_t chunk_span =
                 static_cast<int64_t>(threads) * GEFEN_UPD_CHUNK;
@@ -2737,8 +2779,8 @@ void gefen_quantized_momentum_update_cuda(
 
     // Phase 1: per-block magnitude (reuses the generic v2 magnitude kernels, so
     // new_magnitude is bit-identical to the generic update's m_magnitude).
-    AT_DISPATCH_FLOATING_TYPES_AND2(
-        at::kHalf, at::kBFloat16, grad_view.scalar_type(),
+    GEFEN_DISPATCH_FLOAT_HALF_BF16(
+        grad_view.scalar_type(),
         "gefen_momentum_magnitude", [&] {
             if (period <= 2048) {
                 int64_t nblocks = (total_numel + threads - 1) / threads;
@@ -2767,8 +2809,8 @@ void gefen_quantized_momentum_update_cuda(
     C10_CUDA_KERNEL_LAUNCH_CHECK();
 
     // Phase 2: quantize state + emit the dense quantized momentum (no p write).
-    AT_DISPATCH_FLOATING_TYPES_AND2(
-        at::kHalf, at::kBFloat16, grad_view.scalar_type(),
+    GEFEN_DISPATCH_FLOAT_HALF_BF16(
+        grad_view.scalar_type(),
         "gefen_momentum_emit", [&] {
             int64_t nblocks = (total_numel + threads - 1) / threads;
             if (nblocks > flat_blocks_cap) nblocks = flat_blocks_cap;
@@ -2908,8 +2950,8 @@ void automatic_gefen_fused_update_v2_full_cuda(
     const size_t codebook_bytes = static_cast<size_t>(codebook_size) * sizeof(float);
 
     // Phase 1: per-block magnitude (absmax) + Sum(grad^2) in one grad read.
-    AT_DISPATCH_FLOATING_TYPES_AND2(
-        at::kHalf, at::kBFloat16, p.scalar_type(),
+    GEFEN_DISPATCH_FLOAT_HALF_BF16(
+        p.scalar_type(),
         "gefen_v2_full_magnitude", [&] {
             if (period <= 2048) {
                 int64_t nblocks = (total_numel + threads - 1) / threads;
@@ -2956,8 +2998,8 @@ void automatic_gefen_fused_update_v2_full_cuda(
     // Phase 2: quantize + parameter update with weight decay folded in (K3).
     // Grid sized to chunks (GEFEN_UPD_CHUNK contiguous elements per thread),
     // still capped to a resident grid.
-    AT_DISPATCH_FLOATING_TYPES_AND2(
-        at::kHalf, at::kBFloat16, p.scalar_type(),
+    GEFEN_DISPATCH_FLOAT_HALF_BF16(
+        p.scalar_type(),
         "gefen_v2_full_update", [&] {
             const int64_t chunk_span =
                 static_cast<int64_t>(threads) * GEFEN_UPD_CHUNK;

@@ -1,11 +1,5 @@
-import math
-
 import numpy as np
 import torch
-
-
-class ZeroBlockMeanError(ValueError):
-    pass
 
 
 # When the period search finds no exploitable block structure it returns
@@ -63,16 +57,6 @@ def divisors(n):
             if i != n // i and n // i != n:
                 large.append(n // i)
     return small + large[::-1]
-
-
-def _zero_block_mean_error(parameter_name, parameter_shape, period):
-    return ZeroBlockMeanError(
-        "Encountered a block with mean 0.0, cannot compute element-to-mean ratios. parameter_name={} parameter_shape={} period={}".format(
-            parameter_name,
-            parameter_shape,
-            period,
-        )
-    )
 
 
 def average_within_block_variance_cpu(
@@ -139,15 +123,12 @@ def _find_period_by_block_variance_cpu(
     divs = divisors(n)
 
     for p in divs:
-        try:
-            err_average_variance_in_blocks = average_within_block_variance_cpu(
-                squared_grad_flattened_values,
-                p,
-                parameter_name=parameter_name,
-                parameter_shape=parameter_shape,
-            )
-        except ZeroBlockMeanError:
-            continue
+        err_average_variance_in_blocks = average_within_block_variance_cpu(
+            squared_grad_flattened_values,
+            p,
+            parameter_name=parameter_name,
+            parameter_shape=parameter_shape,
+        )
         list_period_and_error.append((p, err_average_variance_in_blocks))
 
     if len(list_period_and_error) == 0:
@@ -187,16 +168,12 @@ def _find_period_by_block_variance_torch(
     divs = divisors(n)
 
     for p in divs:
-        try:
-            err = average_within_block_variance_torch(
-                values,
-                p,
-                parameter_name=parameter_name,
-                parameter_shape=parameter_shape,
-            )
-        except ZeroBlockMeanError:
-
-            continue
+        err = average_within_block_variance_torch(
+            values,
+            p,
+            parameter_name=parameter_name,
+            parameter_shape=parameter_shape,
+        )
         results.append((p, err))
 
     if len(results) == 0:

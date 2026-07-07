@@ -9,7 +9,9 @@ Hugging Face Trainer / accelerate single-GPU path.
 
 Both sub-optimizers key their per-parameter codebook cache on ``group["name"]``,
 so parameters MUST be supplied as ``(name, param)`` pairs with unique names --
-passing bare tensors collapses every name to ``"none"`` and corrupts the cache.
+bare tensors get positional auto-names ("param_0", ...), so the split validation
+loses its real names and checkpoint state can only be re-matched by construction
+order, which silently breaks on any reordering.
 
 Scope: single-GPU / DDP and FSDP2 (fully_shard / DTensor). Under FSDP2 each rank
 holds only a shard of every parameter, so the backup (plain Gefen) params update
@@ -57,22 +59,55 @@ defaults stay parity-preserving (period-1 off, shared lr, stochastic_round off)
 except ``ns_schedule="tuned3"`` and ``normuon=True``; set the rest explicitly
 to opt in.
 """
+import logging
 from collections import OrderedDict
 
 import torch
+import torch.nn as nn
 
 from gefen.gefen import Gefen
 from gefen.gefen_muon import GefenMuon
-from gefen.params import split_params_for_muon, validate_split
+from gefen.params import (
+    DEFAULT_BACKUP_SUBSTRINGS,
+    is_muon_param,
+    split_params_for_muon,
+    validate_split,
+)
+
+logger = logging.getLogger(__name__)
 
 
 class GefenMuonHybrid(torch.optim.Optimizer):
+    """Composite optimizer: GefenMuon on the 2D hidden weights, Gefen on the rest.
+
+    See the module docstring for the recommended configuration. Two composite
+    quirks to be aware of:
+
+    * Hook semantics: INSTANCE hooks registered on the hybrid
+      (``register_step_pre_hook`` / ``register_step_post_hook`` and the
+      state-dict / load-state-dict pre/post hooks) fire once per hybrid
+      ``step()`` / ``state_dict()`` / ``load_state_dict()``, mirroring
+      ``torch.optim.Optimizer``. GLOBAL optimizer hooks
+      (``torch.optim.optimizer.register_optimizer_step_pre_hook`` etc.) instead
+      fire on each CHILD sub-optimizer's step -- i.e. up to twice per hybrid
+      step, with the child (not the hybrid) as the ``optimizer`` argument. That
+      is inherent to the composite design: the children are real
+      ``torch.optim.Optimizer`` instances and their steps are what torch wraps.
+
+    * ``state_dict()`` schema: NOT the standard ``{"state", "param_groups"}``
+      layout, but ``{"muon": <GefenMuon state_dict or None>, "backup": <Gefen
+      state_dict or None>}``. ``load_state_dict`` only accepts that nested
+      schema; checkpoints consolidated/converted to the flat torch layout (e.g.
+      by FSDP/DeepSpeed tooling) are rejected rather than silently ignored.
+    """
+
     def __init__(
         self,
         muon_named_params,
-        backup_named_params,
+        backup_named_params=None,
         *,
         lr,
+        backup_substrings=None,
         muon_lr=None,
         backup_lr=None,
         weight_decay=0.0,
@@ -100,6 +135,68 @@ class GefenMuonHybrid(torch.optim.Optimizer):
         capturable=False,
         verbose=False,
     ):
+        """Build the hybrid from pre-split lists, a single named-param iterable, or a model.
+
+        Three call forms:
+
+        * Two lists (primary): ``GefenMuonHybrid(muon_named, backup_named, lr=...)``
+          with the params already split into ``(name, param)`` pairs.
+        * Single argument (convenience, for platform factories that call
+          ``cls(params, **kwargs)``): pass an ``nn.Module`` OR a single iterable
+          of ``(name, param)`` pairs (e.g. ``model.named_parameters()``) as the
+          first argument and omit ``backup_named_params``; the split runs
+          internally. A model enables module-type embedding detection (tied
+          heads, T5 ``shared``); a bare named-param iterable falls back to
+          name-substring routing. Bare tensors are rejected (they can't be
+          routed). ``GefenMuonHybrid.from_model(model, ...)`` is the equivalent
+          explicit classmethod.
+
+        Args:
+            muon_named_params: ``(name, param)`` pairs for the 2D hidden weight
+                matrices (GefenMuon half); may be empty (backup-only hybrid). In
+                the single-argument form, this is instead the ``nn.Module`` or
+                the named-param iterable to split.
+            backup_named_params: ``(name, param)`` pairs for everything else --
+                embeddings, LM/classifier heads, norms, biases (plain-Gefen
+                half). May be empty (muon-only hybrid). Leave as ``None`` to use
+                the single-argument form.
+            lr: shared learning rate for both halves (AdamW scale under the
+                default ``adjust_lr_fn="match_rms_adamw"``).
+            backup_substrings: single-argument form only -- override the
+                substrings that force a 2D weight to the backup half (defaults to
+                ``gefen.params.DEFAULT_BACKUP_SUBSTRINGS``). Passing it with the
+                two-list form is an error.
+            muon_lr / backup_lr: per-half overrides of ``lr``. Lowering only
+                ``backup_lr`` (~0.4-0.6x AdamW) is the validated loss lever.
+            weight_decay: shared decoupled (AdamW-style) weight decay, default
+                0.0; ``muon_weight_decay`` / ``backup_weight_decay`` override it
+                per half.
+            no_decay_substrings: names matching any substring (case-insensitive)
+                form a separate backup group with weight_decay=0 (AdamW "no
+                decay on norms/biases" semantics). Default: off.
+            backup_1d_period_one / backup_2d_period_one: per-element 2nd moment
+                on the backup's 1D / 2D tensors (loss levers; memory trade for
+                the 2D one).
+            betas, eps: Adam betas / epsilon for the backup Gefen half.
+            fused: use the fused CUDA kernels in both halves (default True).
+            momentum, nesterov, ns_steps, ns_schedule, adjust_lr_fn,
+            sharded_mode, fp8_ns, fp8_ns_compile, normuon, normuon_beta2,
+            normuon_eps, cautious: forwarded to GefenMuon (see its docstring).
+                Note ``normuon=True`` and ``ns_schedule="tuned3"`` are the
+                hybrid's defaults, unlike raw GefenMuon.
+            stochastic_round, capturable, verbose: forwarded to BOTH halves.
+        """
+        if backup_named_params is None:
+            # Single-argument convenience form: the first arg is a model or a
+            # named-param iterable to split internally.
+            muon_named_params, backup_named_params = self._auto_split(
+                muon_named_params, backup_substrings
+            )
+        elif backup_substrings is not None:
+            raise TypeError(
+                "backup_substrings is only valid with the single-argument "
+                "(model / named-params) form; you also passed backup_named_params."
+            )
         muon_named_params = list(muon_named_params)
         backup_named_params = list(backup_named_params)
         if not muon_named_params and not backup_named_params:
@@ -279,27 +376,162 @@ class GefenMuonHybrid(torch.optim.Optimizer):
         for o in self._subopts:
             o.zero_grad(set_to_none=set_to_none)
 
-    @torch.no_grad()
     def step(self, closure=None):
+        # Dispatch the INSTANCE step hooks around the composite step, mirroring
+        # torch.optim.Optimizer.profile_hook_step exactly: hooks receive
+        # (optimizer, args, kwargs) where args are the raw step() call args
+        # (self first), and a pre-hook may return replacement (args, kwargs).
+        # The hybrid skips Optimizer.__init__ (so its step is never wrapped by
+        # _patch_step_function); without this, registered hooks would silently
+        # never fire. GLOBAL step hooks are NOT dispatched here -- they fire on
+        # each child sub-optimizer's (wrapped) step; see the class docstring.
+        args = (self, closure) if closure is not None else (self,)
+        kwargs = {}
+        for pre_hook in self._optimizer_step_pre_hooks.values():
+            result = pre_hook(self, args, kwargs)
+            if result is not None:
+                if isinstance(result, tuple) and len(result) == 2:
+                    args, kwargs = result
+                else:
+                    raise RuntimeError(
+                        f"{self.__class__.__name__}.step pre hook must return None "
+                        f"or a tuple of (new_args, new_kwargs), but got {result}."
+                    )
+        # Re-read the closure from the (possibly hook-rewritten) call args, as
+        # torch's wrapper would by calling step(*args, **kwargs).
+        closure = args[1] if len(args) > 1 else kwargs.get("closure")
+
         loss = None
         if closure is not None:
             with torch.enable_grad():
                 loss = closure()
-        for o in self._subopts:
-            o.step()
+        with torch.no_grad():
+            for o in self._subopts:
+                o.step()
+
+        for post_hook in self._optimizer_step_post_hooks.values():
+            post_hook(self, args, kwargs)
         return loss
 
     def state_dict(self):
-        return {
+        # Instance state-dict pre/post hooks, mirroring Optimizer.state_dict:
+        # pre-hooks take (optimizer) and return nothing; a post-hook may return
+        # a replacement state_dict.
+        for pre_hook in self._optimizer_state_dict_pre_hooks.values():
+            pre_hook(self)
+        state_dict = {
             "muon": self.muon.state_dict() if self.muon is not None else None,
             "backup": self.backup.state_dict() if self.backup is not None else None,
         }
+        for post_hook in self._optimizer_state_dict_post_hooks.values():
+            hook_result = post_hook(self, state_dict)
+            if hook_result is not None:
+                state_dict = hook_result
+        return state_dict
 
     def load_state_dict(self, state_dict):
-        if self.muon is not None and state_dict.get("muon") is not None:
+        # Instance load pre-hooks first (a pre-hook may return a replacement
+        # dict -- e.g. one that converts a foreign schema), mirroring
+        # Optimizer.load_state_dict's shallow copy + hook pass.
+        state_dict = state_dict.copy()
+        for pre_hook in self._optimizer_load_state_dict_pre_hooks.values():
+            hook_result = pre_hook(self, state_dict)
+            if hook_result is not None:
+                state_dict = hook_result
+
+        # Schema guard: this used to silently skip loading whenever the keys
+        # were absent, so resuming from a standard {"state", "param_groups"}
+        # checkpoint (e.g. one consolidated/converted by FSDP or DeepSpeed
+        # tooling) ran on with ZEROED momentum -- a quiet correctness bug.
+        if "muon" not in state_dict and "backup" not in state_dict:
+            raise ValueError(
+                "GefenMuonHybrid.load_state_dict expects the hybrid's own nested "
+                'schema {{"muon": <GefenMuon state_dict or None>, "backup": '
+                '<Gefen state_dict or None>}} (what GefenMuonHybrid.state_dict() '
+                "saves), but got keys {}. Consolidated/converted checkpoints in "
+                'the standard {{"state", "param_groups"}} layout are not '
+                "supported; resume from the hybrid-saved checkpoint "
+                "instead.".format(sorted(map(str, state_dict.keys())))
+            )
+        # Each half must round-trip: a half present here but missing/None in
+        # the checkpoint (or vice versa) would silently resume that half from
+        # scratch (zeroed momentum), so raise instead of skipping. Validate
+        # BOTH halves before loading either, so a mismatch never half-loads.
+        for attr in ("muon", "backup"):
+            sub = getattr(self, attr)
+            sub_state = state_dict.get(attr)
+            if sub is None and sub_state is not None:
+                raise ValueError(
+                    "GefenMuonHybrid.load_state_dict: the checkpoint carries a "
+                    '"{}" half but this optimizer has none (was it constructed '
+                    "with a different parameter split?)".format(attr)
+                )
+            if sub is not None and sub_state is None:
+                raise ValueError(
+                    "GefenMuonHybrid.load_state_dict: this optimizer has a "
+                    '"{}" half but the checkpoint carries none; loading would '
+                    "silently reset its momentum/state".format(attr)
+                )
+        if self.muon is not None:
             self.muon.load_state_dict(state_dict["muon"])
-        if self.backup is not None and state_dict.get("backup") is not None:
+        if self.backup is not None:
             self.backup.load_state_dict(state_dict["backup"])
+
+        for post_hook in self._optimizer_load_state_dict_post_hooks.values():
+            post_hook(self)
+
+    @staticmethod
+    def _auto_split(params_or_model, backup_substrings):
+        """Split a model / named-param iterable into (muon_named, backup_named).
+
+        A model routes by module type (embeddings, incl. tied heads) plus name
+        substrings and shape; a named-param iterable routes by name+shape only
+        (no module context -- an embedding whose name matches no substring, e.g.
+        T5 ``shared``, would slip to Muon, so a model is preferred). Bare tensors
+        raise, since they carry neither names nor module type to route on.
+        """
+        subs = (
+            DEFAULT_BACKUP_SUBSTRINGS
+            if backup_substrings is None
+            else tuple(backup_substrings)
+        )
+        if isinstance(params_or_model, nn.Module):
+            muon_named, backup_named = split_params_for_muon(
+                params_or_model, backup_substrings=subs
+            )
+            validate_split(muon_named, backup_named, model=params_or_model)
+            return muon_named, backup_named
+        items = list(params_or_model)
+        for item in items:
+            if not (
+                isinstance(item, (tuple, list))
+                and len(item) == 2
+                and isinstance(item[0], str)
+                and isinstance(item[1], torch.Tensor)
+            ):
+                raise TypeError(
+                    "GefenMuonHybrid's single-argument form needs an nn.Module or "
+                    "an iterable of (name, param) pairs (e.g. model.named_parameters()); "
+                    "got a bare {}. Bare tensors can't be routed (embeddings/heads "
+                    "would go to Muon) -- pass the model or use "
+                    "GefenMuonHybrid.from_model(model, ...).".format(
+                        type(item).__name__
+                    )
+                )
+        muon_named, backup_named = [], []
+        for name, param in items:
+            if not param.requires_grad:
+                continue
+            target = muon_named if is_muon_param(name, param, subs) else backup_named
+            target.append((name, param))
+        logger.info(
+            "GefenMuonHybrid auto-split (name-based -- pass an nn.Module for "
+            "module-type embedding detection): %d muon / %d backup",
+            len(muon_named),
+            len(backup_named),
+        )
+        validate_split(muon_named, backup_named)
+        return muon_named, backup_named
 
     @classmethod
     def from_model(cls, model, *, backup_substrings=None, **kwargs):

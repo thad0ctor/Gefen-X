@@ -46,34 +46,43 @@ __global__ void automatic_vmean_update_kernel(
 ) {
     extern __shared__ float shared_sum[];
 
-    const int64_t block_idx = static_cast<int64_t>(blockIdx.x);
-    if (block_idx >= num_blocks) {
-        return;
-    }
+    // Grid-stride over logical blocks: num_blocks (= numel / period) can exceed
+    // the 2^31-1 grid.x launch limit for a >2G-element tensor with a small
+    // period, so the launcher caps grid.x and this loop covers the rest. Each
+    // block does the same per-block reduction it did before, one block at a
+    // time, so results are bit-identical to the one-block-per-logical-block
+    // launch. num_blocks is uniform across the block, so every thread runs the
+    // same iteration count and the shared-memory barriers stay well-formed.
+    for (int64_t block_idx = static_cast<int64_t>(blockIdx.x);
+         block_idx < num_blocks;
+         block_idx += static_cast<int64_t>(gridDim.x)) {
+        const int64_t start = block_idx * period;
+        float local_sum = 0.0f;
 
-    const int64_t start = block_idx * period;
-    float local_sum = 0.0f;
-
-    for (int64_t offset = threadIdx.x; offset < period; offset += blockDim.x) {
-        const float grad_value = static_cast<float>(grad_view[start + offset]);
-        local_sum += grad_value * grad_value;
-    }
-
-    shared_sum[threadIdx.x] = local_sum;
-    __syncthreads();
-
-    for (unsigned int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
-        if (threadIdx.x < stride) {
-            shared_sum[threadIdx.x] += shared_sum[threadIdx.x + stride];
+        for (int64_t offset = threadIdx.x; offset < period; offset += blockDim.x) {
+            const float grad_value = static_cast<float>(grad_view[start + offset]);
+            local_sum += grad_value * grad_value;
         }
-        __syncthreads();
-    }
 
-    if (threadIdx.x == 0) {
-        const float mean_square = shared_sum[0] / static_cast<float>(period);
-        const float previous_vmean = vmean[block_idx];
-        const float updated_vmean = beta2 * previous_vmean + (1.0f - beta2) * mean_square;
-        vmean[block_idx] = updated_vmean;
+        shared_sum[threadIdx.x] = local_sum;
+        __syncthreads();
+
+        for (unsigned int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+            if (threadIdx.x < stride) {
+                shared_sum[threadIdx.x] += shared_sum[threadIdx.x + stride];
+            }
+            __syncthreads();
+        }
+
+        if (threadIdx.x == 0) {
+            const float mean_square = shared_sum[0] / static_cast<float>(period);
+            const float previous_vmean = vmean[block_idx];
+            const float updated_vmean = beta2 * previous_vmean + (1.0f - beta2) * mean_square;
+            vmean[block_idx] = updated_vmean;
+        }
+        // Guard shared_sum reuse: thread 0's read of shared_sum[0] above must
+        // finish before the next grid-stride iteration overwrites the buffer.
+        __syncthreads();
     }
 }
 
@@ -144,6 +153,11 @@ void automatic_vmean_update_cuda(
     if (period <= 0) {
         throw std::invalid_argument("Expected grad_view to have a positive period.");
     }
+    // Empty param (num_blocks == 0): nothing to update, and the period>1 path
+    // below computes grid_blocks == 0 -> dim3 grid(0), an invalid launch. Bail.
+    if (num_blocks == 0) {
+        return;
+    }
 
     if (period == 1) {
         const int threads = 256;
@@ -167,7 +181,17 @@ void automatic_vmean_update_cuda(
     }
 
     const int threads = choose_threads(period);
-    const dim3 grid(static_cast<unsigned int>(num_blocks));
+    // Below the 2^31-1 grid.x limit, launch exactly one CUDA block per logical
+    // block -- the historical geometry, kept so existing tensor sizes see the
+    // same launch. Only the overflow regime (>2G-element tensors with a small
+    // period, which previously produced an invalid grid.x) drops to a
+    // grid-strided cap; the kernel's grid-stride loop covers the remaining
+    // blocks bit-identically. 2^22 blocks keep every SM saturated.
+    constexpr int64_t kGridLimit = (int64_t(1) << 31) - 1;
+    constexpr int64_t kOverflowGridBlocks = int64_t(1) << 22;
+    const int64_t grid_blocks =
+        num_blocks <= kGridLimit ? num_blocks : kOverflowGridBlocks;
+    const dim3 grid(static_cast<unsigned int>(grid_blocks));
     const dim3 block(static_cast<unsigned int>(threads));
     const size_t shared_bytes = static_cast<size_t>(threads) * sizeof(float);
 

@@ -74,6 +74,30 @@ def test_gefen_rejects_non_tensor_param():
         Gefen([("bad", "not a tensor")], fused=False)
 
 
+def test_gefen_add_param_group_atomic_on_partial_failure():
+    # A group whose SECOND param is invalid (complex) must raise and register
+    # NONE of the group's params -- add_param_group is all-or-nothing.
+    opt = Gefen(_params_1d(), fused=False)
+    before = len(opt.param_groups)
+    good = nn.Parameter(torch.randn(4))
+    bad = nn.Parameter(torch.randn(4, dtype=torch.complex64))
+    with pytest.raises(ValueError):
+        opt.add_param_group({"params": [("good", good), ("bad", bad)]})
+    assert len(opt.param_groups) == before
+    # The valid first param must NOT have been left registered.
+    assert not any(g.get("name") == "good" for g in opt.param_groups)
+
+
+def test_gefen_add_param_group_atomic_on_duplicate():
+    # A within-batch duplicate param must raise before ANY group is registered.
+    opt = Gefen(_params_1d(), fused=False)
+    before = len(opt.param_groups)
+    dup = nn.Parameter(torch.randn(4))
+    with pytest.raises(ValueError):
+        opt.add_param_group({"params": [("a", dup), ("b", dup)]})
+    assert len(opt.param_groups) == before
+
+
 # ---------------------------------------------------------------------------
 # GefenMuon constructor validation
 # ---------------------------------------------------------------------------
@@ -98,6 +122,29 @@ def test_gefen_muon_rejects_bad_hyperparams(kwargs):
 def test_gefen_muon_rejects_non_2d_param():
     with pytest.raises(ValueError):
         GefenMuon([("b", nn.Parameter(torch.randn(8)))], fused=False)
+
+
+@pytest.mark.parametrize("ns_steps", [0, -1, 100])
+def test_gefen_muon_rejects_bad_ns_steps_on_fixed_path(ns_steps):
+    # ns_steps IS consumed on the classic fixed-coefficient path (no schedule,
+    # or the "standard" named schedule that defers to ns_coefficients/ns_steps).
+    with pytest.raises(ValueError):
+        GefenMuon(_params_2d(), fused=False, ns_steps=ns_steps)
+    with pytest.raises(ValueError):
+        GefenMuon(
+            _params_2d(), fused=False, ns_schedule="standard", ns_steps=ns_steps
+        )
+
+
+@pytest.mark.parametrize("ns_schedule", ["tuned3", [(3.0, -4.0, 2.0), (2.5, -3.5, 1.5)]])
+def test_gefen_muon_explicit_schedule_ignores_bad_ns_steps(ns_schedule):
+    # An explicit per-iteration schedule (named tuned schedule or an explicit
+    # list) carries its own length, so an out-of-range ns_steps must NOT raise.
+    opt = GefenMuon(
+        _params_2d(), fused=False, ns_schedule=ns_schedule, ns_steps=0
+    )
+    # The schedule length becomes the effective ns_steps, not the ignored arg.
+    assert opt.param_groups[0]["ns_steps"] == len(opt.param_groups[0]["ns_coefficients"])
 
 
 # ---------------------------------------------------------------------------

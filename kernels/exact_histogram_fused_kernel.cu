@@ -24,7 +24,13 @@ __global__ void gefen_exact_histogram_kernel(
     int64_t* __restrict__ bin_counts
 ) {
     __shared__ float shared_absmax[kMaxThreads];
-    __shared__ int shared_counts[kMaxHistogramBins];
+    // 64-bit shared counters: a single logical block can hold >= 2^31 elements
+    // (a huge period), which would wrap a 32-bit int accumulator. unsigned long
+    // long holds any count a block can produce; the flush to the int64 global
+    // counts is exact (integer widening changes no result). At the max 4096 bins
+    // this is 32 KiB of static shared -- under the 48 KiB budget with the
+    // absmax buffer (~33 KiB total).
+    __shared__ unsigned long long shared_counts[kMaxHistogramBins];
 
     const int64_t logical_block_idx = static_cast<int64_t>(blockIdx.x);
     if (logical_block_idx >= num_blocks) {
@@ -35,7 +41,7 @@ __global__ void gefen_exact_histogram_kernel(
     const int64_t start = logical_block_idx * period;
 
     for (int idx = tid; idx < histogram_bins; idx += blockDim.x) {
-        shared_counts[idx] = 0;
+        shared_counts[idx] = 0ULL;
     }
 
     float local_absmax = 0.0f;
@@ -73,14 +79,14 @@ __global__ void gefen_exact_histogram_kernel(
         } else if (bin_idx >= histogram_bins) {
             bin_idx = histogram_bins - 1;
         }
-        atomicAdd(&shared_counts[bin_idx], 1);
+        atomicAdd(&shared_counts[bin_idx], 1ULL);
     }
     __syncthreads();
 
     for (int idx = tid; idx < histogram_bins; idx += blockDim.x) {
         atomicAdd(
             reinterpret_cast<unsigned long long*>(&bin_counts[idx]),
-            static_cast<unsigned long long>(shared_counts[idx])
+            shared_counts[idx]
         );
     }
 }
@@ -103,6 +109,12 @@ void validate_common_inputs(
 ) {
     if (!grad_flat.is_cuda() || !bin_counts.is_cuda()) {
         throw std::invalid_argument("Expected grad_flat and bin_counts to be CUDA tensors.");
+    }
+    // The kernel accumulates into bin_counts on grad_flat's device; a
+    // cross-device pair would launch on grad_flat's device but write across
+    // devices. Reject it (CUDAGuard only selects the launch device).
+    if (grad_flat.device() != bin_counts.device()) {
+        throw std::invalid_argument("Expected grad_flat and bin_counts on the same device.");
     }
     if (!grad_flat.is_contiguous() || !bin_counts.is_contiguous()) {
         throw std::invalid_argument("Expected grad_flat and bin_counts to be contiguous.");
@@ -135,6 +147,13 @@ void gefen_exact_histogram_cuda(
     at::Tensor bin_counts
 ) {
     validate_common_inputs(grad_flat, period, bin_counts);
+
+    // Empty grad (numel() == 0 -> num_blocks == 0): no elements to bin, and a
+    // grid.x of 0 is an invalid launch. No-op before the launch (leaves
+    // bin_counts untouched, which is the correct "added nothing" result).
+    if (grad_flat.numel() == 0) {
+        return;
+    }
 
     c10::cuda::CUDAGuard device_guard(grad_flat.device());
 
