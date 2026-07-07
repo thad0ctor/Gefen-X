@@ -101,6 +101,8 @@ optimizer.zero_grad(set_to_none=True)
 print('Finished successfully.')
 ```
 
+**Want a real end-to-end run?** See [`examples/toy-finetune/`](examples/toy-finetune/README.md) — fine-tune a small model in about four minutes on one 24 GB GPU, with a before/after check that makes success obvious.
+
 ### Learning rate (when porting an AdamW config)
 
 Use **≈0.6× your AdamW learning rate** (e.g. AdamW at `5e-5` → Gefen at `3e-5`). That is Gefen's measured optimum on the models tested (Qwen3 0.6B–8B), and at it Gefen matches AdamW's loss. Don't creep the LR back up toward the AdamW value — Gefen is less tolerant of a too-hot LR than AdamW is.
