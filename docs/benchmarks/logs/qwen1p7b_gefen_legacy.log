@@ -1,0 +1,49 @@
+[gpu] CUDA_VISIBLE_DEVICES=2 -> NVIDIA GeForce RTX 3090
+W0706 21:11:40.853000 1978021 torch/utils/_pytree.py:630] <enum 'KernelPreference'> is an Enum subclass and is now natively supported by torch.compile as an opaque value type. Calling register_constant() on Enum subclasses is deprecated and will be an error in a future release.
+W0706 21:11:40.872000 1978021 torch/utils/_pytree.py:630] <enum 'ScaleCalculationMode'> is an Enum subclass and is now natively supported by torch.compile as an opaque value type. Calling register_constant() on Enum subclasses is deprecated and will be an error in a future release.
+Loading weights:   0%|          | 0/311 [00:00<?, ?it/s]Loading weights: 100%|██████████| 311/311 [00:00<00:00, 12596.48it/s]
+Initializing Gefen optimizer (fused=True).
+[gefen] lever kwargs: {'factored_v_2d': False}
+=== qwen1p7b_legacy gefen_fused lr=2.000e-05 seed=0 steps=2000 seq=2048 params=1.721B ===
+step 0  eval_loss 2.9665
+step 50  train_ema 1.6049  eval 1.7163  3033 tok/s
+step 100  train_ema 1.4914  eval 1.5178  3027 tok/s
+step 150  train_ema 1.4864  eval 1.4769  3034 tok/s
+step 200  train_ema 1.4952  eval 1.4420  3028 tok/s
+step 250  train_ema 1.4516  eval 1.4005  3016 tok/s
+step 300  train_ema 1.5200  eval 1.4049  3026 tok/s
+step 350  train_ema 1.5149  eval 1.4077  3024 tok/s
+step 400  train_ema 1.5229  eval 1.4251  3022 tok/s
+step 450  train_ema 1.5427  eval 1.3716  3031 tok/s
+step 500  train_ema 1.4991  eval 1.3951  3031 tok/s
+step 550  train_ema 1.4655  eval 1.4104  3026 tok/s
+step 600  train_ema 1.4608  eval 1.4288  3028 tok/s
+step 650  train_ema 1.4523  eval 1.3717  3027 tok/s
+step 700  train_ema 1.4512  eval 1.3765  3027 tok/s
+step 750  train_ema 1.4745  eval 1.3392  3023 tok/s
+step 800  train_ema 1.4922  eval 1.3316  3032 tok/s
+step 850  train_ema 1.4929  eval 1.3133  3025 tok/s
+step 900  train_ema 1.4903  eval 1.3311  3033 tok/s
+step 950  train_ema 1.4925  eval 1.3498  3026 tok/s
+step 1000  train_ema 1.4979  eval 1.3330  3030 tok/s
+step 1050  train_ema 1.4495  eval 1.3329  3026 tok/s
+step 1100  train_ema 1.4848  eval 1.3459  3028 tok/s
+step 1150  train_ema 1.4626  eval 1.3367  3021 tok/s
+step 1200  train_ema 1.4433  eval 1.3325  3032 tok/s
+step 1250  train_ema 1.4894  eval 1.3374  3027 tok/s
+step 1300  train_ema 1.4832  eval 1.3339  3030 tok/s
+step 1350  train_ema 1.4235  eval 1.3310  3023 tok/s
+step 1400  train_ema 1.4458  eval 1.3195  3030 tok/s
+step 1450  train_ema 1.4576  eval 1.3223  3028 tok/s
+step 1500  train_ema 1.4674  eval 1.3266  3023 tok/s
+step 1550  train_ema 1.4816  eval 1.3044  3027 tok/s
+step 1600  train_ema 1.4421  eval 1.3116  3024 tok/s
+step 1650  train_ema 1.4801  eval 1.3248  3023 tok/s
+step 1700  train_ema 1.4903  eval 1.3229  3029 tok/s
+step 1750  train_ema 1.4848  eval 1.3320  3025 tok/s
+step 1800  train_ema 1.4284  eval 1.3301  3026 tok/s
+step 1850  train_ema 1.4465  eval 1.3100  3028 tok/s
+step 1900  train_ema 1.4622  eval 1.3297  3023 tok/s
+step 1950  train_ema 1.4476  eval 1.2909  3025 tok/s
+step 2000  train_ema 1.4615  eval 1.2863  3024 tok/s
+RESULT {"tag": "qwen1p7b_legacy", "opt": "gefen_fused", "variant": "gefen_fused", "lr": 2e-05, "seed": 0, "muon_adjust": null, "gefen_flags": {"factored_v_2d": false, "factored_v_2d_explicit": true}, "muon_flags": null, "steps": 2000, "seq": 2048, "params_B": 1.7206, "gpu": "NVIDIA GeForce RTX 3090", "final_train_ema": 1.4615, "eval0": 2.9665, "final_eval": 1.2863, "tok_per_s": 2996.1, "peak_vram_gib": 9.21, "peak_vram_reserved_gib": 11.79, "opt_state_bpp": 1.012, "opt_state_gib": 1.622}

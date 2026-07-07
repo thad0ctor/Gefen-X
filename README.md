@@ -164,7 +164,7 @@ You can run these yourself — see [`benchmarks/`](benchmarks/README.md) for wha
 
 **Loss curves** — loss over the 2000 steps. For each optimizer (distinguished by **color**), there are two lines: **solid = held-out eval loss** (the 32-example validation set, logged every 50 steps — this is the comparison metric in the table above) and **dashed = train-loss EMA** (exponential moving average of the training loss). 
 
-**Gefen-fused (with the `factored_v_2d` default) sits on the AdamW cluster at both scales** — best-in-table at 0.6B (1.4199, −0.014 below the best AdamW) and a statistical tie at 1.7B (1.2257 vs 1.2169; each eval number moves ±0.005–0.007 between reruns, so gaps under ≈0.01 are ties). Gefen-Muon sits on the same cluster (0.6B 1.4249; 1.7B 1.2411).
+**Gefen-fused (with the `factored_v_2d` default) sits on the AdamW cluster at both scales** — best-in-table at 0.6B (1.4199, −0.014 below the best AdamW) and a statistical tie at 1.7B (1.2257 vs 1.2169; each eval number moves ±0.005–0.007 between reruns, so gaps under ≈0.01 are ties). Gefen-Muon matches at 0.6B (1.4249, a tie) and lands +0.024 above the best AdamW at 1.7B (1.2411 vs 1.2169).
 
 ![Qwen3-1.7B loss curves](docs/benchmarks/loss_curve_qwen1p7b.png)
 ![Qwen3-0.6B loss curves](docs/benchmarks/loss_curve_qwen0p6b.png)
@@ -347,6 +347,8 @@ opt = Gefen(model.named_parameters(), lr=0.6 * ADAMW_LR, fused=True)  # factored
 | Optimizer state | **1.01 B/param** | 4.00 | 1.01 |
 
 ![Gefen factored-v ablation — eval loss vs AdamW, factored-v on vs off](docs/benchmarks/gefen_factored_v_loss.png)
+
+> Chart from the original factored-v ablation run; the table above cites the current benchmark re-runs (per-cell logs, including the legacy-mode cell, in [`docs/benchmarks/logs/`](docs/benchmarks/logs/)).
 
 <details>
 <summary>Details: validation, checkpoint migration, and limits</summary>
