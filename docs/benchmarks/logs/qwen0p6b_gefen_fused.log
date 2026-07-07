@@ -1,48 +1,51 @@
-[gpu] CUDA_VISIBLE_DEVICES=1 -> NVIDIA GeForce RTX 3090 Ti
-W0703 12:57:03.602000 2241301 torch/utils/_pytree.py:630] <enum 'KernelPreference'> is an Enum subclass and is now natively supported by torch.compile as an opaque value type. Calling register_constant() on Enum subclasses is deprecated and will be an error in a future release.
-W0703 12:57:03.622000 2241301 torch/utils/_pytree.py:630] <enum 'ScaleCalculationMode'> is an Enum subclass and is now natively supported by torch.compile as an opaque value type. Calling register_constant() on Enum subclasses is deprecated and will be an error in a future release.
-Loading weights:   0%|          | 0/311 [00:00<?, ?it/s]Loading weights: 100%|██████████| 311/311 [00:00<00:00, 10399.16it/s]
+[gpu] CUDA_VISIBLE_DEVICES=7 -> NVIDIA GeForce RTX 3090 Ti
+W0706 15:36:10.234000 1682121 torch/utils/_pytree.py:630] <enum 'KernelPreference'> is an Enum subclass and is now natively supported by torch.compile as an opaque value type. Calling register_constant() on Enum subclasses is deprecated and will be an error in a future release.
+W0706 15:36:10.254000 1682121 torch/utils/_pytree.py:630] <enum 'ScaleCalculationMode'> is an Enum subclass and is now natively supported by torch.compile as an opaque value type. Calling register_constant() on Enum subclasses is deprecated and will be an error in a future release.
+Loading weights:   0%|          | 0/311 [00:00<?, ?it/s]Loading weights: 100%|██████████| 311/311 [00:00<00:00, 12808.23it/s]
 Initializing Gefen optimizer (fused=True).
 === qwen0p6b gefen_fused lr=3.000e-05 seed=0 steps=2000 seq=2048 params=0.596B ===
 step 0  eval_loss 2.6765
-step 50  train_ema 1.7473  eval 1.7314  5333 tok/s
-step 100  train_ema 1.6632  eval 1.6116  5333 tok/s
-step 150  train_ema 1.6620  eval 1.5891  5361 tok/s
-step 200  train_ema 1.6503  eval 1.5407  4971 tok/s
-step 250  train_ema 1.5774  eval 1.5188  5354 tok/s
-step 300  train_ema 1.6384  eval 1.5339  5217 tok/s
-step 350  train_ema 1.6426  eval 1.5091  5043 tok/s
-step 400  train_ema 1.6361  eval 1.5146  5287 tok/s
-step 450  train_ema 1.6577  eval 1.5267  5193 tok/s
-step 500  train_ema 1.6181  eval 1.5141  5377 tok/s
-step 550  train_ema 1.5742  eval 1.4938  5424 tok/s
-step 600  train_ema 1.5663  eval 1.5088  5495 tok/s
-step 650  train_ema 1.5550  eval 1.4938  5314 tok/s
-step 700  train_ema 1.5510  eval 1.4968  5220 tok/s
-step 750  train_ema 1.5758  eval 1.4798  5185 tok/s
-step 800  train_ema 1.5914  eval 1.4451  5372 tok/s
-step 850  train_ema 1.5988  eval 1.4541  5431 tok/s
-step 900  train_ema 1.5987  eval 1.4574  5249 tok/s
-step 950  train_ema 1.6033  eval 1.4605  5390 tok/s
-step 1000  train_ema 1.6072  eval 1.4679  5340 tok/s
-step 1050  train_ema 1.5511  eval 1.4617  5054 tok/s
-step 1100  train_ema 1.5926  eval 1.4681  5327 tok/s
-step 1150  train_ema 1.5676  eval 1.4578  5203 tok/s
-step 1200  train_ema 1.5417  eval 1.4479  5088 tok/s
-step 1250  train_ema 1.5999  eval 1.4388  5272 tok/s
-step 1300  train_ema 1.5880  eval 1.4520  5185 tok/s
-step 1350  train_ema 1.5329  eval 1.4417  5391 tok/s
-step 1400  train_ema 1.5529  eval 1.4660  5461 tok/s
-step 1450  train_ema 1.5660  eval 1.4649  5551 tok/s
-step 1500  train_ema 1.5712  eval 1.4720  5315 tok/s
-step 1550  train_ema 1.5856  eval 1.4547  5225 tok/s
-step 1600  train_ema 1.5488  eval 1.4442  5184 tok/s
-step 1650  train_ema 1.5990  eval 1.4527  5334 tok/s
-step 1700  train_ema 1.5973  eval 1.4550  5389 tok/s
-step 1750  train_ema 1.5902  eval 1.4500  5293 tok/s
-step 1800  train_ema 1.5288  eval 1.4524  5367 tok/s
-step 1850  train_ema 1.5466  eval 1.4410  5291 tok/s
-step 1900  train_ema 1.5689  eval 1.4550  5031 tok/s
-step 1950  train_ema 1.5526  eval 1.4313  5296 tok/s
-step 2000  train_ema 1.5629  eval 1.4221  5185 tok/s
-RESULT {"tag": "qwen0p6b", "opt": "gefen_fused", "variant": "gefen_fused", "lr": 3e-05, "seed": 0, "muon_adjust": null, "gefen_flags": {"factored_v_2d": true, "factored_v_2d_explicit": false}, "muon_flags": null, "steps": 2000, "seq": 2048, "params_B": 0.596, "gpu": "NVIDIA GeForce RTX 3090 Ti", "final_train_ema": 1.5629, "eval0": 2.6765, "final_eval": 1.4221, "tok_per_s": 5251.6, "peak_vram_gib": 5.3, "peak_vram_reserved_gib": 6.83, "opt_state_bpp": 1.014, "opt_state_gib": 0.563}
+Build CUDA kernel.................
+Build CUDA kernel.................
+Build CUDA kernel...................
+step 50  train_ema 1.7467  eval 1.7302  5759 tok/s
+step 100  train_ema 1.6629  eval 1.6112  5531 tok/s
+step 150  train_ema 1.6611  eval 1.5865  5562 tok/s
+step 200  train_ema 1.6498  eval 1.5436  6052 tok/s
+step 250  train_ema 1.5770  eval 1.5171  5402 tok/s
+step 300  train_ema 1.6381  eval 1.5343  5528 tok/s
+step 350  train_ema 1.6428  eval 1.5065  5420 tok/s
+step 400  train_ema 1.6361  eval 1.5141  5617 tok/s
+step 450  train_ema 1.6576  eval 1.5291  5180 tok/s
+step 500  train_ema 1.6184  eval 1.5154  5472 tok/s
+step 550  train_ema 1.5739  eval 1.4955  5253 tok/s
+step 600  train_ema 1.5666  eval 1.5141  5365 tok/s
+step 650  train_ema 1.5552  eval 1.4970  5310 tok/s
+step 700  train_ema 1.5509  eval 1.4999  5462 tok/s
+step 750  train_ema 1.5760  eval 1.4818  5409 tok/s
+step 800  train_ema 1.5914  eval 1.4461  5587 tok/s
+step 850  train_ema 1.5990  eval 1.4604  5401 tok/s
+step 900  train_ema 1.5985  eval 1.4597  5497 tok/s
+step 950  train_ema 1.6032  eval 1.4638  5231 tok/s
+step 1000  train_ema 1.6073  eval 1.4702  5388 tok/s
+step 1050  train_ema 1.5509  eval 1.4623  5331 tok/s
+step 1100  train_ema 1.5927  eval 1.4697  5383 tok/s
+step 1150  train_ema 1.5678  eval 1.4626  5358 tok/s
+step 1200  train_ema 1.5418  eval 1.4532  5608 tok/s
+step 1250  train_ema 1.5999  eval 1.4409  5388 tok/s
+step 1300  train_ema 1.5880  eval 1.4550  5488 tok/s
+step 1350  train_ema 1.5332  eval 1.4441  5219 tok/s
+step 1400  train_ema 1.5528  eval 1.4687  5419 tok/s
+step 1450  train_ema 1.5669  eval 1.4621  5329 tok/s
+step 1500  train_ema 1.5706  eval 1.4763  5429 tok/s
+step 1550  train_ema 1.5852  eval 1.4577  5340 tok/s
+step 1600  train_ema 1.5491  eval 1.4473  5445 tok/s
+step 1650  train_ema 1.5983  eval 1.4519  5395 tok/s
+step 1700  train_ema 1.5972  eval 1.4547  5498 tok/s
+step 1750  train_ema 1.5897  eval 1.4514  5228 tok/s
+step 1800  train_ema 1.5286  eval 1.4530  5349 tok/s
+step 1850  train_ema 1.5461  eval 1.4405  5301 tok/s
+step 1900  train_ema 1.5694  eval 1.4534  5429 tok/s
+step 1950  train_ema 1.5522  eval 1.4325  5361 tok/s
+step 2000  train_ema 1.5626  eval 1.4215  5597 tok/s
+RESULT {"tag": "qwen0p6b", "opt": "gefen_fused", "variant": "gefen_fused", "lr": 3e-05, "seed": 0, "muon_adjust": null, "gefen_flags": {"factored_v_2d": true, "factored_v_2d_explicit": false}, "muon_flags": null, "steps": 2000, "seq": 2048, "params_B": 0.596, "gpu": "NVIDIA GeForce RTX 3090 Ti", "final_train_ema": 1.5626, "eval0": 2.6765, "final_eval": 1.4215, "tok_per_s": 5355.4, "peak_vram_gib": 5.3, "peak_vram_reserved_gib": 6.84, "opt_state_bpp": 1.014, "opt_state_gib": 0.563}
