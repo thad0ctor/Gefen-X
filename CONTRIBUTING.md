@@ -9,10 +9,10 @@ Use a virtual environment. Install a CPU-only PyTorch for local development (the
 ```bash
 python -m pip install --upgrade pip
 pip install torch --index-url https://download.pytorch.org/whl/cpu
-pip install -e .[test]
+pip install -e ".[test]"
 ```
 
-Add the `perf` extra (`pip install -e .[perf,test]`) if you want the compiled numba codebook solver and ninja-backed kernel builds. Both are optional at runtime.
+Add the `perf` extra (`pip install -e ".[perf,test]"`) if you want the compiled numba codebook solver and ninja-backed kernel builds. Both are optional at runtime.
 
 ## Running the tests
 
