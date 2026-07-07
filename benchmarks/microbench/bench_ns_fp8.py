@@ -21,21 +21,10 @@ Run (Blackwell / Ada / Hopper only for a real fp8 measurement):
 import argparse
 import json
 import os
-import sys
 
 import torch
 
-
-def _strip_shadowing_gefen():
-    sys.path[:] = [
-        p for p in sys.path
-        if not os.path.isfile(os.path.join(p or ".", "gefen.py"))
-    ]
-
-
-_strip_shadowing_gefen()
-
-from gefen.gefen_muon import (  # noqa: E402
+from gefen.gefen_muon import (
     _zeropower_via_newtonschulz,
     _fp8_supported, FP8_MIN_DIM,
     DEFAULT_A, DEFAULT_B, DEFAULT_C,

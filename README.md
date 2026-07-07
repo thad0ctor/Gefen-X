@@ -78,7 +78,7 @@ The Hugging Face Trainer flow, the `find_lr` tool, and the `examples/` all use `
 |---|---|
 | Fused CUDA kernel fails to build on the first step | Gefen auto-falls back to `fused=False` (pure-PyTorch, slower) with a warning — training continues. Set `GEFEN_VERBOSE_BUILD=1` for the full build diagnostic; the usual cause is an `nvcc` that doesn't match `torch.version.cuda`. |
 | Changed GPU / arch and the kernel misbehaves or won't load | The build cache is keyed on the effective arch list (`TORCH_CUDA_ARCH_LIST`, or the detected GPU when unset), so a changed arch rebuilds automatically. If you kept an explicit `TORCH_CUDA_ARCH_LIST` across a GPU change, force a fresh build with `GEFEN_FORCE_REBUILD=1`. |
-| Loss diverges or plateaus high | LR is too hot — use **≈0.6× your AdamW LR** ([Learning rate](#learning-rate-when-porting-an-adamw-config)) or measure it with the [`find_lr`](tools/README.md) tool. |
+| Loss diverges or plateaus high | LR is too hot — use **≈0.6× your AdamW LR** ([Learning rate](#learning-rate-when-porting-an-adamw-config)) or measure it with the [`find_lr`](src/gefen/tools/README.md) tool. |
 | Out of memory | See [Hardware Requirements](docs/hardware.md) for measured peak VRAM per model size and method. |
 
 ## Compatibility
@@ -128,7 +128,7 @@ Use **≈0.6× your AdamW learning rate** (e.g. AdamW at `5e-5` → Gefen at `3e
 > ```bash
 > python -m gefen.tools.find_lr --model <path> --optimizer gefen --method sweep
 > ```
-> See [`tools/README.md`](tools/README.md).
+> See [`tools/README.md`](src/gefen/tools/README.md).
 
 One knock-on effect: weight decay in AdamW-style optimizers is applied as `lr × weight_decay`, so scaling `lr` down to 0.6× also weakens regularization by 0.6×. If your recipe relies on weight decay, scale `weight_decay` up by the inverse (≈1.7×) or retune it.
 
@@ -317,7 +317,7 @@ learning_rate: 6.0e-6    # ≈ 0.6× the AdamW LR you'd use — Gefen needs a lo
 weight_decay: 0.0
 ```
 
-`6.0e-6` here is the `≈0.6×` *fallback heuristic*; to set it properly for your model, run the LR finder (`python -m gefen.tools.find_lr --model <path> --optimizer gefen --method sweep`) — see [`tools/README.md`](tools/README.md).
+`6.0e-6` here is the `≈0.6×` *fallback heuristic*; to set it properly for your model, run the LR finder (`python -m gefen.tools.find_lr --model <path> --optimizer gefen --method sweep`) — see [`tools/README.md`](src/gefen/tools/README.md).
 
 **Fused kernels** (recommended — ≈2× faster `opt.step`, bit-exact, requires CUDA):
 
@@ -336,7 +336,7 @@ optim_args:
 |---|---|---|
 | Select Gefen | `optimizer: gefen` | added by PR #3755 |
 | Fused kernels | `optim_args: { fused: true }` | ≈2× faster `opt.step`; bit-exact |
-| Learning rate | `learning_rate: <≈0.6× AdamW>` | `≈0.6×` is a fallback heuristic — better, find it empirically with the LR finder (`python -m gefen.tools.find_lr …`, see [`tools/README.md`](tools/README.md)). Background: [Learning rate](#learning-rate-when-porting-an-adamw-config) |
+| Learning rate | `learning_rate: <≈0.6× AdamW>` | `≈0.6×` is a fallback heuristic — better, find it empirically with the LR finder (`python -m gefen.tools.find_lr …`, see [`tools/README.md`](src/gefen/tools/README.md)). Background: [Learning rate](#learning-rate-when-porting-an-adamw-config) |
 | Betas / eps / weight decay | standard `adam_beta1/2`, `adam_epsilon`, `weight_decay` | forwarded to Gefen |
 | `period==1` memory fallback | *on by default in this fork* | restores ≈1 B/param on modern decoders; it's the module flag `MEMORY_SAFE_FALLBACK`, not a YAML key |
 

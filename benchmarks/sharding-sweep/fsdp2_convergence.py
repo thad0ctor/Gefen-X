@@ -42,14 +42,6 @@ import sys
 import time
 
 
-def _strip_shadowing_gefen():
-    # A flat `gefen.py` on sys.path shadows the installed `gefen/` package.
-    sys.path[:] = [
-        p for p in sys.path
-        if not os.path.isfile(os.path.join(p or ".", "gefen.py"))
-    ]
-
-
 def positive_int(value):
     value = int(value)
     if value <= 0:
@@ -82,8 +74,6 @@ args = ap.parse_args()
 
 os.environ.setdefault("CUDA_DEVICE_ORDER", "PCI_BUS_ID")
 os.environ.setdefault("TORCH_CUDA_ARCH_LIST", "8.6")
-
-_strip_shadowing_gefen()
 
 import torch  # noqa: E402
 import torch.distributed as dist  # noqa: E402

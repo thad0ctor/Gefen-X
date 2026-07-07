@@ -93,11 +93,10 @@ jobs:
           pip install .[test]
 
       - name: Byte-compile all sources
-        run: python -m compileall -q gefen.py gefen_muon.py hybrid.py params.py partitioning.py quantization.py kernels tools
+        run: python -m compileall -q src/gefen
 
       - name: Import smoke (no CUDA required)
-        # Run from a clean dir so the installed package is imported, not the source tree.
-        working-directory: ${{ runner.temp }}
+        # The src layout keeps the checkout root from shadowing the installed package.
         run: |
           python - <<'PY'
           import gefen
@@ -111,12 +110,10 @@ jobs:
           PY
 
       - name: CPU test suite
-        # Run from a clean dir: the repo root's gefen.py would shadow the
-        # installed gefen package on sys.path. CUDA-dependent tests skip
-        # themselves; the CPU-runnable ones (validation, CPU step paths,
-        # checkpoint round-trip, partitioning/quantization, LR tools) run.
-        working-directory: ${{ runner.temp }}
-        run: python -m pytest "$GITHUB_WORKSPACE/tests" -q -ra
+        # CUDA-dependent tests skip themselves; the CPU-runnable ones
+        # (validation, CPU step paths, checkpoint round-trip,
+        # partitioning/quantization, LR tools) run from the checkout root.
+        run: python -m pytest tests -q -ra
 
   gpu-tests:
     name: GPU kernel parity tests
@@ -133,7 +130,5 @@ jobs:
           pip install .[test]
 
       - name: Run full test suite (CUDA)
-        # Same shadowing caveat as the CPU job: run from outside the repo root.
         # Multi-GPU / FSDP2 cases skip themselves when the runner has one GPU.
-        working-directory: ${{ runner.temp }}
-        run: python -m pytest "$GITHUB_WORKSPACE/tests" -q -ra
+        run: python -m pytest tests -q -ra

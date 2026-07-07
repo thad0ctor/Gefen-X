@@ -71,13 +71,13 @@ Each LR spins up a torch.distributed (nccl) group across the GPUs, shards the mo
 
 **Environment redirection** (`--venv` / `--cuda-home`). If you launch from an interpreter whose CUDA doesn't match (the kernel build needs an `nvcc` matching `torch.version.cuda`), point the CLI at the right venv and toolkit and it **re-execs** itself there before importing the kernels:
 ```bash
-PYTHONPATH=<this-repo-or-shim> python -m gefen.tools.find_lr \
+PYTHONPATH=<this-repo>/src python -m gefen.tools.find_lr \
     --venv /path/to/cu130-venv --cuda-home /path/to/cuda-13.0 \
     --model /path/to/Qwen3-0.6B --method range_test --device cuda:0
 # [find_lr] re-exec under /path/to/cu130-venv/bin/python (CUDA_HOME=/path/to/cuda-13.0)
 # Initializing Gefen optimizer (fused=True).   <- runs the real fused path
 ```
-The re-exec preserves the environment (incl. `PYTHONPATH`, `CUDA_VISIBLE_DEVICES`), so you don't have to install this repo into the target venv — just carry it on `PYTHONPATH`. Omit `--venv/--python` when you already run inside the right env.
+The re-exec preserves the environment (incl. `PYTHONPATH`, `CUDA_VISIBLE_DEVICES`), so you don't have to install this repo into the target venv — just carry `<this-repo>/src` on `PYTHONPATH`. Omit `--venv/--python` when you already run inside the right env.
 
 - **Environment.** The fork must be importable (on `PYTHONPATH` or `pip install -e .`). The default `fused=True` uses Gefen's CUDA kernels, which **require a CUDA toolkit whose `nvcc` matches `torch.version.cuda`** (the kernel build guard enforces this; use `--venv/--cuda-home` above to satisfy it). If you don't have a matching toolkit, run with `fused=False` (programmatic) — pure-torch, no kernel build, just slower.
 - **Dataset.** `--dataset` accepts an installed/cached **HuggingFace dataset name** *or* a path to a local **`.txt` / `.json` / `.jsonl`** file (alpaca-style `instruction/input/output`, or a `text`/`content` field, are auto-detected). Offline machines should use a local file or a pre-cached dataset. The programmatic API takes a `[N, seq]` token tensor directly if you'd rather tokenize yourself.

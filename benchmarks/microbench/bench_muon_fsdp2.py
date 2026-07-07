@@ -26,25 +26,11 @@ Run (2x 3090 Ti at nvidia-smi indices 1,7):
 """
 import argparse
 import os
-import sys
 
 import torch
 import torch.distributed as dist
 
-
-def _strip_shadowing_gefen():
-    # A flat `gefen.py` on sys.path shadows the installed `gefen/` package and
-    # breaks `from gefen.X import ...`; drop any such entry (the real package,
-    # reached via the PYTHONPATH symlink, survives).
-    sys.path[:] = [
-        p for p in sys.path
-        if not os.path.isfile(os.path.join(p or ".", "gefen.py"))
-    ]
-
-
-_strip_shadowing_gefen()
-
-from gefen.gefen_muon import (  # noqa: E402
+from gefen.gefen_muon import (
     GefenMuon,
     _zeropower_via_newtonschulz,
     DEFAULT_A,

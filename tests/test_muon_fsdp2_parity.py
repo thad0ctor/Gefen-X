@@ -79,20 +79,6 @@ def _get_free_port():
 
 
 def _worker(rank, world, case, port, q):
-    # A spawned child inherits the parent's sys.path. Under pytest that can
-    # include the worktree root, where a flat `gefen.py` shadows the installed
-    # `gefen/` package and breaks `from gefen.X import ...`. Drop any path entry
-    # that exposes such a shadowing module; the real package (a `gefen/` dir,
-    # reached via PYTHONPATH) survives.
-    import os as _os
-    import sys as _sys
-
-    _sys.path[:] = [
-        pth
-        for pth in _sys.path
-        if not _os.path.isfile(_os.path.join(pth or ".", "gefen.py"))
-    ]
-
     import torch.distributed as dist
     from torch.distributed.tensor import Shard, distribute_tensor, init_device_mesh
 
@@ -201,31 +187,14 @@ def case_fused_cuda():
     apply) and asserts parity with a fused plain-tensor oracle. world_size=1 so
     full_tensor()/redistribute are identities, but the sharded code path is taken
     in full -- which is what we want to cover on GPU."""
-    # Runs in the main process: drop any sys.path entry exposing a flat `gefen.py`
-    # that would shadow the installed `gefen/` package (same guard as _worker).
-    import os as _os
-    import sys as _sys
+    import torch.distributed as dist
+    from torch.distributed.tensor import (
+        Shard,
+        distribute_tensor,
+        init_device_mesh,
+    )
 
-    # Scope the mutation: this runs in the pytest process, so restore sys.path
-    # afterwards to avoid leaking into later tests.
-    _original_sys_path = _sys.path[:]
-    try:
-        _sys.path[:] = [
-            pth
-            for pth in _sys.path
-            if not _os.path.isfile(_os.path.join(pth or ".", "gefen.py"))
-        ]
-
-        import torch.distributed as dist
-        from torch.distributed.tensor import (
-            Shard,
-            distribute_tensor,
-            init_device_mesh,
-        )
-
-        from gefen.gefen_muon import GefenMuon
-    finally:
-        _sys.path[:] = _original_sys_path
+    from gefen.gefen_muon import GefenMuon
 
     os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
     os.environ.setdefault("MASTER_PORT", "29714")
@@ -276,15 +245,6 @@ FUSED_CASES = {"even": (64, 96), "uneven": (65, 96)}
 
 
 def _worker_fused_cuda(rank, world, case, port, q):
-    import os as _os
-    import sys as _sys
-
-    _sys.path[:] = [
-        pth
-        for pth in _sys.path
-        if not _os.path.isfile(_os.path.join(pth or ".", "gefen.py"))
-    ]
-
     import torch.distributed as dist
     from torch.distributed.tensor import Shard, distribute_tensor, init_device_mesh
 
@@ -417,15 +377,6 @@ def _dist_shapes(world):
 
 
 def _worker_distributed(rank, world, port, q, ns_schedule=None):
-    import os as _os
-    import sys as _sys
-
-    _sys.path[:] = [
-        pth
-        for pth in _sys.path
-        if not _os.path.isfile(_os.path.join(pth or ".", "gefen.py"))
-    ]
-
     import torch.distributed as dist
     from torch.distributed.tensor import Shard, distribute_tensor, init_device_mesh
 

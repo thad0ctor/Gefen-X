@@ -17,9 +17,6 @@ This test pins the three contractual properties of that cache:
 
 Run: python tests/test_lr_item_no_sync.py   (or via pytest)
 """
-import os
-import sys
-
 import torch
 
 try:
@@ -27,8 +24,6 @@ try:
 except ImportError:  # pragma: no cover
     pytest = None
 
-# Avoid a flat shadowing gefen.py if a worktree root leaks onto sys.path.
-sys.path[:] = [p for p in sys.path if not os.path.isfile(os.path.join(p or ".", "gefen.py"))]
 from gefen import GefenMuon  # noqa: E402
 
 _CUDA = torch.cuda.is_available()

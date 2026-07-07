@@ -20,21 +20,10 @@ file that plot_ns_schedule.py renders into the committed PNGs.
 import argparse
 import json
 import os
-import sys
 
 import torch
 
-
-def _strip_shadowing_gefen():
-    sys.path[:] = [
-        p for p in sys.path
-        if not os.path.isfile(os.path.join(p or ".", "gefen.py"))
-    ]
-
-
-_strip_shadowing_gefen()
-
-from gefen.gefen_muon import (  # noqa: E402
+from gefen.gefen_muon import (
     _zeropower_via_newtonschulz,
     DEFAULT_A, DEFAULT_B, DEFAULT_C,
     NS_SCHEDULE_3STEP, NS_SCHEDULE_4STEP,
