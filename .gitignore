@@ -1,8 +1,16 @@
 # Local Python packaging artifacts
 __pycache__/
 kernels/__pycache__/
+*.egg-info/
 gefen.egg-info/
 build/
+dist/
+*.so
+
+# Tooling caches
+.pytest_cache/
+.ruff_cache/
+.benchmarks/
 
 # Local prepared benchmark dataset (load_from_disk; ~68MB, machine-local)
 benchmarks/data/
