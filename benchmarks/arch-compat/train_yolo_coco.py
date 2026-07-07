@@ -17,6 +17,7 @@ _USE_GEFEN = {"on": False, "lr": 1e-3}
 
 
 def _install_gefen_patch():
+    import torch.nn as nn
     from ultralytics.engine.trainer import BaseTrainer
     from ultralytics.utils import LOGGER
     from ultralytics.utils.torch_utils import unwrap_model
@@ -26,10 +27,26 @@ def _install_gefen_patch():
     def patched(self, model, name="auto", lr=0.001, momentum=0.9, decay=1e-5, iterations=1e5):
         if _USE_GEFEN["on"]:
             import gefen
-            named = [(n, p) for n, p in unwrap_model(model).named_parameters() if p.requires_grad]
             eff_lr = lr if lr else _USE_GEFEN["lr"]
-            LOGGER.info(f"optimizer: Gefen (fused) built over {len(named)} param tensors, lr={eff_lr}")
-            return gefen.Gefen(named, lr=eff_lr)
+            # Mirror ultralytics' weight-decay grouping so the comparison is fair:
+            # 2-D+ weights get `decay`, biases and norm params get none.
+            bn = tuple(v for k, v in nn.__dict__.items() if "Norm" in k)
+            decay_params, nodecay_params = [], []
+            for _, module in unwrap_model(model).named_modules():
+                for pn, p in module.named_parameters(recurse=False):
+                    if not p.requires_grad:
+                        continue
+                    if p.ndim >= 2 and not isinstance(module, bn):
+                        decay_params.append(p)
+                    else:
+                        nodecay_params.append(p)
+            groups = [
+                {"params": decay_params, "lr": eff_lr, "weight_decay": decay},
+                {"params": nodecay_params, "lr": eff_lr, "weight_decay": 0.0},
+            ]
+            n = len(decay_params) + len(nodecay_params)
+            LOGGER.info(f"optimizer: Gefen (fused) over {n} params, lr={eff_lr}, decay={decay}")
+            return gefen.Gefen(groups, lr=eff_lr)
         return orig(self, model, name, lr, momentum, decay, iterations)
 
     BaseTrainer.build_optimizer = patched
@@ -79,8 +96,12 @@ def main():
     args = ap.parse_args()
 
     _install_gefen_patch()
+    requested = [o.strip() for o in args.optimizers.split(",") if o.strip()]
+    invalid = set(requested) - {"adamw", "gefen"}
+    if invalid:
+        raise SystemExit(f"unknown optimizer(s): {sorted(invalid)} (expected adamw/gefen)")
     summary = {}
-    for name in [o.strip() for o in args.optimizers.split(",") if o.strip()]:
+    for name in requested:
         rec = run_one(name, args, args.project)
         with open(args.out, "a") as f:
             f.write(json.dumps(rec) + "\n")

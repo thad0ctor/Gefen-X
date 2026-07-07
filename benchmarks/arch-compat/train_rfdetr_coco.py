@@ -132,9 +132,12 @@ def _make_gefen_lightning_cls():
 
     class GefenLightning(gefen.Gefen):
         def step(self, closure=None):
+            import torch
+
             loss = None
             if closure is not None:
-                loss = closure()
+                with torch.enable_grad():   # match upstream Gefen's closure path
+                    loss = closure()
             super().step(closure=None)
             return loss
 
@@ -173,8 +176,19 @@ def install_patches(lr):
         if sched_cfg is not None:
             old = sched_cfg["scheduler"] if isinstance(sched_cfg, dict) else sched_cfg
             lambdas = getattr(old, "lr_lambdas", None)
-            if lambdas is not None and len(lambdas) == len(opt.param_groups):
-                new_sched = torch.optim.lr_scheduler.LambdaLR(opt, lr_lambda=list(lambdas))
+            # Gefen flattens each input group into one optimizer group PER PARAM,
+            # so opt.param_groups is longer than the original AdamW groups. Repeat
+            # each group's lambda across its params (Gefen preserves group + param
+            # order) so the per-group layer-wise schedule survives the flattening.
+            expanded = None
+            if lambdas is not None and len(lambdas) == len(adamw.param_groups):
+                expanded = [
+                    lambdas[i]
+                    for i, g in enumerate(adamw.param_groups)
+                    for _ in range(len(list(g["params"])))
+                ]
+            if expanded is not None and len(expanded) == len(opt.param_groups):
+                new_sched = torch.optim.lr_scheduler.LambdaLR(opt, lr_lambda=expanded)
             else:
                 one = lambdas[0] if lambdas else (lambda step: 1.0)
                 new_sched = torch.optim.lr_scheduler.LambdaLR(opt, lr_lambda=one)
@@ -252,8 +266,12 @@ def main():
                                   keep_classes=keep, preserve_head=args.preserve_head)
 
     install_patches(args.lr)
+    requested = [o.strip() for o in args.optimizers.split(",") if o.strip()]
+    invalid = set(requested) - {"adamw", "gefen"}
+    if invalid:
+        raise SystemExit(f"unknown optimizer(s): {sorted(invalid)} (expected adamw/gefen)")
     summary = {}
-    for name in [o.strip() for o in args.optimizers.split(",") if o.strip()]:
+    for name in requested:
         rec = run_one(name, args)
         with open(args.out, "a") as f:
             f.write(json.dumps(rec) + "\n")
