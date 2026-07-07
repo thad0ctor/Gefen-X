@@ -1266,7 +1266,7 @@ __global__ void gefen_factored_stats_kernel(
         float g_f[GEFEN_FACTORED_LANE_COLS];
         uint8_t s_in[GEFEN_FACTORED_LANE_COLS];
         if (full) {
-            scalar_t g_v[GEFEN_FACTORED_LANE_COLS];
+            alignas(16) scalar_t g_v[GEFEN_FACTORED_LANE_COLS];
             gefen_load_vec8(&grad_view[row_base + c_lo], g_v);
             const uint2 sv =
                 *reinterpret_cast<const uint2*>(&m_sign[row_base + c_lo]);
@@ -1310,7 +1310,8 @@ __global__ void gefen_factored_stats_kernel(
                 blk_max = 0.0f;
                 pin = 0;
                 ++blk;
-                if (full || c_lo + k + 1 < cols) {
+                if (k + 1 < GEFEN_FACTORED_LANE_COLS &&
+                    (full || c_lo + k + 1 < cols)) {
                     old_mag = old_magnitude[blk];
                 }
             }
@@ -1478,9 +1479,9 @@ __global__ __launch_bounds__(256) void gefen_update_flat_factored_kernel(
 
         float g_f[GEFEN_UPD_CHUNK];
         uint8_t sign_in[GEFEN_UPD_CHUNK];
-        scalar_t p_v[GEFEN_UPD_CHUNK];
+        alignas(16) scalar_t p_v[GEFEN_UPD_CHUNK];
         if (full) {
-            scalar_t g_v[GEFEN_UPD_CHUNK];
+            alignas(16) scalar_t g_v[GEFEN_UPD_CHUNK];
             gefen_load_vec8(&grad_view[base], g_v);
             const uint2 sv = *reinterpret_cast<const uint2*>(&m_sign[base]);
             const uint8_t* ss = reinterpret_cast<const uint8_t*>(&sv);
@@ -1506,7 +1507,7 @@ __global__ __launch_bounds__(256) void gefen_update_flat_factored_kernel(
         }
 
         uint8_t sign_out[GEFEN_UPD_CHUNK];
-        scalar_t p_out[GEFEN_UPD_CHUNK];
+        alignas(16) scalar_t p_out[GEFEN_UPD_CHUNK];
         float old_mag = old_magnitude[blk];
         float new_mag = new_magnitude[blk];
         float vr = __ldg(&v_row[row]);
@@ -1559,19 +1560,24 @@ __global__ __launch_bounds__(256) void gefen_update_flat_factored_kernel(
                 }
             }
             // Exact integer carries replace the per-element divisions. The
-            // reloads are guarded so the last element of a tail chunk never
-            // reads one block/row past the end.
+            // reloads fire only when a next element exists IN THIS CHUNK (the
+            // k+1 bound covers the chunk end -- without it the tensor's final
+            // full chunk would express reads of v_row[rows] /
+            // *_magnitude[num_blocks], dead loads that only compiler DCE
+            // removed); the in-bounds check covers tail chunks.
             if (++col == cols) {
                 col = 0;
                 ++row;
-                if (full || base + k + 1 < total_numel) {
+                if (k + 1 < GEFEN_UPD_CHUNK &&
+                    (full || base + k + 1 < total_numel)) {
                     vr = __ldg(&v_row[row]);
                 }
             }
             if (++pin == period) {
                 pin = 0;
                 ++blk;
-                if (full || base + k + 1 < total_numel) {
+                if (k + 1 < GEFEN_UPD_CHUNK &&
+                    (full || base + k + 1 < total_numel)) {
                     old_mag = old_magnitude[blk];
                     new_mag = new_magnitude[blk];
                 }
