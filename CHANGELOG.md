@@ -25,7 +25,7 @@ Packaging:
 
 - Distribution renamed to `gefen-x`; project URLs point at the fork repository.
 - Version single-sourced at runtime via `gefen.__version__`.
-- `torch>=2.5` and `numpy` are the only hard runtime dependencies; `numba` and `ninja` moved to the `perf` extra (`pip install gefen-x[perf]`).
+- Hard runtime dependencies are `torch>=2.5`, `numpy`, and `numba` (the compiled codebook solver; the pure-Python fallback is too slow for real training). `ninja` is optional under the `perf` extra (`pip install gefen-x[perf]`) for faster CUDA JIT builds.
 - SPDX `license = "MIT"` metadata and a shipped `py.typed` (PEP 561) marker.
 - CI adds lint, an sdist/wheel build check, and Python 3.13.
 
