@@ -1,6 +1,10 @@
+import logging
+import warnings
 from pathlib import Path
 
 import torch
+
+logger = logging.getLogger(__name__)
 
 _EXACT_DP_NUMBA_KERNEL = None
 
@@ -49,20 +53,7 @@ def save_distribution_histogram_pt_from_counts(
         },
         dist_pt_path,
     )
-    print("Saved distribution histogram data to {}".format(dist_pt_path))
-
-
-def _compute_nearest_assignments(
-    codebook: torch.Tensor, values: torch.Tensor
-) -> torch.Tensor:
-    idx = torch.searchsorted(codebook, values)
-    left_idx = (idx - 1).clamp(0, codebook.numel() - 1)
-    right_idx = idx.clamp(0, codebook.numel() - 1)
-    return torch.where(
-        (values - codebook[left_idx]).abs() <= (values - codebook[right_idx]).abs(),
-        left_idx,
-        right_idx,
-    )
+    logger.info("Saved distribution histogram data to %s", dist_pt_path)
 
 
 def _build_padded_codebook(
@@ -234,7 +225,13 @@ def exact_dp(
     try:
         exact_dp_kernel = _get_exact_dp_numba_kernel()
     except ModuleNotFoundError:
-        print("Gefen: pure Python exact-DP fallback (numba is not installed)")
+        warnings.warn(
+            "Gefen: numba is not installed, falling back to the pure-Python "
+            "exact-DP codebook solver. This can take HOURS on large models; "
+            "install numba to use the compiled kernel.",
+            UserWarning,
+            stacklevel=2,
+        )
         codebook = _run_exact_dp_python(
             prefix_w.tolist(),
             prefix_wx.tolist(),

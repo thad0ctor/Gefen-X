@@ -161,9 +161,12 @@ def _normalize_ns_schedule(
     if is_single_tuple:
         # ns_steps only applies to the single-tuple path (it sets the repeat
         # count); an explicit schedule carries its own length and ignores it.
-        if ns_steps >= 100:
+        if not 1 <= ns_steps < 100:
             raise ValueError(
-                "Number of steps must be less than 100 for computational efficiency"
+                "ns_steps must be in [1, 100) but is: {}. 0 or a negative value "
+                "would produce an EMPTY Newton-Schulz schedule (silently degrading "
+                "Muon to normalized momentum SGD); 100+ is rejected for "
+                "computational efficiency".format(ns_steps)
             )
         if len(ns_coefficients) != 3:
             raise ValueError(
@@ -280,6 +283,77 @@ def _adjust_lr(
 
 
 class GefenMuon(Gefen):
+    """Muon with Gefen's quantized (8-bit codebook) momentum state.
+
+    Muon (MomentUm Orthogonalized by Newton-Schulz; Keller Jordan et al., 2024,
+    https://kellerjordan.github.io/posts/muon/) maintains a momentum buffer per
+    2D weight matrix and orthogonalizes the momentum via a Newton-Schulz
+    iteration before applying it. GefenMuon stores that momentum in Gefen's
+    8-bit learned-codebook format (~1 byte/param optimizer state) and runs the
+    same NS pipeline, bit-identically across the fused/non-fused and
+    single-GPU/FSDP2-exact paths.
+
+    ONLY 2D parameters are accepted, and 2D is not sufficient: embeddings, the
+    (often tied) LM head, and classifier heads are vocabulary/class projections,
+    not hidden matrices, and should NOT be given to raw GefenMuon -- route them
+    (and every 1D norm/bias tensor) to a plain-Gefen/AdamW backup instead. Use
+    ``GefenMuonHybrid`` / ``split_params_for_muon`` (gefen.params) to do that
+    split automatically.
+
+    Args:
+        params: 2D parameters to optimize, ideally as ``(name, param)`` pairs
+            (unique names key the per-param codebook cache; bare tensors get
+            positional auto-names).
+        lr: learning rate (float, or a 1-element tensor for capturable /
+            on-device schedules). Interpretation depends on ``adjust_lr_fn``.
+        weight_decay: decoupled (AdamW-style) weight decay. NOTE: defaults to
+            0.1 (the common Muon recipe), NOT plain Gefen's 0.0.
+        momentum: momentum EMA coefficient in [0, 1) (0.95 is the Muon paper
+            default).
+        nesterov: apply Nesterov-style momentum (default True).
+        ns_coefficients: (a, b, c) quintic coefficients for the classic
+            fixed-coefficient Newton-Schulz iteration.
+        eps: strictly positive clamp floor for the NS input normalization
+            (``grad / max(||grad||, eps)``).
+        ns_steps: number of NS iterations in [1, 100) for the fixed-coefficient
+            path (ignored when ``ns_schedule`` supplies a per-iteration list).
+        ns_schedule: optional tuned per-iteration coefficient schedule: a name
+            ("standard"/"tuned3"/"tuned4") or an explicit list of (a, b, c)
+            tuples. Overrides ns_coefficients/ns_steps; see NS_SCHEDULES.
+        adjust_lr_fn: None/"original" keeps Muon-native LR scaling
+            (sqrt(rows/cols)); "match_rms_adamw" rescales each update to
+            AdamW-equivalent RMS (0.2*sqrt(max(rows, cols))) so an AdamW-scale
+            lr transfers directly (the GefenMuonHybrid default).
+        fused: use the fused CUDA momentum kernel when available (default True;
+            CPU / non-CUDA falls back to the decomposed path).
+        sharded_mode: FSDP2/DTensor handling -- "exact" (default; all-gather the
+            full gradient, NS on the full matrix on every rank, bit-identical to
+            single-GPU), "distributed" (Parallel-Muon: one owner rank per matrix
+            runs NS and broadcasts, bit-identical to "exact" on homogeneous
+            GPUs), or "approx" (NS on the local shard only; cheaper and
+            explicitly NON-parity, opt-in).
+            "distributed" is EXPERIMENTAL, two caveats (issue #45): (1) owners
+            are assigned by position over the params that have a grad each step,
+            so a fluctuating grad set (MoE, gradual unfreezing) shifts owners and
+            silently resets a matrix's momentum; (2) momentum lives only on its
+            owner rank, so a rank-0-only checkpoint saves ~1/world of it. Prefer
+            "exact" (the default) when checkpointing or when the grad set varies.
+        fp8_ns: run the NS GEMMs in fp8 (e4m3) on sm_89+ for large matrices
+            (opt-in; auto-falls back to bf16 elsewhere).
+        fp8_ns_compile: torch.compile the fp8 NS core (default True; eager fp8
+            is slower than bf16).
+        stochastic_round: stochastically round the 8-bit momentum quantization
+            (debiases it; throughput-neutral opt-in).
+        normuon: NorMuon-style per-row 2nd-moment normalization of the NS
+            output (default False here; GefenMuonHybrid turns it on).
+        normuon_beta2: EMA coefficient in [0, 1) for the normuon row statistic.
+        normuon_eps: denominator floor for the normuon normalization.
+        cautious: cautious-optimizer sign-agreement masking of the update
+            (experimental opt-in; LOST in the hybrid's loss sweep).
+        capturable: make step() CUDA-graph/torch.compile capturable (device-side
+            step counters and scalars; see Gefen).
+        verbose: print codebook/quantization diagnostics.
+    """
 
     def __init__(
         self,
@@ -310,8 +384,23 @@ class GefenMuon(Gefen):
             raise ValueError("Tensor lr must be 1-element")
         if not 0.0 <= lr:
             raise ValueError("Learning rate should be >= 0 but is: {}".format(lr))
-        if not 0.0 <= momentum:
-            raise ValueError("momentum should be >= 0 but is: {}".format(momentum))
+        if not 0.0 <= momentum < 1.0:
+            raise ValueError(
+                "momentum should be in [0, 1) but is: {}".format(momentum)
+            )
+        if not eps > 0.0:
+            raise ValueError(
+                "eps should be > 0 but is: {}. The Newton-Schulz input "
+                "normalization divides by the momentum matrix norm clamped at "
+                "eps, so eps=0 turns an all-zero momentum matrix into 0/0 = "
+                "NaN".format(eps)
+            )
+        if not 1 <= ns_steps < 100:
+            raise ValueError(
+                "ns_steps must be in [1, 100) but is: {}. 0 or a negative value "
+                "would produce an EMPTY Newton-Schulz schedule (silently "
+                "degrading Muon to normalized momentum SGD)".format(ns_steps)
+            )
         if not 0.0 <= weight_decay:
             raise ValueError(
                 "weight decay should be >= 0 but is: {}".format(weight_decay)
@@ -366,6 +455,14 @@ class GefenMuon(Gefen):
         # the per-step gradient all-gather (a collective every rank must join) and
         # one extra update broadcast are replicated. Falls back to the "exact"
         # full-NS-everywhere path for non-1D meshes (e.g. HSDP x TP).
+        #
+        # Homogeneity assumption: "exact" runs Newton-Schulz redundantly on
+        # every rank's own GPU and relies on the results agreeing bit-for-bit,
+        # which holds only when all ranks have the SAME GPU architecture --
+        # cross-arch (e.g. sm_86 + sm_120) bf16 GEMMs differ at ULP scale, so a
+        # mixed rig drifts by ~1-2 bf16 ULP per step between "exact" ranks (and
+        # between "exact" and "distributed", which broadcasts ONE owner's
+        # result and is therefore internally consistent on any rig).
         self._sharded_mode = sharded_mode
 
         # fp8 Newton-Schulz (opt-in). Default False keeps the bf16 NS path
@@ -512,17 +609,13 @@ class GefenMuon(Gefen):
         indices = self._gefen_nearest_indices(momentum_view)
         self._gefen_set_indices(state, indices)
 
-        codebook = self._gefen_codebook
+        # Per-device resolver: with device_map-split models the momentum views
+        # live on several GPUs while the codebook is learned once on one; the
+        # resolver hands back a cached same-device copy (a no-op single-device).
+        codebook = self._gefen_codebook_on(indices.device)
         if codebook is None:
             raise ValueError(
                 "Expected Gefen codebook to be initialized before reconstructing quantized momentum."
-            )
-        if codebook.device != indices.device:
-            raise ValueError(
-                "Gefen codebook device {} does not match index device {}.".format(
-                    codebook.device,
-                    indices.device,
-                )
             )
 
         momentum_view.copy_(codebook[indices.long()].to(dtype=momentum_view.dtype))
@@ -661,7 +754,15 @@ class GefenMuon(Gefen):
         automatic_period = state["automatic_period"]
         grad_view = self._automatic_view(flat_grad, automatic_period)
 
-        if self._fused_kernels_available():
+        if (
+            self._fused_kernels_available()
+            and grad_view.is_cuda
+            and grad_view.dtype != torch.float64
+        ):
+            # Per-tensor device/dtype gating (see Gefen._step_automatic): the
+            # momentum kernel is a raw CUDA-pointer launch with a reject-Double
+            # dispatch, so a CPU-resident shard or an fp64 param takes the
+            # pure-torch dequant/lerp/quantize path below instead.
             # The Muon momentum kernel reads grad + quantized state and emits the
             # dense quantized momentum; it never touches p, so no full-matrix
             # scratch is needed under sharding. Unlike the Gefen update kernels,
@@ -744,34 +845,7 @@ class GefenMuon(Gefen):
         ).clamp(min=torch.finfo(torch.float32).tiny)
         return ortho.mul_((frob_scale / denom).to(ortho.dtype))
 
-    def _lr_scalar(self, group) -> float:
-        """Resolve ``group["lr"]`` to a python float, caching a tensor lr's ``.item()``.
-
-        A float lr is returned as-is (no sync). A tensor lr is ``.item()``'d (a
-        D2H sync) only when its identity or ``_version`` changes -- an in-place
-        scheduler update (e.g. ``lr.mul_``) bumps ``_version``, a replacement
-        swaps identity. The cache is keyed by tensor identity and shared across
-        ALL param groups on the optimizer (not per group): GefenMuon assigns one
-        param-group per param, so a per-group cache would still re-read once per
-        param after every in-place scheduler step (O(params) syncs/step). With a
-        shared cache, a tensor lr common to every group costs a single ``.item()``
-        per step (O(steps), per version). The cached value equals ``lr.item()``,
-        so callers stay bit-identical. Kept as a plain instance attribute so it is
-        not serialized into ``param_groups`` / the optimizer ``state_dict``.
-        """
-        lr = group["lr"]
-        if not isinstance(lr, torch.Tensor):
-            return lr
-        cache = getattr(self, "_lr_scalar_cache", None)
-        if cache is None:
-            cache = self._lr_scalar_cache = {}
-        ver = lr._version
-        entry = cache.get(id(lr))
-        if entry is not None and entry[0] is lr and entry[1] == ver:
-            return entry[2]
-        val = lr.item()
-        cache[id(lr)] = (lr, ver, val)
-        return val
+    # _lr_scalar is inherited unchanged from Gefen (single-slot tensor-lr cache).
 
     def _apply_muon_update(
         self,
@@ -1045,7 +1119,10 @@ class GefenMuon(Gefen):
         # on device (the momentum kernel reads them; see Gefen._sr_seed_on).
         if self.capturable and self._stochastic_round:
             self._advance_sr_seeds()
-        self._gefen_global_step += 1
+        # Via the dynamo-disabled helper (NOT a raw += 1): dynamo guards on the
+        # exact value of a python int read in a traced frame, so an in-trace
+        # increment of this per-step counter would recompile every compiled step.
+        self._advance_gefen_global_step()
         if self.capturable and not torch.compiler.is_compiling():
             self._mark_state_static_for_compile()
         return loss

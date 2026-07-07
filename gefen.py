@@ -1,3 +1,16 @@
+"""Gefen: a memory-efficient Adam-family optimizer with 8-bit quantized momentum.
+
+Gefen keeps its first moment as uint8 codebook indices plus one fp32 magnitude
+per block (the codebook itself is learned once from the first step's gradients
+via an exact dynamic program) and shares/factors the second moment below
+per-element resolution, cutting optimizer state to roughly 1 byte per parameter.
+Fused CUDA kernels drive the whole update in a few launches per parameter; a
+decomposed pure-PyTorch path covers CPU and fused-disabled runs. This module
+contains the ``Gefen`` optimizer and the block-partitioning / quantization
+helpers it steps through; ``gefen_muon``/``hybrid`` build on it.
+"""
+
+import logging
 import math
 import os
 import warnings
@@ -30,6 +43,11 @@ from gefen.kernels.automatic_gefen_fused import (
 from gefen.kernels.automatic_gefen_fused import _should_use_v2
 from gefen.kernels.automatic_gefen_fused import _CAPT_V1_FULL_TINY_NUMEL
 from gefen.kernels.automatic_gefen_fused import _codebook_search_lut
+from gefen.kernels.automatic_gefen_fused import (
+    ensure_extension_loaded as _ensure_gefen_fused_extension_loaded,
+)
+
+logger = logging.getLogger(__name__)
 
 # Optional explicit override for the period-search backend ("cuda_kernel" / "cpu"
 # / "gpu"). None (default) means resolve per call from each tensor's own device
@@ -109,6 +127,12 @@ def automatic_vmean_update(
     # the bf16 increment. (Diverges ~1e-3 from the fused kernel, which squares in
     # float32 — there is no cross-path parity requirement.)
     #
+    # fp16 is the exception: its max finite value is 65504, so |g| >= 256
+    # squares to inf and poisons vmean permanently (stepsize -> 0, the block
+    # silently freezes). Promote ONLY fp16 to fp32 before squaring; bf16 keeps
+    # the model-dtype square above bit-for-bit.
+    promote_fp16 = grad_view.dtype == torch.float16
+    #
     # Stream the per-block mean-square reduction in row chunks so the full-size
     # `grad_view * grad_view` temporary (the last param-proportional transient on
     # the non-fused step -- ~594 MiB of bf16 on the 311M-element tied embedding) is
@@ -123,13 +147,16 @@ def automatic_vmean_update(
         # Whole tensor fits one chunk (every param except the largest, e.g. the
         # tied embedding): run the original two-op form directly. Avoids the
         # per-param Python loop / slice overhead while staying the exact same math.
-        block_mean_grad_sq = torch.mean(grad_view * grad_view, dim=1, keepdim=True)
+        g = grad_view.float() if promote_fp16 else grad_view
+        block_mean_grad_sq = torch.mean(g * g, dim=1, keepdim=True)
         vmean.mul_(beta2).add_(block_mean_grad_sq, alpha=1 - beta2)
         return
     vmean.mul_(beta2)
     for r0 in range(0, num_blocks, rows_per_chunk):
         r1 = min(r0 + rows_per_chunk, num_blocks)
         g = grad_view[r0:r1]
+        if promote_fp16:
+            g = g.float()
         block_mean_grad_sq = torch.mean(g * g, dim=1, keepdim=True)
         vmean[r0:r1].add_(block_mean_grad_sq, alpha=1 - beta2)
 
@@ -353,20 +380,6 @@ def learn_gefen_exact_codebook_from_grad_periods(
     compute_mse_logging: bool,
     use_fused_histogram: bool = FUSE_HISTOGRAM_FOR_EXACT,
 ) -> Optional[torch.Tensor]:
-    if hasattr(quantization_module, "SAVE_CODEBOOK_PREFIX"):
-        save_codebook_prefix = quantization_module.SAVE_CODEBOOK_PREFIX
-        if save_codebook_prefix is not None:
-            if not hasattr(quantization_module, "LIST_STEPS_SAVE_HIST_GRAD"):
-                raise ValueError(
-                    "Gefen exact codebook learning does not support SAVE_CODEBOOK_PREFIX exports. "
-                    "Disable exports or define LIST_STEPS_SAVE_HIST_GRAD for the explicit histogram export path."
-                )
-            elif quantization_module.LIST_STEPS_SAVE_HIST_GRAD is None:
-                raise ValueError(
-                    "Gefen exact codebook learning does not support SAVE_CODEBOOK_PREFIX exports. "
-                    "Disable exports or use a non-exact research path outside the publishable Gefen optimizer."
-                )
-
     histogram_bins = num_codebooks * 16
     bin_width = 2.0 / float(histogram_bins)
     # Accumulate counts as int64 and cast to float32 once at assembly: repeated
@@ -433,12 +446,6 @@ def learn_gefen_exact_codebook_from_grad_periods(
         * bin_counts_cpu[active_bins_cpu],
     }
 
-    if verbose:
-        variant = "ForceOne (-1 and 1 fixed)" if force_endpoints else "standard"
-        histogram_backend = (
-            "fused cuda kernel" if use_fused_histogram else "reference pytorch"
-        )
-
     codebook = quantization_module.exact_dp(
         histogram_stats=histogram_stats,
         num_codebooks=num_codebooks,
@@ -481,6 +488,81 @@ def _resolve_find_period_backend(grad: torch.Tensor) -> str:
 
 
 class Gefen(torch.optim.Optimizer):
+    """Adam-family optimizer with 8-bit quantized momentum and block-shared or
+    factored second moments, at roughly 1 byte of optimizer state per parameter.
+
+    ``params`` accepts plain tensors, ``(name, tensor)`` tuples, or param-group
+    dicts (each optionally overriding ``lr`` / ``betas`` / ``eps`` /
+    ``weight_decay``). Internally every parameter becomes its OWN named param
+    group whose ``betas`` are stored as ``beta1``/``beta2`` keys.
+
+    Args:
+        params: iterable of parameters, ``(name, parameter)`` tuples, or
+            param-group dicts with a ``"params"`` key.
+        lr (float or Tensor, default 1e-3): learning rate. May be a 1-element
+            tensor (update it in place to drive an LR schedule; see
+            ``capturable`` for the on-device semantics).
+        betas (tuple, default (0.9, 0.999)): EMA coefficients of the quantized
+            first moment and the second moment.
+        eps (float, default 1e-8): term added to the bias-corrected
+            second-moment root in the stepsize denominator.
+        weight_decay (float, default 0.0): decoupled (AdamW-style) weight
+            decay, applied as ``p *= 1 - lr * weight_decay``.
+        fused (bool, default True): step through the fused CUDA kernels.
+            Downgraded to False with a warning when CUDA is unavailable; the
+            decomposed pure-PyTorch path then runs.
+        force_1d_period_one (bool, default False): 1D parameters
+            (RMSNorm/LayerNorm weights, biases) skip the block-period search
+            and use period==1 -> per-element 2nd moment + momentum magnitude,
+            i.e. AdamW-like fidelity. Without it the memory-safe fallback can
+            lump a whole 1D norm tensor into a single shared block, which
+            over-steps on these high-leverage tensors (the norm weights set
+            the LR stability ceiling). 1D tensors are tiny, so the per-element
+            state is a negligible memory cost.
+        force_2d_period_one (bool, default False): 2D parameters skip the
+            block search and use period==1. In the hybrid backup these are the
+            token embedding / LM head -- the most AdamW-divergent backup
+            tensors under a block-shared vmean. The memory cost is real
+            (per-element fp32 state on a vocab x hidden tensor), so this is an
+            opt-in loss/memory trade, not free like ``force_1d_period_one``.
+        period_one_substrings (tuple of str, default ()): case-insensitive
+            name substrings routed to period==1 for SELECTED params only --
+            the surgical form of the ``force_*_period_one`` flags. E.g.
+            ``("embed", "lm_head")`` gives the vocab projections per-element
+            state without paying per-element memory on every hidden matrix.
+        factored_v_2d (bool, default True): Adafactor-style factored second
+            moment for 2D params (the AdamW-parity configuration): the
+            quantized momentum machinery is unchanged, but row/col fp32 EMAs
+            of grad^2 reconstruct a per-element second moment at
+            ``rows + cols`` state instead of ``numel``. Its fair LR is ~0.6x
+            the AdamW LR. ``False`` selects the legacy block-shared second
+            moment (fair LR ~0.4x). Sharded (DTensor/FSDP2) 2D params fall
+            back to the block-vmean path regardless (local-shard row/col
+            statistics would be wrong).
+        codebook_refresh_every (int, default 0): re-learn the exact-DP
+            codebook from the CURRENT gradients every N steps (0 = learn once
+            on step 1 and freeze). Stored momentum indices are re-quantized
+            onto the new codebook, so the momentum survives the swap with only
+            nearest-codeword rounding error.
+        stochastic_round (bool, default False): momentum->codebook
+            quantization uses unbiased stochastic rounding (seeded per step)
+            instead of deterministic nearest, cancelling the systematic bias
+            nearest-rounding accumulates in the EMA momentum over a long
+            horizon. Only the fused CUDA automatic-step kernels honor it; a
+            warning fires when the fused path is off.
+        capturable (bool, default False): CUDA-graph capturability (mirrors
+            torch.optim's argument). Everything that varies across steps --
+            step counters, bias corrections, kernel scalars -- lives in device
+            tensors and the step avoids host<->device syncs, so ``step()`` can
+            be captured in a ``torch.cuda.CUDAGraph`` and replayed. A tensor
+            ``lr`` flows on device (update it in place between replays); a
+            float ``lr`` is baked at capture time. Codebook learning and the
+            period search are host-driven and run on the FIRST step, so do the
+            standard warmup steps before capturing. Incompatible with
+            ``codebook_refresh_every > 0``.
+        verbose (bool, default False): extra diagnostics during codebook
+            learning and period prediction.
+    """
 
     def __init__(
         self,
@@ -501,126 +583,32 @@ class Gefen(torch.optim.Optimizer):
         verbose: bool = False,
     ):
         if fused and not torch.cuda.is_available():
-            print(
-                "Gefen Optimizer:  got fused=True, but CUDA is not available. Changing fused to False."
+            warnings.warn(
+                "Gefen optimizer got fused=True, but CUDA is not available. "
+                "Changing fused to False.",
+                UserWarning,
+                stacklevel=2,
             )
             fused = False
-        print("Initializing Gefen optimizer (fused={}).".format(fused))
+        logger.info("Initializing Gefen optimizer (fused=%s).", fused)
 
-        if not 0.0 <= lr:
-            raise ValueError("Invalid learning rate: {}".format(lr))
-        if not 0.0 <= betas[0] < 1.0:
-            raise ValueError("Invalid beta parameter at index 0: {}".format(betas[0]))
-        if not 0.0 <= betas[1] < 1.0:
-            raise ValueError("Invalid beta parameter at index 1: {}".format(betas[1]))
-        if not 0.0 <= weight_decay:
-            raise ValueError("Invalid weight_decay value: {}".format(weight_decay))
-
-        def validate_group_options(
-            group_lr, group_betas, group_eps, group_weight_decay
-        ):
-            if not 0.0 <= group_lr:
-                raise ValueError("Invalid learning rate: {}".format(group_lr))
-            elif not 0.0 <= group_betas[0] < 1.0:
-                raise ValueError(
-                    "Invalid beta parameter at index 0: {}".format(group_betas[0])
-                )
-            elif not 0.0 <= group_betas[1] < 1.0:
-                raise ValueError(
-                    "Invalid beta parameter at index 1: {}".format(group_betas[1])
-                )
-            elif not 0.0 <= group_weight_decay:
-                raise ValueError(
-                    "Invalid weight_decay value: {}".format(group_weight_decay)
-                )
-            elif not 0.0 <= group_eps:
-                raise ValueError("Invalid epsilon value: {}".format(group_eps))
-
-        def iter_params_with_names(group_params):
-            if isinstance(group_params, torch.Tensor):
-                yield None, group_params
-                return
-            for item_index, param_or_named_param in enumerate(group_params):
-                if isinstance(param_or_named_param, tuple):
-                    param_name, param = param_or_named_param
-                else:
-                    param_name = None
-                    param = param_or_named_param
-                if not isinstance(param, torch.Tensor):
-                    raise TypeError(
-                        "Gefen can only optimize Tensors, but one of the params is {}".format(
-                            type(param).__name__,
-                        )
-                    )
-                yield param_name, param
-
-        def append_param_group(
-            param_name, param, group_lr, group_betas, group_eps, group_weight_decay
-        ):
-            param_name = str(param_name).lower()
-            if not param.requires_grad:
-                return
-            optim_groups.append(
-                {
-                    "name": param_name,
-                    "params": param,
-                    "lr": group_lr,
-                    "beta1": group_betas[0],
-                    "beta2": group_betas[1],
-                    "eps": group_eps,
-                    "weight_decay": group_weight_decay,
-                }
-            )
+        self._validate_group_options(lr, betas, eps, weight_decay)
 
         self.fused = fused
-        # When set, 1D parameters (RMSNorm/LayerNorm weights, biases) skip the
-        # block-period search and use period==1 -> per-element 2nd moment +
-        # momentum magnitude, i.e. AdamW-like fidelity. Without it the memory-safe
-        # fallback can lump a whole 1D norm tensor into a single shared block,
-        # which over-steps on these high-leverage tensors (the norm weights set
-        # the LR stability ceiling). 1D tensors are tiny, so per-element state here
-        # is a negligible memory cost. See partitioning.memory_safe_fallback_period.
+        # Fused-toolchain probe cache (M8 graceful fallback): None = not yet
+        # probed, True/False = the JIT extension built or permanently failed on
+        # this box. Set lazily on the first step by _gefen_fused_toolchain_ok so
+        # a CUDA host without a working nvcc downgrades to the pure-torch path
+        # with one warning instead of crashing mid-step.
+        self._fused_build_ok = None
+        # Period-one routing knobs: see the class docstring and
+        # partitioning.memory_safe_fallback_period.
         self._force_1d_period_one = force_1d_period_one
-        # When set, 2D parameters (in the hybrid backup these are the token
-        # embedding / LM head -- hidden 2D matrices go to Muon) skip the block
-        # search and use period==1 -> per-element 2nd moment + magnitude, i.e.
-        # AdamW-like fidelity on the vocab projections. These are the most
-        # AdamW-divergent backup tensors; the block-shared vmean coarsens their
-        # per-element second moment. Memory cost is real (per-element fp32 vmean +
-        # magnitude on a vocab x hidden tensor), so this is an opt-in loss/memory
-        # trade, not free like force_1d_period_one (1D tensors are tiny).
         self._force_2d_period_one = force_2d_period_one
-        # Name-substring routing to period==1 (per-element 2nd moment +
-        # momentum magnitude, AdamW-like fidelity) for SELECTED params only --
-        # the surgical form of the force_*_period_one flags. E.g.
-        # ("embed", "lm_head") gives the vocab projections per-element state
-        # (the most AdamW-divergent tensors under block-shared vmean, per the
-        # hybrid backup_2d_period_one finding) without paying per-element
-        # memory on every hidden matrix. Matching is case-insensitive substring
-        # over the parameter name.
         self._period_one_substrings = tuple(
             s.lower() for s in period_one_substrings
         )
-        # Adafactor-style factored second moment for 2D params (ON BY
-        # DEFAULT -- the AdamW-parity configuration): keep the quantized
-        # momentum machinery unchanged but replace the block-shared vmean with
-        # row/col fp32 EMAs of grad^2 whose outer product reconstructs a
-        # per-element second moment at (rows + cols) state instead of numel.
-        # Closes the ~0.06 eval-loss gap to fused AdamW at ~1.01 B/param and
-        # baseline peak VRAM for ~6-8% throughput; its fair LR is ~0.6x the
-        # AdamW LR (higher than block-vmean Gefen's ~0.4x). Set
-        # factored_v_2d=False for the legacy block-shared second moment (and
-        # its lower fair LR). On the fused CUDA path the stepsize is computed
-        # in-kernel; elsewhere a decomposed fallback applies. NOTE: sharded
-        # (DTensor/FSDP2) 2D params currently fall back to the block-vmean
-        # path regardless (local-shard row/col statistics would be wrong).
         self._factored_v_2d = factored_v_2d
-        # Re-learn the exact-DP codebook from the CURRENT gradients every N
-        # steps (0 = off, the default: learn once on step 1 and freeze). The
-        # stored momentum indices are re-quantized from the old codebook onto
-        # the new one, so the momentum state survives the swap with only
-        # nearest-codeword rounding error. Tests whether the frozen step-1
-        # codebook goes stale as the gradient distribution shifts.
         if codebook_refresh_every < 0:
             raise ValueError(
                 "codebook_refresh_every must be >= 0 but is: {}".format(
@@ -628,22 +616,11 @@ class Gefen(torch.optim.Optimizer):
                 )
             )
         self._codebook_refresh_every = codebook_refresh_every
-        # CUDA-graph capturability (mirrors torch.optim's ``capturable``
-        # argument). When True, everything that VARIES across steps -- the
-        # per-param step counters and the bias corrections derived from them --
-        # lives in device tensors, and the step avoids host<->device syncs, so
-        # ``optimizer.step()`` can be captured in a ``torch.cuda.CUDAGraph`` and
-        # replayed. Constants (betas, eps, momentum) may stay python scalars:
-        # they are baked into the graph and never change. A tensor ``lr`` is
-        # consumed directly on device (update it in place between replays for
-        # LR schedules); a float ``lr`` is baked at capture time. The fused
-        # update kernels stay engaged: under capturable they read their
-        # per-step-varying scalars (lr, bias-correction reciprocals, weight-
-        # decay factor) from a small per-param fp32 device buffer that is
-        # refreshed in place with tensor ops each step, instead of from host
-        # kernel arguments a graph would freeze at capture time. Codebook
-        # learning and the period search are host-driven and run on the FIRST
-        # step -- do the standard graph warmup steps before capturing.
+        # Under capturable the fused update kernels stay engaged: they read
+        # their per-step-varying scalars (lr, bias-correction reciprocals,
+        # weight-decay factor) from a small per-param fp32 device buffer that
+        # is refreshed in place with tensor ops each step, instead of from
+        # host kernel arguments a graph would freeze at capture time.
         self.capturable = capturable
         if capturable and codebook_refresh_every:
             raise ValueError(
@@ -651,24 +628,20 @@ class Gefen(torch.optim.Optimizer):
                 "the periodic codebook re-learn is host-driven and cannot run "
                 "inside a replayed CUDA graph."
             )
-        # When set, momentum->codebook quantization uses unbiased stochastic
-        # rounding (seeded per optimizer step) instead of deterministic nearest.
-        # This cancels the systematic bias that nearest-rounding the EMA momentum
-        # accumulates over a long horizon. Default False is bit-identical to the
-        # prior behavior (the kernels take the same parity-preserving fast path).
-        # Under capturable=True the per-step seed lives in a per-device 0-dim
-        # int64 tensor advanced on device once per step (see _sr_seed_on), so a
-        # captured/replayed CUDA graph dithers with a fresh seed every replay
-        # instead of freezing the host seed at its capture-time value; eager
-        # capturable steps read the SAME tensor, so a replay at step k
-        # bit-matches the eager capturable step k.
-        # Only the fused CUDA automatic-step kernels honor this flag; the
-        # non-fused / CPU quantizers use deterministic nearest rounding. Warn (do
-        # not hard-error -- mirroring fp8_ns's portable-config behavior) so
-        # stochastic_round=True is not a silent no-op when the fused path is off
-        # (fused=False, CUDA unavailable, or the fused-step global disabled).
+        # Default False is bit-identical to the prior behavior (the kernels
+        # take the same parity-preserving fast path). Under capturable=True the
+        # per-step seed lives in a per-device 0-dim int64 tensor advanced on
+        # device once per step (see _sr_seed_on), so a captured/replayed CUDA
+        # graph dithers with a fresh seed every replay; eager capturable steps
+        # read the SAME tensor, so a replay at step k bit-matches the eager
+        # capturable step k. Warn (do not hard-error -- mirroring fp8_ns's
+        # portable-config behavior) so stochastic_round=True is not a silent
+        # no-op when the fused path is off.
         self._stochastic_round = stochastic_round
-        if stochastic_round and not self._use_fused_gefen_automatic_step():
+        # Probe-free check: report the CONFIGURED fused intent here, not the
+        # toolchain-probed availability -- construction must never trigger the
+        # JIT build (that is deferred to the first step's lazy probe).
+        if stochastic_round and not self._fused_configured():
             warnings.warn(
                 "stochastic_round=True is honored only by the fused Gefen "
                 "automatic-step CUDA kernels; the non-fused / CPU path uses "
@@ -678,7 +651,6 @@ class Gefen(torch.optim.Optimizer):
             )
         self.verbose = verbose
 
-        self._printed_optimizer_memory = False
         self._gefen_codebook = None
         self._gefen_codebook_by_device = {}
         # Per-device codebook-search LUTs for the COMPILED capturable step:
@@ -709,7 +681,6 @@ class Gefen(torch.optim.Optimizer):
         # nothing it would mark has changed. See _static_mark_signature.
         self._static_mark_sig = None
         self._gefen_global_step = 0
-        self._printed_gefen_materialization = False
 
         optim_groups = []
         for group_index, param_or_group in enumerate(params):
@@ -724,42 +695,246 @@ class Gefen(torch.optim.Optimizer):
                 group_betas = param_or_group.get("betas", betas)
                 group_eps = param_or_group.get("eps", eps)
                 group_weight_decay = param_or_group.get("weight_decay", weight_decay)
-                validate_group_options(
+                self._validate_group_options(
                     group_lr, group_betas, group_eps, group_weight_decay
                 )
                 for param_index, (param_name, param) in enumerate(
-                    iter_params_with_names(param_or_group["params"])
+                    self._iter_params_with_names(param_or_group["params"])
                 ):
                     if param_name is None:
                         param_name = "group_{}_param_{}".format(
                             group_index, param_index
                         )
-                    append_param_group(
-                        param_name,
-                        param,
-                        group_lr,
-                        group_betas,
-                        group_eps,
-                        group_weight_decay,
+                    optim_groups.append(
+                        self._named_param_group(
+                            param_name,
+                            param,
+                            group_lr,
+                            group_betas,
+                            group_eps,
+                            group_weight_decay,
+                        )
                     )
             else:
-                for param_name, param in iter_params_with_names((param_or_group,)):
+                for param_name, param in self._iter_params_with_names(
+                    (param_or_group,)
+                ):
                     if param_name is None:
                         param_name = "param_{}".format(group_index)
-                    append_param_group(param_name, param, lr, betas, eps, weight_decay)
+                    optim_groups.append(
+                        self._named_param_group(
+                            param_name, param, lr, betas, eps, weight_decay
+                        )
+                    )
 
-        defaults = dict(lr=lr, beta1=betas[0], beta2=betas[1], eps=eps)
+        defaults = dict(
+            lr=lr,
+            beta1=betas[0],
+            beta2=betas[1],
+            eps=eps,
+            weight_decay=weight_decay,
+        )
         super().__init__(optim_groups, defaults)
+
+    @staticmethod
+    def _validate_group_options(lr, betas, eps, weight_decay):
+        if torch.is_tensor(lr) and lr.numel() != 1:
+            raise ValueError(
+                "lr as a Tensor must be 1-element, got numel={}".format(lr.numel())
+            )
+        if not 0.0 <= lr:
+            raise ValueError("Invalid learning rate: {}".format(lr))
+        elif not 0.0 <= betas[0] < 1.0:
+            raise ValueError(
+                "Invalid beta parameter at index 0: {}".format(betas[0])
+            )
+        elif not 0.0 <= betas[1] < 1.0:
+            raise ValueError(
+                "Invalid beta parameter at index 1: {}".format(betas[1])
+            )
+        elif not 0.0 <= weight_decay:
+            raise ValueError("Invalid weight_decay value: {}".format(weight_decay))
+        elif not 0.0 <= eps:
+            raise ValueError("Invalid epsilon value: {}".format(eps))
+
+    @staticmethod
+    def _iter_params_with_names(group_params):
+        if isinstance(group_params, torch.Tensor):
+            group_params = (group_params,)
+        for param_or_named_param in group_params:
+            if isinstance(param_or_named_param, tuple):
+                param_name, param = param_or_named_param
+            else:
+                param_name = None
+                param = param_or_named_param
+            if not isinstance(param, torch.Tensor):
+                raise TypeError(
+                    "Gefen can only optimize Tensors, but one of the params is {}".format(
+                        type(param).__name__,
+                    )
+                )
+            if torch.is_complex(param):
+                raise ValueError(
+                    "Gefen does not support complex parameters, but got a "
+                    "parameter with dtype {}".format(param.dtype)
+                )
+            yield param_name, param
+
+    @staticmethod
+    def _named_param_group(param_name, param, lr, betas, eps, weight_decay):
+        return {
+            "name": str(param_name).lower(),
+            "params": param,
+            "lr": lr,
+            "beta1": betas[0],
+            "beta2": betas[1],
+            "eps": eps,
+            "weight_decay": weight_decay,
+        }
+
+    def add_param_group(self, param_group):
+        """Add a param group with the constructor's validation and per-param expansion.
+
+        Accepts the same group dict shape as the constructor (``params`` as
+        tensors or ``(name, tensor)`` tuples; optional ``lr`` / ``betas`` (or
+        ``beta1``/``beta2``) / ``eps`` / ``weight_decay``, defaulting to the
+        constructor values). Each param becomes its own named group, exactly
+        like the constructor builds them, so ``step()``'s per-group state
+        machinery keeps working. ``torch.optim.Optimizer.__init__`` routes the
+        constructor-built groups through here too.
+        """
+        if not isinstance(param_group, dict):
+            raise TypeError(
+                "param_group must be a dict, got {}".format(
+                    type(param_group).__name__
+                )
+            )
+        if "params" not in param_group:
+            raise ValueError("Gefen parameter group is missing the 'params' key.")
+        defaults = self.defaults
+        group_lr = param_group.get("lr", defaults["lr"])
+        if "betas" in param_group:
+            group_betas = param_group["betas"]
+        else:
+            group_betas = (
+                param_group.get("beta1", defaults["beta1"]),
+                param_group.get("beta2", defaults["beta2"]),
+            )
+        group_eps = param_group.get("eps", defaults["eps"])
+        group_weight_decay = param_group.get("weight_decay", defaults["weight_decay"])
+        self._validate_group_options(
+            group_lr, group_betas, group_eps, group_weight_decay
+        )
+        # Keys beyond the ones Gefen manages (e.g. a subclass's extras) are
+        # carried into every expanded group, mirroring torch's behavior of
+        # preserving unknown group keys.
+        consumed = ("params", "name", "lr", "betas", "beta1", "beta2", "eps",
+                    "weight_decay")
+        extra = {k: v for k, v in param_group.items() if k not in consumed}
+        existing_names = {g.get("name") for g in self.param_groups}
+        group_index = len(self.param_groups)
+        for param_index, (param_name, param) in enumerate(
+            self._iter_params_with_names(param_group["params"])
+        ):
+            if param_name is None:
+                param_name = param_group.get("name")
+            if param_name is None:
+                # Synthesize a name that cannot collide with an existing group.
+                param_name = "group_{}_param_{}".format(group_index, param_index)
+                while param_name in existing_names:
+                    group_index += 1
+                    param_name = "group_{}_param_{}".format(
+                        group_index, param_index
+                    )
+            new_group = dict(extra)
+            new_group.update(
+                self._named_param_group(
+                    param_name,
+                    param,
+                    group_lr,
+                    group_betas,
+                    group_eps,
+                    group_weight_decay,
+                )
+            )
+            super().add_param_group(new_group)
+            existing_names.add(new_group["name"])
+
+    def _lr_scalar(self, group) -> float:
+        """Resolve ``group["lr"]`` to a python float, caching a tensor lr's ``.item()``.
+
+        A float lr is returned as-is (no sync). A tensor lr is ``.item()``'d (a
+        D2H sync) only when its identity or ``_version`` changes -- an in-place
+        scheduler update (e.g. ``lr.mul_``) bumps ``_version``, a replacement
+        swaps identity. The cache is a SINGLE slot (the last ``(tensor, version,
+        value)`` triple), shared across all param groups. Gefen stores the SAME
+        lr object in every per-param group (see ``_named_param_group``), and the
+        tensor-lr idiom is a single on-device lr, so one shared slot already
+        costs just one ``.item()`` per step (O(steps), per version). One slot
+        rather than an id-keyed dict so a loop that assigns a FRESH lr tensor
+        each step can't grow the cache (and its strong refs) unboundedly. The
+        cached value equals ``lr.item()``, so callers stay bit-identical.
+        Inherited by GefenMuon. Kept as a plain instance attribute so it is not
+        serialized into ``param_groups`` / the optimizer ``state_dict``.
+        """
+        lr = group["lr"]
+        if not isinstance(lr, torch.Tensor):
+            return lr
+        ver = lr._version
+        cache = getattr(self, "_lr_scalar_cache", None)
+        if cache is not None and cache[0] is lr and cache[1] == ver:
+            return cache[2]
+        val = lr.item()
+        self._lr_scalar_cache = (lr, ver, val)
+        return val
 
     def _use_fused_automatic_vmean(self) -> bool:
         return self.fused and FUSE_AUTOMATIC_VMEAN_UPDATE
+
+    def _fused_configured(self) -> bool:
+        # The CONFIGURED fused intent: fused=True AND the module fuse flag, with
+        # NO toolchain probe (never triggers the JIT build). Used at construction
+        # and anywhere a build side effect would be wrong.
+        return self.fused and FUSE_GEFEN_AUTOMATIC_STEP
+
+    def _gefen_fused_toolchain_ok(self) -> bool:
+        # Lazily probe whether the fused CUDA extension can build/load on this
+        # box. On failure (missing nvcc / toolchain mismatch / unwritable build
+        # dir) warn ONCE, permanently downgrade this instance to fused=False, and
+        # cache the verdict so the probe and the warning happen at most once. A
+        # working pure-torch training run continues instead of a mid-step crash.
+        if not self.fused:
+            return False
+        if self._fused_build_ok is not None:
+            return self._fused_build_ok
+        try:
+            _ensure_gefen_fused_extension_loaded()
+            self._fused_build_ok = True
+        except Exception as exc:  # noqa: BLE001 -- any build/load failure must
+            # degrade to the pure-torch path, never crash the training run.
+            self._fused_build_ok = False
+            self.fused = False
+            warnings.warn(
+                "Gefen could not build/load its fused CUDA kernels ({}: {}); "
+                "continuing with fused=False on the pure-PyTorch path. Set "
+                "GEFEN_VERBOSE_BUILD=1 for the full build diagnostic.".format(
+                    type(exc).__name__, exc
+                ),
+                UserWarning,
+                stacklevel=2,
+            )
+        return self._fused_build_ok
 
     def _fused_kernels_available(self) -> bool:
         # Whether the fused automatic-step CUDA kernels can run at all,
         # REGARDLESS of capturable. GefenMuon uses this for its momentum kernel,
         # whose only scalar argument (the constant momentum beta) is
-        # capture-safe to bake into a graph.
-        return self.fused and FUSE_GEFEN_AUTOMATIC_STEP
+        # capture-safe to bake into a graph. Lazily probes the toolchain and
+        # downgrades to pure-torch on a build failure (see
+        # _gefen_fused_toolchain_ok).
+        if not self._fused_configured():
+            return False
+        return self._gefen_fused_toolchain_ok()
 
     def _use_fused_gefen_automatic_step(self) -> bool:
         # The fused update kernels stay on under capturable=True: the per-step-
@@ -1377,9 +1552,18 @@ class Gefen(torch.optim.Optimizer):
         grad_view: torch.Tensor,
         beta2: float,
     ) -> None:
-        automatic_vmean_update(
-            vmean, grad_view, beta2, use_fused=self._use_fused_automatic_vmean()
+        # The fused vmean CUDA kernel only runs on co-located CUDA tensors and
+        # squares in float32; a CPU-resident param (device_map spill / CPU
+        # offload) or an fp64 param must take the pure-torch reduction instead,
+        # which handles both natively. Gate the fused path per-call so those
+        # params never reach the CUDA binding.
+        use_fused = (
+            self._use_fused_automatic_vmean()
+            and grad_view.is_cuda
+            and vmean.is_cuda
+            and grad_view.dtype != torch.float64
         )
+        automatic_vmean_update(vmean, grad_view, beta2, use_fused=use_fused)
 
     def _gefen_codebook_device(self) -> torch.device:
         for group in self.param_groups:
@@ -1440,10 +1624,6 @@ class Gefen(torch.optim.Optimizer):
     def _gefen_set_indices(self, state, indices: torch.Tensor) -> None:
         gefen_set_unpacked_indices(state["m_codebook"], indices)
 
-    def _print_gefen_codebook(self, label: str, codebook: torch.Tensor) -> None:
-        if self.verbose:
-            print("{} ({} entries):".format(label, codebook.numel()))
-
     def _automatic_view(self, flat_tensor: torch.Tensor, period: int) -> torch.Tensor:
         return automatic_partition_view(flat_tensor, period)
 
@@ -1472,6 +1652,22 @@ class Gefen(torch.optim.Optimizer):
         self, param_name: str, param: torch.Tensor, grad: torch.Tensor
     ) -> int:
         backend = _resolve_find_period_backend(grad)
+        # If the fused CUDA toolchain GENUINELY failed to build (the step-1 probe
+        # ran and returned False -> _fused_build_ok is False), fall back to the
+        # pure-torch "gpu" period backend rather than crashing in the separate
+        # period-variance extension load. Gate on the explicit build-failure
+        # verdict, NOT on _gefen_fused_toolchain_ok(): the latter also returns
+        # False for a user-chosen fused=False optimizer, which must keep using
+        # the cuda_kernel period backend (bit-identical to before this scrub).
+        # Only override the AUTO resolution -- an explicit FIND_PERIOD_BACKEND is
+        # the user's deliberate choice.
+        if (
+            backend == "cuda_kernel"
+            and FIND_PERIOD_BACKEND is None
+            and grad.device.type == "cuda"
+            and self._fused_build_ok is False
+        ):
+            backend = "gpu"
         if backend == "cuda_kernel":
             grad_work = grad.to_local() if hasattr(grad, "to_local") else grad
             grad_flat = grad_work.detach().reshape(-1)
@@ -1492,8 +1688,6 @@ class Gefen(torch.optim.Optimizer):
                 )
                 if not needs_materialization:
                     raise
-                if not self._printed_gefen_materialization:
-                    pass
 
                 grad_work.add_(0)
                 grad_flat = grad_work.detach().reshape(-1)
@@ -1561,6 +1755,10 @@ class Gefen(torch.optim.Optimizer):
                 if p.grad is None:
                     continue
                 grad = p.grad
+                # Codebook learning runs before the step loop's own guard, so
+                # reject sparse grads here too with the same clear error.
+                if getattr(grad, "is_sparse", False):
+                    raise RuntimeError("Gefen does not support sparse gradients")
                 if hasattr(grad, "to_local"):
                     grad = grad.to_local()
                 if hasattr(grad, "wait"):
@@ -1603,6 +1801,13 @@ class Gefen(torch.optim.Optimizer):
         reuse_existing_periods: bool = False,
         compute_mse_logging: bool = True,
     ) -> Optional[torch.Tensor]:
+        # Fire the fused-toolchain probe ONCE here, at the first fused CUDA
+        # extension boundary (step-1 codebook learning), so a broken toolchain
+        # is discovered and downgraded before the histogram / period-finding /
+        # update paths run. On a healthy box this just builds the extension a
+        # little earlier; for fused=False the probe is a no-op (never builds).
+        if self.fused:
+            self._gefen_fused_toolchain_ok()
         codebook = learn_gefen_exact_codebook_from_grad_periods(
             grad_periods=self._iter_gefen_grad_periods(
                 reuse_existing_periods=reuse_existing_periods
@@ -1612,7 +1817,15 @@ class Gefen(torch.optim.Optimizer):
             force_endpoints=True,
             verbose=self.verbose,
             compute_mse_logging=compute_mse_logging,
-            use_fused_histogram=FUSE_HISTOGRAM_FOR_EXACT,
+            # Use the fused histogram UNLESS the toolchain probe explicitly
+            # failed (_fused_build_ok is False). Gating on the build-failure
+            # verdict rather than self.fused preserves the pre-scrub behavior of
+            # the histogram (it ran on CUDA tensors regardless of the optimizer's
+            # fused flag), so a fused=False run stays bit-identical; only a
+            # genuinely broken toolchain drops to the pure-torch bincount path.
+            use_fused_histogram=(
+                FUSE_HISTOGRAM_FOR_EXACT and self._fused_build_ok is not False
+            ),
         )
         if codebook is None:
             return None
@@ -1620,12 +1833,9 @@ class Gefen(torch.optim.Optimizer):
         return codebook
 
     def _ensure_gefen_codebook(self, reuse_existing_periods: bool = False) -> None:
-        compute_mse_logging = False
-        if "COMPUTE_GEFEN_EXACT_MSE_LOGGING" in globals():
-            compute_mse_logging = COMPUTE_GEFEN_EXACT_MSE_LOGGING
         codebook = self._learn_gefen_exact_codebook(
             reuse_existing_periods=reuse_existing_periods,
-            compute_mse_logging=compute_mse_logging,
+            compute_mse_logging=False,
         )
         if codebook is not None:
             self._gefen_codebook = codebook
@@ -1713,6 +1923,7 @@ class Gefen(torch.optim.Optimizer):
             self._use_fused_gefen_automatic_step()
             and p.is_cuda
             and p.is_contiguous()
+            and p.dtype != torch.float64
         ):
             # Fused path. Phase 1 of the kernel computes the per-block absmax
             # AND the raw row/col grad^2 sums in ONE pass over grad + m_sign;
@@ -1762,6 +1973,11 @@ class Gefen(torch.optim.Optimizer):
             # EMA; bc2 must correct the factored v EMA's own age.
             bias_correction_1 = 1 - beta1 ** state["step"]
             bias_correction_2 = 1 - beta2 ** state["factored_step"]
+            if torch.is_tensor(lr):
+                # The kernel binding takes lr / wd_factor as host doubles;
+                # scalarize a tensor lr through the cached no-sync .item()
+                # hoist (_lr_scalar) instead of passing the tensor through.
+                lr = self._lr_scalar(group)
             weight_decay_factor = 1.0 - lr * group["weight_decay"]
             _gefen_factored_update_cuda(
                 p,
@@ -1800,7 +2016,15 @@ class Gefen(torch.optim.Optimizer):
         rows_per_chunk = max(1, (1 << 20) // max(1, cols))
         for r0 in range(0, rows, rows_per_chunk):
             r1 = min(r0 + rows_per_chunk, rows)
-            chunk_sq = grad2d[r0:r1].float().square_()
+            chunk = grad2d[r0:r1]
+            # .float() on an fp32 grad returns an ALIAS, so squaring in place
+            # would corrupt p.grad (which grad_view below also reads); square
+            # out-of-place there. Half-precision grads get a fresh fp32 copy
+            # from .float(), which square_ can safely reuse.
+            if chunk.dtype == torch.float32:
+                chunk_sq = chunk.square()
+            else:
+                chunk_sq = chunk.float().square_()
             row_ms[r0:r1] = chunk_sq.sum(dim=1)
             col_sq += chunk_sq.sum(dim=0)
         row_ms.div_(cols)
@@ -1949,7 +2173,6 @@ class Gefen(torch.optim.Optimizer):
         )
 
     def _init_gefen_state(self, state, grad_view: torch.Tensor) -> None:
-        state["m_codebook_shape"] = tuple(grad_view.shape)
         state["m_codebook"] = torch.zeros_like(
             grad_view, dtype=torch.uint8, memory_format=torch.preserve_format
         )
@@ -1958,27 +2181,6 @@ class Gefen(torch.optim.Optimizer):
             grad_view[:, 0:1],
             dtype=torch.float32,
             memory_format=torch.preserve_format,
-        )
-
-    def _automatic_gefen_fused_update(
-        self, p, state, grad_view, beta1, stepsize, lr
-    ) -> None:
-
-        codebook = self._gefen_codebook_on(p.device)
-        if codebook is None:
-            raise ValueError(
-                "Expected Gefen codebook to be initialized before fused update."
-            )
-        gefen_automatic_fused_update(
-            p=p,
-            grad_view=grad_view,
-            m_codebook=state["m_codebook"],
-            m_magnitude=state["m_magnitude"],
-            stepsize=stepsize,
-            codebook=codebook,
-            packed_indices=False,
-            beta1=beta1,
-            lr=lr,
         )
 
     def _gefen_quantized_momentum_update(
@@ -2404,7 +2606,19 @@ class Gefen(torch.optim.Optimizer):
         # / few-block params stay on the decomposed v2 path, and the non-fused
         # path stays decomposed. The routing predicate is the same one the v1/v2
         # update dispatch uses, so the choice is consistent.
-        fused_step = self._use_fused_gefen_automatic_step()
+        # Per-tensor device/dtype gating: the fused update kernels take a raw
+        # CUDA pointer launch, so a CPU-resident param (device_map spill / CPU
+        # offload) would crash in the binding, and an fp64 param would be
+        # silently downcast to fp32 (the reject-Double dispatch now errors).
+        # Route both to the decomposed pure-torch path per-param -- it handles
+        # CPU tensors and fp64 natively. grad_view is the unwrapped local shard
+        # actually fed to the kernel, so gate on its device/dtype (mirrors the
+        # factored path's p.is_cuda guard for the co-located shard).
+        fused_step = (
+            self._use_fused_gefen_automatic_step()
+            and grad_view.is_cuda
+            and grad_view.dtype != torch.float64
+        )
         route_v2 = _should_use_v2(
             grad_view.shape[0], automatic_period, grad_view.device
         )
@@ -2464,6 +2678,11 @@ class Gefen(torch.optim.Optimizer):
             # only when vmean was lazily recreated after a factored->legacy
             # toggle.
             bias_correction_2 = 1 - beta2 ** state["vmean_step"]
+            if torch.is_tensor(lr) and (use_full_fused or use_v2_full):
+                # The fused kernel bindings take lr / wd_factor as host
+                # doubles; scalarize a tensor lr through the cached no-sync
+                # .item() hoist (_lr_scalar) instead of passing the tensor.
+                lr = self._lr_scalar(group)
 
         if use_full_fused:
             # K1+K2+K3: vmean EMA, per-block stepsize, and weight decay are all
@@ -2585,34 +2804,6 @@ class Gefen(torch.optim.Optimizer):
             h.div_(math.sqrt(bias_correction_2)).add_(eps)
         torch.reciprocal(h, out=stepsize)
         stepsize.mul_(1.0 / bias_correction_1)
-
-        if self._use_fused_gefen_automatic_step():
-            # The fused kernel flat-indexes p and requires it contiguous. A
-            # contiguous DTensor shard is written in place directly; a
-            # non-contiguous shard is updated on a contiguous copy that is then
-            # copied back so the in-place semantics are preserved.
-            if p_local.is_contiguous():
-                self._automatic_gefen_fused_update(
-                    p_local,
-                    state,
-                    grad_view,
-                    beta1,
-                    stepsize,
-                    lr,
-                )
-            else:
-                p_contig = p_local.contiguous()
-                self._automatic_gefen_fused_update(
-                    p_contig,
-                    state,
-                    grad_view,
-                    beta1,
-                    stepsize,
-                    lr,
-                )
-                p_local.copy_(p_contig)
-
-            return
 
         # Streamed momentum update + parameter apply: row-chunked, bit-for-bit
         # identical to the old whole-tensor form, but it never materializes the
@@ -2807,15 +2998,16 @@ class Gefen(torch.optim.Optimizer):
             codebooks, list(merged_codebook.reshape(k, nblocks, period).unbind(0))
         )
 
-    def _optimizer_state_memory_bytes(self) -> int:
-        total = 0
-        for state in self.state.values():
-            for value in state.values():
-                if torch.is_tensor(value):
-                    total += value.numel() * value.element_size()
-        return total
-
     def state_dict(self):
+        """Serialize optimizer state, plus Gefen's run-level extras.
+
+        Beyond the base ``torch.optim.Optimizer.state_dict`` contents (per-param
+        state keyed by index, param_groups incl. each group's ``name``), the dict
+        carries ``gefen_global_step`` and the frozen exact-DP ``gefen_codebook``
+        (without it a resume would re-learn the codebook and desync the restored
+        block periods). Per-step scratch buffers are stripped, and non-owning
+        state views are compacted to tight clones so checkpoints stay small.
+        """
         state_dict = super().state_dict()
         # stepsize/_h_buf are per-step scratch buffers (recomputed from vmean every
         # step); they live in self.state only to be reused across steps, so strip
@@ -2872,6 +3064,17 @@ class Gefen(torch.optim.Optimizer):
         return state_dict
 
     def load_state_dict(self, state_dict):
+        """Restore optimizer state saved by :meth:`state_dict`.
+
+        On top of the base load this restores ``gefen_global_step`` and the
+        frozen codebook, and undoes the base class's dtype coercion of aux
+        state: ``torch.optim`` casts every floating state tensor to the owning
+        param's dtype, which would corrupt Gefen's fp32 moments and uint8
+        momentum indices on bf16 models, so each aux tensor is written back in
+        its ORIGINAL saved dtype. Step counters are normalized to this
+        optimizer's ``capturable`` mode (host ints vs 0-dim device tensors), so
+        checkpoints are portable across the toggle in either direction.
+        """
         # Shallow-copy so the pop()s below don't mutate the caller's checkpoint
         # dict (torch.optim.Optimizer.load_state_dict leaves its input intact);
         # otherwise a second load of the same dict loses the gefen_* keys.
@@ -2982,7 +3185,23 @@ class Gefen(torch.optim.Optimizer):
 
     @torch.no_grad()
     def step(self, closure=None):
+        """Perform a single optimization step.
+
+        Args:
+            closure (callable, optional): re-evaluates the model and returns
+                the loss; invoked under ``torch.enable_grad()`` BEFORE any
+                optimizer work (matching :meth:`GefenMuon.step`), so
+                closure-driven loops that produce the gradients inside the
+                closure feed the first step's codebook learning correctly. The
+                returned loss is passed through.
+        """
         self._assert_capturable_if_capturing()
+
+        loss = None
+        if closure is not None:
+            with torch.enable_grad():
+                loss = closure()
+
         self._maybe_refresh_gefen_codebook()
         self._maybe_save_gefen_grad_histogram()
         # Periodic codebook re-learn (opt-in): every N steps, refit the exact-DP
@@ -2994,11 +3213,6 @@ class Gefen(torch.optim.Optimizer):
             and self._gefen_global_step % self._codebook_refresh_every == 0
         ):
             self._refresh_codebook_with_requant()
-
-        loss = None
-        if closure is not None:
-            with torch.enable_grad():
-                loss = closure()
 
         # Batched capturable refresh: advance every registered param's device
         # step counters and refresh every param's [lr, 1/bcX, 1/bc1, wd]
@@ -3038,6 +3252,10 @@ class Gefen(torch.optim.Optimizer):
                 grad = p.grad
                 if grad is None:
                     continue
+                if getattr(grad, "is_sparse", False):
+                    raise RuntimeError("Gefen does not support sparse gradients")
+                if torch.is_complex(grad):
+                    raise RuntimeError("Gefen does not support complex gradients")
                 # Factored-v routing (opt-in): plain 2D params keep their
                 # quantized momentum but step through the factored-second-
                 # moment path (in-kernel elementwise stepsize on the fused

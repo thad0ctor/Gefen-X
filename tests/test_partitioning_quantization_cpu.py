@@ -168,7 +168,8 @@ def test_exact_dp_numba_and_python_paths_agree(monkeypatch):
         raise ModuleNotFoundError("numba disabled for parity test")
 
     monkeypatch.setattr(quantization, "_get_exact_dp_numba_kernel", _no_numba)
-    via_python = exact_dp(hist, num_codebooks=16)
+    with pytest.warns(UserWarning, match="numba"):
+        via_python = exact_dp(hist, num_codebooks=16)
 
     assert torch.allclose(
         via_numba.to(torch.float64), via_python.to(torch.float64), atol=1e-12

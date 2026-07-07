@@ -392,7 +392,19 @@ def _run_fused_cuda_case(case):
 # than world_size (empty non-owner shards) -- proving no collective deadlocks.
 DIST_TOL = 1e-3  # absorbs cross-rank bf16 NS noise vs the single-GPU oracle
 DIST_EXACT_TOL = 0.0  # distributed must be BIT-IDENTICAL to exact mode
+# ... but ONLY on a homogeneous rig: exact mode runs Newton-Schulz on every
+# rank's own GPU while distributed broadcasts one owner's result, so with mixed
+# GPU architectures (e.g. a 3090 + 5090 box) the cross-arch bf16 GEMMs differ at
+# ULP scale and bit-identity is unattainable by design (verified: 4x3090 passes
+# at 0.0, any 5090+3090 mix fails). On a mixed rig the exact-vs-distributed
+# comparison is relaxed to this ULP-scale bound instead.
+DIST_MIXED_ARCH_EXACT_TOL = 2e-3
 DIST_STEPS = 3
+
+
+def _cuda_archs_homogeneous(world):
+    """True iff the first `world` visible GPUs share one compute capability."""
+    return len({torch.cuda.get_device_capability(i) for i in range(world)}) == 1
 
 
 def _dist_shapes(world):
@@ -574,17 +586,29 @@ def _run_distributed_case(world, ns_schedule=None):
     empty_owner_ok = (
         empty_owner_rank == 0 or owner_empty.get(empty_owner_rank, False)
     )
+    # Bit-identity vs exact mode is only enforceable on a homogeneous rig; on
+    # mixed GPU archs relax to the ULP-scale bound (see DIST_MIXED_ARCH_EXACT_TOL).
+    homogeneous = _cuda_archs_homogeneous(world)
+    exact_tol = DIST_EXACT_TOL if homogeneous else DIST_MIXED_ARCH_EXACT_TOL
+    if not homogeneous:
+        caps = [torch.cuda.get_device_capability(i) for i in range(world)]
+        print(
+            f"[dist x{world}] MIXED GPU archs {caps}: exact<->distributed "
+            f"bit-identity is unattainable cross-arch; relaxing the exact-mode "
+            f"comparison to {DIST_MIXED_ARCH_EXACT_TOL:.0e}"
+        )
     ok = (
         changed
         and finite
         and (max_vs_oracle <= DIST_TOL)
-        and (max_vs_exact <= DIST_EXACT_TOL)
+        and (max_vs_exact <= exact_tol)
         and empty_owner_ok
     )
     sched_label = ns_schedule if ns_schedule is not None else "standard"
     print(
         f"[dist x{world} sched={sched_label}] changed={changed} finite={finite} "
         f"max|dist-oracle|={max_vs_oracle:.3e} max|dist-exact|={max_vs_exact:.3e} "
+        f"(tol={exact_tol:.0e}) "
         f"empty_owner(rank{empty_owner_rank})={'n/a' if empty_owner_rank==0 else owner_empty.get(empty_owner_rank)} "
         f"{'PASS' if ok else 'FAIL'}"
     )

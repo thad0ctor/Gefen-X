@@ -267,11 +267,18 @@ def _check_cuda_toolkit() -> tuple[str, str]:
             "Gefen could not parse torch.version.cuda='{}'.\n"
             "{}".format(torch.version.cuda, _cuda_diagnostic(nvcc, nvcc_output))
         )
-    if nvcc_version != torch_cuda:
+    # CUDA minor versions are compile-compatible (a 13.3 nvcc builds sources
+    # that link against a 13.1 PyTorch runtime, and vice versa), so only a MAJOR
+    # mismatch is fatal. Requiring an exact major.minor match rejected otherwise
+    # working toolchains (e.g. nvcc 13.3 vs torch cu13.1) and forced a needless
+    # crash despite a complete pure-torch fallback. A differing minor is allowed
+    # and only surfaced under GEFEN_VERBOSE_BUILD.
+    if nvcc_version[0] != torch_cuda[0]:
         raise RuntimeError(
-            "Gefen CUDA toolkit version mismatch: nvcc reports {}.{}, "
+            "Gefen CUDA toolkit major version mismatch: nvcc reports {}.{}, "
             "but PyTorch was built with CUDA {}.{}.\n"
-            "Install an nvcc toolkit that exactly matches torch.version.cuda and point CUDA_HOME to that toolkit.\n"
+            "Install an nvcc toolkit whose MAJOR version matches torch.version.cuda "
+            "and point CUDA_HOME to that toolkit.\n"
             "{}\n\n{}".format(
                 nvcc_version[0],
                 nvcc_version[1],
@@ -279,6 +286,13 @@ def _check_cuda_toolkit() -> tuple[str, str]:
                 torch_cuda[1],
                 _cuda_diagnostic(nvcc, nvcc_output),
                 _cuda_install_instructions(),
+            )
+        )
+    if nvcc_version[1] != torch_cuda[1] and _env_flag("GEFEN_VERBOSE_BUILD"):
+        print(
+            "Gefen: nvcc CUDA {}.{} differs from torch CUDA {}.{} in the minor "
+            "version only; proceeding (minor versions are compile-compatible).".format(
+                nvcc_version[0], nvcc_version[1], torch_cuda[0], torch_cuda[1]
             )
         )
     cuda_runtime_header = _find_cuda_runtime_header(nvcc)
@@ -303,12 +317,32 @@ def _check_cuda_toolkit() -> tuple[str, str]:
     return nvcc, nvcc_output
 
 
+def _effective_arch_list() -> str:
+    # The exact set of SM targets the JIT will compile for: an explicit
+    # TORCH_CUDA_ARCH_LIST wins (that is what nvcc actually receives), otherwise
+    # fall back to the capabilities we would infer for the visible device. This
+    # feeds the build-dir key so switching GPUs or arch lists (e.g. sm_86 ->
+    # sm_120, or adding +PTX) rebuilds into a fresh dir instead of silently
+    # loading a binary compiled for the other arch.
+    explicit = os.environ.get("TORCH_CUDA_ARCH_LIST")
+    if explicit:
+        return explicit
+    inferred = _infer_torch_cuda_arch_list()
+    return inferred if inferred is not None else "unknown"
+
+
 def _build_dir(extension_name: str, kernel_dir: Path) -> Path:
     path_hash = hashlib.sha256(str(kernel_dir).encode("utf-8")).hexdigest()[:12]
+    # Hash the arch list too: it can be long / contain characters the cache-part
+    # sanitizer would mangle, and only its identity matters for the key.
+    arch_hash = hashlib.sha256(
+        _effective_arch_list().encode("utf-8")
+    ).hexdigest()[:12]
     env_parts = [
         "py{}.{}".format(sys.version_info.major, sys.version_info.minor),
         "torch{}".format(torch.__version__),
         "cu{}".format(torch.version.cuda),
+        "arch{}".format(arch_hash),
         "src{}".format(path_hash),
     ]
     env_key = "_".join(_sanitize_cache_part(part) for part in env_parts)
@@ -353,7 +387,19 @@ def load_gefen_cuda_extension(extension_name: str, source_filenames):
     build_dir = _build_dir(extension_name, kernel_dir)
     if _env_flag("GEFEN_FORCE_REBUILD") and build_dir.exists():
         shutil.rmtree(build_dir)
-    build_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        build_dir.mkdir(parents=True, exist_ok=True)
+    except PermissionError as exc:
+        # Read-only / unwritable HOME (containers, shared clusters): the default
+        # build root lives under the torch extensions dir in HOME. Point the
+        # user at the override instead of failing with a bare errno.
+        raise RuntimeError(
+            "Gefen could not create its CUDA kernel build directory:\n  {}\n"
+            "The location is not writable ({}). Set GEFEN_KERNEL_BUILD_ROOT to a "
+            "writable directory (e.g. a scratch or tmp path) and retry.".format(
+                build_dir, exc
+            )
+        ) from exc
 
     will_build = not _cached_extension_exists(build_dir, extension_name, sources)
     nvcc = None
@@ -395,7 +441,23 @@ def load_gefen_cuda_extension(extension_name: str, source_filenames):
         if "Unknown CUDA arch" in message:
             raise RuntimeError(
                 "Gefen CUDA JIT build failed because PyTorch rejected the CUDA architecture.\n"
-                "Set TORCH_CUDA_ARCH_LIST using the commands below, then rebuild.\n"
+                "Set TORCH_CUDA_ARCH_LIST using the commands below, then rebuild with "
+                "GEFEN_FORCE_REBUILD=1 to discard any stale cached binary.\n"
+                "{}\n\n{}".format(
+                    _cuda_diagnostic(nvcc, nvcc_output), _cuda_install_instructions()
+                )
+            ) from exc
+        if "no kernel image is available" in message or "invalid device function" in message:
+            # A cached binary compiled for a different SM than the current GPU
+            # (the arch-list build-dir key now separates these, but a binary
+            # cached before that fix, or one loaded across an arch change with a
+            # forced build dir, can still slip through). A forced rebuild for the
+            # current TORCH_CUDA_ARCH_LIST fixes it.
+            raise RuntimeError(
+                "Gefen CUDA kernel load failed: the cached binary has no kernel image "
+                "for the current GPU architecture.\n"
+                "Rebuild for this GPU with GEFEN_FORCE_REBUILD=1 (optionally set "
+                "TORCH_CUDA_ARCH_LIST to this GPU's compute capability first).\n"
                 "{}\n\n{}".format(
                     _cuda_diagnostic(nvcc, nvcc_output), _cuda_install_instructions()
                 )

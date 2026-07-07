@@ -37,6 +37,14 @@ def gefen_exact_histogram_cuda(
                 "Expected {} to be on CUDA, got device {}.".format(name, tensor.device)
             )
 
+    # The kernel accumulates into bin_counts on grad_flat's device; mirror the
+    # C++ same-device guard so a cross-device pair fails clearly here.
+    if grad_flat.device != bin_counts.device:
+        raise ValueError(
+            "Expected grad_flat and bin_counts on the same device, got {} and {}.".format(
+                grad_flat.device, bin_counts.device
+            )
+        )
     if grad_flat.dim() != 1:
         raise ValueError(
             "Expected grad_flat to be 1D, got dim={}".format(grad_flat.dim())

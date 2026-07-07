@@ -34,7 +34,21 @@ _V2_BLOCKS_PER_SM = 2  # below 2 blocks/SM the single-pass kernel can't fill SMs
 # under capturable=True, where there is no bit-exact-vs-history contract;
 # capturable=False keeps the historical routing bit-for-bit.
 _CAPT_V1_FULL_TINY_NUMEL = 1 << 14
-_GEFEN_UPDATE_V2_ENV = os.environ.get("GEFEN_UPDATE_V2")
+
+
+def _env_override(name: str) -> Optional[str]:
+    # An env var set to the empty string (or only whitespace) means UNSET, not a
+    # truthy force: e.g. `GEFEN_UPDATE_V2=""` in a shell profile must fall back
+    # to the occupancy heuristic rather than pinning v2. os.environ.get returns
+    # "" for such a var, so normalize it (and stray whitespace) to None here.
+    value = os.environ.get(name)
+    if value is None:
+        return None
+    value = value.strip()
+    return value if value else None
+
+
+_GEFEN_UPDATE_V2_ENV = _env_override("GEFEN_UPDATE_V2")
 _SM_COUNT_BY_DEVICE: dict = {}
 
 # Codebook-search LUT (bit-exact accelerator; see the kernel-side comment on
@@ -106,6 +120,18 @@ def _load_extension():
         ],
     )
     return _EXTENSION_MODULE
+
+
+def ensure_extension_loaded() -> None:
+    """Force the fused CUDA extension to build/load now, raising on failure.
+
+    Callers use this to probe whether the CUDA toolchain can produce the fused
+    kernels before committing to the fused path, so a build failure can be
+    caught once and downgraded to the pure-torch fallback instead of crashing
+    mid-step. On a healthy box this is the same JIT build the first kernel call
+    would trigger; after the first success it is a cheap no-op.
+    """
+    _load_extension()
 
 
 def _sm_count(device: torch.device) -> int:
