@@ -14,7 +14,6 @@ import torch
 import gefen.quantization as quantization
 from gefen.partitioning import (
     FALLBACK_PERIOD_CAP,
-    ZeroBlockMeanError,
     average_within_block_variance_cpu,
     divisors,
     _finalize_period_results,
@@ -35,10 +34,6 @@ def test_divisors_excludes_n_itself():
     assert divisors(13) == [1]
     assert divisors(1) == []
     assert divisors(16) == [1, 2, 4, 8]
-
-
-def test_zero_block_mean_error_is_value_error():
-    assert issubclass(ZeroBlockMeanError, ValueError)
 
 
 def test_average_within_block_variance_cpu():

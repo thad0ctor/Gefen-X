@@ -2197,6 +2197,12 @@ void automatic_gefen_fused_full_update_cuda(
     if (packed_indices && codebook_numel > 16) {
         throw std::invalid_argument("Expected packed codebook size in [1, 16].");
     }
+    // Empty param (num_blocks == 0 -> total_numel == 0): nothing to update, and
+    // grid_blocks would round down to 0 -> dim3 grid(0), an invalid launch. Bail
+    // before building the grid (matches the v1-legacy update path guard).
+    if (num_blocks == 0) {
+        return;
+    }
 
     const int threads = choose_threads(period);
     // Multi-row packing: host ~256 threads (>= 2 warps) per CUDA block by

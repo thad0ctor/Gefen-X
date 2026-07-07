@@ -153,6 +153,11 @@ void automatic_vmean_update_cuda(
     if (period <= 0) {
         throw std::invalid_argument("Expected grad_view to have a positive period.");
     }
+    // Empty param (num_blocks == 0): nothing to update, and the period>1 path
+    // below computes grid_blocks == 0 -> dim3 grid(0), an invalid launch. Bail.
+    if (num_blocks == 0) {
+        return;
+    }
 
     if (period == 1) {
         const int threads = 256;

@@ -67,7 +67,7 @@ def test_hybrid_named_params_iterable_first_arg():
 
 def test_hybrid_bare_tensors_rejected():
     model = TinyLM()
-    with pytest.raises(TypeError, match="can't be routed|Bare tensors"):
+    with pytest.raises(TypeError, match=r"can't be routed|Bare tensors"):
         GefenMuonHybrid(list(model.parameters()), lr=1e-3, fused=False)
 
 

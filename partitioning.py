@@ -2,10 +2,6 @@ import numpy as np
 import torch
 
 
-class ZeroBlockMeanError(ValueError):
-    pass
-
-
 # When the period search finds no exploitable block structure it returns
 # period==1, which forces per-element fp32 vmean/m_magnitude (~9 bytes/param,
 # worse than AdamW). On modern architectures (SwiGLU MLP, GQA) the squared-grad

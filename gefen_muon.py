@@ -395,12 +395,6 @@ class GefenMuon(Gefen):
                 "eps, so eps=0 turns an all-zero momentum matrix into 0/0 = "
                 "NaN".format(eps)
             )
-        if not 1 <= ns_steps < 100:
-            raise ValueError(
-                "ns_steps must be in [1, 100) but is: {}. 0 or a negative value "
-                "would produce an EMPTY Newton-Schulz schedule (silently "
-                "degrading Muon to normalized momentum SGD)".format(ns_steps)
-            )
         if not 0.0 <= weight_decay:
             raise ValueError(
                 "weight decay should be >= 0 but is: {}".format(weight_decay)
@@ -439,6 +433,24 @@ class GefenMuon(Gefen):
                 schedule = _normalize_ns_schedule(resolved, ns_steps)
                 ns_coefficients = schedule
                 ns_steps = len(schedule)
+        # ns_steps only drives the classic fixed-coefficient path (a single
+        # (a, b, c) tuple repeated ns_steps times). An explicit per-iteration
+        # schedule -- a named tuned schedule or an explicit list of tuples --
+        # carries its own length and IGNORES ns_steps, so only validate ns_steps
+        # when it will actually be consumed. Mirror _normalize_ns_schedule's own
+        # single-tuple detection (a scalar first element) on the RESOLVED
+        # coefficients so a list schedule with an out-of-range ns_steps does not
+        # raise spuriously.
+        if (
+            len(ns_coefficients) > 0
+            and isinstance(ns_coefficients[0], (int, float))
+            and not 1 <= ns_steps < 100
+        ):
+            raise ValueError(
+                "ns_steps must be in [1, 100) but is: {}. 0 or a negative value "
+                "would produce an EMPTY Newton-Schulz schedule (silently "
+                "degrading Muon to normalized momentum SGD)".format(ns_steps)
+            )
         # "exact" (default): under FSDP2 every rank gathers the full gradient and
         # runs Newton-Schulz on the full matrix -> bit-for-bit single-GPU parity.
         # "approx": each rank runs the whole pipeline on its LOCAL shard only --

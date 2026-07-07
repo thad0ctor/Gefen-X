@@ -833,9 +833,26 @@ class Gefen(torch.optim.Optimizer):
         extra = {k: v for k, v in param_group.items() if k not in consumed}
         existing_names = {g.get("name") for g in self.param_groups}
         group_index = len(self.param_groups)
+        # Build (and fully validate) EVERY per-param group up front so a failure
+        # partway through -- a complex/non-tensor param from
+        # _iter_params_with_names, or a duplicate param -- leaves
+        # self.param_groups untouched. add_param_group is all-or-nothing: only
+        # once the whole batch is materialized do we register any of it.
+        existing_params = set()
+        for g in self.param_groups:
+            existing_params.update(g["params"])
+        batch_params = set()
+        new_groups = []
         for param_index, (param_name, param) in enumerate(
             self._iter_params_with_names(param_group["params"])
         ):
+            # Reject duplicates before registering any group, so the base class's
+            # own (post-registration) duplicate check can't leave us partial.
+            if param in existing_params or param in batch_params:
+                raise ValueError(
+                    "some parameters appear in more than one parameter group"
+                )
+            batch_params.add(param)
             if param_name is None:
                 param_name = param_group.get("name")
             if param_name is None:
@@ -857,8 +874,10 @@ class Gefen(torch.optim.Optimizer):
                     group_weight_decay,
                 )
             )
-            super().add_param_group(new_group)
+            new_groups.append(new_group)
             existing_names.add(new_group["name"])
+        for new_group in new_groups:
+            super().add_param_group(new_group)
 
     def _lr_scalar(self, group) -> float:
         """Resolve ``group["lr"]`` to a python float, caching a tensor lr's ``.item()``.
@@ -1759,6 +1778,8 @@ class Gefen(torch.optim.Optimizer):
                 # reject sparse grads here too with the same clear error.
                 if getattr(grad, "is_sparse", False):
                     raise RuntimeError("Gefen does not support sparse gradients")
+                if torch.is_complex(grad):
+                    raise RuntimeError("Gefen does not support complex gradients")
                 if hasattr(grad, "to_local"):
                     grad = grad.to_local()
                 if hasattr(grad, "wait"):
