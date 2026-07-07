@@ -52,6 +52,9 @@ CASES = [
     (3072 * 1024, 64),       # flat kernel
     (3072 * 1024, 16),       # tiny period -> v2 regime
     (2048 * 1024, 1),        # period == 1 (bit-identical vmean)
+    (771 * 3001, 3001),      # odd period in the blocks_per_row==1 split window
+                             # AND total % 8 != 0: exercises the chunked
+                             # kernels' scalar tail + unaligned-row fallbacks
 ]
 STEPS = [1, 2, 7, 50]
 
