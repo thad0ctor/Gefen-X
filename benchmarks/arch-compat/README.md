@@ -21,15 +21,21 @@ Smoke tests (memorize a fixed batch):
 | `validate_vision.py` | torchvision classifiers + detectors, transformers DETR-family detectors, ultralytics YOLO, RF-DETR (`--arch all`) |
 | `validate_audio.py` | torchaudio (Wav2Vec2, Conformer, Tacotron2) + transformers audio (Dia) speech models (`--arch all`) |
 
-Real-dataset training (held-out accuracy / mAP vs AdamW):
+Real-dataset training (held-out accuracy / mAP / val loss vs AdamW — these back the Vision and Audio tables in `COMPATIBILITY.md`):
 
 | Script | Covers |
 |---|---|
 | `validate_mnist_cnn.py` | official PyTorch MNIST CNN — real training, test accuracy over seeds (`--optimizers adamw,gefen,hybrid`) |
 | `validate_cifar10.py` | ResNet-18 (CIFAR stem) on real CIFAR-10, test accuracy |
-| `validate_speechcommands.py` | M5 raw-waveform Conv1d recognizer on real Speech Commands v2, test accuracy |
+| `validate_finetune_cls.py` | ImageNet-pretrained torchvision classifiers (ResNet/ConvNeXt/EfficientNet/MobileNet/DenseNet/RegNet/ViT/Swin) fine-tuned on Imagenette, test accuracy (`--arch all`) |
+| `train_tv_detectors.py` | COCO-pretrained torchvision detectors (Faster R-CNN, RetinaNet, SSD, FCOS) fine-tuned on COCO128, mAP via torchmetrics (`--arch all`) |
+| `train_hf_detectors.py` | pretrained transformers detectors (RT-DETR, YOLOS, Deformable-DETR) fine-tuned on COCO128, mAP (`--arch all`) |
 | `train_yolo_coco.py` | ultralytics YOLO11n fine-tuned on COCO128, mAP — Gefen injected via the trainer's `build_optimizer` |
 | `train_rfdetr_coco.py` | RF-DETR Nano on COCO128 (COCO-format converter built in), mAP — Gefen injected via the Lightning module's `configure_optimizers`, reusing RF-DETR's layer-wise LR |
+| `validate_speechcommands.py` | M5 raw-waveform Conv1d recognizer on real Speech Commands v2, test accuracy |
+| `validate_asr_finetune.py` | pretrained Wav2Vec2 / HuBERT / Wav2Vec2-Conformer fine-tuned on Speech Commands, test accuracy (`--arch all`) |
+| `validate_tts_finetune.py` | pretrained Tacotron2 fine-tuned on an LJSpeech subset, held-out validation loss |
+| `validate_dia_tts.py` | pretrained Dia-1.6B fine-tuned on an LJSpeech subset (DiaProcessor encodes audio to DAC codes), held-out validation loss |
 
 ## Methods
 

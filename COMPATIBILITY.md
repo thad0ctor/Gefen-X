@@ -37,49 +37,51 @@ Parameter ranks exercised: 1-D through 5-D — norms/biases, linears, Conv1d/pat
 
 ## Vision
 
-CNN classifiers and object detectors. Models with a standard task are trained on a real dataset (test accuracy / COCO mAP vs AdamW); the rest memorize a fixed batch, with loss shown as `first → last (Δ%)` (the first→last reduction, must exceed 30% with no NaN/Inf). Gefen `fused=True` defaults.
+Every row is a real training run compared head to head with AdamW at matched model / data / LR / schedule / epochs. The MNIST CNN and CIFAR-10 ResNet-18 are trained from scratch; the other classifiers fine-tune ImageNet-pretrained weights on Imagenette; detectors fine-tune COCO-pretrained weights on COCO128 and report mAP@50-95 / @50. Higher is better. Gefen `fused=True` defaults.
 
-| Model | Kind | Check | Result (accuracy / mAP / loss Δ%) |
-|---|---|---|---|
-| CNN (2-conv, PyTorch example) | CNN | MNIST, test acc (3 seeds) | Gefen 98.96% · AdamW 99.04% · hybrid 99.20% |
-| ResNet-18 | CNN — residual | CIFAR-10, test acc (20 ep) | Gefen 91.82% · AdamW 91.94% · hybrid 91.40% |
-| ResNet-50 | CNN — residual | memorize fixed batch | ✅ 2.73 → 0.00 (−100%) |
-| ConvNeXt-Tiny | CNN — modern conv | memorize fixed batch | ✅ 2.55 → 0.00 (−100%) |
-| EfficientNet-B0 | CNN — MBConv | memorize fixed batch | ✅ 3.65 → 0.36 (−90%) |
-| MobileNetV3-Large | CNN — inverted residual | memorize fixed batch | ✅ 2.30 → 0.00 (−100%) |
-| DenseNet-121 | CNN — dense | memorize fixed batch | ✅ 2.29 → 0.00 (−100%) |
-| RegNet-Y-1.6GF | CNN — grouped | memorize fixed batch | ✅ 2.44 → 0.00 (−100%) |
-| ViT-B/16 | vision transformer | memorize fixed batch | ✅ 2.30 → 0.00 (−100%) |
-| Swin-T | vision transformer — windowed | memorize fixed batch | ✅ 2.23 → 1.55 (−31%) |
-| YOLO11n | detector — YOLO (ultralytics) | COCO128, mAP@50-95 / @50 (40 ep) | Gefen 0.702 / 0.882 · AdamW 0.680 / 0.872 |
-| RF-DETR Nano | detector — DETR (roboflow) | COCO128 person, mAP@50-95 / @50 (30 ep) | Gefen 0.726 / 0.909 · AdamW 0.701 / 0.910 |
-| Faster R-CNN (R50-FPN) | detector — two-stage conv | memorize fixed batch | ✅ 2.54 → 1.64 (−36%) |
-| RetinaNet (R50-FPN) | detector — one-stage conv | memorize fixed batch | ✅ 1.82 → 0.96 (−47%) |
-| SSD300-VGG16 | detector — one-stage conv | memorize fixed batch | ✅ 101.7 → 1.82 (−98%) |
-| FCOS (R50-FPN) | detector — anchor-free conv | memorize fixed batch | ✅ 3.03 → 1.49 (−51%) |
-| RT-DETR | detector — DETR transformer | memorize fixed batch | ✅ 46.0 → 15.7 (−66%) |
-| YOLOS | detector — ViT transformer | memorize fixed batch | ✅ 5.37 → 1.69 (−69%) |
-| Deformable-DETR | detector — deformable transformer | memorize fixed batch | ✅ 8.01 → 0.60 (−92%) |
+| Model | Kind | Task (metric ↑) | Gefen | AdamW |
+|---|---|---|---|---|
+| CNN (2-conv, PyTorch example) | CNN | MNIST acc (3 seeds) | 98.96% | 99.04% |
+| ResNet-18 | CNN — residual | CIFAR-10 acc | 91.82% | 91.94% |
+| ResNet-50 | CNN — residual | Imagenette acc | 99.08% | 98.96% |
+| ConvNeXt-Tiny | CNN — modern conv | Imagenette acc | 99.34% | 99.36% |
+| EfficientNet-B0 | CNN — MBConv | Imagenette acc | 98.29% | 98.24% |
+| MobileNetV3-Large | CNN — inverted residual | Imagenette acc | 98.29% | 98.42% |
+| DenseNet-121 | CNN — dense | Imagenette acc | 97.63% | 97.91% |
+| RegNet-Y-1.6GF | CNN — grouped | Imagenette acc | 99.16% | 99.21% |
+| ViT-B/16 | vision transformer | Imagenette acc | 99.03% | 99.29% |
+| Swin-T | vision transformer — windowed | Imagenette acc | 99.03% | 99.16% |
+| Faster R-CNN (R50-FPN) | detector — two-stage conv | COCO128 mAP | 0.767 / 0.974 | 0.782 / 0.973 |
+| RetinaNet (R50-FPN) | detector — one-stage conv | COCO128 mAP | 0.790 / 0.925 | 0.822 / 0.942 |
+| SSD300-VGG16 | detector — one-stage conv | COCO128 mAP | 0.684 / 0.896 | 0.701 / 0.891 |
+| FCOS (R50-FPN) | detector — anchor-free conv | COCO128 mAP | 0.849 / 0.958 | 0.866 / 0.970 |
+| YOLO11n | detector — YOLO (ultralytics) | COCO128 mAP | 0.702 / 0.882 | 0.680 / 0.872 |
+| RT-DETR | detector — DETR transformer | COCO128 mAP | 0.828 / 0.949 | 0.854 / 0.971 |
+| YOLOS | detector — ViT transformer | COCO128 mAP | 0.361 / 0.586 | 0.388 / 0.622 |
+| Deformable-DETR | detector — deformable transformer | COCO128 mAP | 0.729 / 0.931 | 0.800 / 0.966 |
+| RF-DETR Nano | detector — DETR (roboflow) | COCO128-person mAP | 0.726 / 0.909 | 0.701 / 0.910 |
 
 ## Audio
 
-Speech recognition and text-to-speech. Speech Commands is trained on the real dataset (test accuracy vs AdamW); the rest memorize a fixed batch, with loss shown as `first → last (Δ%)`.
+Same head-to-head setup. ASR rows report Speech Commands keyword accuracy (higher is better) — the M5 baseline is trained from scratch, while Wav2Vec2 / HuBERT / Wav2Vec2-Conformer fine-tune pretrained encoders. TTS has no accuracy metric, so it reports held-out LJSpeech validation loss after fine-tuning the pretrained model (lower is better).
 
-| Model | Kind | Check | Result (accuracy / loss Δ%) |
-|---|---|---|---|
-| M5 raw-waveform Conv1d | speech recognition — Conv1d | Speech Commands v2, test acc (12 ep) | Gefen 83.64% · AdamW 84.86% · hybrid 85.57% |
-| Wav2Vec2 | ASR — conv + transformer (CTC) | memorize fixed batch | ✅ 5312 → 975 (−82%) |
-| HuBERT | ASR — conv + transformer (CTC) | memorize fixed batch | ✅ 5281 → 1649 (−69%) |
-| Conformer | speech encoder — conv + attention | memorize fixed batch | ✅ 37.7 → 2.11 (−94%) |
-| Tacotron2 | TTS — conv + LSTM + attention | memorize fixed batch | ✅ 4.76 → 1.56 (−67%) |
-| Dia | TTS — transformer, audio codebooks | memorize fixed batch | ✅ 7.37 → 2.66 (−64%) |
+| Model | Kind | Task | Gefen | AdamW |
+|---|---|---|---|---|
+| M5 raw-waveform Conv1d | speech recognition — Conv1d | Speech Commands acc ↑ | 83.64% | 84.86% |
+| Wav2Vec2 | ASR — conv + transformer | Speech Commands acc ↑ | 93.6% | 93.4% |
+| HuBERT | ASR — conv + transformer | Speech Commands acc ↑ | 94.6% | 93.55% |
+| Wav2Vec2-Conformer | ASR — conv + attention | Speech Commands acc ↑ | 77.1% | 80.1% |
+| Tacotron2 | TTS — conv + LSTM + attention | LJSpeech val loss ↓ | 0.578 | 0.583 |
+| Dia | TTS — transformer, audio codebooks | LJSpeech val loss ↓ | 4.75 | 4.72 |
 
-Real-dataset recipes: MNIST is the paper's recipe (batch 64, 4 epochs, StepLR γ=0.7, lr 1e-3), accuracy averaged over three seeds; CIFAR-10 is ResNet-18 with a CIFAR stem; Speech Commands is the M5 Conv1d recognizer; YOLO11n fine-tunes the pretrained detector; RF-DETR trains a person detector and reuses its layer-wise learning rates so the pretrained DINOv2 backbone stays at a low LR while the head trains fast. Gefen peak VRAM was at or below AdamW throughout (e.g. CIFAR-10 ResNet-18: 0.71 vs 0.77 GiB). Smoke tests ran on one RTX 5090; the detectors trained on one RTX PRO 6000 (Blackwell). Recipes: [`benchmarks/arch-compat/`](benchmarks/arch-compat/) (`validate_mnist_cnn.py`, `validate_cifar10.py`, `validate_speechcommands.py`, `validate_vision.py`, `validate_audio.py`, `train_yolo_coco.py`, `train_rfdetr_coco.py`).
+Gefen ≈ AdamW on the classifiers, ASR, and TTS, and leads on YOLO11n and RF-DETR; it trails by ~1–7 mAP points on the other detectors and the Conformer at matched LR. That gap is mostly hyperparameter: a per-optimizer LR grid (Gefen's optimum ≈0.6× AdamW's, at 3e-5) shrinks it to ≤0.01 on five of seven detectors — Gefen ahead on RetinaNet and RT-DETR — and ≤0.03 on the rest, e.g. Deformable-DETR's −0.21 at a shared 1e-4 collapses to −0.03. The `Gefen-Muon` hybrid matched or beat AdamW where run.
+
+Setup: from scratch — MNIST (paper recipe, 3 seeds), CIFAR-10 ResNet-18; fine-tuned — classifiers→Imagenette, detectors→COCO128, ASR→Speech Commands, TTS→LJSpeech. RTX 5090 + RTX PRO 6000. Harnesses: [`benchmarks/arch-compat/`](benchmarks/arch-compat/).
 
 ## Method
 
-- **Real-dataset rows** report held-out test accuracy or COCO mAP after a full training run — a convergence comparison against AdamW at matched model / data / LR / schedule / epochs.
-- **Smoke-test rows** train a fixed batch for N optimizer steps and report the loss as `first → last (Δ%)`, where Δ% is the reduction from the first step's loss to the last (`(first − last) / first`); PASS if it exceeds 30% with no NaN/Inf. Peak VRAM from `torch.cuda.max_memory_allocated`.
+- **Real-dataset rows** (the Vision and Audio tables) report held-out accuracy, COCO mAP, or — where no accuracy metric exists (TTS) — validation loss, after a full training run: a convergence comparison against AdamW at matched model / data / LR / schedule / epochs.
+- **Smoke-test rows** (the LLM / VLM / diffusion matrix above) train a fixed batch for N optimizer steps and report the loss as `first → last (Δ%)`, where Δ% is the reduction from the first step's loss to the last (`(first − last) / first`); PASS if it exceeds 30% with no NaN/Inf. Peak VRAM from `torch.cuda.max_memory_allocated`.
 - The **Method** column: `full-param` trains every native parameter tensor; `full-param FSDP2` / `device_map` shard that same full-parameter training for models over one card; `LoRA` covers models too large to full-fine-tune even sharded — a weaker claim, since only the adapter matrices are trained.
 - **Versions**: LLM / VLM / diffusion smokes on torch 2.12.0+cu133, transformers 5.10.2 (≥ 5.11 for PaddleOCR-VL), diffusers 0.39.0. Vision / audio / real-data runs on torch 2.13.0+cu133, torchvision 0.28, torchaudio 2.11, transformers 5.12, ultralytics 8.4, rfdetr 1.8. Harness and per-model recipes: [`benchmarks/arch-compat/`](benchmarks/arch-compat/).
 
