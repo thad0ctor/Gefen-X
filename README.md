@@ -307,44 +307,49 @@ trainer = Trainer(model=model, args=training_args, train_dataset=train_dataset,
 
 ## Using Gefen with Axolotl
 
-[Axolotl](https://github.com/axolotl-ai-cloud/axolotl) can train with Gefen via its `optimizer: gefen` integration — see the (draft) PR [axolotl-ai-cloud/axolotl#3755](https://github.com/axolotl-ai-cloud/axolotl/pull/3755).
+[Axolotl](https://github.com/axolotl-ai-cloud/axolotl) trains with Gefen through two native optimizer names, added by [axolotl-ai-cloud/axolotl#3808](https://github.com/axolotl-ai-cloud/axolotl/pull/3808) (install axolotl from that PR until it lands in a release):
 
-> ⚠️ **Install this fork from source, not the PyPI package.** PR #3755 documents  `pip install gefen`, which pulls **upstream** Gefen — *without* this fork's fixes (the modern-arch `period==1` memory fallback, the ≈2× fused kernels, the robustness guards). Install this fork from source (see [Installation](#installation)); axolotl's `optimizer: gefen` then imports whichever `gefen` is on the path..
+- **`optimizer: gefenx`** — the core quantized AdamW drop-in (`Gefen`).
+- **`optimizer: gefenx_muon`** — the whole-model Muon hybrid (`GefenMuonHybrid`): Muon on 2D hidden weights, Gefen on embeddings / LM head / norms / biases, at the same ≈1 B/param footprint.
 
-**Basic** (memory-efficient AdamW drop-in):
+> **Install this fork from source**, not the PyPI `gefen` — which is **upstream** Gefen, *without* this fork's fixes (the modern-arch `period==1` memory fallback, the ≈2× fused kernels, the Muon hybrid): `git clone https://github.com/thad0ctor/Gefen-X && cd Gefen-X && pip install -e .` (see [Installation](#installation)).
+
+**`gefenx` — memory-efficient AdamW drop-in (recommended):**
 
 ```yaml
-optimizer: gefen
-learning_rate: 6.0e-6    # ≈ 0.6× the AdamW LR you'd use — Gefen needs a lower LR
-weight_decay: 0.0
+optimizer: gefenx
+learning_rate: 6.0e-6    # ≈0.6× your AdamW LR — Gefen takes larger effective steps
+bf16: true
+optim_args:
+  fused: true            # ≈2× faster opt.step, bit-exact (default)
+  factored_v_2d: true    # Adafactor-style 2D 2nd moment — matches AdamW loss (default)
 ```
 
-`6.0e-6` here is the `≈0.6×` *fallback heuristic*; to set it properly for your model, run the LR finder (`python -m gefen.tools.find_lr --model <path> --optimizer gefen --method sweep`) — see [`tools/README.md`](https://github.com/thad0ctor/Gefen-X/blob/main/src/gefen/tools/README.md).
-
-**Fused kernels** (recommended — ≈2× faster `opt.step`, bit-exact, requires CUDA):
+**`gefenx_muon` — whole-model Muon hybrid, same ≈1 B/param footprint:**
 
 ```yaml
-optimizer: gefen
-learning_rate: 6.0e-6
+optimizer: gefenx_muon
+learning_rate: 5.0e-5    # Muon tolerates a hotter LR than plain gefenx
+bf16: true
 optim_args:
   fused: true
+  backup_lr: 2.5e-5      # Gefen LR for embed / head / norms; defaults to 0.5 × learning_rate
+  sharded_mode: exact    # "distributed" splits Newton-Schulz across GPUs under FSDP2
 ```
 
-`learning_rate`, `weight_decay`, `adam_beta1`/`adam_beta2`, `adam_epsilon` are forwarded straight to the `Gefen` constructor; anything under `optim_args` (e.g. `fused`) is passed through as extra constructor kwargs.
+`gefenx_muon` applies the fork's recommended recipe by default (`backup_lr = 0.5 × lr`, `backup_1d_period_one`, `adjust_lr_fn="match_rms_adamw"`) — all overridable under `optim_args`.
 
-**The levers, and where each lives:**
+**How config maps:** `learning_rate`, `weight_decay`, `adam_beta1`/`adam_beta2`, `adam_epsilon` forward to the constructor; anything under `optim_args` (`fused`, `factored_v_2d`, `backup_lr`, `sharded_mode`, …) passes through as extra constructor kwargs (string values are coerced to type). To set the LR properly instead of the `≈0.6×` heuristic, run the finder: `python -m gefen.tools.find_lr --model <path> --optimizer gefen --method sweep` — see [`tools/README.md`](https://github.com/thad0ctor/Gefen-X/blob/main/src/gefen/tools/README.md).
 
-| Lever | How (axolotl) | Notes |
+| Lever | axolotl config | Notes |
 |---|---|---|
-| Select Gefen | `optimizer: gefen` | added by PR #3755 |
-| Fused kernels | `optim_args: { fused: true }` | ≈2× faster `opt.step`; bit-exact |
-| Learning rate | `learning_rate: <≈0.6× AdamW>` | `≈0.6×` is a fallback heuristic — better, find it empirically with the LR finder (`python -m gefen.tools.find_lr …`, see [`tools/README.md`](https://github.com/thad0ctor/Gefen-X/blob/main/src/gefen/tools/README.md)). Background: [Learning rate](#learning-rate-when-porting-an-adamw-config) |
-| Betas / eps / weight decay | standard `adam_beta1/2`, `adam_epsilon`, `weight_decay` | forwarded to Gefen |
-| `period==1` memory fallback | *on by default in this fork* | restores ≈1 B/param on modern decoders; it's the module flag `MEMORY_SAFE_FALLBACK`, not a YAML key |
-
-**Not (yet) exposed via axolotl config:** the **Muon hybrid** (`GefenMuonHybrid` + `adjust_lr_fn`) is **not** in PR #3755 (the PR notes Muon is "more involved") — use it directly in Python per [Gefen-Muon](#extension-gefen-muon) above. `MEMORY_SAFE_FALLBACK` is a module default (on in this fork), toggled in code rather than YAML.
-
-> PR #3755 is an early draft and marked *untested* upstream; the config keys above may change — check the PR for the current state.
+| Select Gefen / Muon hybrid | `optimizer: gefenx` / `gefenx_muon` | core drop-in / whole-model hybrid |
+| Fused kernels | `optim_args: { fused: true }` | ≈2× faster `opt.step`; bit-exact; default on |
+| Factored 2D 2nd moment | `optim_args: { factored_v_2d: true }` | matches AdamW loss; default on |
+| Muon backup LR | `optim_args: { backup_lr: <lr> }` | Gefen LR for embed / head / norms; defaults to `0.5 × learning_rate` |
+| Sharded Newton-Schulz | `optim_args: { sharded_mode: exact }` | `exact` (default) or `distributed` (splits NS across GPUs under FSDP2) |
+| Learning rate | `learning_rate: <≈0.6× AdamW>` | heuristic — better, measure with the LR finder. Background: [Learning rate](#learning-rate-when-porting-an-adamw-config) |
+| `period==1` memory fallback | *on by default in this fork* | restores ≈1 B/param on modern decoders; module flag `MEMORY_SAFE_FALLBACK`, not a YAML key |
 
 ## Quality Lever: factored second moment on 2D params (`factored_v_2d`)
 
