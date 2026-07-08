@@ -488,15 +488,8 @@ def _shard_worker(rank: int, world: int, lr: float, cfg: dict, port: str, q) -> 
     their local shard size + peak memory (evidence of true sharding). The process
     group is torn down in ``finally`` so a failed arm can't leak a group or hang."""
     import os as _os
-    import sys as _sys
     import traceback
 
-    # Drop any sys.path entry exposing a flat ``gefen.py`` that would shadow the
-    # ``gefen/`` package (same guard the FSDP2 parity test uses for spawned ranks).
-    _sys.path[:] = [
-        p for p in _sys.path
-        if not _os.path.isfile(_os.path.join(p or ".", "gefen.py"))
-    ]
     try:
         import types
         import torch as _torch

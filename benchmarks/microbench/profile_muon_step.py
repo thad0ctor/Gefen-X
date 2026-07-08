@@ -24,25 +24,11 @@ Run:
 import argparse
 import inspect
 import os
-import sys
 
 import torch
 
-
-def _strip_shadowing_gefen():
-    # A flat `gefen.py` on sys.path shadows the installed `gefen/` package and
-    # breaks `from gefen import ...`; drop any such entry (the real package,
-    # reached via the PYTHONPATH symlink, survives).
-    sys.path[:] = [
-        p for p in sys.path
-        if not os.path.isfile(os.path.join(p or ".", "gefen.py"))
-    ]
-
-
-_strip_shadowing_gefen()
-
-from gefen import GefenMuon  # noqa: E402
-from gefen.gefen_muon import (  # noqa: E402
+from gefen import GefenMuon
+from gefen.gefen_muon import (
     _zeropower_via_newtonschulz, DEFAULT_A, DEFAULT_B, DEFAULT_C)
 
 

@@ -12,10 +12,6 @@ test_muon_fsdp2_parity.py. Here we cover the per-GPU behaviour:
 
 Run: python tests/test_muon_combined_levers.py
 """
-import os
-import sys
-
-sys.path[:] = [p for p in sys.path if not os.path.isfile(os.path.join(p or ".", "gefen.py"))]
 
 import torch  # noqa: E402
 

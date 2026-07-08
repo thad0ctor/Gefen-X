@@ -53,16 +53,19 @@ Issues = "https://github.com/thad0ctor/Gefen-X/issues"
 
 [tool.setuptools]
 include-package-data = true
-packages = ["gefen", "gefen.kernels", "gefen.tools"]
 
 [tool.setuptools.package-dir]
-gefen = "."
-"gefen.kernels" = "kernels"
-"gefen.tools" = "tools"
+"" = "src"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["gefen*"]
 
 [tool.setuptools.package-data]
-# Ship the PEP 561 typing marker in the wheel (CUDA/C++ sources go via MANIFEST.in).
+# Ship the PEP 561 typing marker plus CUDA/C++ sources needed by the runtime JIT.
 gefen = ["py.typed"]
+"gefen.kernels" = ["*.cu", "*.cpp"]
+"gefen.tools" = ["*.md"]
 
 [tool.ruff]
 # Non-disruptive: lint only, no reformatting of the existing tree. Line length is

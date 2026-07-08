@@ -16,11 +16,10 @@ Add the `perf` extra (`pip install -e ".[perf,test]"`) for ninja-backed CUDA ker
 
 ## Running the tests
 
-CI runs the CPU suite from outside the repo root, because the flat layout means the repo's `gefen.py` would otherwise shadow the installed `gefen` package on `sys.path`. Mirror that locally:
+CI runs the CPU suite from the repo root after installing the package. Mirror that locally:
 
 ```bash
-cd "$(mktemp -d)"
-python -m pytest /path/to/gefen-x/tests -q -ra
+python -m pytest tests -q -ra
 ```
 
 CUDA-dependent tests skip themselves automatically on CPU. GPU kernel-parity tests require an NVIDIA device plus `nvcc` and are gated behind the manual `workflow_dispatch` GPU job in CI; run them locally with the same command on a CUDA host.

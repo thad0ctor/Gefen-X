@@ -12,10 +12,6 @@ close in aggregate, not bit-for-bit.
 
 Run: python tests/test_gefen_factored_v.py
 """
-import os
-import sys
-
-sys.path[:] = [p for p in sys.path if not os.path.isfile(os.path.join(p or ".", "gefen.py"))]
 
 import torch  # noqa: E402
 import torch.nn as nn  # noqa: E402

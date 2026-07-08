@@ -40,15 +40,6 @@ def _get_free_port():
 
 
 def _worker(rank, world, case, port, q):
-    import os as _os
-    import sys as _sys
-
-    _sys.path[:] = [
-        pth
-        for pth in _sys.path
-        if not _os.path.isfile(_os.path.join(pth or ".", "gefen.py"))
-    ]
-
     import torch.distributed as dist
     from torch.distributed.tensor import Shard, distribute_tensor, init_device_mesh
 
