@@ -20,12 +20,16 @@ concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
 
+# Least-privilege default for every job: none of them write to the repo, so a
+# read-only token limits the blast radius if an install/test dependency is
+# compromised. A job can widen this locally if it ever needs to.
+permissions:
+  contents: read
+
 jobs:
   lint:
     name: Lint (ruff)
     runs-on: ubuntu-latest
-    permissions:
-      contents: read
     steps:
       - uses: actions/checkout@v4
         with:
@@ -47,8 +51,6 @@ jobs:
   build:
     name: Build sdist + wheel
     runs-on: ubuntu-latest
-    permissions:
-      contents: read
     steps:
       - uses: actions/checkout@v4
         with:
