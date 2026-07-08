@@ -14,6 +14,15 @@ DEFAULT_B = -4.7750
 DEFAULT_C = 2.0315
 DEFAULT_NS_STEPS = 5
 
+
+def _stable_distributed_owner(stable_index: int, world: int) -> int:
+    """Map a stable full-param-set index to a process-group rank coordinate."""
+    if world <= 0:
+        raise ValueError("world must be positive, got {}".format(world))
+    if stable_index < 0:
+        raise ValueError("stable_index must be non-negative, got {}".format(stable_index))
+    return stable_index % world
+
 # Tuned per-iteration Newton-Schulz coefficient schedules. Each entry is a list
 # of (a, b, c) quintic coefficients applied one per iteration. Unlike the fixed
 # (DEFAULT_A, DEFAULT_B, DEFAULT_C) quintic -- which uses identical, conservative
@@ -332,12 +341,12 @@ class GefenMuon(Gefen):
             runs NS and broadcasts, bit-identical to "exact" on homogeneous
             GPUs), or "approx" (NS on the local shard only; cheaper and
             explicitly NON-parity, opt-in).
-            "distributed" is EXPERIMENTAL, two caveats (issue #45): (1) owners
-            are assigned by position over the params that have a grad each step,
-            so a fluctuating grad set (MoE, gradual unfreezing) shifts owners and
-            silently resets a matrix's momentum; (2) momentum lives only on its
-            owner rank, so a rank-0-only checkpoint saves ~1/world of it. Prefer
-            "exact" (the default) when checkpointing or when the grad set varies.
+            "distributed" is EXPERIMENTAL but checkpoint-safe when every rank
+            participates in ``state_dict()``: each owner broadcasts its local
+            momentum state so rank 0 can write a complete checkpoint. Ownership
+            is keyed by stable position in the full distributed parameter set
+            (not by per-step active position), so a fluctuating grad set does not
+            move an active matrix's momentum between ranks.
         fp8_ns: run the NS GEMMs in fp8 (e4m3) on sm_89+ for large matrices
             (opt-in; auto-falls back to bf16 elsewhere).
         fp8_ns_compile: torch.compile the fp8 NS core (default True; eager fp8
@@ -458,9 +467,10 @@ class GefenMuon(Gefen):
         # cheaper, but Newton-Schulz of a row block is NOT the orthogonalization
         # of the full matrix: this mode is explicitly NON-PARITY. Opt-in only.
         # "distributed" ("Parallel Muon" / Moonshot): EXACT like "exact", but the
-        # redundant Newton-Schulz is removed. Each 2D matrix is round-robin
-        # assigned to a single owner rank; only that rank runs the quantized
-        # momentum + Newton-Schulz on the full matrix, then broadcasts the
+        # redundant Newton-Schulz is removed. Each 2D matrix is assigned by its
+        # stable position in the full distributed parameter set to a single owner
+        # rank; only that rank runs the quantized momentum + Newton-Schulz on the
+        # full matrix, then broadcasts the
         # orthogonalized full-matrix update so every rank slices its own shard.
         # The NS/momentum compute (and the persistent momentum state) is therefore
         # cut ~world_size x while staying bit-for-bit identical to "exact". Only
@@ -927,35 +937,53 @@ class GefenMuon(Gefen):
                 p.mul_(1 - lr * group["weight_decay"])
             p.add_(update, alpha=-adjusted_lr)
 
+    @staticmethod
+    def _dist_available() -> bool:
+        if not torch.distributed.is_available():
+            return False
+        return torch.distributed.is_initialized()
+
+    def _distributed_process_group(self, p: torch.Tensor):
+        if not self._dist_available() or not self._is_sharded(p):
+            return None
+        import torch.distributed as dist
+
+        mesh = p.device_mesh
+        if mesh.ndim != 1:
+            return None
+        pg = mesh.get_group()
+        if dist.get_world_size(pg) < 2:
+            return None
+        return pg
+
     def _step_distributed(self, items) -> None:
-        # "distributed" / Parallel-Muon path. Each 2D matrix is round-robin
-        # assigned to one owner rank that alone runs the quantized-momentum +
-        # Newton-Schulz; the result is broadcast so every rank slices its shard.
+        # "distributed" / Parallel-Muon path. Each 2D matrix is assigned to one
+        # stable owner rank that alone runs the quantized-momentum + Newton-Schulz;
+        # the result is broadcast so every rank slices its shard.
         #
         # CRITICAL for the speed-up: the gather, compute and broadcast are
         # SEPARATED into phases per bucket of `world` matrices. If we broadcast
         # each update right after its owner computes it, the non-owner ranks block
         # at the broadcast while the owner runs NS -- the NS serializes and there
         # is no win. By all-gathering every grad in the bucket first, then letting
-        # each rank compute its ONE owned matrix with no collective in between, the
-        # owners' NS runs concurrently (NS critical path ~ NS_total / world), and
-        # the per-bucket broadcasts are a pure communication phase.
-        import torch.distributed as dist
-
+        # each rank compute its owned matrix/matrices with no collective in
+        # between, the owners' NS runs concurrently (NS critical path ~ NS_total /
+        # world), and the per-bucket broadcasts are a pure communication phase.
         # Eligibility (1-D mesh, world>=2) is a property of each param's mesh and
         # so is identical on every rank -> the eligible/fallback split, and thus
         # the collective order, agrees globally. Non-eligible matrices (multi-dim
         # HSDP x TP meshes, world==1) keep the replicated exact full-NS path.
         eligible, fallback = [], []
         for (group, name, p, grad) in items:
-            mesh = p.device_mesh
-            if mesh.ndim == 1 and dist.get_world_size(mesh.get_group()) >= 2:
-                eligible.append((group, name, p, grad))
+            pg = self._distributed_process_group(p)
+            if pg is not None:
+                eligible.append((pg, group, name, p, grad))
             else:
                 fallback.append((group, name, p, grad))
 
         for (group, name, p, grad) in fallback:
-            self._step_automatic(group, name, p, grad)
+            if grad is not None:
+                self._step_automatic(group, name, p, grad)
 
         if not eligible:
             return
@@ -963,9 +991,8 @@ class GefenMuon(Gefen):
         # Group by process group (one mesh under plain FSDP2; multiple only under
         # exotic setups). Insertion-ordered so the order is identical across ranks.
         by_pg = OrderedDict()
-        for item in eligible:
-            pg = item[2].device_mesh.get_group()
-            by_pg.setdefault(pg, []).append(item)
+        for pg, group, name, p, grad in eligible:
+            by_pg.setdefault(pg, []).append((group, name, p, grad))
 
         for pg, pg_items in by_pg.items():
             self._step_distributed_pg(pg, pg_items)
@@ -977,19 +1004,28 @@ class GefenMuon(Gefen):
         my_coord = dist.get_group_rank(pg, dist.get_rank())
         global_rank = [dist.get_global_rank(pg, c) for c in range(world)]
 
-        # Buckets of `world` consecutive matrices; within a bucket the matrix at
-        # offset k is owned by rank k (so each bucket has exactly one matrix per
-        # rank, except possibly a short tail bucket). idx = b + k, b % world == 0,
-        # so owner == k -- the round-robin assignment, stable across steps.
-        for b in range(0, len(pg_items), world):
-            bucket = pg_items[b : b + world]
+        active_items = [
+            (_stable_distributed_owner(idx, world), group, name, p, grad)
+            for idx, (group, name, p, grad) in enumerate(pg_items)
+            if grad is not None
+        ]
+        if not active_items:
+            return
+
+        # Buckets of `world` active matrices bound peak full-gradient scratch.
+        # Ownership is NOT active-position based: every matrix maps from its
+        # stable position in the full distributed param set, so dropping/adding
+        # unrelated gradients between steps does not move a matrix's momentum to a
+        # different rank. When all grads are present this preserves the old
+        # balanced model-order schedule.
+        for b in range(0, len(active_items), world):
+            bucket = active_items[b : b + world]
 
             # --- Phase 1: all-gather every grad in the bucket; keep only mine. ---
             # Every rank joins every full_tensor (matched collective). No compute
             # is interleaved, so ranks march through the gathers in lockstep.
-            my_full_grad = None
-            my_entry = None
-            for k, (group, name, p, grad) in enumerate(bucket):
+            owned = []
+            for bucket_idx, (owner, group, name, p, grad) in enumerate(bucket):
                 fg = grad
                 if hasattr(fg, "full_tensor"):
                     fg = fg.full_tensor()
@@ -997,7 +1033,7 @@ class GefenMuon(Gefen):
                     fg = fg.to_local()
                 if hasattr(fg, "wait"):
                     fg = fg.wait()
-                if k == my_coord:
+                if owner == my_coord:
                     if torch.is_complex(p):
                         raise RuntimeError(
                             "GefenMuon does not support complex parameters"
@@ -1012,24 +1048,22 @@ class GefenMuon(Gefen):
                                 name
                             )
                         )
-                    my_full_grad = fg
-                    my_entry = (group, name, p)
+                    owned.append((bucket_idx, group, name, p, fg))
                 else:
                     fg = None  # drop the gathered full grad we do not own
 
             # --- Phase 2: compute MY owned update (no collectives -> parallel). ---
-            my_update = None
-            if my_entry is not None:
-                group, name, p = my_entry
-                my_update = self._compute_muon_update(
-                    group, name, p, my_full_grad, p.numel()
+            owned_updates = [None] * len(bucket)
+            for bucket_idx, group, name, p, full_grad in owned:
+                owned_updates[bucket_idx] = self._compute_muon_update(
+                    group, name, p, full_grad, p.numel()
                 )
-                my_full_grad = None
+            owned = None
 
             # --- Phase 3: broadcast each update from its owner; apply locally. ---
-            for k, (group, name, p, grad) in enumerate(bucket):
-                if k == my_coord:
-                    buf = my_update.contiguous()
+            for bucket_idx, (owner, group, name, p, grad) in enumerate(bucket):
+                if owner == my_coord:
+                    buf = owned_updates[bucket_idx].contiguous()
                     if buf.dtype != torch.bfloat16:
                         buf = buf.to(torch.bfloat16)
                 else:
@@ -1038,7 +1072,7 @@ class GefenMuon(Gefen):
                         dtype=torch.bfloat16,
                         device=p.to_local().device,
                     )
-                dist.broadcast(buf, src=global_rank[k], group=pg)
+                dist.broadcast(buf, src=global_rank[owner], group=pg)
                 self._apply_muon_update(
                     group, p, buf, is_sharded=True, approx=False
                 )
@@ -1094,6 +1128,200 @@ class GefenMuon(Gefen):
         update = self._compute_muon_update(group, param_name, p, grad, eff_numel)
         self._apply_muon_update(group, p, update, is_sharded, approx)
 
+    @staticmethod
+    def _state_tensor_device(p: torch.Tensor) -> torch.device:
+        if hasattr(p, "to_local"):
+            local = p.to_local()
+            if hasattr(local, "wait"):
+                local = local.wait()
+            return local.device
+        return p.device
+
+    def _distributed_state_items(self, state_dict):
+        saved_ids = []
+        for saved_group in state_dict["param_groups"]:
+            saved_ids.extend(saved_group["params"])
+
+        live_params = []
+        for group in self.param_groups:
+            live_params.extend(group["params"])
+        param_to_saved_id = dict(zip(live_params, saved_ids))
+
+        by_pg = OrderedDict()
+        for group in self.param_groups:
+            if group["sharded_mode"] != "distributed":
+                continue
+            for name, p in self._iter_group_params_with_names(group):
+                pg = self._distributed_process_group(p)
+                if pg is None:
+                    continue
+                saved_id = param_to_saved_id.get(p)
+                if saved_id is None:
+                    continue
+                by_pg.setdefault(pg, []).append((name, p, saved_id))
+        return by_pg
+
+    def _consolidate_distributed_state_dict(self, state_dict):
+        # In distributed mode the persistent momentum state is updated only on the
+        # stable owner rank for each matrix. Before checkpointing, broadcast each
+        # owner's serialized per-param state to every rank so rank-0-only writers
+        # can save a complete optimizer state_dict AFTER all ranks have called
+        # this method. This method is therefore collective for distributed
+        # sharded params, matching the DTensor collectives used by step().
+        if not self._dist_available():
+            return state_dict
+
+        import torch.distributed as dist
+
+        by_pg = self._distributed_state_items(state_dict)
+        if not by_pg:
+            return state_dict
+
+        for pg, pg_items in by_pg.items():
+            world = dist.get_world_size(pg)
+            my_coord = dist.get_group_rank(pg, dist.get_rank())
+            global_rank = [dist.get_global_rank(pg, c) for c in range(world)]
+            owner_by_saved_id = {
+                saved_id: _stable_distributed_owner(idx, world)
+                for idx, (_, _, saved_id) in enumerate(pg_items)
+            }
+
+            for name, p, saved_id in pg_items:
+                owner = owner_by_saved_id[saved_id]
+                src = global_rank[owner]
+                tensor_values = []
+                if my_coord == owner:
+                    pstate = state_dict["state"].get(saved_id, {})
+                    meta = []
+                    for key, value in pstate.items():
+                        if torch.is_tensor(value):
+                            tensor = value.detach()
+                            if not tensor.is_contiguous():
+                                tensor = tensor.contiguous()
+                            meta.append(
+                                (
+                                    key,
+                                    "tensor",
+                                    tuple(tensor.shape),
+                                    tensor.dtype,
+                                )
+                            )
+                            tensor_values.append(tensor)
+                        else:
+                            meta.append((key, "object", value))
+                else:
+                    meta = None
+
+                obj = [meta]
+                dist.broadcast_object_list(obj, src=src, group=pg)
+                meta = obj[0]
+
+                owner_state = {}
+                tensor_idx = 0
+                for entry in meta:
+                    key = entry[0]
+                    kind = entry[1]
+                    if kind == "object":
+                        owner_state[key] = entry[2]
+                        continue
+
+                    _, _, shape, dtype = entry
+                    if my_coord == owner:
+                        tensor = tensor_values[tensor_idx]
+                    else:
+                        tensor = torch.empty(
+                            shape,
+                            dtype=dtype,
+                            device=self._state_tensor_device(p),
+                        )
+                    dist.broadcast(tensor, src=src, group=pg)
+                    owner_state[key] = tensor
+                    tensor_idx += 1
+
+                state_dict["state"][saved_id] = owner_state
+
+        state_dict["gefen_muon_distributed"] = {
+            "version": 1,
+            "ownership": "stable_full_param_index_v1",
+            "consolidated": True,
+        }
+        return state_dict
+
+    def _drop_non_owned_distributed_state(self) -> None:
+        if not self._dist_available():
+            return
+
+        import torch.distributed as dist
+
+        by_pg = OrderedDict()
+        for group in self.param_groups:
+            if group["sharded_mode"] != "distributed":
+                continue
+            for name, p in self._iter_group_params_with_names(group):
+                pg = self._distributed_process_group(p)
+                if pg is not None:
+                    by_pg.setdefault(pg, []).append((name, p))
+
+        for pg, pg_items in by_pg.items():
+            for idx, (name, p) in enumerate(pg_items):
+                world = dist.get_world_size(pg)
+                my_coord = dist.get_group_rank(pg, dist.get_rank())
+                owner = _stable_distributed_owner(idx, world)
+                if owner == my_coord:
+                    continue
+                pstate = self.state[p]
+                pstate.clear()
+                pstate["name"] = str(name).lower()
+
+    def state_dict(self):
+        state_dict = super().state_dict()
+        return self._consolidate_distributed_state_dict(state_dict)
+
+    def _warn_if_unconsolidated_distributed_load(self, state_dict, marker) -> None:
+        # In distributed mode the persistent momentum lives only on each matrix's
+        # stable owner rank; state_dict() runs a collective that broadcasts every
+        # owner's state to all ranks and stamps the consolidation marker. A
+        # checkpoint that skipped that consolidation (an old/foreign save, or a
+        # rank-0-only dump) leaves non-owner ranks without the owner's momentum, so
+        # a resumed run silently diverges. Warn (do NOT raise) so loading such a
+        # checkpoint degrades rather than crashes.
+        if not self._dist_available():
+            return
+        consolidated = isinstance(marker, dict) and marker.get("consolidated") is True
+        if consolidated:
+            return
+        try:
+            by_pg = self._distributed_state_items(state_dict)
+        except (KeyError, TypeError):
+            return
+        if not by_pg:
+            return
+        saved_state = state_dict.get("state", {})
+        carries_state = any(
+            saved_id in saved_state
+            for pg_items in by_pg.values()
+            for (_, _, saved_id) in pg_items
+        )
+        if not carries_state:
+            return
+        warnings.warn(
+            "GefenMuon.load_state_dict: loading a sharded_mode='distributed' "
+            "checkpoint that is not marked consolidated (missing/incomplete "
+            "'gefen_muon_distributed' marker written by GefenMuon.state_dict()). "
+            "Non-owner ranks may start with incomplete momentum and the resumed "
+            "run can diverge. Re-save with GefenMuon.state_dict() (called on every "
+            "rank) to produce a consolidated checkpoint.",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+
+    def load_state_dict(self, state_dict):
+        state_dict = dict(state_dict)
+        marker = state_dict.pop("gefen_muon_distributed", None)
+        self._warn_if_unconsolidated_distributed_load(state_dict, marker)
+        super().load_state_dict(state_dict)
+        self._drop_non_owned_distributed_state()
+
     @torch.no_grad()
     def step(self, closure=None):
         self._assert_capturable_if_capturing()
@@ -1102,26 +1330,30 @@ class GefenMuon(Gefen):
             with torch.enable_grad():
                 loss = closure()
 
-        self._maybe_refresh_gefen_codebook()
-        self._maybe_save_gefen_grad_histogram()
-
-        # Partition the work. "distributed"-mode SHARDED matrices are handled by
-        # the bucketed Parallel-Muon path (round-robin owner per matrix, in the
-        # deterministic param-iteration order that agrees on every rank); every
-        # other matrix (exact / approx / non-sharded) takes the per-param path.
-        # The two passes run in the same order on every rank, so all collectives
-        # stay matched.
+        # Partition the work once so distributed-mode sharded params can take the
+        # stable-owner Parallel-Muon path while every other param keeps the normal
+        # per-param path.
         distributed_items = []
+        regular_items = []
         for group in self.param_groups:
             distributed = group["sharded_mode"] == "distributed"
             for name, p in self._iter_group_params_with_names(group):
                 grad = p.grad
-                if grad is None:
-                    continue
                 if distributed and self._is_sharded(p):
                     distributed_items.append((group, name, p, grad))
-                else:
-                    self._step_automatic(group, name, p, grad)
+                elif grad is not None:
+                    regular_items.append((group, name, p, grad))
+
+        self._maybe_refresh_gefen_codebook()
+        self._maybe_save_gefen_grad_histogram()
+
+        # "distributed"-mode SHARDED matrices are handled by the bucketed
+        # Parallel-Muon path (stable full-param-index owner per matrix); every other
+        # matrix (exact / approx / non-sharded) takes the per-param path.
+        # The two passes run in the same order on every rank, so all collectives
+        # stay matched.
+        for group, name, p, grad in regular_items:
+            self._step_automatic(group, name, p, grad)
 
         if distributed_items:
             self._step_distributed(distributed_items)

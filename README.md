@@ -440,7 +440,7 @@ All three optimizers accept `capturable=True` (same meaning as `torch.optim`'s a
 Under FSDP2, Muon's orthogonalization needs each full weight matrix, but every GPU only holds a slice. Three strategies:
 
 - **`"exact"`** (default) — every GPU rebuilds every matrix and does the same work. Identical to single-GPU results, but redundant.
-- **`"distributed"`** (experimental) — each matrix is assigned to one GPU, which does the work and shares the result. Bit-identical to `"exact"` on homogeneous GPUs and faster as you add them, but momentum follows per-step ownership: a fluctuating gradient set (MoE routing, gradual unfreezing) resets it, and a rank-0-only checkpoint saves only part of it. Prefer `"exact"` when checkpointing or when the active-parameter set varies.
+- **`"distributed"`** (experimental) — each matrix is assigned by its stable position in the full distributed parameter set to one GPU, which does the work and shares the result. Bit-identical to `"exact"` on homogeneous GPUs and faster as you add them. Momentum ownership is stable when the active gradient set varies, and `state_dict()` collectively gathers owner-local momentum so rank 0 can write a complete checkpoint after all ranks call it.
 - **`"approx"`** — each GPU works on just its slice. Fastest, but results genuinely differ — an accuracy trade.
 
 ```python
@@ -449,10 +449,12 @@ from gefen import GefenMuonHybrid
 opt = GefenMuonHybrid(
     muon_named_params, backup_named_params,
     lr=5e-5, adjust_lr_fn="match_rms_adamw", fused=True,
-    sharded_mode="distributed",  # "exact" (default, parity) | "distributed" (experimental — see note above) | "approx" (fastest, non-parity)
+    sharded_mode="distributed",  # "exact" (default, parity) | "distributed" (experimental, collective checkpoint) | "approx" (fastest, non-parity)
 )
 # only takes effect under FSDP2 (DTensor params); no-op single-GPU
 ```
+
+> **`"distributed"` checkpointing is collective.** `state_dict()` gathers each owner's momentum across ranks, so **every rank must call it** (as in a standard FSDP full-state-dict flow). Calling `state_dict()` on rank 0 only — e.g. a rank-0-only save loop — **deadlocks**. Save and load also transiently materialize the full unsharded momentum on every rank, so peak memory at checkpoint time approaches `"exact"` mode's.
 
 ![Gefen-Muon exact / distributed / approx sharded — eval loss](docs/benchmarks/muon_shard_loss.png)
 ![Gefen-Muon exact / distributed / approx sharded — throughput & VRAM](docs/benchmarks/muon_shard_perf.png)

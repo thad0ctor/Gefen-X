@@ -7,6 +7,7 @@ All notable changes to this project are documented here. This project adheres to
 API and usability:
 
 - Preserve caller-visible optimizer `param_groups` in `Gefen`, `GefenMuon`, and `GefenMuonHybrid` instead of expanding every tensor into its own group. Per-parameter names now live in optimizer state and in each group's `param_names`; legacy flattened Gefen checkpoints are packed on load when representable.
+- `GefenMuon(sharded_mode="distributed")` now assigns owners by stable full-param-set position instead of per-step active position, and `state_dict()` collectively consolidates owner-local momentum so distributed checkpoints can restore across world-size changes.
 
 ## [0.2.0]
 

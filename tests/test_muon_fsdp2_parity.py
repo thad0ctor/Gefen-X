@@ -341,12 +341,12 @@ def _run_fused_cuda_case(case):
 
 
 # ---------------------------------------------------------------------------
-# "distributed" mode parity ("Parallel Muon"): each 2D matrix is round-robin
-# assigned to ONE owner rank that runs Newton-Schulz on the full matrix and
+# "distributed" mode parity ("Parallel Muon"): each 2D matrix is assigned by
+# stable full-param-set position to ONE owner rank that runs Newton-Schulz and
 # broadcasts the orthogonalized update. This must be EXACT vs (a) the single-GPU
 # oracle and (b) the existing "exact" mode (which runs NS redundantly on every
-# rank). The test uses SEVERAL matrices so the round-robin owner actually cycles
-# over ranks, runs MULTIPLE steps (so each owner's momentum state must persist),
+# rank). The test uses SEVERAL matrices so stable owners cover multiple ranks,
+# runs MULTIPLE steps (so each owner's momentum state must persist),
 # and deliberately includes a matrix whose owner rank holds an EMPTY shard (owner
 # still all-gathers the full grad, runs NS, and broadcasts) plus matrices smaller
 # than world_size (empty non-owner shards) -- proving no collective deadlocks.
@@ -367,13 +367,18 @@ def _cuda_archs_homogeneous(world):
     return len({torch.cuda.get_device_capability(i) for i in range(world)}) == 1
 
 
-def _dist_shapes(world):
-    # Shapes chosen so round-robin owner = idx % world hits, in order:
-    #   idx0 -> rank0 (normal), idx1 -> rank1 (normal),
-    #   idx2 -> rank2%world (normal-ish), idx3 -> rank3%world owns an EMPTY shard
-    # The (1, 8) matrix has a single row, so every rank except rank0 owns 0 rows;
-    # placing it at idx3 makes rank (3 % world) an empty OWNER when world>1.
-    return [(64, 96), (48, 64), (65, 96), (1, 8), (2, 12)]
+def _dist_specs(world):
+    # The (1, 8) matrix has a single row, so every rank except rank0 owns 0 rows.
+    # Put it at stable full-param index 1, whose owner is rank1 for the 2/4-GPU
+    # worlds this test uses, proving an empty owner still gathers+NS+broadcasts
+    # without relying on active-gradient-list ownership.
+    return [
+        ("w0", 64, 96),
+        ("empty_owner", 1, 8),
+        ("w2", 65, 96),
+        ("w3", 48, 64),
+        ("w4", 2, 12),
+    ]
 
 
 def _worker_distributed(rank, world, port, q, ns_schedule=None):
@@ -391,7 +396,9 @@ def _worker_distributed(rank, world, port, q, ns_schedule=None):
     dist.init_process_group("nccl", rank=rank, world_size=world)
     try:
         mesh = init_device_mesh("cuda", (world,))
-        shapes = _dist_shapes(world)
+        specs = _dist_specs(world)
+        names = [name for name, _, _ in specs]
+        shapes = [(M, N) for _, M, N in specs]
 
         def make_grads(step):
             # Identical full grads on every rank (same seed) per step.
@@ -411,10 +418,10 @@ def _worker_distributed(rank, world, port, q, ns_schedule=None):
 
         def build(mode):
             params = []
-            for i, init in enumerate(inits):
+            for name, init in zip(names, inits):
                 params.append(
                     (
-                        f"w{i}",
+                        name,
                         nn.Parameter(distribute_tensor(init.clone(), mesh, [Shard(0)])),
                     )
                 )
@@ -441,12 +448,12 @@ def _worker_distributed(rank, world, port, q, ns_schedule=None):
             ex_opt.step()
             di_opt.step()
 
-        # Record whether this rank was an empty OWNER for some matrix (idx3 -> the
-        # (1,8) row matrix; rank (3%world) owns it and, for world>1, owns 0 rows).
-        owner_idx3 = 3 % world
-        if rank == owner_idx3:
-            local_rows_idx3 = di_params[3][1].to_local().shape[0]
-            owner_empty_seen = local_rows_idx3 == 0
+        # Record whether rank1 was the empty owner for the one-row matrix.
+        empty_owner_idx = 1
+        empty_owner_rank = 1
+        if rank == empty_owner_rank:
+            local_rows = di_params[empty_owner_idx][1].to_local().shape[0]
+            owner_empty_seen = local_rows == 0
 
         ex_gathered = [p.detach().full_tensor() for _, p in ex_params]
         di_gathered = [p.detach().full_tensor() for _, p in di_params]
@@ -454,7 +461,7 @@ def _worker_distributed(rank, world, port, q, ns_schedule=None):
         if rank == 0:
             # Single-GPU oracle: plain GefenMuon, same inits + grads, no mesh.
             ref_params = [
-                (f"w{i}", nn.Parameter(init.clone())) for i, init in enumerate(inits)
+                (name, nn.Parameter(init.clone())) for name, init in zip(names, inits)
             ]
             ref_opt = GefenMuon(
                 ref_params,
@@ -531,12 +538,10 @@ def _run_distributed_case(world, ns_schedule=None):
     assert result is not None, f"[dist x{world}] no result from rank 0"
 
     max_vs_oracle, max_vs_exact, changed, finite = result
-    # For world>1, rank (3%world) owns the (1,8) matrix and holds 0 rows -> proves
+    # Rank1 owns the (1,8) matrix by stable full-param index and holds 0 rows -> proves
     # an empty owner still gathers+NS+broadcasts without deadlock.
-    empty_owner_rank = 3 % world
-    empty_owner_ok = (
-        empty_owner_rank == 0 or owner_empty.get(empty_owner_rank, False)
-    )
+    empty_owner_rank = 1
+    empty_owner_ok = owner_empty.get(empty_owner_rank, False)
     # Bit-identity vs exact mode is only enforceable on a homogeneous rig; on
     # mixed GPU archs relax to the ULP-scale bound (see DIST_MIXED_ARCH_EXACT_TOL).
     homogeneous = _cuda_archs_homogeneous(world)
@@ -566,6 +571,403 @@ def _run_distributed_case(world, ns_schedule=None):
     return ok
 
 
+def _active_for_fluctuating_step(step, idx):
+    # Initialize every matrix, then vary the active set. The old positional owner
+    # scheme shifted owners for later matrices on steps 1/2 and reset momentum.
+    if step == 1 and idx == 0:
+        return False
+    if step == 2 and idx == 2:
+        return False
+    return True
+
+
+def _worker_distributed_fluctuating(rank, world, port, q):
+    import torch.distributed as dist
+    from torch.distributed.tensor import Shard, distribute_tensor, init_device_mesh
+
+    from gefen.gefen_muon import GefenMuon
+
+    os.environ["MASTER_ADDR"] = "127.0.0.1"
+    os.environ["MASTER_PORT"] = port
+    os.environ["RANK"] = str(rank)
+    os.environ["WORLD_SIZE"] = str(world)
+    torch.cuda.set_device(rank)
+    dev = torch.device("cuda", rank)
+    dist.init_process_group("nccl", rank=rank, world_size=world)
+    try:
+        mesh = init_device_mesh("cuda", (world,))
+        specs = _dist_specs(world)
+        names = [name for name, _, _ in specs]
+        shapes = [(M, N) for _, M, N in specs]
+
+        def make_grads(step):
+            g = torch.Generator(device="cpu").manual_seed(500 + step)
+            return [
+                (torch.randn(M, N, generator=g, dtype=torch.float32) * 0.01).to(
+                    dev, torch.bfloat16
+                )
+                for (M, N) in shapes
+            ]
+
+        torch.manual_seed(5678)
+        inits = [
+            (torch.randn(M, N, dtype=torch.float32) * 0.1).to(dev, torch.bfloat16)
+            for (M, N) in shapes
+        ]
+
+        def build(mode):
+            params = [
+                (name, nn.Parameter(distribute_tensor(init.clone(), mesh, [Shard(0)])))
+                for name, init in zip(names, inits)
+            ]
+            opt = GefenMuon(
+                params,
+                lr=LR,
+                fused=False,
+                weight_decay=WD,
+                sharded_mode=mode,
+            )
+            return params, opt
+
+        ex_params, ex_opt = build("exact")
+        di_params, di_opt = build("distributed")
+
+        for step in range(DIST_STEPS + 1):
+            grads = make_grads(step)
+            for idx, ((_, p), g) in enumerate(zip(ex_params, grads)):
+                p.grad = distribute_tensor(g.clone(), mesh, [Shard(0)]) if _active_for_fluctuating_step(step, idx) else None
+            for idx, ((_, p), g) in enumerate(zip(di_params, grads)):
+                p.grad = distribute_tensor(g.clone(), mesh, [Shard(0)]) if _active_for_fluctuating_step(step, idx) else None
+            ex_opt.step()
+            di_opt.step()
+
+        ex_gathered = [p.detach().full_tensor() for _, p in ex_params]
+        di_gathered = [p.detach().full_tensor() for _, p in di_params]
+
+        if rank == 0:
+            ref_params = [
+                (name, nn.Parameter(init.clone())) for name, init in zip(names, inits)
+            ]
+            ref_opt = GefenMuon(
+                ref_params,
+                lr=LR,
+                fused=False,
+                weight_decay=WD,
+            )
+            for step in range(DIST_STEPS + 1):
+                grads = make_grads(step)
+                for idx, ((_, p), g) in enumerate(zip(ref_params, grads)):
+                    p.grad = g.clone() if _active_for_fluctuating_step(step, idx) else None
+                ref_opt.step()
+            ref = [p.detach() for _, p in ref_params]
+
+            max_vs_oracle = max(
+                (di_gathered[i].float() - ref[i].float()).abs().max().item()
+                for i in range(len(shapes))
+            )
+            max_vs_exact = max(
+                (di_gathered[i].float() - ex_gathered[i].float()).abs().max().item()
+                for i in range(len(shapes))
+            )
+            finite = all(torch.isfinite(g).all().item() for g in di_gathered)
+            q.put(("result", max_vs_oracle, max_vs_exact, finite))
+        else:
+            q.put(("done", rank))
+    finally:
+        if dist.is_initialized():
+            dist.destroy_process_group()
+
+
+def _run_distributed_fluctuating_case(world=2):
+    import torch.multiprocessing as mp
+
+    ctx = mp.get_context("spawn")
+    q = ctx.Queue()
+    port = _get_free_port()
+    procs = [
+        ctx.Process(target=_worker_distributed_fluctuating, args=(r, world, port, q))
+        for r in range(world)
+    ]
+    for pr in procs:
+        pr.start()
+
+    result = None
+    for _ in range(world):
+        try:
+            item = q.get(timeout=300)
+        except queue.Empty:
+            break
+        if item[0] == "result":
+            result = item[1:]
+
+    for pr in procs:
+        pr.join(timeout=300)
+    for pr in procs:
+        if pr.is_alive():
+            pr.terminate()
+            pr.join(timeout=10)
+    for pr in procs:
+        assert pr.exitcode == 0, f"[fluctuating x{world}] worker exited with {pr.exitcode}"
+    assert result is not None, f"[fluctuating x{world}] no result from rank 0"
+
+    max_vs_oracle, max_vs_exact, finite = result
+    homogeneous = _cuda_archs_homogeneous(world)
+    exact_tol = DIST_EXACT_TOL if homogeneous else DIST_MIXED_ARCH_EXACT_TOL
+    ok = finite and (max_vs_oracle <= DIST_TOL) and (max_vs_exact <= exact_tol)
+    print(
+        f"[fluctuating x{world}] finite={finite} "
+        f"max|dist-oracle|={max_vs_oracle:.3e} "
+        f"max|dist-exact|={max_vs_exact:.3e} (tol={exact_tol:.0e}) "
+        f"{'PASS' if ok else 'FAIL'}"
+    )
+    return ok
+
+
+CKPT_SPLIT_STEP = 2
+CKPT_TOTAL_STEPS = 5
+
+
+def _checkpoint_specs():
+    return [
+        ("ckpt_w0", 32, 48),
+        ("ckpt_w1", 40, 32),
+        ("ckpt_w2", 33, 64),
+        ("ckpt_w3", 2, 16),
+    ]
+
+
+def _checkpoint_grads(step, shapes, dev):
+    g = torch.Generator(device="cpu").manual_seed(900 + step)
+    return [
+        (torch.randn(M, N, generator=g, dtype=torch.float32) * 0.01).to(
+            dev, torch.bfloat16
+        )
+        for (M, N) in shapes
+    ]
+
+
+def _worker_distributed_checkpoint_save(rank, world, port, path, q):
+    import torch.distributed as dist
+    from torch.distributed.tensor import Shard, distribute_tensor, init_device_mesh
+
+    from gefen.gefen_muon import GefenMuon
+
+    os.environ["MASTER_ADDR"] = "127.0.0.1"
+    os.environ["MASTER_PORT"] = port
+    os.environ["RANK"] = str(rank)
+    os.environ["WORLD_SIZE"] = str(world)
+    torch.cuda.set_device(rank)
+    dev = torch.device("cuda", rank)
+    dist.init_process_group("nccl", rank=rank, world_size=world)
+    try:
+        mesh = init_device_mesh("cuda", (world,))
+        specs = _checkpoint_specs()
+        names = [name for name, _, _ in specs]
+        shapes = [(M, N) for _, M, N in specs]
+        gen = torch.Generator(device="cpu").manual_seed(2468)
+        init_cpu = [
+            (torch.randn(M, N, generator=gen, dtype=torch.float32) * 0.1).to(torch.bfloat16)
+            for (M, N) in shapes
+        ]
+        params = [
+            (
+                name,
+                nn.Parameter(distribute_tensor(init.to(dev).clone(), mesh, [Shard(0)])),
+            )
+            for name, init in zip(names, init_cpu)
+        ]
+        opt = GefenMuon(
+            params,
+            lr=LR,
+            fused=False,
+            weight_decay=WD,
+            sharded_mode="distributed",
+        )
+
+        for step in range(CKPT_SPLIT_STEP):
+            grads = _checkpoint_grads(step, shapes, dev)
+            for (_, p), grad in zip(params, grads):
+                p.grad = distribute_tensor(grad.clone(), mesh, [Shard(0)])
+            opt.step()
+
+        opt_state = opt.state_dict()  # collective consolidation
+        # After the collective consolidation EVERY rank must hold complete owner
+        # momentum for every param -- a regression where a non-zero rank keeps
+        # incomplete consolidated state must fail, so every rank reports.
+        complete = all(
+            "m_codebook" in opt_state["state"].get(pid, {})
+            for group in opt_state["param_groups"]
+            for pid in group["params"]
+        )
+        full_params = [p.detach().full_tensor().cpu() for _, p in params]
+        if rank == 0:
+            torch.save(
+                {
+                    "init": init_cpu,
+                    "params": full_params,
+                    "optimizer": opt_state,
+                    "names": names,
+                    "shapes": shapes,
+                },
+                path,
+            )
+        q.put(("saved", rank, complete))
+        dist.barrier()
+    finally:
+        if dist.is_initialized():
+            dist.destroy_process_group()
+
+
+def _worker_distributed_checkpoint_load(rank, world, port, path, q):
+    import torch.distributed as dist
+    from torch.distributed.tensor import Shard, distribute_tensor, init_device_mesh
+
+    from gefen.gefen_muon import GefenMuon, _stable_distributed_owner
+
+    os.environ["MASTER_ADDR"] = "127.0.0.1"
+    os.environ["MASTER_PORT"] = port
+    os.environ["RANK"] = str(rank)
+    os.environ["WORLD_SIZE"] = str(world)
+    torch.cuda.set_device(rank)
+    dev = torch.device("cuda", rank)
+    dist.init_process_group("nccl", rank=rank, world_size=world)
+    try:
+        checkpoint = torch.load(path, map_location=dev, weights_only=False)
+        mesh = init_device_mesh("cuda", (world,))
+        names = checkpoint["names"]
+        shapes = checkpoint["shapes"]
+        params = [
+            (
+                name,
+                nn.Parameter(distribute_tensor(full.to(dev).clone(), mesh, [Shard(0)])),
+            )
+            for name, full in zip(names, checkpoint["params"])
+        ]
+        opt = GefenMuon(
+            params,
+            lr=LR,
+            fused=False,
+            weight_decay=WD,
+            sharded_mode="distributed",
+        )
+        opt.load_state_dict(checkpoint["optimizer"])
+
+        # Full owner/non-owner invariant on THIS rank:
+        #   * every param this rank now owns has its momentum (m_codebook present);
+        #   * every param this rank does NOT own has EMPTY state -- proving
+        #     _drop_non_owned_distributed_state() actually dropped the momentum it
+        #     received during (broadcast) load rather than silently retaining it.
+        # A distributed load leaves only the sentinel "name" key on dropped params.
+        state_ok = True
+        for idx, (_, p) in enumerate(params):
+            owns = _stable_distributed_owner(idx, world) == rank
+            pstate_keys = set(opt.state[p].keys())
+            if owns:
+                if "m_codebook" not in pstate_keys:
+                    state_ok = False
+            else:
+                if pstate_keys - {"name"}:
+                    state_ok = False
+        gathered_owner_state_ok = [None] * world
+        dist.all_gather_object(gathered_owner_state_ok, state_ok)
+
+        for step in range(CKPT_SPLIT_STEP, CKPT_TOTAL_STEPS):
+            grads = _checkpoint_grads(step, shapes, dev)
+            for (_, p), grad in zip(params, grads):
+                p.grad = distribute_tensor(grad.clone(), mesh, [Shard(0)])
+            opt.step()
+
+        gathered = [p.detach().full_tensor() for _, p in params]
+        if rank == 0:
+            ref_params = [
+                (name, nn.Parameter(init.to(dev).clone()))
+                for name, init in zip(names, checkpoint["init"])
+            ]
+            ref_opt = GefenMuon(
+                ref_params,
+                lr=LR,
+                fused=False,
+                weight_decay=WD,
+            )
+            for step in range(CKPT_TOTAL_STEPS):
+                grads = _checkpoint_grads(step, shapes, dev)
+                for (_, p), grad in zip(ref_params, grads):
+                    p.grad = grad.clone()
+                ref_opt.step()
+            ref = [p.detach() for _, p in ref_params]
+            max_vs_oracle = max(
+                (gathered[i].float() - ref[i].float()).abs().max().item()
+                for i in range(len(shapes))
+            )
+            finite = all(torch.isfinite(g).all().item() for g in gathered)
+            q.put(("result", max_vs_oracle, finite, gathered_owner_state_ok))
+        else:
+            q.put(("done", rank))
+    finally:
+        if dist.is_initialized():
+            dist.destroy_process_group()
+
+
+def _spawn_checkpoint_phase(worker, world, path):
+    import torch.multiprocessing as mp
+
+    ctx = mp.get_context("spawn")
+    q = ctx.Queue()
+    port = _get_free_port()
+    procs = [
+        ctx.Process(target=worker, args=(r, world, port, str(path), q))
+        for r in range(world)
+    ]
+    for pr in procs:
+        pr.start()
+
+    items = []
+    for _ in range(world):
+        try:
+            items.append(q.get(timeout=300))
+        except queue.Empty:
+            break
+
+    for pr in procs:
+        pr.join(timeout=300)
+    for pr in procs:
+        if pr.is_alive():
+            pr.terminate()
+            pr.join(timeout=10)
+    for pr in procs:
+        assert pr.exitcode == 0, f"[checkpoint x{world}] worker exited with {pr.exitcode}"
+    return items
+
+
+def _run_distributed_checkpoint_case(path, save_world=2, load_world=2):
+    save_items = _spawn_checkpoint_phase(
+        _worker_distributed_checkpoint_save, save_world, path
+    )
+    saved = [item for item in save_items if item[0] == "saved"]
+    assert len(saved) == save_world, (
+        f"[checkpoint] expected {save_world} save-rank reports, got {len(saved)}"
+    )
+    incomplete = [rank for _, rank, complete in saved if not complete]
+    assert not incomplete, (
+        "[checkpoint] consolidated state missing owner momentum on save ranks "
+        f"{incomplete}"
+    )
+
+    load_items = _spawn_checkpoint_phase(
+        _worker_distributed_checkpoint_load, load_world, path
+    )
+    result = [item[1:] for item in load_items if item[0] == "result"]
+    assert result, "[checkpoint] no load result from rank 0"
+    max_vs_oracle, finite, state_ok = result[0]
+    ok = finite and all(state_ok) and max_vs_oracle <= DIST_TOL
+    print(
+        f"[checkpoint {save_world}->{load_world}] finite={finite} "
+        f"state_ok={state_ok} max|resume-oracle|={max_vs_oracle:.3e} "
+        f"{'PASS' if ok else 'FAIL'}"
+    )
+    return ok
+
+
 def run():
     results = {c: _run_case(c) for c in CASES}
     if (
@@ -578,6 +980,7 @@ def run():
             for c in FUSED_CASES:
                 results[f"fused_multirank_{c}"] = _run_fused_cuda_case(c)
             results["distributed_x2"] = _run_distributed_case(2)
+            results["distributed_fluctuating_x2"] = _run_distributed_fluctuating_case(2)
             # Combined-lever coverage: distributed mode WITH the tuned4 schedule
             # must still be bit-identical to exact mode (also tuned4) and within
             # tol of the single-GPU tuned4 oracle.
@@ -627,6 +1030,31 @@ if pytest is not None:
     @pytest.mark.parametrize("ns_schedule", [None, "tuned4"])
     def test_muon_fsdp2_distributed_parity(world, ns_schedule):
         assert _run_distributed_case(world, ns_schedule)
+
+    @pytest.mark.skipif(
+        not torch.cuda.is_available()
+        or not torch.distributed.is_available()
+        or not torch.distributed.is_nccl_available()
+        or torch.cuda.device_count() < 2,
+        reason="distributed Muon mode requires >=2 CUDA GPUs + NCCL",
+    )
+    def test_muon_fsdp2_distributed_fluctuating_grad_set():
+        assert _run_distributed_fluctuating_case(2)
+
+    @pytest.mark.skipif(
+        not torch.cuda.is_available()
+        or not torch.distributed.is_available()
+        or not torch.distributed.is_nccl_available()
+        or torch.cuda.device_count() < 2,
+        reason="distributed Muon checkpoint test requires >=2 CUDA GPUs + NCCL",
+    )
+    def test_muon_fsdp2_distributed_checkpoint_restore(tmp_path):
+        load_world = 4 if torch.cuda.device_count() >= 4 else 2
+        assert _run_distributed_checkpoint_case(
+            tmp_path / "gefen_muon_distributed.pt",
+            save_world=2,
+            load_world=load_world,
+        )
 
 
 if __name__ == "__main__":
