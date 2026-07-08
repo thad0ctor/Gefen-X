@@ -89,9 +89,25 @@ def build_optimizer(
     if optimizer == "hybrid":
         from gefen import GefenMuonHybrid
 
+        # Genuine hybrid: exercise BOTH sub-optimizers instead of measuring a
+        # muon-only step. make_shapes emits 7 tensors per layer in the order
+        # (q, k, v, o, gate, up, down); route the kv-sized k_proj/v_proj
+        # projections (positions 1 and 2 within each layer group) to the
+        # plain-Gefen backup half -- a stand-in for the embeddings / heads /
+        # norms / biases a real model sends there -- and keep the square
+        # attention and MLP weight matrices on the GefenMuon half. Both halves
+        # are non-empty, so the reported numbers reflect a real hybrid step.
+        muon_params: list[tuple[str, torch.nn.Parameter]] = []
+        backup_params: list[tuple[str, torch.nn.Parameter]] = []
+        for name, p in params:
+            layer_pos = int(name.rsplit(".", 2)[-2]) % 7
+            if layer_pos in (1, 2):
+                backup_params.append((name, p))
+            else:
+                muon_params.append((name, p))
         return GefenMuonHybrid(
-            params,
-            [],
+            muon_params,
+            backup_params,
             lr=lr,
             weight_decay=0.01,
             fused=True,
@@ -236,6 +252,20 @@ def main() -> None:
     parser.set_defaults(check_finite=True)
     ns = parser.parse_args()
 
+    if ns.steps <= 0:
+        parser.error(f"--steps must be positive, got {ns.steps}")
+    if ns.tail <= 0:
+        parser.error(f"--tail must be positive, got {ns.tail}")
+    if ns.tail > ns.steps:
+        parser.error(f"--tail ({ns.tail}) must be <= --steps ({ns.steps})")
+    if ns.kv_groups <= 0:
+        parser.error(f"--kv-groups must be positive, got {ns.kv_groups}")
+    if ns.hidden % ns.kv_groups != 0:
+        parser.error(
+            f"--hidden ({ns.hidden}) must be divisible by --kv-groups "
+            f"({ns.kv_groups})"
+        )
+
     if not torch.cuda.is_available():
         raise SystemExit("CUDA is required")
     ns.device = torch.device("cuda", 0)
@@ -246,8 +276,6 @@ def main() -> None:
 
     optimizers = parse_csv(ns.optimizers, ("gefen", "hybrid"))
     modes = parse_csv(ns.modes, ("default_eager", "capturable_eager", "manual_graph", "compile"))
-    if ns.tail > ns.steps:
-        raise SystemExit("--tail must be <= --steps")
 
     device_name = torch.cuda.get_device_name(ns.device)
     print(
