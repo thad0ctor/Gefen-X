@@ -454,6 +454,8 @@ opt = GefenMuonHybrid(
 # only takes effect under FSDP2 (DTensor params); no-op single-GPU
 ```
 
+> **`"distributed"` checkpointing is collective.** `state_dict()` gathers each owner's momentum across ranks, so **every rank must call it** (as in a standard FSDP full-state-dict flow). Calling `state_dict()` on rank 0 only — e.g. a rank-0-only save loop — **deadlocks**. Save and load also transiently materialize the full unsharded momentum on every rank, so peak memory at checkpoint time approaches `"exact"` mode's.
+
 ![Gefen-Muon exact / distributed / approx sharded — eval loss](docs/benchmarks/muon_shard_loss.png)
 ![Gefen-Muon exact / distributed / approx sharded — throughput & VRAM](docs/benchmarks/muon_shard_perf.png)
 
