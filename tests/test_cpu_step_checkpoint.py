@@ -180,6 +180,21 @@ def test_load_legacy_flattened_param_group_checkpoint():
         assert torch.isfinite(p).all()
 
 
+def test_load_legacy_flattened_checkpoint_rejects_heterogeneous_group_hypers():
+    _, opt_src = _run_and_save(factored=False)
+    legacy_sd = _legacy_flattened_param_groups(opt_src.state_dict())
+    legacy_sd["param_groups"][1]["lr"] = legacy_sd["param_groups"][0]["lr"] * 2
+
+    model_dst = _small_model()
+    opt_dst = Gefen(list(model_dst.named_parameters()), lr=1e-3, fused=False)
+
+    with pytest.raises(
+        ValueError,
+        match="legacy Gefen checkpoint with per-parameter hyperparameters",
+    ):
+        opt_dst.load_state_dict(legacy_sd)
+
+
 def _run_and_save(factored):
     model = _small_model()
     opt = Gefen(

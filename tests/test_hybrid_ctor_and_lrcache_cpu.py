@@ -135,6 +135,75 @@ def test_gefen_preserves_user_param_groups_for_integrations():
     assert [group["lr"] for group in opt.param_groups] == [1e-4, 2e-4]
 
 
+def test_gefen_same_name_params_keep_isolated_state_within_one_group():
+    p0 = nn.Parameter(torch.ones(3, 3))
+    p1 = nn.Parameter(torch.ones(3, 3) * 2.0)
+    opt = Gefen(
+        [{"params": [("shared.weight", p0), ("shared.weight", p1)], "lr": 1e-3}],
+        fused=False,
+    )
+
+    p0.grad = torch.full_like(p0, 0.01)
+    p1.grad = torch.full_like(p1, -0.02)
+    opt.step()
+
+    assert len(opt.param_groups) == 1
+    assert opt.param_groups[0]["param_names"] == ["shared.weight", "shared.weight"]
+    assert p0 in opt.state and p1 in opt.state
+    assert opt.state[p0] is not opt.state[p1]
+    assert opt.state[p0]["name"] == "shared.weight"
+    assert opt.state[p1]["name"] == "shared.weight"
+    assert opt.state[p0]["m_codebook"].data_ptr() != opt.state[p1][
+        "m_codebook"
+    ].data_ptr()
+
+
+def test_gefen_auto_names_do_not_collide_when_group_names_repeat():
+    p0 = nn.Parameter(torch.ones(2, 2))
+    p1 = nn.Parameter(torch.ones(2, 2))
+    opt = Gefen([{"params": [p0], "name": "dup"}], lr=1e-3, fused=False)
+
+    opt.add_param_group({"params": [p1], "name": "dup"})
+
+    assert [group["param_names"] for group in opt.param_groups] == [["dup"], ["dup_1"]]
+    assert opt.state[p0]["name"] == "dup"
+    assert opt.state[p1]["name"] == "dup_1"
+
+
+def test_gefen_per_group_lr_and_weight_decay_route_numerically():
+    p_no_decay = nn.Parameter(torch.ones(4))
+    p_low_lr = nn.Parameter(torch.ones(4))
+    p_high_lr = nn.Parameter(torch.ones(4))
+    opt = Gefen(
+        [
+            {
+                "params": [("no_decay", p_no_decay)],
+                "lr": 3e-2,
+                "weight_decay": 0.0,
+            },
+            {"params": [("low_lr", p_low_lr)], "lr": 1e-2, "weight_decay": 0.1},
+            {"params": [("high_lr", p_high_lr)], "lr": 3e-2, "weight_decay": 0.1},
+        ],
+        lr=1e-2,
+        weight_decay=0.0,
+        fused=False,
+    )
+    for p in (p_no_decay, p_low_lr, p_high_lr):
+        p.grad = torch.zeros_like(p)
+
+    opt.step()
+
+    torch.testing.assert_close(p_no_decay, torch.ones_like(p_no_decay))
+    torch.testing.assert_close(p_low_lr, torch.full_like(p_low_lr, 1.0 - 1e-2 * 0.1))
+    torch.testing.assert_close(
+        p_high_lr,
+        torch.full_like(p_high_lr, 1.0 - 3e-2 * 0.1),
+    )
+    low_delta = (1.0 - p_low_lr).abs().mean().item()
+    high_delta = (1.0 - p_high_lr).abs().mean().item()
+    assert high_delta == pytest.approx(3.0 * low_delta, rel=1e-4)
+
+
 def test_hybrid_param_groups_are_per_half_not_per_parameter():
     model = TinyLM()
     with warnings.catch_warnings():
