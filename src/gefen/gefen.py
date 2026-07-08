@@ -493,8 +493,9 @@ class Gefen(torch.optim.Optimizer):
 
     ``params`` accepts plain tensors, ``(name, tensor)`` tuples, or param-group
     dicts (each optionally overriding ``lr`` / ``betas`` / ``eps`` /
-    ``weight_decay``). Internally every parameter becomes its OWN named param
-    group whose ``betas`` are stored as ``beta1``/``beta2`` keys.
+    ``weight_decay``). Public ``param_groups`` preserve the caller's group
+    boundaries; each parameter's stable lowercase name is stored in its
+    per-param state and mirrored in the containing group's ``param_names`` list.
 
     Args:
         params: iterable of parameters, ``(name, parameter)`` tuples, or
@@ -682,51 +683,6 @@ class Gefen(torch.optim.Optimizer):
         self._static_mark_sig = None
         self._gefen_global_step = 0
 
-        optim_groups = []
-        for group_index, param_or_group in enumerate(params):
-            if isinstance(param_or_group, dict):
-                if "params" not in param_or_group:
-                    raise ValueError(
-                        "Gefen parameter group {} is missing the 'params' key.".format(
-                            group_index
-                        )
-                    )
-                group_lr = param_or_group.get("lr", lr)
-                group_betas = param_or_group.get("betas", betas)
-                group_eps = param_or_group.get("eps", eps)
-                group_weight_decay = param_or_group.get("weight_decay", weight_decay)
-                self._validate_group_options(
-                    group_lr, group_betas, group_eps, group_weight_decay
-                )
-                for param_index, (param_name, param) in enumerate(
-                    self._iter_params_with_names(param_or_group["params"])
-                ):
-                    if param_name is None:
-                        param_name = "group_{}_param_{}".format(
-                            group_index, param_index
-                        )
-                    optim_groups.append(
-                        self._named_param_group(
-                            param_name,
-                            param,
-                            group_lr,
-                            group_betas,
-                            group_eps,
-                            group_weight_decay,
-                        )
-                    )
-            else:
-                for param_name, param in self._iter_params_with_names(
-                    (param_or_group,)
-                ):
-                    if param_name is None:
-                        param_name = "param_{}".format(group_index)
-                    optim_groups.append(
-                        self._named_param_group(
-                            param_name, param, lr, betas, eps, weight_decay
-                        )
-                    )
-
         defaults = dict(
             lr=lr,
             beta1=betas[0],
@@ -734,7 +690,20 @@ class Gefen(torch.optim.Optimizer):
             eps=eps,
             weight_decay=weight_decay,
         )
-        super().__init__(optim_groups, defaults)
+        self._param_names = {}
+        super().__init__(self._normalize_param_groups(params), defaults)
+
+    @staticmethod
+    def _normalize_param_groups(params):
+        if isinstance(params, torch.Tensor):
+            param_groups = [params]
+        else:
+            param_groups = list(params)
+        if len(param_groups) == 0:
+            raise ValueError("optimizer got an empty parameter list")
+        if isinstance(param_groups[0], dict):
+            return param_groups
+        return [{"params": param_groups, "_gefen_implicit_group": True}]
 
     @staticmethod
     def _validate_group_options(lr, betas, eps, weight_decay):
@@ -780,28 +749,54 @@ class Gefen(torch.optim.Optimizer):
                 )
             yield param_name, param
 
+    def _param_name(self, param) -> str:
+        state = self.state.get(param)
+        if state is not None and "name" in state:
+            return state["name"]
+        return self._param_names.get(param, "none")
+
+    def _iter_group_params_with_names(self, group):
+        names = group.get("param_names")
+        for idx, param in enumerate(group["params"]):
+            if names is not None and idx < len(names):
+                yield names[idx], param
+            else:
+                yield self._param_name(param), param
+
     @staticmethod
-    def _named_param_group(param_name, param, lr, betas, eps, weight_decay):
-        return {
-            "name": str(param_name).lower(),
-            "params": param,
-            "lr": lr,
-            "beta1": betas[0],
-            "beta2": betas[1],
-            "eps": eps,
-            "weight_decay": weight_decay,
-        }
+    def _unique_name(base: str, existing_names) -> str:
+        name = str(base).lower()
+        if name not in existing_names:
+            return name
+        suffix = 1
+        while "{}_{}".format(name, suffix) in existing_names:
+            suffix += 1
+        return "{}_{}".format(name, suffix)
+
+    def _sync_param_names_to_state(self) -> None:
+        self._param_names = {}
+        for group in self.param_groups:
+            params = group["params"]
+            names = list(group.get("param_names", ()))
+            if len(names) != len(params):
+                names = [self._param_name(p) for p in params]
+            normalized_names = []
+            for param, name in zip(params, names):
+                name = str(name).lower()
+                normalized_names.append(name)
+                self._param_names[param] = name
+                self.state[param]["name"] = name
+            group["param_names"] = normalized_names
 
     def add_param_group(self, param_group):
-        """Add a param group with the constructor's validation and per-param expansion.
+        """Add a param group while preserving the caller-visible group boundary.
 
         Accepts the same group dict shape as the constructor (``params`` as
         tensors or ``(name, tensor)`` tuples; optional ``lr`` / ``betas`` (or
         ``beta1``/``beta2``) / ``eps`` / ``weight_decay``, defaulting to the
-        constructor values). Each param becomes its own named group, exactly
-        like the constructor builds them, so ``step()``'s per-group state
-        machinery keeps working. ``torch.optim.Optimizer.__init__`` routes the
-        constructor-built groups through here too.
+        constructor values). The public group is preserved; each parameter's
+        stable lowercase name is stored in its per-param state and in the
+        group's ``param_names`` list for introspection.
         """
         if not isinstance(param_group, dict):
             raise TypeError(
@@ -825,27 +820,41 @@ class Gefen(torch.optim.Optimizer):
         self._validate_group_options(
             group_lr, group_betas, group_eps, group_weight_decay
         )
+        named_params = list(self._iter_params_with_names(param_group["params"]))
+        if len(named_params) == 0:
+            raise ValueError("optimizer got an empty parameter list")
         # Keys beyond the ones Gefen manages (e.g. a subclass's extras) are
-        # carried into every expanded group, mirroring torch's behavior of
+        # carried onto the preserved group, mirroring torch's behavior of
         # preserving unknown group keys.
-        consumed = ("params", "name", "lr", "betas", "beta1", "beta2", "eps",
-                    "weight_decay")
+        consumed = (
+            "params",
+            "name",
+            "lr",
+            "betas",
+            "beta1",
+            "beta2",
+            "eps",
+            "weight_decay",
+            "param_names",
+            "_gefen_implicit_group",
+        )
         extra = {k: v for k, v in param_group.items() if k not in consumed}
-        existing_names = {g.get("name") for g in self.param_groups}
+        existing_names = set(self._param_names.values())
         group_index = len(self.param_groups)
-        # Build (and fully validate) EVERY per-param group up front so a failure
+        # Build (and fully validate) the preserved group up front so a failure
         # partway through -- a complex/non-tensor param from
         # _iter_params_with_names, or a duplicate param -- leaves
         # self.param_groups untouched. add_param_group is all-or-nothing: only
-        # once the whole batch is materialized do we register any of it.
+        # once the whole group is materialized do we register any of it.
         existing_params = set()
         for g in self.param_groups:
             existing_params.update(g["params"])
         batch_params = set()
-        new_groups = []
-        for param_index, (param_name, param) in enumerate(
-            self._iter_params_with_names(param_group["params"])
-        ):
+        group_name = param_group.get("name")
+        implicit_group = bool(param_group.get("_gefen_implicit_group", False))
+        params = []
+        param_names = []
+        for param_index, (param_name, param) in enumerate(named_params):
             # Reject duplicates before registering any group, so the base class's
             # own (post-registration) duplicate check can't leave us partial.
             if param in existing_params or param in batch_params:
@@ -853,31 +862,46 @@ class Gefen(torch.optim.Optimizer):
                     "some parameters appear in more than one parameter group"
                 )
             batch_params.add(param)
+            params.append(param)
             if param_name is None:
-                param_name = param_group.get("name")
-            if param_name is None:
-                # Synthesize a name that cannot collide with an existing group.
-                param_name = "group_{}_param_{}".format(group_index, param_index)
-                while param_name in existing_names:
-                    group_index += 1
-                    param_name = "group_{}_param_{}".format(
-                        group_index, param_index
+                if group_name is not None and len(named_params) == 1:
+                    param_name = group_name
+                    param_name = self._unique_name(param_name, existing_names)
+                elif implicit_group:
+                    param_name = self._unique_name(
+                        "param_{}".format(len(self._param_names) + param_index),
+                        existing_names,
                     )
-            new_group = dict(extra)
-            new_group.update(
-                self._named_param_group(
-                    param_name,
-                    param,
-                    group_lr,
-                    group_betas,
-                    group_eps,
-                    group_weight_decay,
-                )
-            )
-            new_groups.append(new_group)
-            existing_names.add(new_group["name"])
-        for new_group in new_groups:
-            super().add_param_group(new_group)
+                else:
+                    param_name = self._unique_name(
+                        "group_{}_param_{}".format(group_index, param_index),
+                        existing_names,
+                    )
+            else:
+                param_name = str(param_name).lower()
+            param_names.append(param_name)
+            existing_names.add(param_name)
+
+        new_group = dict(extra)
+        if group_name is not None:
+            new_group["name"] = str(group_name).lower()
+        elif len(param_names) == 1:
+            new_group["name"] = param_names[0]
+        new_group.update(
+            {
+                "params": params,
+                "param_names": param_names,
+                "lr": group_lr,
+                "beta1": group_betas[0],
+                "beta2": group_betas[1],
+                "eps": group_eps,
+                "weight_decay": group_weight_decay,
+            }
+        )
+        super().add_param_group(new_group)
+        for param, param_name in zip(params, param_names):
+            self._param_names[param] = param_name
+            self.state[param]["name"] = param_name
 
     def _lr_scalar(self, group) -> float:
         """Resolve ``group["lr"]`` to a python float, caching a tensor lr's ``.item()``.
@@ -886,10 +910,9 @@ class Gefen(torch.optim.Optimizer):
         D2H sync) only when its identity or ``_version`` changes -- an in-place
         scheduler update (e.g. ``lr.mul_``) bumps ``_version``, a replacement
         swaps identity. The cache is a SINGLE slot (the last ``(tensor, version,
-        value)`` triple), shared across all param groups. Gefen stores the SAME
-        lr object in every per-param group (see ``_named_param_group``), and the
-        tensor-lr idiom is a single on-device lr, so one shared slot already
-        costs just one ``.item()`` per step (O(steps), per version). One slot
+        value)`` triple), shared across all param groups. The tensor-lr idiom is
+        a single on-device lr, so one shared slot already costs just one
+        ``.item()`` per step (O(steps), per version). One slot
         rather than an id-keyed dict so a loop that assigns a FRESH lr tensor
         each step can't grow the cache (and its strong refs) unboundedly. The
         cached value equals ``lr.item()``, so callers stay bit-identical.
@@ -1770,7 +1793,7 @@ class Gefen(torch.optim.Optimizer):
     def _iter_gefen_grad_periods(self, reuse_existing_periods: bool = False):
 
         for group in self.param_groups:
-            for p in group["params"]:
+            for param_name, p in self._iter_group_params_with_names(group):
                 if p.grad is None:
                     continue
                 grad = p.grad
@@ -1794,7 +1817,7 @@ class Gefen(torch.optim.Optimizer):
                     if "automatic_period" not in state:
                         raise ValueError(
                             "Expected automatic_period to exist for {} before refreshing Gefen codebook at optimizer step {}".format(
-                                group["name"],
+                                param_name,
                                 self._gefen_global_step,
                             )
                         )
@@ -1802,7 +1825,7 @@ class Gefen(torch.optim.Optimizer):
                 elif flat.numel() == 1:
                     period = 1
                 else:
-                    period = self._resolve_automatic_period(group["name"], p, grad)
+                    period = self._resolve_automatic_period(param_name, p, grad)
 
                 self.state[p]["automatic_period"] = period
 
@@ -1810,12 +1833,12 @@ class Gefen(torch.optim.Optimizer):
                     raise ValueError(
                         "Automatic partition period {} does not divide parameter {} with numel {} while learning Gefen codebook".format(
                             period,
-                            group["name"],
+                            param_name,
                             flat.numel(),
                         )
                     )
 
-                yield group["name"], flat, period, grad
+                yield param_name, flat, period, grad
 
     def _learn_gefen_exact_codebook(
         self,
@@ -3023,11 +3046,12 @@ class Gefen(torch.optim.Optimizer):
         """Serialize optimizer state, plus Gefen's run-level extras.
 
         Beyond the base ``torch.optim.Optimizer.state_dict`` contents (per-param
-        state keyed by index, param_groups incl. each group's ``name``), the dict
-        carries ``gefen_global_step`` and the frozen exact-DP ``gefen_codebook``
-        (without it a resume would re-learn the codebook and desync the restored
-        block periods). Per-step scratch buffers are stripped, and non-owning
-        state views are compacted to tight clones so checkpoints stay small.
+        state keyed by index and caller-preserved ``param_groups``), the dict
+        carries each parameter's stable ``name`` in its state, plus
+        ``gefen_global_step`` and the frozen exact-DP ``gefen_codebook`` (without
+        it a resume would re-learn the codebook and desync the restored block
+        periods). Per-step scratch buffers are stripped, and non-owning state
+        views are compacted to tight clones so checkpoints stay small.
         """
         state_dict = super().state_dict()
         # stepsize/_h_buf are per-step scratch buffers (recomputed from vmean every
@@ -3084,6 +3108,68 @@ class Gefen(torch.optim.Optimizer):
         state_dict["gefen_codebook"] = self._gefen_codebook
         return state_dict
 
+    @staticmethod
+    def _same_serialized_group_value(a, b) -> bool:
+        if torch.is_tensor(a) or torch.is_tensor(b):
+            return torch.is_tensor(a) and torch.is_tensor(b) and torch.equal(a, b)
+        return a == b
+
+    def _pack_legacy_param_groups_for_load(self, state_dict):
+        """Pack legacy one-param groups to the current caller-preserved layout.
+
+        Older Gefen checkpoints serialized one param group per tensor. The
+        underlying parameter order is the same flattening PyTorch uses for
+        state_dict ids, so a legacy checkpoint can load into the new grouped
+        optimizer when the total parameter count still matches and each run of
+        legacy groups that maps to one current group has representable shared
+        hyperparameters.
+        """
+        saved_groups = state_dict.get("param_groups")
+        if not saved_groups or len(saved_groups) == len(self.param_groups):
+            return state_dict
+        if not all(len(group.get("params", ())) == 1 for group in saved_groups):
+            return state_dict
+
+        live_sizes = [len(group["params"]) for group in self.param_groups]
+        if sum(live_sizes) != len(saved_groups):
+            return state_dict
+
+        packed_groups = []
+        cursor = 0
+        ignored = {"params", "name", "param_names"}
+        for live_group, size in zip(self.param_groups, live_sizes):
+            chunk = saved_groups[cursor : cursor + size]
+            cursor += size
+            first_meta = {k: v for k, v in chunk[0].items() if k not in ignored}
+            for legacy_group in chunk[1:]:
+                meta = {k: v for k, v in legacy_group.items() if k not in ignored}
+                if set(meta) != set(first_meta) or any(
+                    not self._same_serialized_group_value(meta[k], first_meta[k])
+                    for k in first_meta
+                ):
+                    raise ValueError(
+                        "Cannot load a legacy Gefen checkpoint with per-parameter "
+                        "hyperparameters into a preserved multi-parameter group. "
+                        "Recreate the optimizer with matching param groups or "
+                        "load before changing the grouping layout."
+                    )
+            names = [
+                str(group.get("name", "param_{}".format(i))).lower()
+                for i, group in enumerate(chunk, start=cursor - size)
+            ]
+            packed = dict(first_meta)
+            if "name" in live_group:
+                packed["name"] = live_group["name"]
+            elif len(names) == 1:
+                packed["name"] = names[0]
+            packed["params"] = [group["params"][0] for group in chunk]
+            packed["param_names"] = names
+            packed_groups.append(packed)
+
+        migrated = dict(state_dict)
+        migrated["param_groups"] = packed_groups
+        return migrated
+
     def load_state_dict(self, state_dict):
         """Restore optimizer state saved by :meth:`state_dict`.
 
@@ -3102,6 +3188,7 @@ class Gefen(torch.optim.Optimizer):
         state_dict = dict(state_dict)
         gefen_global_step = state_dict.pop("gefen_global_step", 0)
         gefen_codebook = state_dict.pop("gefen_codebook", None)
+        state_dict = self._pack_legacy_param_groups_for_load(state_dict)
 
         # torch.optim.Optimizer.load_state_dict casts *every* per-param state
         # tensor to the owning parameter's dtype whenever that parameter is
@@ -3203,6 +3290,7 @@ class Gefen(torch.optim.Optimizer):
                             ).reshape(())
                     elif torch.is_tensor(value):
                         pstate[key] = int(value.item())
+        self._sync_param_names_to_state()
 
     @torch.no_grad()
     def step(self, closure=None):
@@ -3268,8 +3356,7 @@ class Gefen(torch.optim.Optimizer):
         # stream) keeps the per-param path.
         nonfused_groups = {}
         for group in self.param_groups:
-            name = group["name"]
-            for p in group["params"]:
+            for name, p in self._iter_group_params_with_names(group):
                 grad = p.grad
                 if grad is None:
                     continue

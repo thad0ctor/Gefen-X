@@ -24,11 +24,11 @@ except ImportError:  # pragma: no cover
 from gefen import Gefen  # noqa: E402
 
 
-def _run(fused, steps=6, shape=(768, 512), seed=3):
+def _run(fused, steps=6, shape=(768, 512), seed=3, **opt_kwargs):
     torch.manual_seed(seed)
     p = nn.Parameter((torch.randn(*shape, device="cuda") * 0.02).bfloat16())
     opt = Gefen([("w", p)], lr=1e-3, fused=fused, factored_v_2d=True,
-                weight_decay=0.1)
+                weight_decay=0.1, **opt_kwargs)
     torch.manual_seed(seed + 1)
     for _ in range(steps):
         p.grad = torch.randn(*shape, device="cuda").bfloat16() * 1e-3
@@ -54,8 +54,8 @@ def check_kernel_vs_fallback_aggregate():
 
 
 def check_single_step_adjacency():
-    _, ok = _run(fused=True, steps=1)
-    _, of = _run(fused=False, steps=1)
+    _, ok = _run(fused=True, steps=1, force_2d_period_one=True)
+    _, of = _run(fused=False, steps=1, force_2d_period_one=True)
     sk = next(iter(ok.state.values()))
     sf = next(iter(of.state.values()))
     didx = (sk["m_codebook"].short() - sf["m_codebook"].short()).abs()

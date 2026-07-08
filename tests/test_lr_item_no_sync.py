@@ -1,6 +1,6 @@
 """Regression test for the tensor-LR `.item()` hoist (GefenMuon._lr_scalar).
 
-GefenMuon assigns one param-group per param. The pre-change `_adjust_lr` did a
+GefenMuon applies Muon scaling per parameter. The pre-change `_adjust_lr` did a
 fresh `lr.item()` (a D2H sync) on every per-param call, so a tensor LR meant
 ~one sync per param per step, serializing the Newton-Schulz pipeline. The fix
 caches the scalar read keyed on `(tensor identity, tensor._version)`.
@@ -29,12 +29,12 @@ from gefen import GefenMuon  # noqa: E402
 _CUDA = torch.cuda.is_available()
 _SKIP = "GefenMuon fused path requires CUDA"
 
-# A handful of 2D matrices of mixed shape -> several one-param groups.
+# A handful of 2D matrices of mixed shape in one public optimizer group.
 _SPEC = [(256, 256), (384, 256), (256, 384), (512, 256), (256, 512)]
 
 
 def _build(lr, seed=1234, dev="cuda"):
-    """Build a GefenMuon over the `_SPEC` 2D matrices (one param-group per param)."""
+    """Build a GefenMuon over the `_SPEC` 2D matrices."""
     torch.manual_seed(seed)
     params = []
     for i, (r, c) in enumerate(_SPEC):

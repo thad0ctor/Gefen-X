@@ -85,7 +85,7 @@ def test_gefen_add_param_group_atomic_on_partial_failure():
         opt.add_param_group({"params": [("good", good), ("bad", bad)]})
     assert len(opt.param_groups) == before
     # The valid first param must NOT have been left registered.
-    assert not any(g.get("name") == "good" for g in opt.param_groups)
+    assert not any("good" in g.get("param_names", ()) for g in opt.param_groups)
 
 
 def test_gefen_add_param_group_atomic_on_duplicate():

@@ -102,7 +102,7 @@ def test_add_param_group_steps_and_honors_hypers():
     assert group["beta1"] == 0.5 and group["beta2"] == 0.9
     assert group["lr"] == 1e-4
     assert group["weight_decay"] == opt.defaults["weight_decay"]
-    names = [g["name"] for g in opt.param_groups]
+    names = [name for g in opt.param_groups for name in g["param_names"]]
     assert all(names) and len(names) == len(set(names))
     p1.grad = torch.randn_like(p1) * 0.1
     p2.grad = torch.randn_like(p2) * 0.1
@@ -115,7 +115,7 @@ def test_add_param_group_accepts_named_params_and_single_tensor():
     opt = Gefen([nn.Parameter(torch.randn(4, 4))], fused=False)
     named = nn.Parameter(torch.randn(4, 4))
     opt.add_param_group({"params": [("extra.weight", named)]})
-    assert opt.param_groups[-1]["name"] == "extra.weight"
+    assert opt.param_groups[-1]["param_names"] == ["extra.weight"]
     bare = nn.Parameter(torch.randn(4))
     opt.add_param_group({"params": bare})
     assert any(p is bare for p in opt.param_groups[-1]["params"])

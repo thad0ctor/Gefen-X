@@ -9,6 +9,10 @@ import torch.nn as nn
 from gefen import Gefen, GefenMuon, GefenMuonHybrid
 
 
+def _param_names(groups):
+    return {name for group in groups for name in group.get("param_names", ())}
+
+
 class TinyLM(nn.Module):
     def __init__(self, vocab=32, dim=16):
         super().__init__()
@@ -46,8 +50,8 @@ def test_hybrid_from_module_first_arg_constructs_and_steps():
         warnings.simplefilter("ignore")
         opt = GefenMuonHybrid(model, lr=1e-3, fused=False)
     # hidden weight -> muon; embed + lm_head + norm/bias -> backup.
-    muon_names = {g["name"] for g in opt.muon.param_groups}
-    backup_names = {g["name"] for g in opt.backup.param_groups}
+    muon_names = _param_names(opt.muon.param_groups)
+    backup_names = _param_names(opt.backup.param_groups)
     assert any("hidden.weight" in n for n in muon_names)
     assert any("embed" in n for n in backup_names)
     assert any("lm_head" in n for n in backup_names)
@@ -60,7 +64,7 @@ def test_hybrid_named_params_iterable_first_arg():
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
         opt = GefenMuonHybrid(list(model.named_parameters()), lr=1e-3, fused=False)
-    backup_names = {g["name"] for g in opt.backup.param_groups}
+    backup_names = _param_names(opt.backup.param_groups)
     assert any("embed" in n for n in backup_names)
     assert _step(opt, model) > 0.0
 
@@ -102,8 +106,47 @@ def test_backup_substrings_override_on_module_form():
         opt = GefenMuonHybrid(
             model, lr=1e-3, fused=False, backup_substrings=("embed", "lm_head", "hidden")
         )
-    muon_names = {g["name"] for g in opt.muon.param_groups} if opt.muon else set()
+    muon_names = _param_names(opt.muon.param_groups) if opt.muon else set()
     assert not any("hidden.weight" in n for n in muon_names)
+
+
+# ---- Issue #44: public param_groups preserve caller grouping --------------
+
+def test_gefen_preserves_user_param_groups_for_integrations():
+    p0 = nn.Parameter(torch.randn(4, 4))
+    p1 = nn.Parameter(torch.randn(4))
+    p2 = nn.Parameter(torch.randn(4, 4))
+    opt = Gefen(
+        [
+            {"params": [("layer0.weight", p0), ("layer0.bias", p1)], "lr": 1e-3},
+            {"params": [("layer1.weight", p2)], "lr": 2e-3},
+        ],
+        fused=False,
+    )
+
+    assert len(opt.param_groups) == 2
+    assert [len(group["params"]) for group in opt.param_groups] == [2, 1]
+    assert opt.param_groups[0]["param_names"] == ["layer0.weight", "layer0.bias"]
+    assert opt.param_groups[1]["param_names"] == ["layer1.weight"]
+    assert len(opt.state_dict()["param_groups"]) == 2
+
+    for group, lr in zip(opt.param_groups, [1e-4, 2e-4]):
+        group["lr"] = lr
+    assert [group["lr"] for group in opt.param_groups] == [1e-4, 2e-4]
+
+
+def test_hybrid_param_groups_are_per_half_not_per_parameter():
+    model = TinyLM()
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        opt = GefenMuonHybrid(model, lr=1e-3, fused=False)
+
+    assert len(opt.muon.param_groups) == 1
+    assert len(opt.backup.param_groups) == 1
+    assert len(opt.param_groups) == 2
+    assert sum(len(group["params"]) for group in opt.param_groups) == sum(
+        1 for _ in model.parameters()
+    )
 
 
 # ---- REVIEW-1: unified single-slot tensor-lr cache -----------------------

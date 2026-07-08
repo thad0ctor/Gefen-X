@@ -157,6 +157,29 @@ def test_load_state_dict_does_not_mutate_caller_dict():
     opt.load_state_dict(sd)
 
 
+def test_load_legacy_flattened_param_group_checkpoint():
+    model_src, opt_src = _run_and_save(factored=False)
+    legacy_sd = _legacy_flattened_param_groups(opt_src.state_dict())
+    assert len(legacy_sd["param_groups"]) == sum(1 for _ in model_src.parameters())
+
+    model_dst = _small_model()
+    with torch.no_grad():
+        for pd, ps in zip(model_dst.parameters(), model_src.parameters()):
+            pd.copy_(ps)
+    opt_dst = Gefen(list(model_dst.named_parameters()), lr=1e-3, fused=False)
+    opt_dst.load_state_dict(legacy_sd)
+
+    grouped_sd = opt_dst.state_dict()
+    assert len(grouped_sd["param_groups"]) == 1
+    assert grouped_sd["param_groups"][0]["param_names"] == [
+        name for name, _ in model_dst.named_parameters()
+    ]
+    _apply_grads(model_dst, _synthetic_grads(model_dst, 1)[0])
+    opt_dst.step()
+    for p in model_dst.parameters():
+        assert torch.isfinite(p).all()
+
+
 def _run_and_save(factored):
     model = _small_model()
     opt = Gefen(
@@ -171,10 +194,31 @@ def _run_and_save(factored):
 
 def _state_of_2d(opt):
     for group in opt.param_groups:
-        (p,) = group["params"]
-        if p.ndim == 2:
-            return p, opt.state[p]
+        for p in group["params"]:
+            if p.ndim == 2:
+                return p, opt.state[p]
     raise AssertionError("no 2D param found")
+
+
+def _legacy_flattened_param_groups(state_dict):
+    state_dict = copy.deepcopy(state_dict)
+    legacy_groups = []
+    for group in state_dict["param_groups"]:
+        names = group.get("param_names") or [
+            group.get("name", "param_{}".format(i))
+            for i in range(len(group["params"]))
+        ]
+        for param_id, name in zip(group["params"], names):
+            legacy_group = {
+                k: v
+                for k, v in group.items()
+                if k not in {"params", "param_names"}
+            }
+            legacy_group["params"] = [param_id]
+            legacy_group["name"] = name
+            legacy_groups.append(legacy_group)
+    state_dict["param_groups"] = legacy_groups
+    return state_dict
 
 
 def test_checkpoint_migration_legacy_to_factored():
