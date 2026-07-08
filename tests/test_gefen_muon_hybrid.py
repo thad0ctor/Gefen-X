@@ -56,10 +56,10 @@ def run():
     # --- A. routing + step ---
     opt, params = _build()
     # muon got the 2 weights, backup got bias + embedding
-    assert len(opt.muon.param_groups) == 2
-    assert len(opt.backup.param_groups) == 2
-    # param_groups property exposes all 4 children groups
-    assert len(opt.param_groups) == 4
+    assert len(opt.muon.param_groups) == 1
+    assert len(opt.backup.param_groups) == 1
+    # param_groups property exposes the child optimizers' preserved groups.
+    assert len(opt.param_groups) == 2
     before = [p.detach().clone() for p in params]
     _step(opt, params)
     changed = [not torch.equal(p.detach(), b) for p, b in zip(params, before)]

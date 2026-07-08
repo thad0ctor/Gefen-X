@@ -557,7 +557,7 @@ class GefenMuon(Gefen):
         # never 0, so every rank iterates every parameter in the same order and
         # the full_tensor() collective is matched across ranks.
         for group in self.param_groups:
-            for p in group["params"]:
+            for param_name, p in self._iter_group_params_with_names(group):
                 if p.grad is None:
                     continue
                 grad = p.grad
@@ -582,7 +582,7 @@ class GefenMuon(Gefen):
                     if "automatic_period" not in state:
                         raise ValueError(
                             "Expected automatic_period to exist for {} before refreshing Gefen codebook at optimizer step {}".format(
-                                group["name"],
+                                param_name,
                                 self._gefen_global_step,
                             )
                         )
@@ -590,7 +590,7 @@ class GefenMuon(Gefen):
                 elif flat.numel() == 1:
                     period = 1
                 else:
-                    period = self._predict_period_from_grad_sq(group["name"], p, grad)
+                    period = self._predict_period_from_grad_sq(param_name, p, grad)
 
                 self.state[p]["automatic_period"] = period
 
@@ -598,12 +598,12 @@ class GefenMuon(Gefen):
                     raise ValueError(
                         "Automatic partition period {} does not divide parameter {} with numel {} while learning Gefen codebook".format(
                             period,
-                            group["name"],
+                            param_name,
                             flat.numel(),
                         )
                     )
 
-                yield group["name"], flat, period, grad
+                yield param_name, flat, period, grad
 
     def _quantize_momentum_(self, state, momentum_view: torch.Tensor) -> None:
         period = state["automatic_period"]
@@ -899,8 +899,8 @@ class GefenMuon(Gefen):
         # rows/cols LR ratio wants -- keep it unchanged under sharding.
         # Resolve a tensor LR (tensor-LR / capturable scheduler) to a python float
         # via a cached scalar instead of a fresh lr.item() per Muon param. A tensor
-        # lr.item() is a D2H sync; GefenMuon assigns one param-group per param, so
-        # the per-param _adjust_lr call meant ~one sync per param per step,
+        # lr.item() is a D2H sync; the per-param _adjust_lr call would otherwise
+        # mean ~one sync per param per step for tensor-lr schedules,
         # serializing the Newton-Schulz pipeline. The cache re-reads only when the
         # lr tensor's identity or _version changes (an in-place scheduler update
         # bumps _version), so a constant tensor lr is read once and reused; the
@@ -1113,9 +1113,8 @@ class GefenMuon(Gefen):
         # stay matched.
         distributed_items = []
         for group in self.param_groups:
-            name = group["name"]
             distributed = group["sharded_mode"] == "distributed"
-            for p in group["params"]:
+            for name, p in self._iter_group_params_with_names(group):
                 grad = p.grad
                 if grad is None:
                     continue

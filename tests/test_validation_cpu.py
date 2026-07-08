@@ -85,7 +85,7 @@ def test_gefen_add_param_group_atomic_on_partial_failure():
         opt.add_param_group({"params": [("good", good), ("bad", bad)]})
     assert len(opt.param_groups) == before
     # The valid first param must NOT have been left registered.
-    assert not any(g.get("name") == "good" for g in opt.param_groups)
+    assert not any("good" in g.get("param_names", ()) for g in opt.param_groups)
 
 
 def test_gefen_add_param_group_atomic_on_duplicate():
@@ -95,6 +95,60 @@ def test_gefen_add_param_group_atomic_on_duplicate():
     dup = nn.Parameter(torch.randn(4))
     with pytest.raises(ValueError):
         opt.add_param_group({"params": [("a", dup), ("b", dup)]})
+    assert len(opt.param_groups) == before
+
+
+def _step_and_assert_moved(opt, params, n=3):
+    before = [p.detach().clone() for p in params]
+    gen = torch.Generator().manual_seed(7)
+    for _ in range(n):
+        for p in params:
+            p.grad = torch.randn(p.shape, generator=gen) * 1e-2
+        opt.step()
+        opt.zero_grad()
+    for b, p in zip(before, params):
+        assert torch.isfinite(p).all()
+        assert not torch.equal(b, p), "step() left a parameter untouched"
+
+
+def test_constructor_input_forms():
+    # (a) a single bare Parameter (NOT wrapped in a list) builds one implicit
+    # group and steps.
+    bare = nn.Parameter(torch.randn(4, 4))
+    opt_bare = Gefen(bare, lr=1e-3, fused=False)
+    assert len(opt_bare.param_groups) == 1
+    assert opt_bare.param_groups[0]["params"] == [bare]
+    _step_and_assert_moved(opt_bare, [bare])
+
+    # (b) a generator of params (consumed exactly once) builds and steps.
+    model = nn.Linear(4, 4)
+    opt_gen = Gefen((p for p in model.parameters()), lr=1e-3, fused=False)
+    assert len(opt_gen.param_groups) == 1
+    assert len(opt_gen.param_groups[0]["params"]) == len(list(model.parameters()))
+    _step_and_assert_moved(opt_gen, list(model.parameters()))
+
+    # (c) an empty list raises the constructor's empty-params error.
+    with pytest.raises(ValueError, match="empty parameter list"):
+        Gefen([], lr=1e-3, fused=False)
+
+
+def test_add_param_group_error_paths():
+    opt = Gefen(_params_1d(), fused=False)
+    before = len(opt.param_groups)
+
+    # (a) a non-dict arg -> TypeError naming the actual type.
+    with pytest.raises(TypeError, match="param_group must be a dict"):
+        opt.add_param_group([nn.Parameter(torch.randn(4))])
+    assert len(opt.param_groups) == before
+
+    # (b) a dict missing the 'params' key -> ValueError.
+    with pytest.raises(ValueError, match="missing the 'params' key"):
+        opt.add_param_group({"lr": 1e-3})
+    assert len(opt.param_groups) == before
+
+    # (c) a dict with empty 'params' -> the empty-params ValueError.
+    with pytest.raises(ValueError, match="empty parameter list"):
+        opt.add_param_group({"params": []})
     assert len(opt.param_groups) == before
 
 

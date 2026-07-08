@@ -7,11 +7,12 @@ composite routes the 2D hidden weight matrices to GefenMuon and routes the rest
 ``torch.optim.Optimizer``-compatible interface so it drops straight into the
 Hugging Face Trainer / accelerate single-GPU path.
 
-Both sub-optimizers key their per-parameter codebook cache on ``group["name"]``,
-so parameters MUST be supplied as ``(name, param)`` pairs with unique names --
-bare tensors get positional auto-names ("param_0", ...), so the split validation
-loses its real names and checkpoint state can only be re-matched by construction
-order, which silently breaks on any reordering.
+Both sub-optimizers keep per-parameter names in optimizer state (and mirror them
+in each public group's ``param_names`` list), so parameters SHOULD be supplied as
+``(name, param)`` pairs with unique names. Bare tensors get positional auto-names
+("param_0", ...), so the split validation loses its real names and checkpoint
+state can only be re-matched by construction order, which silently breaks on any
+reordering.
 
 Scope: single-GPU / DDP and FSDP2 (fully_shard / DTensor). Under FSDP2 each rank
 holds only a shard of every parameter, so the backup (plain Gefen) params update

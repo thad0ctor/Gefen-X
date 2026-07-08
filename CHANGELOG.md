@@ -4,6 +4,10 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+API and usability:
+
+- Preserve caller-visible optimizer `param_groups` in `Gefen`, `GefenMuon`, and `GefenMuonHybrid` instead of expanding every tensor into its own group. Per-parameter names now live in optimizer state and in each group's `param_names`; legacy flattened Gefen checkpoints are packed on load when representable.
+
 ## [0.2.0]
 
 Renames the distribution to `gefen-x` and lands a production-readiness pass ahead of proposing Gefen as an optimizer for training platforms. `gefen-x` is a maintained fork of the original [Gefen](https://github.com/ndvbd/Gefen), published under a distinct distribution name so it can evolve independently on PyPI; the import name remains `gefen`.

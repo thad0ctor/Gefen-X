@@ -459,9 +459,12 @@ opt = GefenMuonHybrid(
 
 Measured (Qwen3-0.6B, 2 and 4 GPUs): `"distributed"` is a free speedup at identical results (1.06× / 1.12×); `"approx"` is faster still (1.25× / 1.39×) but visibly costs training quality, and the cost grows with GPU count. The `"distributed"` win grows with model size.
 
+## Param Groups and Integrations
+
+`Gefen`, `GefenMuon`, and `GefenMuonHybrid` preserve the parameter groups you pass to the optimizer, so list-indexed layer-wise LR recipes, per-group LR logging, and `state_dict()["param_groups"]` see the same group boundaries as conventional `torch.optim` optimizers. Per-parameter names are stored in optimizer state and mirrored as each group's `param_names` list for integrations that need name-level routing. Checkpoints from the older one-group-per-parameter layout are migrated on load when the total parameter order still matches and the old per-param hyperparameters can be represented by the new group layout.
+
 ## Known limitations
 
-- **One param-group per parameter.** Gefen expands its parameters into one `param_group` each. LR schedulers work normally (they set `group["lr"]` in place), but code that indexes `optimizer.param_groups` by position to assign per-group LRs, and cross-run resume when the trainable-parameter set changes between runs, are affected — key on parameter identity rather than group index.
 - **Hybrid checkpoint schema.** `GefenMuonHybrid`'s `state_dict()` uses its own nested `{"muon": ..., "backup": ...}` layout. Resume from a checkpoint Gefen itself saved — not one consolidated or converted to the flat torch `{state, param_groups}` layout (those are rejected, not silently ignored).
 
 ## Citation:
