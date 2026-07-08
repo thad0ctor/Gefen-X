@@ -206,6 +206,107 @@ def test_load_legacy_flattened_checkpoint_rejects_changed_trainable_set():
         opt_dst.load_state_dict(legacy_sd)
 
 
+def _multi_group_run_and_save():
+    """A 2-group [2, 1] live layout, stepped twice, returned with its state.
+
+    Names differ per param so a legacy repack can be shown to restore them in
+    destination order.
+    """
+    torch.manual_seed(0)
+    pa = nn.Parameter(torch.randn(6, 4))
+    pb = nn.Parameter(torch.randn(6))
+    pc = nn.Parameter(torch.randn(5, 3))
+    opt = Gefen(
+        [
+            {"params": [("block.weight", pa), ("block.bias", pb)], "lr": 1e-3},
+            {"params": [("head.weight", pc)], "lr": 1e-3},
+        ],
+        fused=False,
+    )
+    gen = torch.Generator().manual_seed(3)
+    for _ in range(2):
+        for p in (pa, pb, pc):
+            p.grad = torch.randn(p.shape, generator=gen) * 1e-2
+        opt.step()
+        opt.zero_grad()
+    return [pa, pb, pc], opt
+
+
+def _fresh_multi_group_opt():
+    """A destination optimizer with the same [2, 1] layout but DIFFERENT names,
+    so a successful legacy load must overwrite them with the checkpoint's."""
+    qa = nn.Parameter(torch.zeros(6, 4))
+    qb = nn.Parameter(torch.zeros(6))
+    qc = nn.Parameter(torch.zeros(5, 3))
+    opt = Gefen(
+        [
+            {"params": [("x.weight", qa), ("x.bias", qb)], "lr": 1e-3},
+            {"params": [("y.weight", qc)], "lr": 1e-3},
+        ],
+        fused=False,
+    )
+    return [qa, qb, qc], opt
+
+
+def test_load_legacy_flattened_checkpoint_multi_group_repack():
+    # Live layout is two groups of sizes [2, 1]; the legacy checkpoint is one
+    # group per param (3 flat groups). The repacker must fold the 3 flat groups
+    # back into the 2 live groups, restoring each group's names in order.
+    _, opt_src = _multi_group_run_and_save()
+    legacy_sd = _legacy_flattened_param_groups(opt_src.state_dict())
+    assert len(legacy_sd["param_groups"]) == 3
+
+    params_dst, opt_dst = _fresh_multi_group_opt()
+    opt_dst.load_state_dict(legacy_sd)
+
+    grouped = opt_dst.state_dict()["param_groups"]
+    assert [len(g["params"]) for g in grouped] == [2, 1]
+    # Names come from the checkpoint (overwriting the destination's x/y names),
+    # restored in per-group destination order.
+    assert grouped[0]["param_names"] == ["block.weight", "block.bias"]
+    assert grouped[1]["param_names"] == ["head.weight"]
+
+    for p in params_dst:
+        p.grad = torch.zeros_like(p)
+    opt_dst.step()
+    for p in params_dst:
+        assert torch.isfinite(p).all()
+
+
+def test_load_legacy_flattened_checkpoint_tensor_valued_hyper():
+    # A legacy checkpoint whose per-param groups carry a TENSOR-valued lr routes
+    # the repacker's homogeneity check through _same_serialized_group_value's
+    # torch.equal branch. All params of live group 0 share the same tensor lr,
+    # so the compare returns True and the load succeeds.
+    _, opt_src = _multi_group_run_and_save()
+    legacy_sd = _legacy_flattened_param_groups(opt_src.state_dict())
+    # The first two flat groups map onto live group 0 (size 2): same tensor lr.
+    legacy_sd["param_groups"][0]["lr"] = torch.tensor(1e-3)
+    legacy_sd["param_groups"][1]["lr"] = torch.tensor(1e-3)
+
+    params_dst, opt_dst = _fresh_multi_group_opt()
+    opt_dst.load_state_dict(legacy_sd)
+    assert torch.is_tensor(opt_dst.param_groups[0]["lr"])
+    for p in params_dst:
+        p.grad = torch.zeros_like(p)
+    opt_dst.step()
+    for p in params_dst:
+        assert torch.isfinite(p).all()
+
+    # Heterogeneous tensor lrs across the SAME live group take the same
+    # torch.equal branch (returning False) and must raise -- mirroring the
+    # scalar heterogeneous-hyper rejection.
+    legacy_het = _legacy_flattened_param_groups(opt_src.state_dict())
+    legacy_het["param_groups"][0]["lr"] = torch.tensor(1e-3)
+    legacy_het["param_groups"][1]["lr"] = torch.tensor(2e-3)
+    _, opt_het = _fresh_multi_group_opt()
+    with pytest.raises(
+        ValueError,
+        match="legacy Gefen checkpoint with per-parameter hyperparameters",
+    ):
+        opt_het.load_state_dict(legacy_het)
+
+
 def _run_and_save(factored):
     model = _small_model()
     opt = Gefen(
