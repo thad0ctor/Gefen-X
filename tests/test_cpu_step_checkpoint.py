@@ -332,7 +332,7 @@ def _legacy_flattened_param_groups(state_dict):
     legacy_groups = []
     for group in state_dict["param_groups"]:
         names = group.get("param_names") or [
-            group.get("name", "param_{}".format(i))
+            "{}_{}".format(group.get("name", "param"), i)
             for i in range(len(group["params"]))
         ]
         for param_id, name in zip(group["params"], names):
