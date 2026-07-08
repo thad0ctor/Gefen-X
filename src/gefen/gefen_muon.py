@@ -1277,9 +1277,48 @@ class GefenMuon(Gefen):
         state_dict = super().state_dict()
         return self._consolidate_distributed_state_dict(state_dict)
 
+    def _warn_if_unconsolidated_distributed_load(self, state_dict, marker) -> None:
+        # In distributed mode the persistent momentum lives only on each matrix's
+        # stable owner rank; state_dict() runs a collective that broadcasts every
+        # owner's state to all ranks and stamps the consolidation marker. A
+        # checkpoint that skipped that consolidation (an old/foreign save, or a
+        # rank-0-only dump) leaves non-owner ranks without the owner's momentum, so
+        # a resumed run silently diverges. Warn (do NOT raise) so loading such a
+        # checkpoint degrades rather than crashes.
+        if not self._dist_available():
+            return
+        consolidated = isinstance(marker, dict) and marker.get("consolidated") is True
+        if consolidated:
+            return
+        try:
+            by_pg = self._distributed_state_items(state_dict)
+        except (KeyError, TypeError):
+            return
+        if not by_pg:
+            return
+        saved_state = state_dict.get("state", {})
+        carries_state = any(
+            saved_id in saved_state
+            for pg_items in by_pg.values()
+            for (_, _, saved_id) in pg_items
+        )
+        if not carries_state:
+            return
+        warnings.warn(
+            "GefenMuon.load_state_dict: loading a sharded_mode='distributed' "
+            "checkpoint that is not marked consolidated (missing/incomplete "
+            "'gefen_muon_distributed' marker written by GefenMuon.state_dict()). "
+            "Non-owner ranks may start with incomplete momentum and the resumed "
+            "run can diverge. Re-save with GefenMuon.state_dict() (called on every "
+            "rank) to produce a consolidated checkpoint.",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+
     def load_state_dict(self, state_dict):
         state_dict = dict(state_dict)
-        state_dict.pop("gefen_muon_distributed", None)
+        marker = state_dict.pop("gefen_muon_distributed", None)
+        self._warn_if_unconsolidated_distributed_load(state_dict, marker)
         super().load_state_dict(state_dict)
         self._drop_non_owned_distributed_state()
 

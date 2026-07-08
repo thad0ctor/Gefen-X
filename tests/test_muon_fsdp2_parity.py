@@ -791,6 +791,9 @@ def _worker_distributed_checkpoint_save(rank, world, port, path, q):
             opt.step()
 
         opt_state = opt.state_dict()  # collective consolidation
+        # After the collective consolidation EVERY rank must hold complete owner
+        # momentum for every param -- a regression where a non-zero rank keeps
+        # incomplete consolidated state must fail, so every rank reports.
         complete = all(
             "m_codebook" in opt_state["state"].get(pid, {})
             for group in opt_state["param_groups"]
@@ -808,9 +811,7 @@ def _worker_distributed_checkpoint_save(rank, world, port, path, q):
                 },
                 path,
             )
-            q.put(("saved", complete))
-        else:
-            q.put(("done", rank))
+        q.put(("saved", rank, complete))
         dist.barrier()
     finally:
         if dist.is_initialized():
@@ -851,13 +852,24 @@ def _worker_distributed_checkpoint_load(rank, world, port, path, q):
         )
         opt.load_state_dict(checkpoint["optimizer"])
 
-        owner_state_ok = all(
-            "m_codebook" in opt.state[p]
-            for idx, (_, p) in enumerate(params)
-            if _stable_distributed_owner(idx, world) == rank
-        )
+        # Full owner/non-owner invariant on THIS rank:
+        #   * every param this rank now owns has its momentum (m_codebook present);
+        #   * every param this rank does NOT own has EMPTY state -- proving
+        #     _drop_non_owned_distributed_state() actually dropped the momentum it
+        #     received during (broadcast) load rather than silently retaining it.
+        # A distributed load leaves only the sentinel "name" key on dropped params.
+        state_ok = True
+        for idx, (_, p) in enumerate(params):
+            owns = _stable_distributed_owner(idx, world) == rank
+            pstate_keys = set(opt.state[p].keys())
+            if owns:
+                if "m_codebook" not in pstate_keys:
+                    state_ok = False
+            else:
+                if pstate_keys - {"name"}:
+                    state_ok = False
         gathered_owner_state_ok = [None] * world
-        dist.all_gather_object(gathered_owner_state_ok, owner_state_ok)
+        dist.all_gather_object(gathered_owner_state_ok, state_ok)
 
         for step in range(CKPT_SPLIT_STEP, CKPT_TOTAL_STEPS):
             grads = _checkpoint_grads(step, shapes, dev)
@@ -932,18 +944,25 @@ def _run_distributed_checkpoint_case(path, save_world=2, load_world=2):
         _worker_distributed_checkpoint_save, save_world, path
     )
     saved = [item for item in save_items if item[0] == "saved"]
-    assert saved and saved[0][1], "[checkpoint] consolidated state missing owner momentum"
+    assert len(saved) == save_world, (
+        f"[checkpoint] expected {save_world} save-rank reports, got {len(saved)}"
+    )
+    incomplete = [rank for _, rank, complete in saved if not complete]
+    assert not incomplete, (
+        "[checkpoint] consolidated state missing owner momentum on save ranks "
+        f"{incomplete}"
+    )
 
     load_items = _spawn_checkpoint_phase(
         _worker_distributed_checkpoint_load, load_world, path
     )
     result = [item[1:] for item in load_items if item[0] == "result"]
     assert result, "[checkpoint] no load result from rank 0"
-    max_vs_oracle, finite, owner_state_ok = result[0]
-    ok = finite and all(owner_state_ok) and max_vs_oracle <= DIST_TOL
+    max_vs_oracle, finite, state_ok = result[0]
+    ok = finite and all(state_ok) and max_vs_oracle <= DIST_TOL
     print(
         f"[checkpoint {save_world}->{load_world}] finite={finite} "
-        f"owner_state_ok={owner_state_ok} max|resume-oracle|={max_vs_oracle:.3e} "
+        f"state_ok={state_ok} max|resume-oracle|={max_vs_oracle:.3e} "
         f"{'PASS' if ok else 'FAIL'}"
     )
     return ok
