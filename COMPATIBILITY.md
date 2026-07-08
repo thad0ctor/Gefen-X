@@ -122,4 +122,5 @@ Caveats:
 - `capturable=True` rejects the host-driven option `codebook_refresh_every > 0` at construction.
 - A float `lr` bakes into the graph (as in `torch.optim`); pass a tensor `lr` and update it in place to drive an LR schedule.
 - Checkpoints are portable across the `capturable` toggle in both directions.
-- Validated single-process; sharded (FSDP2) capture is not.
+- FSDP2 / DTensor row-shard capture is validated by `tests/test_capturable_fsdp2.py` on 2 ranks for plain Gefen plus GefenMuon `sharded_mode="approx"`, `"exact"`, and `"distributed"` (including empty-shard coverage); ranks must capture and replay in lockstep.
+- Capturing the sharded `"exact"`/`"distributed"` modes records NCCL collectives (the in-`step()` all-gather) into the graph, which requires an NCCL/PyTorch build that supports collective graph capture — validated on PyTorch 2.12 / CUDA 13.3; on older stacks capture may raise (use `"approx"` or plain Gefen, which take no collectives, or `capturable=False`).
