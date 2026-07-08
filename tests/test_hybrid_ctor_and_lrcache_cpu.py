@@ -161,13 +161,20 @@ def test_gefen_same_name_params_keep_isolated_state_within_one_group():
 def test_gefen_auto_names_do_not_collide_when_group_names_repeat():
     p0 = nn.Parameter(torch.ones(2, 2))
     p1 = nn.Parameter(torch.ones(2, 2))
+    p2 = nn.Parameter(torch.ones(2, 2))
     opt = Gefen([{"params": [p0], "name": "dup"}], lr=1e-3, fused=False)
 
     opt.add_param_group({"params": [p1], "name": "dup"})
+    opt.add_param_group({"params": [p2], "name": "dup"})
 
-    assert [group["param_names"] for group in opt.param_groups] == [["dup"], ["dup_1"]]
+    assert [group["param_names"] for group in opt.param_groups] == [
+        ["dup"],
+        ["dup_1"],
+        ["dup_2"],
+    ]
     assert opt.state[p0]["name"] == "dup"
     assert opt.state[p1]["name"] == "dup_1"
+    assert opt.state[p2]["name"] == "dup_2"
 
 
 def test_gefen_per_group_lr_and_weight_decay_route_numerically():

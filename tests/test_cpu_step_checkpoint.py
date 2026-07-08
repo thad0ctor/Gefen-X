@@ -195,6 +195,17 @@ def test_load_legacy_flattened_checkpoint_rejects_heterogeneous_group_hypers():
         opt_dst.load_state_dict(legacy_sd)
 
 
+def test_load_legacy_flattened_checkpoint_rejects_changed_trainable_set():
+    _, opt_src = _run_and_save(factored=False)
+    legacy_sd = _legacy_flattened_param_groups(opt_src.state_dict())
+
+    smaller_model = nn.Sequential(nn.Linear(32, 48))
+    opt_dst = Gefen(list(smaller_model.named_parameters()), lr=1e-3, fused=False)
+
+    with pytest.raises(ValueError, match="parameter group"):
+        opt_dst.load_state_dict(legacy_sd)
+
+
 def _run_and_save(factored):
     model = _small_model()
     opt = Gefen(
