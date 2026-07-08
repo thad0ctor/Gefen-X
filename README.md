@@ -58,6 +58,8 @@ cd Gefen-X
 pip install -e .          # imports as `gefen`
 ```
 
+> **Install PyTorch first.** `torch>=2.5` is a dependency, but pip's default PyTorch wheel may be CPU-only or built for a CUDA version that doesn't match your machine. Install the [PyTorch build for your platform/CUDA](https://pytorch.org/get-started/locally/) **before** installing Gefen. A CPU-only or mismatched build won't crash — Gefen falls back to pure PyTorch — but you lose the fused CUDA kernels.
+
 The package is pure-Python at install time, the fused kernels (CUDA required) are **built on first use** via PyTorch JIT (`torch.utils.cpp_extension`) + `nvcc`. The first CUDA run takes a few minutes; later runs reuse the cached build keyed on your Python / PyTorch / CUDA version, GPU architecture, and the Gefen source checkout. Force a rebuild with `GEFEN_FORCE_REBUILD=1`.
 
 **Requirements:** a CUDA toolkit and host compiler compatible with your PyTorch build (the JIT compiles for your GPU's compute capability; set `TORCH_CUDA_ARCH_LIST` to target arch or a multi-arch build).
