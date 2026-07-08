@@ -51,3 +51,4 @@ def test_package_lives_under_src_gefen():
         "the gefen package must live under src/gefen/ (src-layout)."
     )
     assert (REPO_ROOT / "src" / "gefen" / "kernels").is_dir()
+    assert (REPO_ROOT / "src" / "gefen" / "tools").is_dir()
