@@ -22,7 +22,12 @@ from typing import Any, Iterable
 
 import torch
 
-from .cells import CELL_RECIPES, CellBuildConfig, build_optimizer
+from .cells import (
+    BATCHED_NS_DEFAULT_WORKSPACE_BYTES,
+    CELL_RECIPES,
+    CellBuildConfig,
+    build_optimizer,
+)
 from .comparison import attach_comparison, canonical_json
 from .data import ALPACA_NO_INPUT, ALPACA_WITH_INPUT, deterministic_order
 from .schedule import GroupLRSchedule
@@ -110,6 +115,18 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="override the fair AdamW-scale Muon adjustment for a native-scaling ablation",
     )
     parser.add_argument("--fused", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument(
+        "--batched-ns",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="opt into shape-batched Newton-Schulz for Gefen Muon cells only",
+    )
+    parser.add_argument(
+        "--batched-ns-workspace-bytes",
+        type=_positive_int,
+        default=BATCHED_NS_DEFAULT_WORKSPACE_BYTES,
+        help="temporary-memory cap for the opt-in batched Newton-Schulz path",
+    )
     parser.add_argument("--grad-clip", type=float, default=1.0)
 
     parser.add_argument("--schedule", choices=("constant", "warmup_cosine"), default="constant")
@@ -404,6 +421,8 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             momentum=args.momentum,
             nesterov=args.nesterov,
             fused=args.fused,
+            batched_ns=args.batched_ns,
+            batched_ns_workspace_bytes=args.batched_ns_workspace_bytes,
             adjust_lr_fn=args.muon_adjust,
         ),
     )
@@ -591,6 +610,8 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             "nesterov": args.nesterov,
             "muon_adjust": args.muon_adjust,
             "fused": args.fused,
+            "batched_ns": args.batched_ns,
+            "batched_ns_workspace_bytes": args.batched_ns_workspace_bytes,
             "grad_clip": args.grad_clip,
         },
         "initialization": None,

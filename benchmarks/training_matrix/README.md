@@ -66,6 +66,21 @@ baseline. Native/reference scaling remains an explicit ablation:
 --muon-adjust original
 ```
 
+Shape-batched Newton-Schulz is a separate, explicit opt-in and defaults off:
+
+```bash
+--batched-ns --batched-ns-workspace-bytes 268435456
+```
+
+Only `GefenMuon` and the Muon child of `GefenMuonHybrid` receive these
+constructor arguments. AdamW and stock `torch.optim.Muon` result recipes record
+`batched_ns_supported=false`, effective `batched_ns=false`, and a null
+workspace even when the shared matrix command requests the experiment; this
+keeps the baseline cells runnable without suggesting that they used the
+optimization. The comparison context records both raw CLI values. The flag is
+an opt-in, not proof that a batch formed: the fast path also requires fused
+CUDA execution and at least two eligible matrices with the same shape.
+
 All cells default to matched `weight_decay=0`. Set one common value with
 `--weight-decay`, or deliberately separate the halves with
 `--muon-weight-decay` and `--backup-weight-decay`. `--muon-lr` and

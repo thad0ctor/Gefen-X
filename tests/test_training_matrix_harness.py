@@ -18,6 +18,7 @@ if str(ROOT) not in sys.path:
 
 from benchmarks.training_matrix.cells import (
     ALL_CELLS,
+    BATCHED_NS_DEFAULT_WORKSPACE_BYTES,
     CELL_RECIPES,
     CORE_CELLS,
     ISOLATION_CELLS,
@@ -34,6 +35,7 @@ from benchmarks.training_matrix.comparison import (
 )
 from benchmarks.training_matrix.data import build_dataset
 from benchmarks.training_matrix.hf_sft import accumulate_hf_microbatches
+from benchmarks.training_matrix.hf_sft import parse_args as parse_hf_sft_args
 from benchmarks.training_matrix.run_matrix import commands as matrix_commands
 from benchmarks.training_matrix.run_matrix import parse_args as parse_matrix_args
 from benchmarks.training_matrix.schedule import GroupLRSchedule
@@ -152,6 +154,108 @@ def test_resolved_lr_and_weight_decay_are_explicit_and_tunable():
     assert overridden["muon_weight_decay"] == pytest.approx(0.04)
     assert overridden["backup_weight_decay"] == pytest.approx(0.01)
     assert overridden["adjust_lr_fn"] == "original"
+
+
+def test_batched_ns_cli_defaults_off_with_an_explicit_workspace_cap():
+    tiny = parse_args(["--cell", "adamw"])
+    hf = parse_hf_sft_args(
+        [
+            "--cell",
+            "adamw",
+            "--model",
+            "unused",
+            "--lr",
+            "0.001",
+            "--results",
+            "unused.jsonl",
+        ]
+    )
+    for parsed in (tiny, hf):
+        assert parsed.batched_ns is False
+        assert (
+            parsed.batched_ns_workspace_bytes
+            == BATCHED_NS_DEFAULT_WORKSPACE_BYTES
+        )
+
+    enabled = parse_args(
+        [
+            "--cell",
+            "gefen_hybrid_recommended",
+            "--batched-ns",
+            "--batched-ns-workspace-bytes",
+            "123456",
+        ]
+    )
+    assert enabled.batched_ns is True
+    assert enabled.batched_ns_workspace_bytes == 123456
+
+
+@pytest.mark.parametrize("cell", ALL_CELLS)
+def test_batched_ns_resolved_default_is_off_and_support_is_honest(cell):
+    resolved = resolve_cell(cell, CellBuildConfig(lr=1e-3))
+    supported = CELL_RECIPES[cell].primary in {
+        "gefen.GefenMuon",
+        "gefen.GefenMuonHybrid",
+    }
+    assert resolved["batched_ns_requested"] is False
+    assert resolved["batched_ns_supported"] is supported
+    assert resolved["batched_ns"] is False
+    assert (
+        resolved["batched_ns_workspace_bytes_requested"]
+        == BATCHED_NS_DEFAULT_WORKSPACE_BYTES
+    )
+    assert resolved["batched_ns_workspace_bytes"] == (
+        BATCHED_NS_DEFAULT_WORKSPACE_BYTES if supported else None
+    )
+    assert resolved["unsupported_requests"] == []
+
+
+@pytest.mark.parametrize(
+    "cell",
+    ("gefen_muon_classic_adamw", "gefen_hybrid_recommended"),
+)
+def test_batched_ns_opt_in_reaches_actual_gefen_muon_child_group(cell):
+    workspace_bytes = 123456
+    optimizer, resolved = build_optimizer(
+        _model(),
+        cell,
+        CellBuildConfig(
+            lr=1e-3,
+            fused=False,
+            batched_ns=True,
+            batched_ns_workspace_bytes=workspace_bytes,
+        ),
+    )
+    child = optimizer.muon if isinstance(optimizer, GefenMuonHybrid) else optimizer.primary
+    group = child.param_groups[0]
+    assert group["batched_ns"] is True
+    assert group["batched_ns_workspace_bytes"] == workspace_bytes
+    assert resolved["batched_ns_requested"] is True
+    assert resolved["batched_ns_supported"] is True
+    assert resolved["batched_ns"] is True
+    assert resolved["batched_ns_workspace_bytes_requested"] == workspace_bytes
+    assert resolved["batched_ns_workspace_bytes"] == workspace_bytes
+
+
+@pytest.mark.parametrize("cell", ("adamw", "torch_muon_adamw"))
+def test_stock_cells_record_batched_ns_request_as_unsupported(cell):
+    optimizer, resolved = build_optimizer(
+        _model(),
+        cell,
+        CellBuildConfig(
+            lr=1e-3,
+            fused=False,
+            batched_ns=True,
+            batched_ns_workspace_bytes=123456,
+        ),
+    )
+    assert resolved["batched_ns_requested"] is True
+    assert resolved["batched_ns_supported"] is False
+    assert resolved["batched_ns"] is False
+    assert resolved["batched_ns_workspace_bytes_requested"] == 123456
+    assert resolved["batched_ns_workspace_bytes"] is None
+    assert resolved["unsupported_requests"] == ["batched_ns"]
+    assert all("batched_ns" not in group for group in optimizer.param_groups)
 
 
 def test_auxiliary_only_isolation_edges_hold_hidden_recipe_fixed():
@@ -276,6 +380,7 @@ def test_every_available_cell_takes_a_real_cpu_step(cell):
         assert optimizer.primary.param_groups[0]["eps"] == resolved["muon_eps"]
         assert optimizer.auxiliary.param_groups[0]["eps"] == resolved["backup_eps"]
         assert optimizer.primary.fused is resolved["primary_fused"]
+        assert optimizer.primary.param_groups[0]["batched_ns"] is False
         assert optimizer.auxiliary.param_groups[0]["fused"] is resolved["auxiliary_fused"]
     elif cell.startswith("gefen_hybrid"):
         assert isinstance(optimizer, GefenMuonHybrid)
@@ -283,6 +388,7 @@ def test_every_available_cell_takes_a_real_cpu_step(cell):
         assert optimizer.muon.param_groups[0]["eps"] == resolved["muon_eps"]
         assert optimizer.backup.param_groups[0]["eps"] == resolved["backup_eps"]
         assert optimizer.muon.fused is resolved["primary_fused"]
+        assert optimizer.muon.param_groups[0]["batched_ns"] is False
         assert optimizer.backup.fused is resolved["auxiliary_fused"]
     else:
         assert optimizer.param_groups[0]["eps"] == resolved["backup_eps"]
@@ -557,6 +663,9 @@ def test_pretrain_checkpoint_hands_weights_and_lineage_to_sft(tmp_path):
         "--dtype",
         "float32",
         "--no-fused",
+        "--batched-ns",
+        "--batched-ns-workspace-bytes",
+        "123456",
         "--hidden-size",
         "16",
         "--intermediate-size",
@@ -589,6 +698,14 @@ def test_pretrain_checkpoint_hands_weights_and_lineage_to_sft(tmp_path):
     assert sft["tail_eval_mean"] == sft["final_eval_loss"]
     assert sft["evaluation"][0]["step"] == 0
     assert sft["comparison_id"] == comparison_key(sft)[1]
+    assert pretrain["optimizer"]["batched_ns_requested"] is True
+    assert pretrain["optimizer"]["batched_ns_supported"] is False
+    assert pretrain["optimizer"]["batched_ns"] is False
+    assert pretrain["optimizer"]["batched_ns_workspace_bytes_requested"] == 123456
+    assert pretrain["optimizer"]["batched_ns_workspace_bytes"] is None
+    shared_optimizer_args = pretrain["comparison_context"]["shared_optimizer_args"]
+    assert shared_optimizer_args["batched_ns"] is True
+    assert shared_optimizer_args["batched_ns_workspace_bytes"] == 123456
     json.dumps(pretrain)
     json.dumps(sft)
 
@@ -727,6 +844,29 @@ def test_explicit_comparison_id_is_content_validated():
     baseline["comparison_context"]["seed"] = 1
     with pytest.raises(ValueError, match="stale/tampered"):
         comparison_key(baseline)
+
+
+def test_fallback_comparison_uses_requested_not_cell_effective_batched_ns():
+    stock = {
+        "optimizer": {
+            "batched_ns_requested": True,
+            "batched_ns_workspace_bytes_requested": 123456,
+            "batched_ns_supported": False,
+            "batched_ns": False,
+            "batched_ns_workspace_bytes": None,
+        }
+    }
+    gefen = copy.deepcopy(stock)
+    gefen["optimizer"].update(
+        batched_ns_supported=True,
+        batched_ns=True,
+        batched_ns_workspace_bytes=123456,
+    )
+    assert comparison_key(stock) == comparison_key(gefen)
+
+    different_request = copy.deepcopy(gefen)
+    different_request["optimizer"]["batched_ns_workspace_bytes_requested"] = 654321
+    assert comparison_key(stock) != comparison_key(different_request)
 
 
 def test_matrix_default_remains_core_cells_and_all_is_explicit():

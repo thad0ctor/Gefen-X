@@ -6,6 +6,7 @@ harness, not part of the installed ``gefen`` runtime API.
 
 from .cells import (
     ALL_CELLS,
+    BATCHED_NS_DEFAULT_WORKSPACE_BYTES,
     CELL_RECIPES,
     CORE_CELLS,
     ISOLATION_CELLS,
@@ -17,6 +18,7 @@ from .cells import (
 
 __all__ = [
     "ALL_CELLS",
+    "BATCHED_NS_DEFAULT_WORKSPACE_BYTES",
     "CELL_RECIPES",
     "CORE_CELLS",
     "ISOLATION_CELLS",

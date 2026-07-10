@@ -26,7 +26,12 @@ from typing import Any
 
 import torch
 
-from .cells import CELL_RECIPES, CellBuildConfig, build_optimizer
+from .cells import (
+    BATCHED_NS_DEFAULT_WORKSPACE_BYTES,
+    CELL_RECIPES,
+    CellBuildConfig,
+    build_optimizer,
+)
 from .comparison import attach_comparison, immutable_source_fingerprint
 from .data import DatasetBundle, build_dataset
 from .schedule import GroupLRSchedule
@@ -108,6 +113,18 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="override the cell's explicit Muon LR scaling (default: fair AdamW-scale recipes)",
     )
     parser.add_argument("--fused", action=argparse.BooleanOptionalAction, default=None)
+    parser.add_argument(
+        "--batched-ns",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="opt into shape-batched Newton-Schulz for Gefen Muon cells only",
+    )
+    parser.add_argument(
+        "--batched-ns-workspace-bytes",
+        type=_positive_int,
+        default=BATCHED_NS_DEFAULT_WORKSPACE_BYTES,
+        help="temporary-memory cap for the opt-in batched Newton-Schulz path",
+    )
     parser.add_argument("--grad-clip", type=float, default=1.0)
 
     parser.add_argument("--schedule", choices=("constant", "warmup_cosine"), default="warmup_cosine")
@@ -542,6 +559,8 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         momentum=args.momentum,
         nesterov=args.nesterov,
         fused=fused,
+        batched_ns=args.batched_ns,
+        batched_ns_workspace_bytes=args.batched_ns_workspace_bytes,
         adjust_lr_fn=args.muon_adjust,
     )
     optimizer, optimizer_recipe = build_optimizer(model, args.cell, build_config)
@@ -722,6 +741,8 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             "nesterov": args.nesterov,
             "muon_adjust": args.muon_adjust,
             "fused": fused,
+            "batched_ns": args.batched_ns,
+            "batched_ns_workspace_bytes": args.batched_ns_workspace_bytes,
             "grad_clip": args.grad_clip,
         },
         "initialization": (
