@@ -1369,6 +1369,9 @@ class Gefen(torch.optim.Optimizer):
                 d["keys"].append(info[0])
                 d["sqrt"].append(info[1])
                 d["betas"].append((group["beta1"], group["beta2"]))
+        single_cohort_registry = bool(per_dev) and all(
+            len(cohorts) == 1 for cohorts in per_dev.values()
+        )
         stacks = {}
         for device, cohorts in per_dev.items():
             device_stacks = []
@@ -1417,7 +1420,13 @@ class Gefen(torch.optim.Optimizer):
                     state["step"] = step_view
                     state["_capt_scalars"] = scalar_view
                     state.pop("_capt_consts", None)
-                    state["_capt_stack"] = stack_index
+                    if single_cohort_registry:
+                        # The fast validator addresses the sole stack directly.
+                        # Avoiding 0 in every row also keeps the per-step static-
+                        # address fingerprint at its old uniform-stack cost.
+                        state.pop("_capt_stack", None)
+                    else:
+                        state["_capt_stack"] = stack_index
                     state["_capt_row"] = i
                     step_views.append(step_view)
                     bc2_views.append(bc2_view)
@@ -1495,6 +1504,21 @@ class Gefen(torch.optim.Optimizer):
             if capturing:
                 return False
             return self._capt_build_stacks()
+        # Preserve the old uniform-stack host cost: the overwhelmingly common
+        # case has one scalar cohort per device, so stack_index is always zero
+        # and counts/live specs can be keyed by device directly. Keep every
+        # per-row alias/routing guard, but validate group-owned hypers once per
+        # contiguous device run instead of once per parameter. Heterogeneous
+        # registries take the fully general path below.
+        if stacks and all(
+            len(device_stacks) == 1 for device_stacks in stacks.values()
+        ):
+            if self._capt_single_cohort_ready(stacks):
+                return True
+            if capturing:
+                self._capt_invalidate()
+                return False
+            return self._capt_build_stacks()
         counts = {}
         live_specs = {}
         ok = True
@@ -1525,7 +1549,6 @@ class Gefen(torch.optim.Optimizer):
                     or rows[i] is not p
                     or stack["row_groups"][i] is not group
                     or stack["keys"][i] != info[0]
-                    or state.get("_capt_stack") != stack_index
                     or state.get("_capt_row") != i
                     or state["step"] is not stack["step_views"][i]
                     or state.get(info[0]) is not stack["bc2_views"][i]
@@ -1565,6 +1588,65 @@ class Gefen(torch.optim.Optimizer):
             self._capt_invalidate()
             return False
         return self._capt_build_stacks()
+
+    def _capt_single_cohort_ready(self, stacks) -> bool:
+        """Fast validation for one scalar cohort per device.
+
+        Group hyperparameters cannot vary between parameters inside a group,
+        so validate them once per contiguous device run. Row identity and all
+        state aliases remain guarded per parameter, including the scalar view
+        whose replacement must force a safe rebuild.
+        """
+        counts = {}
+        live_lrs = {}
+        for group in self.param_groups:
+            spec_device = None
+            for p in group["params"]:
+                info = self._capt_row_info(p)
+                if info is None:
+                    continue
+                device = p.device
+                device_stacks = stacks.get(device)
+                state = self.state[p]
+                if device_stacks is None or len(device_stacks) != 1:
+                    return False
+                stack = device_stacks[0]
+                i = counts.get(device, 0)
+                rows = stack["rows"]
+                if (
+                    i >= len(rows)
+                    or rows[i] is not p
+                    or stack["row_groups"][i] is not group
+                    or stack["keys"][i] != info[0]
+                    or state.get("_capt_row") != i
+                    or state["step"] is not stack["step_views"][i]
+                    or state.get(info[0]) is not stack["bc2_views"][i]
+                    or state.get("_capt_scalars") is not stack["scalar_views"][i]
+                ):
+                    return False
+                if device != spec_device:
+                    if (
+                        stack["betas"][i] != (group["beta1"], group["beta2"])
+                        or group["weight_decay"] != stack["weight_decay0"]
+                    ):
+                        return False
+                    lr = group["lr"]
+                    if stack["tensor_lr"]:
+                        if lr is not stack["lr0"]:
+                            return False
+                    elif torch.is_tensor(lr):
+                        return False
+                    live = live_lrs.get(device)
+                    if live is None:
+                        live_lrs[device] = lr
+                    elif not stack["tensor_lr"] and lr != live:
+                        return False
+                    spec_device = device
+                counts[device] = i + 1
+        return all(
+            counts.get(device, 0) == len(device_stacks[0]["rows"])
+            for device, device_stacks in stacks.items()
+        )
 
     def _capt_batched_refresh(self) -> None:
         # One short vectorized op chain per device/cohort stack replaces every
