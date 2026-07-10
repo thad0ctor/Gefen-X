@@ -15,6 +15,9 @@ import torch
 from gefen import GefenMuon, GefenMuonHybrid, split_params_for_muon
 
 
+BATCHED_NS_DEFAULT_WORKSPACE_BYTES = 256 << 20
+
+
 @dataclass(frozen=True)
 class CellRecipe:
     name: str
@@ -260,6 +263,8 @@ class CellBuildConfig:
     momentum: float = 0.95
     nesterov: bool = True
     fused: bool = False
+    batched_ns: bool = False
+    batched_ns_workspace_bytes: int = BATCHED_NS_DEFAULT_WORKSPACE_BYTES
     adjust_lr_fn: str | None = None
 
 
@@ -327,6 +332,15 @@ def resolve_cell(name: str, config: CellBuildConfig) -> dict[str, Any]:
     _check_positive("lr", config.lr)
     _check_positive("muon_eps", config.muon_eps)
     _check_positive("backup_eps", config.backup_eps)
+    if not isinstance(config.batched_ns, bool):
+        raise TypeError("batched_ns must be a boolean")
+    if not isinstance(config.batched_ns_workspace_bytes, int) or isinstance(
+        config.batched_ns_workspace_bytes, bool
+    ):
+        raise TypeError("batched_ns_workspace_bytes must be an integer")
+    _check_positive(
+        "batched_ns_workspace_bytes", config.batched_ns_workspace_bytes
+    )
     primary_lr = (
         config.lr
         if recipe.ns_steps is None or config.muon_lr is None
@@ -357,6 +371,10 @@ def resolve_cell(name: str, config: CellBuildConfig) -> dict[str, Any]:
     ):
         _check_nonnegative(key, value)
 
+    batched_ns_supported = recipe.primary in {
+        "gefen.GefenMuon",
+        "gefen.GefenMuonHybrid",
+    }
     resolved = asdict(recipe)
     if recipe.ns_steps is not None and config.adjust_lr_fn is not None:
         if config.adjust_lr_fn not in {"original", "match_rms_adamw"}:
@@ -383,6 +401,15 @@ def resolve_cell(name: str, config: CellBuildConfig) -> dict[str, Any]:
                 None if recipe.primary == "torch.optim.Muon" else config.fused
             ),
             "auxiliary_fused": config.fused if recipe.auxiliary is not None else None,
+            "batched_ns_requested": config.batched_ns,
+            "batched_ns_supported": batched_ns_supported,
+            "batched_ns": config.batched_ns if batched_ns_supported else False,
+            "batched_ns_workspace_bytes_requested": (
+                config.batched_ns_workspace_bytes
+            ),
+            "batched_ns_workspace_bytes": (
+                config.batched_ns_workspace_bytes if batched_ns_supported else None
+            ),
         }
     )
     overrides = []
@@ -408,6 +435,16 @@ def resolve_cell(name: str, config: CellBuildConfig) -> dict[str, Any]:
         overrides.append("momentum")
     if config.nesterov is not True:
         overrides.append("nesterov")
+    if config.batched_ns and batched_ns_supported:
+        overrides.append("batched_ns")
+    if (
+        config.batched_ns_workspace_bytes != BATCHED_NS_DEFAULT_WORKSPACE_BYTES
+        and batched_ns_supported
+    ):
+        overrides.append("batched_ns_workspace_bytes")
+    resolved["unsupported_requests"] = (
+        ["batched_ns"] if config.batched_ns and not batched_ns_supported else []
+    )
     resolved["recipe_overrides"] = overrides
     resolved["effective_label"] = (
         recipe.label
@@ -486,6 +523,8 @@ def build_optimizer(model: torch.nn.Module, name: str, config: CellBuildConfig):
             adjust_lr_fn=resolved["adjust_lr_fn"],
             normuon=resolved["normuon"],
             fused=config.fused,
+            batched_ns=resolved["batched_ns"],
+            batched_ns_workspace_bytes=resolved["batched_ns_workspace_bytes"],
         )
         auxiliary = torch.optim.AdamW(
             _params(backup_named),
@@ -515,6 +554,8 @@ def build_optimizer(model: torch.nn.Module, name: str, config: CellBuildConfig):
         ns_schedule=resolved["ns_schedule"],
         adjust_lr_fn=resolved["adjust_lr_fn"],
         normuon=resolved["normuon"],
+        batched_ns=resolved["batched_ns"],
+        batched_ns_workspace_bytes=resolved["batched_ns_workspace_bytes"],
         backup_1d_period_one=resolved["backup_1d_period_one"],
         backup_2d_period_one=resolved["backup_2d_period_one"],
     )
