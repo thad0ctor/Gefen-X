@@ -1,9 +1,11 @@
- ### `Gefen-X` Fork
-
 <p align="center">
   <a href="https://pypi.org/project/gefen-x/"><img src="https://img.shields.io/pypi/v/gefen-x?style=flat-square&amp;color=blue" alt="PyPI"></a>
   <a href="https://pypi.org/project/gefen-x/"><img src="https://img.shields.io/pypi/pyversions/gefen-x?style=flat-square" alt="Python versions"></a>
   <a href="https://github.com/thad0ctor/Gefen-X/blob/main/LICENSE"><img src="https://img.shields.io/pypi/l/gefen-x?style=flat-square" alt="License"></a>
+</p>
+
+<p align="center">
+  <img src="https://raw.githubusercontent.com/thad0ctor/Gefen-X/main/media/gefen-x-pulse.gif" alt="Gefen-X" width="640">
 </p>
 
 **A fork of [upstream Gefen](https://github.com/ndvbd/Gefen) that fixes critical gaps in the shipped release, adds modern-architecture support, and closes the loss gap to AdamW.**
