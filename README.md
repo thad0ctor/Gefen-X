@@ -190,6 +190,8 @@ You can run these yourself — see [`benchmarks/`](https://github.com/thad0ctor/
 
 **Throughput vs peak VRAM** — the speed/memory frontier (upper-left = faster *and* lighter is better). Gefen-fused holds the lowest-VRAM column at ≈0.96× the fused-AdamW throughput at both scales; AdamW-4-bit is worst on *both* axes despite its small optimizer state (torchao transient buffers). 
 
+> **Why AdamW-4-bit's peak VRAM is high (and Gefen's isn't).** torchao's 4-bit step [upcasts each parameter's state to fp32 to compute the update](https://github.com/pytorch/ao/tree/main/torchao/optim) ("optimizer step calculations are always done in FP32"), so the peak is set by a transient stack of fp32 buffers sized to the *largest* tensor — here the tied embedding / LM head — not by the tiny 1.06 B/param packed state. With **bf16 master weights** the fused-AdamW baseline is already lean, so that fp32 spike pushes 4-bit's peak *above* even full-precision AdamW (15.11 vs 14.00 GiB at 1.7B). Gefen keeps the same ≈1 B/param state *without* the fp32 recompute, so it holds the lowest peak in the table — the smaller-model / large-vocab regime where 4-bit's spike is largest is exactly where Gefen's VRAM lead is widest.
+
 Gefen-Muon shares Gefen-fused's lowest-VRAM column but sits far lower on throughput — the Newton-Schulz orthogonalization makes it the slowest optimizer.
 
 ![Qwen3-1.7B throughput vs VRAM](https://raw.githubusercontent.com/thad0ctor/Gefen-X/main/docs/benchmarks/tput_vram_qwen1p7b.png)
