@@ -194,6 +194,7 @@ def test_float_lr_cohort_moves_together_then_rebuilds_on_divergence():
     )
     _warm_stacks(opt, params)
     assert len(_stacks(opt)) == 1
+    assert all("_capt_stack" not in opt.state[p] for p in params)
 
     builds = 0
     original_build = opt._capt_build_stacks
@@ -216,6 +217,7 @@ def test_float_lr_cohort_moves_together_then_rebuilds_on_divergence():
     opt.step()
     assert builds == 1
     assert len(_stacks(opt)) == 2
+    assert [opt.state[p]["_capt_stack"] for p in params] == [0, 0, 1, 1]
     _set_grads(params, 5)
     opt.step()
     assert builds == 1  # the heterogeneous registry is retained, not retried
