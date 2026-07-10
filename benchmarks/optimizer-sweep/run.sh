@@ -82,7 +82,7 @@ fair_lr() {
   case "$1" in
     adamw_bf16|adamw8bit|adamw4bit) echo "5e-5" ;;
     gefen_fused|gefen_nonfused)     echo "3e-5" ;;  # factored-v default (block-v legacy: 2e-5)
-    gefen_muon)                     echo "5e-5" ;;
+    gefen_muon)                     echo "3e-5" ;;
     *) echo "5e-5" ;;
   esac
 }
@@ -92,7 +92,7 @@ sweep_grid() {
   case "$1" in
     adamw_bf16|adamw8bit|adamw4bit) echo "1e-5 2e-5 5e-5 1e-4" ;;
     gefen_fused|gefen_nonfused)     echo "1e-5 2e-5 3e-5 5e-5" ;;
-    gefen_muon)                     echo "1e-5 2e-5 5e-5 1e-4" ;;
+    gefen_muon)                     echo "1e-5 2e-5 3e-5 5e-5" ;;
     *) echo "1e-5 2e-5 5e-5" ;;
   esac
 }

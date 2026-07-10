@@ -38,7 +38,7 @@ gefen_muon` — pass `--no-muon` to drop the (slow) Newton-Schulz `gefen_muon`.
 
 The fair default LRs (175-step fair-sweep optima): AdamW family `5e-5`,
 `gefen_fused` / `gefen_nonfused` `3e-5` (the shipped `factored_v_2d` default;
-the legacy block-shared mode's fair LR is `2e-5`), `gefen_muon` `5e-5` (with
+the legacy block-shared mode's fair LR is `2e-5`), `gefen_muon` `3e-5` (with
 `--muon-adjust match_rms_adamw`). Pass `--lr-sweep` to re-derive each
 optimizer's optimum on your hardware instead of using these defaults.
 

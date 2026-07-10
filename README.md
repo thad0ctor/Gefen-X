@@ -169,7 +169,8 @@ You can run these yourself — see [`benchmarks/`](https://github.com/thad0ctor/
 - **Models:** Qwen3-0.6B and Qwen3-1.7B — full fine-tune (all weights trained, no adapters).
 - **Regime:** bf16 master weights, gradient checkpointing, sequence length 2048, micro-batch 1, Alpaca greedy-packed to 2048-token blocks, 2000 steps, identical data order across optimizers, 32-example held-out eval.
 - **Noise:** single seed; the eval metric moves about ±0.005–0.007 between reruns (bf16 nondeterminism), so treat eval differences under 0.01 as a tie.
-- **Learning rate (each at its own fair optimum):** AdamW family `5e-5`; Gefen `3e-5`; Gefen-Muon `5e-5` with the recommended hybrid config.
+- **Learning rate (each at its own fair optimum):** AdamW family `5e-5`; Gefen
+  `3e-5`; balanced-SFT Gefen-Muon `3e-5`.
 - **Optimizers:** `adamw_bf16` = torch fused AdamW · `adamw8bit` =
   bitsandbytes · `adamw4bit` = torchao · `gefen_fused` =
   `Gefen(fused=True)` · `gefen_muon` = the balanced SFT
