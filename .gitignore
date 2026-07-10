@@ -17,6 +17,7 @@ benchmarks/data/
 
 # Generated optimizer-matrix results, logs, and checkpoints
 benchmarks/training_matrix/out/
+benchmarks/training_matrix/RESULTS_*.md
 
 # Toy fine-tuning example outputs (generated data + saved checkpoints)
 examples/toy-finetune/data/

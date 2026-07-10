@@ -17,8 +17,8 @@ The older [`optimizer-sweep`](../optimizer-sweep/README.md) remains the source
 for the published historical rows. This matrix makes the control recipes and
 current literal-vs-recommended behavior explicit.
 
-The retained RTX 3090 performance and training-quality evidence collected for
-this matrix is summarized in [`RESULTS_2026-07-10.md`](RESULTS_2026-07-10.md).
+Generated result rows, checkpoints, and run-specific reports are intentionally
+untracked. This document defines the reproducible protocol and output schema.
 Generated JSONL artifacts remain intentionally untracked.
 
 ## Seven core cells
