@@ -58,6 +58,16 @@ CASES = [
 ]
 STEPS = [1, 2, 7, 50]
 
+# Representative shapes whose default path changes when moving from the legacy
+# partial-update crossover to the current full-kernel crossover. This pins the
+# accepted numerical contract at the exact v1/v2 boundary being retuned.
+ROUTE_SWITCH_CASES = [
+    (4096, 1),    # legacy v2 -> full v1: tiny period
+    (4096, 12),   # legacy v2 -> full v1: packed short rows
+    (4, 512),     # legacy v2 -> full v1: few medium-period rows
+    (512, 8192),  # legacy v1 -> full v2: large-period split reducer
+]
+
 
 def _codebook(device, seed=0):
     g = torch.Generator(device=device).manual_seed(seed)
@@ -109,6 +119,19 @@ def _fused(mod, p, gv, ms, mm, vm, cb, step, wd, lut=None):
     if lut is None:
         lut = torch.empty(0, dtype=torch.int16, device=p.device)
     mod.automatic_gefen_fused_update_v2_full_cuda(
+        p, gv, ms, mm, vm, cb, lut, False, BETA1, BETA2, LR, EPS,
+        1.0 / math.sqrt(bc2), 1.0 / bc1, weight_decay_factor)
+    return p, ms, mm, vm
+
+
+def _fused_v1(mod, p, gv, ms, mm, vm, cb, step, wd, lut=None):
+    p, ms, mm, vm = p.clone(), ms.clone(), mm.clone(), vm.clone()
+    bc1 = 1 - BETA1 ** step
+    bc2 = 1 - BETA2 ** step
+    weight_decay_factor = 1.0 - LR * wd
+    if lut is None:
+        lut = torch.empty(0, dtype=torch.int16, device=p.device)
+    mod.automatic_gefen_fused_full_update_cuda(
         p, gv, ms, mm, vm, cb, lut, False, BETA1, BETA2, LR, EPS,
         1.0 / math.sqrt(bc2), 1.0 / bc1, weight_decay_factor)
     return p, ms, mm, vm
@@ -213,10 +236,58 @@ def determinism(device, runs=4):
     return ok
 
 
+def route_switch_numerics(device):
+    """The full-kernel route may change performance, not optimizer semantics.
+
+    The momentum state is exactly equal across v1/v2. Their different grad^2
+    reduction orders may perturb vmean and therefore p within the same bound
+    already used for v2-full versus the standalone tree reduction. With one
+    grad^2 term per row (period one), every output remains bit-identical.
+    """
+    mod = _load_extension()
+    cb = _codebook(device, seed=19)
+    lut = _codebook_search_lut(cb)
+    ok = True
+    for num_blocks, period in ROUTE_SWITCH_CASES:
+        numel = num_blocks * period
+        p, gv, ms, mm, vm = _make(
+            numel, period, torch.float32, device, 700 + period
+        )
+        v1_p, v1_ms, v1_mm, v1_vm = _fused_v1(
+            mod, p, gv, ms, mm, vm, cb, step=7, wd=0.1, lut=lut
+        )
+        v2_p, v2_ms, v2_mm, v2_vm = _fused(
+            mod, p, gv, ms, mm, vm, cb, step=7, wd=0.1, lut=lut
+        )
+        momentum_exact = _bit_equal(v1_ms, v2_ms) and _bit_equal(v1_mm, v2_mm)
+        p_ok = torch.allclose(v1_p, v2_p, rtol=VMEAN_RTOL, atol=VMEAN_ATOL)
+        vm_ok = torch.allclose(v1_vm, v2_vm, rtol=VMEAN_RTOL, atol=VMEAN_ATOL)
+        if period == 1:
+            p_ok = p_ok and _bit_equal(v1_p, v2_p)
+            vm_ok = vm_ok and _bit_equal(v1_vm, v2_vm)
+        good = momentum_exact and p_ok and vm_ok
+        ok = ok and good
+        if not good:
+            print(
+                f"  [route-switch FAIL] blocks={num_blocks} period={period} "
+                f"momentum_exact={momentum_exact} p_ok={p_ok} vm_ok={vm_ok}"
+            )
+    print(
+        "[full v1/v2 route-switch numerics: exact momentum; bounded vmean/p] "
+        f"{len(ROUTE_SWITCH_CASES)} cases -> {'PASS' if ok else 'FAIL'}"
+    )
+    return ok
+
+
 def run_suite(device):
     cap = torch.cuda.get_device_capability(device)
     print(f"=== device {device} ({torch.cuda.get_device_name(device)}, sm_{cap[0]}{cap[1]}) ===")
-    results = [parity(device, wd=0.0), parity(device, wd=0.1), determinism(device)]
+    results = [
+        parity(device, wd=0.0),
+        parity(device, wd=0.1),
+        determinism(device),
+        route_switch_numerics(device),
+    ]
     ok = all(results)
     print(f"OVERALL [{device}]: {'PASS' if ok else 'FAIL'}\n")
     return ok
@@ -228,6 +299,10 @@ if pytest is not None:
     @requires_cuda
     def test_fused_update_v2_full_parity():
         assert run_suite(torch.device("cuda"))
+
+    @requires_cuda
+    def test_full_v1_v2_route_switch_numerics():
+        assert route_switch_numerics(torch.device("cuda"))
 
 
 if __name__ == "__main__":

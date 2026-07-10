@@ -23,17 +23,31 @@ _EXTENSION_MODULE = None
 _V2_PERIOD_MAX = 16  # period <= 16 underfills the warp (threads = next_pow2)
 _V2_BLOCKS_PER_SM = 2  # below 2 blocks/SM the single-pass kernel can't fill SMs
 
-# Capturable-only tiny-param override for the FULL-update routing (see
+# Capturable tiny-param extension for the FULL-update routing (see
 # Gefen._step_automatic): a param this small is launch-bound, not
 # occupancy-bound -- the v1-full path is ONE kernel while the v2-full path is
 # 4-5 launches (zero-fill + two phases + finalize + the capturable magnitude
 # copy), so inside a replayed/captured graph v1 wins on node count no matter
-# how badly it underfills the SMs. v1-full and v2-full are NOT bit-identical
-# (the in-kernel vmean grad^2 sums reduce in different orders -- measured
-# ulp-level vmean/p diffs, m_sign identical), so the override applies ONLY
-# under capturable=True, where there is no bit-exact-vs-history contract;
-# capturable=False keeps the historical routing bit-for-bit.
+# how badly it underfills the SMs. The general full-kernel predicate below is
+# also performance-calibrated for eager execution. v1-full and v2-full reduce
+# grad^2 in different orders, so a route change can produce documented
+# sub-ULP vmean/p differences; momentum indices and magnitudes remain exact.
 _CAPT_V1_FULL_TINY_NUMEL = 1 << 14
+
+# The fully-fused pair has diverged from the legacy update pair that originally
+# calibrated ``_should_use_v2``.  In particular, v1-full now packs multiple
+# short rows into one block while v2-full's flat phase performs one atomic max
+# and one atomic add per element for periods up to 2048.  Direct current-kernel
+# sweeps on sm_86 and sm_120 show v1-full wins throughout periods 16..2048
+# (apart from the very-large period-16 tail), and also wins the
+# one-vs-three-launch contest for small low-period tensors. Keep a separate
+# predicate so the public legacy v1/v2 dispatcher retains its historical
+# crossover.
+_FULL_V1_PERIOD_MIN = 16
+_FULL_V1_PERIOD_MAX = 2048
+_FULL_V1_TINY_NUM_BLOCKS = 1 << 13
+_FULL_V2_LARGE_PERIOD_MIN = 1 << 13
+_FULL_V2_PERIOD16_NUMEL = 1 << 24
 
 
 def _env_override(name: str) -> Optional[str]:
@@ -157,6 +171,32 @@ def _should_use_v2(num_blocks: int, period: int, device: torch.device) -> bool:
         # initialize (or crash on) CUDA on CPU-only hosts).
         return False
     return num_blocks < _V2_BLOCKS_PER_SM * _sm_count(device)
+
+
+def _should_use_v2_full(
+    num_blocks: int, period: int, device: torch.device
+) -> bool:
+    """Route the current fully-fused v1/v2 pair.
+
+    ``_should_use_v2`` remains the contract for the older partial-update pair.
+    Full v1 gained multi-row packing and LUT search later, while full v2 has a
+    high-contention flat-atomic phase through period 2048, so sharing the old
+    predicate now misroutes both tiny tensors and medium periods.
+    """
+    if _GEFEN_UPDATE_V2_ENV is not None:
+        return _GEFEN_UPDATE_V2_ENV.lower() not in {"0", "false", "no", "off"}
+    numel = num_blocks * period
+    if period <= 15 and num_blocks <= _FULL_V1_TINY_NUM_BLOCKS:
+        return False
+    if period >= _FULL_V2_LARGE_PERIOD_MIN:
+        return True
+    if _FULL_V1_PERIOD_MIN <= period <= _FULL_V1_PERIOD_MAX:
+        # At period 16 the v1 grid eventually becomes launch/dispatch heavy;
+        # both sm_86 and sm_120 sweeps cross only at this very large tail.
+        if period == 16 and numel >= _FULL_V2_PERIOD16_NUMEL:
+            return True
+        return False
+    return _should_use_v2(num_blocks, period, device)
 
 
 def automatic_gefen_fused_update_cuda(
@@ -334,13 +374,17 @@ def _quantized_momentum_update_impl(
     stochastic_round: bool = False,
     rng_seed: int = 0,
     seed_dev: Optional[torch.Tensor] = None,
+    codebook_lut: Optional[torch.Tensor] = None,
 ) -> None:
     grad_c = grad_view if grad_view.is_contiguous() else grad_view.contiguous()
     cb_c = codebook if codebook.is_contiguous() else codebook.contiguous()
 
     module = _load_extension()
     module.gefen_quantized_momentum_update_cuda(
-        grad_c, m_sign, m_magnitude, cb_c, momentum_out, beta1,
+        grad_c, m_sign, m_magnitude, cb_c,
+        codebook_lut if codebook_lut is not None
+        else _codebook_search_lut(cb_c),
+        momentum_out, beta1,
         stochastic_round, rng_seed, seed_dev
     )
 
@@ -573,7 +617,12 @@ def gefen_factored_update_cuda(
 
     ``seed_dev`` (capturable stochastic rounding): 0-dim/[1] int64 device
     tensor with the per-step rounding seed; overrides the host ``rng_seed``
-    when given (see ``automatic_gefen_fused_full_update_cuda``)."""
+    when given (see ``automatic_gefen_fused_full_update_cuda``).
+
+    ``codebook_lut`` optionally supplies the cached int16 search bounds used by
+    the chunked emitter.  Eager callers may omit it (the wrapper resolves the
+    process cache); compiled/captured callers pass the optimizer-owned static
+    tensor so no allocation occurs inside the custom op."""
     if (
         step_scalars is not None
         and codebook_lut is not None
@@ -610,6 +659,7 @@ def gefen_quantized_momentum_update_cuda(
     stochastic_round: bool = False,
     rng_seed: int = 0,
     seed_dev: Optional[torch.Tensor] = None,
+    codebook_lut: Optional[torch.Tensor] = None,
 ) -> None:
     """Muon-specific quantized-momentum update: advance the quantized momentum
     state (m_sign / m_magnitude) AND emit the dense quantized momentum
@@ -628,18 +678,22 @@ def gefen_quantized_momentum_update_cuda(
     # registration flag first: False on torch builds too old to have
     # torch.compiler.is_compiling, whose evaluation would raise -- and this
     # wrapper runs on the DEFAULT (non-capturable) path too.
-    if _COMPILE_OPS_REGISTERED and torch.compiler.is_compiling():
+    if (
+        codebook_lut is not None
+        and _COMPILE_OPS_REGISTERED
+        and torch.compiler.is_compiling()
+    ):
         # Traced step: custom op keeps the kernel in the graph (no break).
         # This kernel always copies m_magnitude in place, so it is safe in
         # both capturable and non-capturable modes.
         torch.ops.gefen.quantized_momentum_update(
             grad_view, m_sign, m_magnitude, codebook, momentum_out, beta1,
-            stochastic_round, rng_seed, seed_dev,
+            stochastic_round, rng_seed, seed_dev, codebook_lut,
         )
         return
     _quantized_momentum_update_impl(
         grad_view, m_sign, m_magnitude, codebook, momentum_out, beta1,
-        stochastic_round, rng_seed, seed_dev,
+        stochastic_round, rng_seed, seed_dev, codebook_lut,
     )
 
 

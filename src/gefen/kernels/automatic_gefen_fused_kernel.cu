@@ -431,6 +431,12 @@ int choose_threads(int64_t period) {
     return threads;
 }
 
+// Muon's momentum-only two-phase path: above this period, reducing locally
+// before one atomic per CUDA block is substantially faster than issuing one
+// atomicMax per element. The same cutoff keeps the lower-overhead scalar emit
+// kernel for the small-period tail; larger periods use the chunked/LUT emitter.
+constexpr int64_t GEFEN_MOMENTUM_FLAT_MAX_PERIOD = 64;
+
 // ---------------------------------------------------------------------------
 // Fully-fused v1 update (Tier-1 K1+K2): a single kernel that, in the same
 // pass-1 grad read the absmax already needs, also accumulates Sum(grad^2) and
@@ -1411,6 +1417,108 @@ __global__ __launch_bounds__(256) void gefen_update_flat_full_kernel(
 
         gefen_store_update_chunk(m_sign, p, base, total_numel, full,
                                  lr != 0.0f, sign_out, p_out);
+    }
+}
+
+// Muon phase 2: quantize the advanced momentum and emit the dense tensor that
+// Newton--Schulz consumes.  This is the no-parameter-write sibling of the
+// chunked full-update kernel above.  The old emitter assigned one element to
+// each thread, paying an int64 idx/period division plus scalar grad/sign/output
+// transactions per element and an eight-step full-codebook search.  Each
+// thread now owns eight adjacent elements: one divmod plus exact carries,
+// vector traffic, and the same bit-exact LUT-narrowed lower_bound used by the
+// Gefen update kernels.
+//
+// The dense output deliberately retains the old two-round contract:
+// codebook fp32 -> scalar_t, then scalar_t*fp32 magnitude -> scalar_t.  Do not
+// collapse those casts or replace updated/new_mag with reciprocal-multiply;
+// either change would perturb the bf16/fp16 Newton--Schulz input.
+template <typename scalar_t>
+__global__ __launch_bounds__(256) void gefen_momentum_emit_chunked_kernel(
+    const scalar_t* __restrict__ grad_view,
+    uint8_t* __restrict__ m_sign,
+    const float* __restrict__ old_magnitude,
+    const float* __restrict__ new_magnitude,
+    const float* __restrict__ codebook,
+    const int16_t* __restrict__ lut,
+    int lut_buckets,
+    scalar_t* __restrict__ momentum_out,
+    int codebook_size,
+    int64_t period,
+    int64_t total_numel,
+    float beta1,
+    bool stochastic_round,
+    uint64_t rng_seed,
+    const int64_t* __restrict__ rng_seed_dev
+) {
+    if (stochastic_round && rng_seed_dev != nullptr) {
+        rng_seed = static_cast<uint64_t>(
+            __ldg(reinterpret_cast<const long long*>(rng_seed_dev)));
+    }
+    extern __shared__ float s_codebook[];
+    for (int i = threadIdx.x; i < codebook_size; i += blockDim.x) {
+        s_codebook[i] = codebook[i];
+    }
+    __syncthreads();
+
+    const bool ptrs_aligned = gefen_aligned16(grad_view) &&
+                              gefen_aligned8(m_sign) &&
+                              gefen_aligned16(momentum_out);
+    const int64_t chunk_stride =
+        static_cast<int64_t>(gridDim.x) * blockDim.x * GEFEN_UPD_CHUNK;
+    for (int64_t base =
+             (static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x) *
+             GEFEN_UPD_CHUNK;
+         base < total_numel; base += chunk_stride) {
+        const bool full =
+            ptrs_aligned && (base + GEFEN_UPD_CHUNK <= total_numel);
+        int64_t blk = base / period;
+        int64_t pin = base - blk * period;
+
+        float g_f[GEFEN_UPD_CHUNK];
+        uint8_t sign_in[GEFEN_UPD_CHUNK];
+        alignas(16) scalar_t unused_out[GEFEN_UPD_CHUNK];
+        gefen_load_update_chunk(
+            grad_view, m_sign, momentum_out, base, total_numel, full,
+            false, g_f, sign_in, unused_out);
+
+        uint8_t sign_out[GEFEN_UPD_CHUNK];
+        alignas(16) scalar_t momentum_v[GEFEN_UPD_CHUNK];
+        float old_mag = old_magnitude[blk];
+        float new_mag = new_magnitude[blk];
+        #pragma unroll
+        for (int k = 0; k < GEFEN_UPD_CHUNK; ++k) {
+            if (!full && base + k >= total_numel) {
+                break;
+            }
+            const float coeff = s_codebook[static_cast<int>(sign_in[k])];
+            const float updated =
+                updated_momentum_val(coeff, old_mag, g_f[k], beta1);
+            float normalized_value = 0.0f;
+            if (new_mag > 0.0f) {
+                normalized_value = updated / new_mag;
+            }
+            const uint8_t quantized_index = quantize_codebook_index_lut(
+                normalized_value, s_codebook, codebook_size, lut, lut_buckets,
+                stochastic_round, rng_seed, base + k);
+            sign_out[k] = quantized_index;
+            const scalar_t quantized_coeff = static_cast<scalar_t>(
+                s_codebook[static_cast<int>(quantized_index)]);
+            momentum_v[k] = static_cast<scalar_t>(
+                static_cast<float>(quantized_coeff) * new_mag);
+
+            if (++pin == period) {
+                pin = 0;
+                ++blk;
+                if (k + 1 < GEFEN_UPD_CHUNK && base + k + 1 < total_numel) {
+                    old_mag = old_magnitude[blk];
+                    new_mag = new_magnitude[blk];
+                }
+            }
+        }
+        gefen_store_update_chunk(
+            m_sign, momentum_out, base, total_numel, full, true,
+            sign_out, momentum_v);
     }
 }
 
@@ -2702,6 +2810,7 @@ void gefen_quantized_momentum_update_cuda(
     at::Tensor m_sign,
     at::Tensor m_magnitude,
     at::Tensor codebook,
+    at::Tensor lut,
     at::Tensor momentum_out,
     double beta1,
     bool stochastic_round,
@@ -2711,6 +2820,19 @@ void gefen_quantized_momentum_update_cuda(
     if (!grad_view.is_cuda() || !m_sign.is_cuda() || !m_magnitude.is_cuda() ||
         !codebook.is_cuda() || !momentum_out.is_cuda()) {
         throw std::invalid_argument("Expected all tensors to be on CUDA.");
+    }
+    const bool use_lut = lut.numel() > 0;
+    if (use_lut) {
+        if (!lut.is_cuda() || lut.device() != grad_view.device()) {
+            throw std::invalid_argument(
+                "Expected lut on the same device as grad_view.");
+        }
+        if (!lut.is_contiguous() || lut.scalar_type() != at::kShort) {
+            throw std::invalid_argument("Expected lut to be contiguous int16.");
+        }
+        if (lut.numel() < 2) {
+            throw std::invalid_argument("Expected lut to have at least 2 entries.");
+        }
     }
     // Optional capturable device-side stochastic-rounding seed (read by the
     // phase-2 emit kernel); null -> legacy host-seed path.
@@ -2782,7 +2904,11 @@ void gefen_quantized_momentum_update_cuda(
     GEFEN_DISPATCH_FLOAT_HALF_BF16(
         grad_view.scalar_type(),
         "gefen_momentum_magnitude", [&] {
-            if (period <= 2048) {
+            // Per-element atomics scale poorly once many elements share a
+            // magnitude slot.  The split reducer wins decisively on both
+            // Ampere and Blackwell above this small-period tail (notably the
+            // period-512/2048 K/V matrices common in transformer Muon paths).
+            if (period <= GEFEN_MOMENTUM_FLAT_MAX_PERIOD) {
                 int64_t nblocks = (total_numel + threads - 1) / threads;
                 if (nblocks > flat_blocks_cap) nblocks = flat_blocks_cap;
                 if (nblocks < 1) nblocks = 1;
@@ -2812,13 +2938,34 @@ void gefen_quantized_momentum_update_cuda(
     GEFEN_DISPATCH_FLOAT_HALF_BF16(
         grad_view.scalar_type(),
         "gefen_momentum_emit", [&] {
-            int64_t nblocks = (total_numel + threads - 1) / threads;
+            if (period <= GEFEN_MOMENTUM_FLAT_MAX_PERIOD) {
+                // At tiny periods phase 1 is already a flat grid and the
+                // scalar emitter has slightly lower register/control overhead;
+                // keep it instead of regressing the elementwise tail.
+                int64_t nblocks = (total_numel + threads - 1) / threads;
+                if (nblocks > flat_blocks_cap) nblocks = flat_blocks_cap;
+                if (nblocks < 1) nblocks = 1;
+                gefen_momentum_emit_flat_kernel<scalar_t><<<static_cast<unsigned int>(nblocks), threads, codebook_bytes, c10::cuda::getCurrentCUDAStream()>>>(
+                    grad_view.data_ptr<scalar_t>(), m_sign.data_ptr<uint8_t>(),
+                    m_magnitude.data_ptr<float>(), new_magnitude.data_ptr<float>(),
+                    codebook.data_ptr<float>(), momentum_out.data_ptr<scalar_t>(),
+                    codebook_size, period, total_numel, static_cast<float>(beta1),
+                    stochastic_round, static_cast<uint64_t>(rng_seed),
+                    seed_dev_ptr);
+                return;
+            }
+            const int64_t chunk_span =
+                static_cast<int64_t>(threads) * GEFEN_UPD_CHUNK;
+            int64_t nblocks = (total_numel + chunk_span - 1) / chunk_span;
             if (nblocks > flat_blocks_cap) nblocks = flat_blocks_cap;
             if (nblocks < 1) nblocks = 1;
-            gefen_momentum_emit_flat_kernel<scalar_t><<<static_cast<unsigned int>(nblocks), threads, codebook_bytes, c10::cuda::getCurrentCUDAStream()>>>(
+            gefen_momentum_emit_chunked_kernel<scalar_t><<<static_cast<unsigned int>(nblocks), threads, codebook_bytes, c10::cuda::getCurrentCUDAStream()>>>(
                 grad_view.data_ptr<scalar_t>(), m_sign.data_ptr<uint8_t>(),
                 m_magnitude.data_ptr<float>(), new_magnitude.data_ptr<float>(),
-                codebook.data_ptr<float>(), momentum_out.data_ptr<scalar_t>(), codebook_size,
+                codebook.data_ptr<float>(),
+                use_lut ? lut.data_ptr<int16_t>() : nullptr,
+                use_lut ? static_cast<int>(lut.numel() - 1) : 0,
+                momentum_out.data_ptr<scalar_t>(), codebook_size,
                 period, total_numel, static_cast<float>(beta1),
                 stochastic_round, static_cast<uint64_t>(rng_seed),
                 seed_dev_ptr);
