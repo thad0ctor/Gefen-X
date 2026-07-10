@@ -2248,12 +2248,14 @@ class Gefen(torch.optim.Optimizer):
         )
 
     def _gefen_quantized_momentum_update(
-        self, state, grad_view, beta1
+        self, state, grad_view, beta1, *, nesterov=False
     ) -> torch.Tensor:
         # Muon-specific quantized-momentum update. Advances the quantized momentum
         # state (m_codebook / m_magnitude) by one EMA step and returns the DENSE
         # quantized momentum for Newton-Schulz in a single kernel pass -- no lr==0
         # dummy-stepsize parameter write, and no second full-size codebook gather.
+        # Optional Nesterov changes only that dense output; persistent state stays
+        # the underlying EMA, matching the decomposed optimizer path.
         codebook = self._gefen_codebook_on(grad_view.device)
         if codebook is None:
             raise ValueError(
@@ -2276,6 +2278,7 @@ class Gefen(torch.optim.Optimizer):
             self._kernel_rng_seed(),
             seed_dev=self._sr_seed_on(grad_view.device),
             codebook_lut=self._gefen_codebook_lut_on(grad_view.device),
+            nesterov=nesterov,
         )
         return momentum_out
 
