@@ -19,7 +19,12 @@ from pathlib import Path
 from typing import Any
 
 from .cells import CELL_RECIPES
-from .comparison import SOURCE_FINGERPRINT_ENV, canonical_json, source_fingerprint
+from .comparison import (
+    SOURCE_FINGERPRINT_ENV,
+    canonical_json,
+    require_unchanged_source,
+    source_fingerprint,
+)
 
 
 PROTECTED = {"cell", "phase", "checkpoint_out", "init_checkpoint", "run_name", "results"}
@@ -123,9 +128,12 @@ def main(argv: list[str] | None = None) -> int:
     root = Path(__file__).resolve().parents[2]
     env = os.environ.copy()
     env["PYTHONPATH"] = str(root / "src") + os.pathsep + env.get("PYTHONPATH", "")
-    env[SOURCE_FINGERPRINT_ENV] = canonical_json(source_fingerprint(root))
+    captured_source = source_fingerprint(root)
+    env[SOURCE_FINGERPRINT_ENV] = canonical_json(captured_source)
     print("# 2 pretraining runs followed by 4 checkpoint-crossed SFT runs")
-    for command in plan:
+    for index, command in enumerate(plan):
+        if args.execute and index:
+            require_unchanged_source(root, captured_source)
         print(shlex.join(command), flush=True)
         if args.execute:
             subprocess.run(command, cwd=root, env=env, check=True)

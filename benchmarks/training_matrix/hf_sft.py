@@ -34,14 +34,14 @@ from .schedule import GroupLRSchedule
 from .train import (
     _append_jsonl,
     _git_metadata,
-    _sync,
-    _tensor_bytes,
     _nvidia_driver_version,
     _package_version,
+    _sync,
     normalize_gradients,
     materialize_finite_update_loss,
     snapshot_peak_then_measure_serialized_state,
     training_batch_metadata,
+    throughput_measurement_metadata,
     validate_and_clip_gradients,
 )
 
@@ -225,23 +225,28 @@ def _local_model_manifest_sha256(model_path: str) -> str | None:
     if not path.is_dir():
         return None
     digest = hashlib.sha256()
-    interesting = {
-        "config.json",
-        "generation_config.json",
-        "model.safetensors.index.json",
-        "tokenizer.json",
-        "tokenizer_config.json",
-        "special_tokens_map.json",
-    }
-    for child in sorted(item for item in path.iterdir() if item.is_file()):
-        if child.name in interesting:
-            digest.update(child.name.encode())
-            digest.update(child.read_bytes())
-        elif child.suffix in {".safetensors", ".bin"}:
-            # Full multi-GiB weight hashing per cell is prohibitive; the local
-            # manifest still detects shard replacement/size changes while the
-            # resolved Hub commit covers normal cached-ID usage.
-            digest.update(f"{child.name}:{child.stat().st_size}".encode())
+    files = sorted(
+        (item for item in path.rglob("*") if item.is_file()),
+        key=lambda item: item.relative_to(path).as_posix(),
+    )
+    for child in files:
+        relative = child.relative_to(path).as_posix()
+        size = child.stat().st_size
+        digest.update(b"file\0")
+        digest.update(relative.encode("utf-8", errors="surrogateescape"))
+        digest.update(b"\0")
+        digest.update(str(size).encode())
+        digest.update(b"\0")
+        bytes_read = 0
+        with child.open("rb") as handle:
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                bytes_read += len(chunk)
+                digest.update(chunk)
+        if bytes_read != size:
+            raise RuntimeError(
+                f"local model file changed while hashing: {child} "
+                f"({size} bytes before read, {bytes_read} bytes read)"
+            )
     return digest.hexdigest()
 
 
@@ -569,7 +574,12 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "tail_eval_count": tail_count,
         "tail_eval_mean": tail_mean,
         "final_train_loss": train_loss,
-        "training_step_tokens_per_second": measured_tokens / measured_time if measured_time else None,
+        **throughput_measurement_metadata(
+            measured_tokens=measured_tokens,
+            measured_seconds=measured_time,
+            optimizer_updates=args.steps,
+            warmup_updates=args.throughput_warmup,
+        ),
         "training_step_timing_scope": (
             "H2D transfer + forward/backward + finite/grad checks + optimizer step + zero_grad; "
             "excludes CPU order lookup/stack/cast and evaluation"

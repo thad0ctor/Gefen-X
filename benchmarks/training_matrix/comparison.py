@@ -78,6 +78,21 @@ def immutable_source_fingerprint(root: str | Path) -> dict[str, Any]:
     return source_fingerprint(root)
 
 
+def require_unchanged_source(
+    root: str | Path, captured: dict[str, Any]
+) -> None:
+    """Abort a sequential matrix before it spans two source revisions."""
+
+    current = source_fingerprint(root)
+    if current != captured:
+        raise RuntimeError(
+            "source tree changed after the matrix fingerprint was captured; "
+            "refusing to launch the next cell\n"
+            f"captured={canonical_json(captured)}\n"
+            f"current={canonical_json(current)}"
+        )
+
+
 def attach_comparison(result: dict[str, Any], context: dict[str, Any]) -> None:
     """Attach the auditable context and its content hash in place."""
 
