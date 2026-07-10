@@ -1,0 +1,14 @@
+version: 2
+updates:
+  # Keep GitHub Actions pinned to commit SHAs (supply-chain hardening) while
+  # still receiving updates: Dependabot opens a PR whenever a pinned action has
+  # a newer release, bumping the SHA and the trailing "# vX.Y.Z" comment.
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly
+    groups:
+      # One consolidated PR per week instead of one per action.
+      github-actions:
+        patterns:
+          - "*"
