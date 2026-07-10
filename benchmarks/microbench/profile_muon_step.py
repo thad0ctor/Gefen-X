@@ -23,13 +23,18 @@ Run:
 """
 import argparse
 import inspect
-import os
+from collections import OrderedDict
 
 import torch
 
 from gefen import GefenMuon
 from gefen.gefen_muon import (
-    _zeropower_via_newtonschulz, DEFAULT_A, DEFAULT_B, DEFAULT_C)
+    NS_SCHEDULES,
+    _batched_ns_chunk_sizes,
+    _batched_ns_shape_eligible,
+    _zeropower_via_newtonschulz,
+    _zeropower_via_newtonschulz_batched,
+)
 
 
 def make_shapes(hidden, inter, n_layers, n_kv_groups=1):
@@ -70,13 +75,18 @@ def main():
     ap.add_argument("--iters", type=int, default=30)
     ap.add_argument("--warmup", type=int, default=10)
     ap.add_argument("--fused", type=int, default=1)
+    ap.add_argument("--batched-ns", type=int, choices=(0, 1), default=0)
+    ap.add_argument("--batched-ns-workspace-mib", type=int, default=256)
+    ap.add_argument("--ns-schedule", choices=("tuned3", "tuned4"), default=None)
+    ap.add_argument("--normuon", type=int, choices=(0, 1), default=0)
+    ap.add_argument("--weight-decay", type=float, default=0.1)
     args = ap.parse_args()
 
     dev = "cuda"
     name = torch.cuda.get_device_name(0)
     shapes = make_shapes(args.hidden, args.inter, args.layers, args.kv_groups)
     n_params = sum(r * c for r, c in shapes)
-    print(f"=== {name}  fused={bool(args.fused)} ===")
+    print(f"=== {name}  fused={bool(args.fused)} batched_ns={bool(args.batched_ns)} ===")
     print(f"shapes: {len(shapes)} matrices, {n_params/1e6:.1f}M params "
           f"(hidden={args.hidden} inter={args.inter} layers={args.layers})")
 
@@ -88,11 +98,22 @@ def main():
         params.append((f"layer{i}", p))
     grads = [torch.randn(r, c, device=dev, dtype=torch.bfloat16) * 1e-3 for r, c in shapes]
 
-    coeffs = (DEFAULT_A, DEFAULT_B, DEFAULT_C)
+    variants = (
+        [(len(NS_SCHEDULES[args.ns_schedule]), args.ns_schedule)]
+        if args.ns_schedule is not None
+        else [(5, None), (4, None), (3, None)]
+    )
 
-    for ns_steps in (5, 4, 3):
+    for ns_steps, ns_schedule in variants:
         opt = GefenMuon(params, lr=1e-3, ns_steps=ns_steps, fused=bool(args.fused),
-                        adjust_lr_fn="match_rms_adamw")
+                        adjust_lr_fn="match_rms_adamw",
+                        weight_decay=args.weight_decay,
+                        ns_schedule=ns_schedule,
+                        normuon=bool(args.normuon),
+                        batched_ns=bool(args.batched_ns),
+                        batched_ns_workspace_bytes=args.batched_ns_workspace_mib << 20)
+        coeffs = opt.param_groups[0]["ns_coefficients"]
+        resolved_steps = opt.param_groups[0]["ns_steps"]
 
         def full_step(opt=opt, params=params, grads=grads):
             for (_, p), g in zip(params, grads):
@@ -104,15 +125,67 @@ def main():
             full_step()
 
         step_ms = cuda_time(full_step, args.iters, args.warmup)
+        torch.cuda.synchronize()
+        live_bytes = torch.cuda.memory_allocated()
+        torch.cuda.reset_peak_memory_stats()
+        full_step()
+        torch.cuda.synchronize()
+        step_peak_mib = (
+            torch.cuda.max_memory_allocated() - live_bytes
+        ) / (1 << 20)
 
         # NS-only: run the same NS over all matrices once per "step". Keep the
         # bf16 param dtype -- NS casts to bf16 internally, so .float() here would
         # charge the timer an fp32->bf16 cast the real step never pays.
         ns_inputs = [g.clone() for g in grads]
+        batched_ns_active = bool(args.batched_ns and opt.fused)
 
-        def ns_only(ns_inputs=ns_inputs, coeffs=coeffs, ns_steps=ns_steps):
-            for x in ns_inputs:
-                _zeropower_via_newtonschulz(x, coeffs, ns_steps, 1e-7)
+        def ns_only(
+            ns_inputs=ns_inputs,
+            coeffs=coeffs,
+            ns_steps=resolved_steps,
+            batched_ns_active=batched_ns_active,
+        ):
+            if not batched_ns_active:
+                for x in ns_inputs:
+                    _zeropower_via_newtonschulz(x, coeffs, ns_steps, 1e-7)
+                return
+
+            buckets = OrderedDict()
+            for position, x in enumerate(ns_inputs):
+                rows, cols = x.shape
+                if _batched_ns_shape_eligible(rows, cols):
+                    key = (rows, cols)
+                else:
+                    key = ("serial", position)
+                buckets.setdefault(key, []).append(x)
+
+            workspace_bytes = args.batched_ns_workspace_mib << 20
+            for key, bucket in buckets.items():
+                if key[0] == "serial":
+                    _zeropower_via_newtonschulz(
+                        bucket[0], coeffs, ns_steps, 1e-7
+                    )
+                    continue
+                sizes, serial_tail = _batched_ns_chunk_sizes(
+                    len(bucket), key[0], key[1], workspace_bytes
+                )
+                offset = 0
+                transposed = key[0] > key[1]
+                for size in sizes:
+                    chunk = bucket[offset : offset + size]
+                    stack = torch.stack(
+                        [x.T for x in chunk] if transposed else chunk
+                    )
+                    _zeropower_via_newtonschulz_batched(
+                        stack, coeffs, ns_steps, 1e-7
+                    )
+                    del stack
+                    offset += size
+                for x in bucket[offset : offset + serial_tail]:
+                    _zeropower_via_newtonschulz(
+                        x, coeffs, ns_steps, 1e-7
+                    )
 
         ns_ms = cuda_time(ns_only, args.iters, args.warmup)
 
@@ -130,7 +203,8 @@ def main():
         if args.fused:
             mom_fn = opt._fused_quantized_momentum_update
             # baseline signature: (p, state, grad_view, momentum); this branch drops p.
-            takes_p = len(inspect.signature(mom_fn).parameters) == 4
+            parameters = tuple(inspect.signature(mom_fn).parameters)
+            takes_p = bool(parameters) and parameters[0] == "p"
             primed = []  # (p_or_None, state, grad_view, momentum) precomputed once
             for (_, p), g in zip(params, grads):
                 state = opt.state[p]
@@ -149,9 +223,15 @@ def main():
             mom_ms = cuda_time(momentum_only, args.iters, args.warmup)
 
         frac = 100.0 * ns_ms / step_ms if step_ms else 0.0
-        line = (f"ns_steps={ns_steps}: step={step_ms:7.3f} ms  "
+        label = (
+            f"ns_schedule={ns_schedule}"
+            if ns_schedule is not None
+            else f"ns_steps={ns_steps}"
+        )
+        line = (f"{label}: step={step_ms:7.3f} ms  "
                 f"NS-only={ns_ms:7.3f} ms  NS≈{frac:4.1f}% of step  "
-                f"(rest≈{step_ms-ns_ms:6.3f} ms)")
+                f"(rest≈{step_ms-ns_ms:6.3f} ms)  "
+                f"step-peak=+{step_peak_mib:.1f} MiB")
         if mom_ms is not None:
             mom_frac = 100.0 * mom_ms / step_ms if step_ms else 0.0
             line += f"  momentum-only={mom_ms:6.3f} ms ({mom_frac:4.1f}% of step)"

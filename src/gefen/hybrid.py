@@ -128,6 +128,8 @@ class GefenMuonHybrid(torch.optim.Optimizer):
         sharded_mode="exact",
         fp8_ns=False,
         fp8_ns_compile=True,
+        batched_ns=False,
+        batched_ns_workspace_bytes=256 << 20,
         stochastic_round=False,
         normuon=True,
         normuon_beta2=0.95,
@@ -181,8 +183,9 @@ class GefenMuonHybrid(torch.optim.Optimizer):
             betas, eps: Adam betas / epsilon for the backup Gefen half.
             fused: use the fused CUDA kernels in both halves (default True).
             momentum, nesterov, ns_steps, ns_schedule, adjust_lr_fn,
-            sharded_mode, fp8_ns, fp8_ns_compile, normuon, normuon_beta2,
-            normuon_eps, cautious: forwarded to GefenMuon (see its docstring).
+            sharded_mode, fp8_ns, fp8_ns_compile, batched_ns,
+            batched_ns_workspace_bytes, normuon, normuon_beta2, normuon_eps,
+            cautious: forwarded to GefenMuon (see its docstring).
                 Note ``normuon=True`` and ``ns_schedule="tuned3"`` are the
                 hybrid's defaults, unlike raw GefenMuon.
             stochastic_round, capturable, verbose: forwarded to BOTH halves.
@@ -261,6 +264,8 @@ class GefenMuonHybrid(torch.optim.Optimizer):
                 sharded_mode=sharded_mode,
                 fp8_ns=fp8_ns,
                 fp8_ns_compile=fp8_ns_compile,
+                batched_ns=batched_ns,
+                batched_ns_workspace_bytes=batched_ns_workspace_bytes,
                 stochastic_round=stochastic_round,
                 normuon=normuon,
                 normuon_beta2=normuon_beta2,
