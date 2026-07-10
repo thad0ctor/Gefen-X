@@ -76,6 +76,26 @@ FP8_MIN_DIM = 1536
 _ns_fp8_compiled = None
 _fp8_fallback_warned = False
 
+# Shape-batched Newton--Schulz is an explicit numerical/performance trade-off.
+# Strided-batched GEMMs are dramatically faster for repeated small matrices on
+# Ampere, but their reduction order is not bit-identical to launching one GEMM
+# per matrix.  Keep the conservative, measured gate centralized so constructor,
+# routing tests, and benchmarks describe the same supported region.
+BATCHED_NS_MIN_BATCH = 8
+BATCHED_NS_MAX_MIN_DIM = 512
+BATCHED_NS_MAX_NUMEL = 1 << 20
+BATCHED_NS_DEFAULT_WORKSPACE_BYTES = 256 << 20
+
+
+def _batched_ns_shape_eligible(rows: int, cols: int) -> bool:
+    """Whether one oriented matrix is inside the measured batching region."""
+    return (
+        rows > 0
+        and cols > 0
+        and min(rows, cols) <= BATCHED_NS_MAX_MIN_DIM
+        and rows * cols <= BATCHED_NS_MAX_NUMEL
+    )
+
 
 def _fp8_supported() -> bool:
     if not torch.cuda.is_available():
@@ -256,6 +276,108 @@ def _zeropower_via_newtonschulz(
     return ortho_grad
 
 
+def _batched_ns_workspace_bytes(
+    batch: int, rows: int, cols: int, element_size: int = 2
+) -> int:
+    """Conservative tensor-temporary budget for the batched bf16 NS path.
+
+    With ``m=min(rows, cols)`` and ``n=max(rows, cols)``, the implementation
+    can simultaneously retain up to three matrix batches and two Gram batches:
+    ``3 * B*m*n + 2 * B*m*m`` elements.  The estimate deliberately includes
+    the per-item momentum outputs retained while the stack is formed, so the
+    configured cap remains meaningful even when allocator reuse is imperfect.
+    cuBLAS-internal workspace and allocator fragmentation are outside this
+    tensor accounting, so this is a routing budget rather than a hard process
+    memory limit.
+    """
+    m, n = min(rows, cols), max(rows, cols)
+    return int(batch) * int(element_size) * (3 * m * n + 2 * m * m)
+
+
+def _batched_ns_chunk_sizes(
+    count: int,
+    rows: int,
+    cols: int,
+    workspace_bytes: int,
+    min_batch: int = BATCHED_NS_MIN_BATCH,
+) -> "Tuple[list[int], int]":
+    """Return eligible balanced batch sizes plus a serial tail count.
+
+    Every returned batch is in ``[min_batch, max_batch_for_workspace]``.  When
+    a small remainder can be absorbed by rebalancing the last full batch, do
+    that; otherwise leave the undersized tail on the bit-identical serial path.
+    """
+    if count < min_batch:
+        return [], count
+    per_item = _batched_ns_workspace_bytes(1, rows, cols)
+    max_batch = workspace_bytes // per_item if per_item else count
+    if max_batch < min_batch:
+        return [], count
+    max_batch = min(int(max_batch), int(count))
+
+    full, remainder = divmod(int(count), max_batch)
+    sizes = [max_batch] * full
+    if remainder == 0:
+        return sizes, 0
+    if remainder >= min_batch:
+        sizes.append(remainder)
+        return sizes, 0
+
+    # Rebalance the last full batch and the short remainder when their combined
+    # population can form two legal batches.  Example: cap=10, count=17 -> 9+8.
+    if sizes and max_batch + remainder >= 2 * min_batch:
+        sizes.pop()
+        combined = max_batch + remainder
+        left = (combined + 1) // 2
+        right = combined - left
+        sizes.extend((left, right))
+        return sizes, 0
+    return sizes, remainder
+
+
+def _zeropower_via_newtonschulz_batched(
+    grads: torch.Tensor,
+    ns_coefficients,
+    ns_steps: int,
+    eps: float,
+) -> torch.Tensor:
+    """Newton--Schulz over a homogeneous ``[B, rows, cols]`` bf16 stack.
+
+    This intentionally uses strided-batched GEMMs, so it is close to but not
+    bit-identical with a Python loop over ``_zeropower_via_newtonschulz``.
+    Callers must keep it behind the explicit ``batched_ns`` opt-in. A bf16
+    ``grads`` tensor is scratch and may be overwritten; optimizer routing passes
+    a newly stacked temporary, never a user gradient.
+    """
+    if grads.ndim != 3:
+        raise ValueError("Batched Newton-Schulz expects [batch, rows, cols]")
+    schedule = _normalize_ns_schedule(ns_coefficients, ns_steps)
+    ortho = grads.bfloat16()
+    transposed = ortho.size(1) > ortho.size(2)
+    if transposed:
+        ortho = ortho.transpose(1, 2).contiguous()
+
+    norms = torch.linalg.vector_norm(ortho, dim=(1, 2), keepdim=True)
+    ortho.div_(norms.clamp(min=eps))
+    # Ping-pong two matrix batches instead of allocating a third live iterate.
+    # The conservative public workspace model intentionally retains its extra
+    # headroom for the pre-stack momentum buffers and allocator behavior.
+    next_ortho = torch.empty_like(ortho)
+    for a, b, c in schedule:
+        gram = torch.bmm(ortho, ortho.transpose(1, 2))
+        gram_update = torch.baddbmm(gram, gram, gram, beta=b, alpha=c)
+        del gram
+        torch.baddbmm(
+            ortho, gram_update, ortho, beta=a, out=next_ortho
+        )
+        del gram_update
+        ortho, next_ortho = next_ortho, ortho
+
+    if transposed:
+        ortho = ortho.transpose(1, 2)
+    return ortho
+
+
 def _cautious_mask_(update: torch.Tensor, grad: torch.Tensor) -> torch.Tensor:
     # Cautious masking (Cautious Optimizers, Liang et al. 2024): zero every
     # update coordinate whose sign disagrees with the current gradient, then
@@ -351,6 +473,17 @@ class GefenMuon(Gefen):
             (opt-in; auto-falls back to bf16 elsewhere).
         fp8_ns_compile: torch.compile the fp8 NS core (default True; eager fp8
             is slower than bf16).
+        batched_ns: opt into shape-batched bf16 Newton--Schulz for repeated
+            small matrices (default False). This changes GEMM reduction order
+            and is therefore not bit-identical to the serial path. It is gated
+            to non-sharded, non-capturable CUDA bf16 matrices with batch >= 8,
+            min dimension <= 512, and at most 2**20 elements per matrix.
+        batched_ns_workspace_bytes: conservative temporary-memory cap used to
+            chunk eligible shape groups (default 256 MiB). An undersized tail
+            remains on the serial, bit-identical path. This budgets explicit
+            tensors, not cuBLAS-internal workspace or allocator fragmentation.
+            Changing the budget can change batch sizes and therefore the
+            opt-in path's approximate numerical result.
         stochastic_round: stochastically round the 8-bit momentum quantization
             (debiases it; throughput-neutral opt-in).
         normuon: NorMuon-style per-row 2nd-moment normalization of the NS
@@ -381,6 +514,8 @@ class GefenMuon(Gefen):
         sharded_mode: str = "exact",
         fp8_ns: bool = False,
         fp8_ns_compile: bool = True,
+        batched_ns: bool = False,
+        batched_ns_workspace_bytes: int = BATCHED_NS_DEFAULT_WORKSPACE_BYTES,
         stochastic_round: bool = False,
         normuon: bool = False,
         normuon_beta2: float = 0.95,
@@ -505,6 +640,15 @@ class GefenMuon(Gefen):
         self._fp8_ns = fp8_ns
         self._fp8_ns_compile = fp8_ns_compile
 
+        if not isinstance(batched_ns_workspace_bytes, int) or isinstance(
+            batched_ns_workspace_bytes, bool
+        ):
+            raise TypeError("batched_ns_workspace_bytes must be an integer")
+        if batched_ns_workspace_bytes <= 0:
+            raise ValueError("batched_ns_workspace_bytes must be positive")
+        self._batched_ns = bool(batched_ns)
+        self._batched_ns_workspace_bytes = batched_ns_workspace_bytes
+
         # NorMuon-style per-neuron 2nd moment on the orthogonalized update
         # (opt-in). After Newton-Schulz, each ROW of the update (an output
         # neuron) is divided by the bias-corrected EMA-RMS of that row across
@@ -542,6 +686,8 @@ class GefenMuon(Gefen):
             group["sharded_mode"] = sharded_mode
             group["fp8_ns"] = fp8_ns
             group["fp8_ns_compile"] = fp8_ns_compile
+            group["batched_ns"] = bool(batched_ns)
+            group["batched_ns_workspace_bytes"] = batched_ns_workspace_bytes
             group["normuon"] = normuon
             group["normuon_beta2"] = normuon_beta2
             group["normuon_eps"] = normuon_eps
@@ -731,20 +877,15 @@ class GefenMuon(Gefen):
                 local = local.narrow(dim, min(start, size), length)
         return local.contiguous()
 
-    def _compute_muon_update(
+    def _prepare_muon_momentum(
         self,
         group,
         param_name: str,
         p: torch.Tensor,
         grad: torch.Tensor,
         eff_numel: int,
-    ) -> torch.Tensor:
-        # The full quantized-momentum + Newton-Schulz pipeline that turns a
-        # gradient matrix into the orthogonalized update. Shared verbatim by the
-        # exact path (grad = full matrix, eff_numel = global numel), the approx
-        # path (grad = local shard, eff_numel = local numel) and the distributed
-        # owner path (grad = full matrix, eff_numel = global numel) so all three
-        # are bit-identical on identical inputs. Reads/writes self.state[p].
+    ) -> "Tuple[dict, torch.Tensor]":
+        """Advance quantized momentum and return the dense NS input."""
         state = self.state[p]
         momentum = group["momentum"]
         flat_grad = grad.reshape(-1)
@@ -818,7 +959,41 @@ class GefenMuon(Gefen):
 
         if group["nesterov"] and not nesterov_emitted:
             momentum_update.mul_(momentum).add_(grad_view, alpha=1 - momentum)
-        update = momentum_update.view_as(grad)
+        return state, momentum_update.view_as(grad)
+
+    def _finish_muon_update(
+        self,
+        group,
+        state,
+        grad: torch.Tensor,
+        ortho: torch.Tensor,
+    ) -> torch.Tensor:
+        """Apply optional post-NS levers shared by serial and batched NS."""
+        if group.get("normuon", False):
+            ortho = self._normuon_normalize(
+                state, ortho, group["normuon_beta2"], group["normuon_eps"]
+            )
+        if group.get("cautious", False):
+            ortho = _cautious_mask_(ortho.contiguous(), grad)
+        return ortho
+
+    def _compute_muon_update(
+        self,
+        group,
+        param_name: str,
+        p: torch.Tensor,
+        grad: torch.Tensor,
+        eff_numel: int,
+    ) -> torch.Tensor:
+        # The full quantized-momentum + Newton-Schulz pipeline that turns a
+        # gradient matrix into the orthogonalized update. Shared verbatim by the
+        # exact path (grad = full matrix, eff_numel = global numel), the approx
+        # path (grad = local shard, eff_numel = local numel) and the distributed
+        # owner path (grad = full matrix, eff_numel = global numel) so all three
+        # are bit-identical on identical inputs. Reads/writes self.state[p].
+        state, update = self._prepare_muon_momentum(
+            group, param_name, p, grad, eff_numel
+        )
 
         ortho = _zeropower_via_newtonschulz(
             update,
@@ -828,13 +1003,7 @@ class GefenMuon(Gefen):
             use_fp8=group.get("fp8_ns", False),
             compile_fp8=group.get("fp8_ns_compile", True),
         )
-        if group.get("normuon", False):
-            ortho = self._normuon_normalize(
-                state, ortho, group["normuon_beta2"], group["normuon_eps"]
-            )
-        if group.get("cautious", False):
-            ortho = _cautious_mask_(ortho.contiguous(), grad)
-        return ortho
+        return self._finish_muon_update(group, state, grad, ortho)
 
     def _normuon_normalize(
         self,
@@ -1087,6 +1256,126 @@ class GefenMuon(Gefen):
                 )
                 buf = None
 
+    def _batched_ns_key(self, item, fused_available: bool):
+        """Return a homogeneous batch key, or ``None`` for serial routing."""
+        group, _name, p, grad = item
+        if (
+            not group.get("batched_ns", False)
+            or not fused_available
+            or self.capturable
+            or torch.compiler.is_compiling()
+            or self._is_sharded(p)
+            or group.get("fp8_ns", False)
+            or torch.is_complex(p)
+            or grad.is_sparse
+            or grad.ndim != 2
+            or not p.is_cuda
+            or not grad.is_cuda
+            or p.dtype != torch.bfloat16
+            or grad.dtype != torch.bfloat16
+            or tuple(p.shape) != tuple(grad.shape)
+        ):
+            return None
+        rows, cols = grad.shape
+        if not _batched_ns_shape_eligible(rows, cols):
+            return None
+        schedule = tuple(
+            _normalize_ns_schedule(group["ns_coefficients"], group["ns_steps"])
+        )
+        return (
+            grad.device,
+            grad.dtype,
+            (rows, cols),
+            schedule,
+            float(group["eps"]),
+            int(
+                group.get(
+                    "batched_ns_workspace_bytes",
+                    BATCHED_NS_DEFAULT_WORKSPACE_BYTES,
+                )
+            ),
+        )
+
+    def _step_batched_ns_chunk(self, items) -> None:
+        states = []
+        momentum_updates = []
+        for group, name, p, grad in items:
+            state, update = self._prepare_muon_momentum(
+                group, name, p, grad, p.numel()
+            )
+            states.append(state)
+            momentum_updates.append(update)
+
+        first_group = items[0][0]
+        transposed = momentum_updates[0].size(0) > momentum_updates[0].size(1)
+        # Orient before stacking so tall matrices do not require a second full
+        # contiguous batch inside the NS helper (and therefore stay inside the
+        # same 3S+2G workspace model as wide matrices).
+        stack_inputs = (
+            [update.T for update in momentum_updates]
+            if transposed
+            else momentum_updates
+        )
+        stacked = torch.stack(stack_inputs, dim=0)
+        # The stacked tensor owns the NS inputs now. Drop the individual dense
+        # momentum buffers before allocating Gram matrices so the allocator can
+        # reuse them within the configured workspace envelope.
+        del stack_inputs, momentum_updates
+        ortho_batch = _zeropower_via_newtonschulz_batched(
+            stacked,
+            first_group["ns_coefficients"],
+            first_group["ns_steps"],
+            first_group["eps"],
+        )
+        if transposed:
+            ortho_batch = ortho_batch.transpose(1, 2)
+        for i, ((group, _name, p, grad), state) in enumerate(zip(items, states)):
+            update = self._finish_muon_update(
+                group, state, grad, ortho_batch[i]
+            )
+            self._apply_muon_update(
+                group, p, update, is_sharded=False, approx=False
+            )
+
+    def _step_regular_items(self, items) -> None:
+        if not items:
+            return
+        wants_batched = any(group.get("batched_ns", False) for group, *_ in items)
+        if not wants_batched or self.capturable or torch.compiler.is_compiling():
+            for group, name, p, grad in items:
+                self._step_automatic(group, name, p, grad)
+            return
+
+        fused_available = self._fused_kernels_available()
+        buckets = OrderedDict()
+        for position, item in enumerate(items):
+            key = self._batched_ns_key(item, fused_available)
+            # Give every serial item a unique key so its relative position among
+            # first-seen shape buckets remains deterministic.
+            if key is None:
+                key = ("serial", position)
+            buckets.setdefault(key, []).append(item)
+
+        for key, bucket in buckets.items():
+            if key[0] == "serial":
+                group, name, p, grad = bucket[0]
+                self._step_automatic(group, name, p, grad)
+                continue
+
+            rows, cols = key[2]
+            workspace_bytes = key[5]
+            sizes, serial_tail = _batched_ns_chunk_sizes(
+                len(bucket), rows, cols, workspace_bytes
+            )
+            offset = 0
+            for size in sizes:
+                self._step_batched_ns_chunk(bucket[offset : offset + size])
+                offset += size
+            # A group below the minimum, a workspace cap that cannot fit eight,
+            # or an unavoidable short remainder stays bit-identical and serial.
+            for group, name, p, grad in bucket[offset : offset + serial_tail]:
+                self._step_automatic(group, name, p, grad)
+
     def _step_automatic(
         self, group, param_name: str, p: torch.Tensor, grad: torch.Tensor
     ) -> None:
@@ -1329,6 +1618,17 @@ class GefenMuon(Gefen):
         marker = state_dict.pop("gefen_muon_distributed", None)
         self._warn_if_unconsolidated_distributed_load(state_dict, marker)
         super().load_state_dict(state_dict)
+        # Old checkpoints predate shape-batched NS. Keep their historical,
+        # bit-identical serial behavior even when this optimizer was constructed
+        # with the new opt-in; current checkpoints carry and restore both keys.
+        # This mirrors torch optimizers' usual setdefault migration for newly
+        # introduced group options.
+        for group in self.param_groups:
+            group.setdefault("batched_ns", False)
+            group.setdefault(
+                "batched_ns_workspace_bytes",
+                BATCHED_NS_DEFAULT_WORKSPACE_BYTES,
+            )
         self._drop_non_owned_distributed_state()
 
     @torch.no_grad()
@@ -1361,8 +1661,7 @@ class GefenMuon(Gefen):
         # matrix (exact / approx / non-sharded) takes the per-param path.
         # The two passes run in the same order on every rank, so all collectives
         # stay matched.
-        for group, name, p, grad in regular_items:
-            self._step_automatic(group, name, p, grad)
+        self._step_regular_items(regular_items)
 
         if distributed_items:
             self._step_distributed(distributed_items)

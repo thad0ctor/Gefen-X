@@ -421,6 +421,7 @@ def test_graph_capture_muon():
         lambda ps, lr: GefenMuon(
             ps, lr=lr, weight_decay=0.01, adjust_lr_fn="match_rms_adamw",
             ns_schedule="tuned3", normuon=True, nesterov=True, capturable=True,
+            batched_ns=True,  # explicit opt-in must safely stay serial in capture
         ),
         MUON_SPECS, rtol=5e-2, atol=5e-3, what="muon-graph",
     )
