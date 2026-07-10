@@ -31,6 +31,9 @@ Run from `benchmarks/microbench/` with `gefen` importable (fp8 paths require an 
 
 - `bench_ns_schedule.py` / `plot_ns_schedule.py` — tuned NS coefficient schedules (tuned3 / tuned4) vs the standard 5-step quintic: per-shape step time + orthogonality.
 - `bench_ns_fp8.py` / `plot_ns_fp8.py` — fp8 (e4m3) NS vs bf16: per-shape step time + orthogonality drift.
+- `bench_batched_ns.py` — serial vs opt-in shape-batched bf16 NS, including
+  speed, relative/max numerical delta, and the conservative workspace estimate;
+  `--full-step` runs a paired tuned3 + NorMuon + Nesterov optimizer comparison.
 - `bench_capturable_step.py` — 386M-param optimizer-step timing for eager, capturable eager, manual CUDA graph replay, and `torch.compile(mode="reduce-overhead")`, reporting tail-window CUDA and wall time plus peak allocated memory.
 - `profile_capturable_cohorts.py` — CUDA-activity counts and step latency for uniform, decay/no-decay, and independently scheduled tensor-LR capturable cohorts in eager and CUDA-graph modes.
 - `plot_ns_levers.py` — the consolidated "faster Newton-Schulz" charts (real-training loss + end-to-end throughput across NS variants).
