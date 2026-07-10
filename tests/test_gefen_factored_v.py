@@ -174,7 +174,18 @@ def check_noncontiguous_fused_copyback(capturable=False):
 
     assert not p_nc.is_contiguous()
     assert not torch.equal(before, p_nc)
-    assert torch.equal(p_ref, p_nc)
+    if capturable:
+        # Capturable factored updates derive mean(v_row) through block-reduced
+        # atomicAdd operations. Independent launches can therefore land a few
+        # bf16 values on an adjacent rounding boundary; use the same calibrated
+        # envelope as test_parity_gefen_factored_fused.
+        diff = (p_ref.detach().float() - p_nc.detach().float()).abs()
+        max_diff = diff.max().item()
+        frac_diff = (diff > 0).float().mean().item()
+        assert max_diff <= 1.5e-3, max_diff
+        assert frac_diff <= 1e-3, frac_diff
+    else:
+        assert torch.equal(p_ref, p_nc)
     sr = opt_ref.state[p_ref]
     sn = opt_nc.state[p_nc]
     assert torch.equal(sr["m_codebook"], sn["m_codebook"])
