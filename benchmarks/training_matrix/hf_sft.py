@@ -39,6 +39,7 @@ from .train import (
     _sync,
     normalize_gradients,
     materialize_finite_update_loss,
+    measurement_policy_metadata,
     snapshot_peak_then_measure_serialized_state,
     training_batch_metadata,
     throughput_measurement_metadata,
@@ -545,6 +546,11 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         optimizer_updates=args.steps,
     )
     schedule_metadata = scheduler.metadata()
+    measurement_policy = measurement_policy_metadata(
+        eval_every=args.eval_every,
+        tail_evals=args.tail_evals,
+        throughput_warmup=args.throughput_warmup,
+    )
     runtime_metadata = {
         "device_name": device_name,
         "cuda_visible_devices": visible_uuid,
@@ -570,6 +576,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "data": data_metadata,
         "training_batch": batch_metadata,
         "evaluation": evaluation,
+        "measurement_policy": measurement_policy,
         "final_eval_loss": evaluation[-1]["loss"],
         "tail_eval_count": tail_count,
         "tail_eval_mean": tail_mean,
@@ -601,6 +608,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "model": model_metadata,
         "data": data_metadata,
         "training_batch": batch_metadata,
+        "measurement_policy": measurement_policy,
         "schedule": {
             key: schedule_metadata[key]
             for key in ("name", "total_steps", "warmup_steps", "min_lr_ratio")

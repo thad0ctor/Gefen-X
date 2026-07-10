@@ -113,6 +113,7 @@ def strict_fallback_context(row: dict[str, Any]) -> dict[str, Any]:
         "data": row.get("data"),
         "schedule": row.get("schedule"),
         "training_batch": row.get("training_batch"),
+        "measurement_policy": row.get("measurement_policy"),
         "shared_optimizer_knobs": {
             key: optimizer.get(key)
             for key in (

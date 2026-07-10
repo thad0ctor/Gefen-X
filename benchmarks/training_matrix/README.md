@@ -120,9 +120,10 @@ harness does not silently represent it as BF16-autocast with FP32 masters.
   loss is recorded but never included in the tail.
 - Results record microbatch size, accumulation, effective batch,
   tokens/optimizer-update, serialized persistent optimizer-state bytes,
-  device-pipeline training-step throughput and its measured-update count, device, visible
-  GPU UUID, NVIDIA driver, Python, Transformers, Datasets, PyTorch/CUDA
-  versions, and an immutable commit+source-diff fingerprint. Sequential launchers
+  requested evaluation cadence/tail window/throughput warmup, their resolved
+  tail and measured-update counts, device-pipeline training-step throughput,
+  device, visible GPU UUID, NVIDIA driver, Python, Transformers, Datasets,
+  PyTorch/CUDA versions, and an immutable commit+source-diff fingerprint. Sequential launchers
   capture that fingerprint once for every child result, then recompute it before
   each later cell and abort if relevant source changed; generated files under
   `benchmarks/training_matrix/out/` remain excluded.
@@ -383,8 +384,10 @@ PYTHONPATH=.:src "$GEFEN_TRAINING_PY" -m benchmarks.training_matrix.summarize \
 ```
 
 Only rows with the same model, phase, seed, data fingerprint, schedule, update
-count, and initialization are valid speedup comparisons. Run multiple seeds
-before treating small tail-loss differences as signal.
+count, evaluation cadence, tail window, throughput warmup, and initialization
+are valid speedup comparisons. These requested measurement-policy values are
+part of every new row's comparison ID. Run multiple seeds before treating small
+tail-loss differences as signal.
 
 ## Runtime and storage planning
 

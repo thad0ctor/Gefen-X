@@ -57,6 +57,7 @@ from benchmarks.training_matrix.tiny_qwen import (
 from benchmarks.training_matrix.train import (
     accumulate_tiny_microbatches,
     materialize_finite_update_loss,
+    measurement_policy_metadata,
     normalize_gradients,
     parse_args,
     run,
@@ -341,6 +342,31 @@ def test_throughput_metadata_is_shared_and_counts_post_warmup_updates():
         "training_step_tokens_per_second": None,
         "throughput_measured_updates": 0,
     }
+
+
+def test_measurement_policy_changes_the_comparison_fingerprint():
+    baseline_policy = measurement_policy_metadata(
+        eval_every=50,
+        tail_evals=10,
+        throughput_warmup=5,
+    )
+    assert baseline_policy == {
+        "eval_every": 50,
+        "tail_evals": 10,
+        "throughput_warmup": 5,
+    }
+
+    baseline = {"cell": "adamw", "measurement_policy": baseline_policy}
+    attach_comparison(baseline, {"measurement_policy": baseline_policy})
+    for key, value in (
+        ("eval_every", 100),
+        ("tail_evals", 5),
+        ("throughput_warmup", 15),
+    ):
+        changed_policy = {**baseline_policy, key: value}
+        changed = {"cell": "gefen", "measurement_policy": changed_policy}
+        attach_comparison(changed, {"measurement_policy": changed_policy})
+        assert changed["comparison_id"] != baseline["comparison_id"]
 
 
 def test_save_optimizer_help_is_explicitly_archival_only(capsys):
@@ -760,6 +786,12 @@ def test_pretrain_checkpoint_hands_weights_and_lineage_to_sft(tmp_path):
     assert sft["initialization"]["metadata"]["cell"] == "adamw"
     assert sft["model"]["parameter_count"] == pretrain["model"]["parameter_count"]
     assert sft["training_batch"]["gradient_accumulation_steps"] == 1
+    assert sft["measurement_policy"] == {
+        "eval_every": 1,
+        "tail_evals": 1,
+        "throughput_warmup": 0,
+    }
+    assert sft["comparison_context"]["measurement_policy"] == sft["measurement_policy"]
     assert sft["tail_eval_count"] == 1
     assert sft["tail_eval_mean"] == sft["final_eval_loss"]
     assert sft["evaluation"][0]["step"] == 0
@@ -832,6 +864,11 @@ def test_strict_fallback_comparison_rejects_every_changed_invariant():
             "tokens_per_optimizer_update": 32,
             "optimizer_updates": 10,
         },
+        "measurement_policy": {
+            "eval_every": 5,
+            "tail_evals": 2,
+            "throughput_warmup": 1,
+        },
         "optimizer": {
             "lr": 1e-3,
             "weight_decay": 0.01,
@@ -876,6 +913,18 @@ def test_strict_fallback_comparison_rejects_every_changed_invariant():
         (
             "accum",
             lambda row: row["training_batch"].__setitem__("gradient_accumulation_steps", 4),
+        ),
+        (
+            "eval-every",
+            lambda row: row["measurement_policy"].__setitem__("eval_every", 10),
+        ),
+        (
+            "tail-evals",
+            lambda row: row["measurement_policy"].__setitem__("tail_evals", 1),
+        ),
+        (
+            "throughput-warmup",
+            lambda row: row["measurement_policy"].__setitem__("throughput_warmup", 2),
         ),
         ("uuid", lambda row: row["runtime"].__setitem__("cuda_visible_devices", "GPU-b")),
         ("git", lambda row: row["runtime"]["git"].__setitem__("commit", "commit-b")),
