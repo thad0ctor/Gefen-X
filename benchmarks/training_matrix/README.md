@@ -17,6 +17,10 @@ The older [`optimizer-sweep`](../optimizer-sweep/README.md) remains the source
 for the published historical rows. This matrix makes the control recipes and
 current literal-vs-recommended behavior explicit.
 
+The retained RTX 3090 performance and training-quality evidence collected for
+this matrix is summarized in [`RESULTS_2026-07-10.md`](RESULTS_2026-07-10.md).
+Generated JSONL artifacts remain intentionally untracked.
+
 ## Seven core cells
 
 Every non-AdamW cell uses Gefen's public model-aware split: hidden 2D matrices
