@@ -21,6 +21,8 @@
     "device": "cuda",
     "dtype": "bfloat16",
     "fused": true,
+    "batched_ns": false,
+    "batched_ns_workspace_bytes": 268435456,
     "expected_device_name": "RTX 3090",
     "expected_cuda_uuid": "GPU-22becb18-bef9-4f98-4eee-5fc4bb8c7a53"
   },

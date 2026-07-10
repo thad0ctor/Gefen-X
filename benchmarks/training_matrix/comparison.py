@@ -126,6 +126,8 @@ def strict_fallback_context(row: dict[str, Any]) -> dict[str, Any]:
                 "momentum",
                 "nesterov",
                 "fused",
+                "batched_ns_requested",
+                "batched_ns_workspace_bytes_requested",
             )
         },
         "initialization": row.get("initialization"),
