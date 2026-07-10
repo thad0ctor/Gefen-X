@@ -1,9 +1,10 @@
 # Gefen benchmarks
 
-Reproducible benchmarks behind the numbers in the top-level [README](../README.md#benchmarks). Three suites, each self-contained (point it at a model + some GPUs and it regenerates its data → tables/plots):
+Reproducible benchmarks behind the numbers in the top-level [README](../README.md#benchmarks). Four suites, each self-contained:
 
 | Suite | What it measures | GPUs | How to run |
 |---|---|---|---|
+| [`training_matrix/`](training_matrix/README.md) | Seven core AdamW/Muon recipes plus optional single-lever isolation cells; large-batch tiny-Qwen pretraining, checkpoint-crossed SFT, and full-model HF/Qwen SFT | RTX 3090 for retained throughput; CPU smoke | `python -m benchmarks.training_matrix.run_matrix` |
 | [`optimizer-sweep/`](optimizer-sweep/README.md) | AdamW vs Gefen vs Gefen-Muon on a full fine-tune — eval loss, throughput, peak VRAM, optimizer-state bytes/param (the main table + quad / loss-curve / throughput-vs-VRAM plots) | single GPU per cell | `bash optimizer-sweep/run.sh` |
 | [`sharding-sweep/`](sharding-sweep/README.md) | GefenMuon `sharded_mode` (exact / distributed / approx) convergence + throughput under FSDP2 as shard count grows | 2–4 GPUs | `bash sharding-sweep/run.sh` |
 | `microbench/` | Newton-Schulz kernel-level studies — tuned coefficient schedules, fp8, the speed/quality of the NS speed levers | single GPU (fp8 needs sm_89+) | see scripts below |
