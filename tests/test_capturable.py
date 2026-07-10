@@ -420,10 +420,69 @@ def test_graph_capture_muon():
     _capture_replay_case(
         lambda ps, lr: GefenMuon(
             ps, lr=lr, weight_decay=0.01, adjust_lr_fn="match_rms_adamw",
-            ns_schedule="tuned3", normuon=True, capturable=True,
+            ns_schedule="tuned3", normuon=True, nesterov=True, capturable=True,
         ),
         MUON_SPECS, rtol=5e-2, atol=5e-3, what="muon-graph",
     )
+
+
+def test_graph_capture_muon_fused_nesterov_preserves_momentum_state():
+    # Integration contract for fused Nesterov + optimizer-level capturability:
+    # graph replay must consume the folded momentum output (so the parameter
+    # trajectory differs from classical momentum) without folding Nesterov back
+    # into the persistent quantized EMA state. The ordinary test above pins the
+    # nesterov=True captured trajectory to eager; this cross-run check pins the
+    # state/effect split that the fused emitter promises.
+    warmup, replays = 3, 4
+    steps = warmup + replays
+    lr_values = [1e-3 * 0.9**i for i in range(steps)]
+    grads = _grad_sequence(91, MUON_SPECS, steps)
+
+    def make(nesterov):
+        return lambda ps, lr: GefenMuon(
+            ps,
+            lr=lr,
+            weight_decay=0.01,
+            momentum=0.9,
+            nesterov=nesterov,
+            adjust_lr_fn="match_rms_adamw",
+            ns_schedule="tuned3",
+            normuon=False,
+            capturable=True,
+        )
+
+    nested_params, nested_opt = _run_captured(
+        make(True), MUON_SPECS, grads, lr_values, warmup, seed=90
+    )
+    plain_params, plain_opt = _run_captured(
+        make(False), MUON_SPECS, grads, lr_values, warmup, seed=90
+    )
+    assert nested_opt._fused_kernels_available()
+    assert plain_opt._fused_kernels_available()
+
+    # Identical externally supplied grads mean the underlying EMA state must be
+    # bit-identical even though Nesterov changes the dense tensor sent through
+    # Newton-Schulz and therefore the final parameters.
+    for (_name_n, p_nested), (_name_p, p_plain) in zip(
+        nested_params, plain_params
+    ):
+        nested_state = nested_opt.state[p_nested]
+        plain_state = plain_opt.state[p_plain]
+        assert nested_state["step"].item() == plain_state["step"].item() == steps
+        assert torch.equal(
+            nested_state["m_codebook"], plain_state["m_codebook"]
+        )
+        assert torch.equal(
+            nested_state["m_magnitude"], plain_state["m_magnitude"]
+        )
+
+    nesterov_effect = max(
+        (p_nested.detach() - p_plain.detach()).abs().max().item()
+        for (_name_n, p_nested), (_name_p, p_plain) in zip(
+            nested_params, plain_params
+        )
+    )
+    assert nesterov_effect > 1e-5, nesterov_effect
 
 
 def test_graph_capture_hybrid():
