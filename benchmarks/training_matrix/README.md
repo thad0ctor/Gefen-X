@@ -105,9 +105,16 @@ harness does not silently represent it as BF16-autocast with FP32 masters.
   loss is recorded but never included in the tail.
 - Results record microbatch size, accumulation, effective batch,
   tokens/optimizer-update, serialized persistent optimizer-state bytes,
-  device-pipeline training-step throughput, device, visible
+  device-pipeline training-step throughput and its measured-update count, device, visible
   GPU UUID, NVIDIA driver, Python, Transformers, Datasets, PyTorch/CUDA
-  versions, and an immutable commit+source-diff fingerprint.
+  versions, and an immutable commit+source-diff fingerprint. Sequential launchers
+  capture that fingerprint once for every child result, then recompute it before
+  each later cell and abort if relevant source changed; generated files under
+  `benchmarks/training_matrix/out/` remain excluded.
+- Pinned Hub model IDs record the requested and resolved revisions. A local model
+  directory instead gets a streaming SHA-256 manifest over every model,
+  tokenizer, configuration, and ancillary file's path and full contents; local
+  shard replacement cannot hide behind an unchanged filename or byte count.
 
 ## RTX 3090 policy
 
@@ -378,7 +385,9 @@ job; none is launched by the smoke instructions.
 Weights-only checkpoints are approximately 64 MiB for `screen_33m` and 256 MiB
 for `pretrain_134m` in BF16, plus small serialization metadata. The default does
 not save optimizer state. `--save-optimizer` adds two native-dtype AdamW moments
-(about 0.5 GiB at 134M with BF16 parameters) and recipe-dependent Gefen state, so enable it
-only for an actual resume requirement. JSONL result rows are small; packed
+(about 0.5 GiB at 134M with BF16 parameters) and recipe-dependent Gefen state,
+so enable it only for archival inspection. The harness does not restore
+optimizer, scheduler, or update-counter state, so this payload is not a
+training-resume checkpoint. JSONL result rows are small; packed
 blocks live in host memory and are not written to disk. The cached Qwen3-0.6B
 checkpoint itself occupies about 1.5 GiB on this machine.

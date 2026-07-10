@@ -147,7 +147,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--checkpoint-out")
     parser.add_argument("--overwrite-checkpoint", action="store_true")
-    parser.add_argument("--save-optimizer", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument(
+        "--save-optimizer",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "archive optimizer state for external inspection only; this harness "
+            "does not restore optimizer/scheduler/update state for training resume"
+        ),
+    )
     parser.add_argument("--results", help="append the complete result to this JSONL file")
     parser.add_argument("--run-name")
     return parser.parse_args(argv)
@@ -261,6 +269,23 @@ def training_batch_metadata(
             micro_batch_size * gradient_accumulation_steps * sequence_length
         ),
         "optimizer_updates": optimizer_updates,
+    }
+
+
+def throughput_measurement_metadata(
+    *,
+    measured_tokens: int,
+    measured_seconds: float,
+    optimizer_updates: int,
+    warmup_updates: int,
+) -> dict[str, int | float | None]:
+    """Return the shared throughput schema for both training backends."""
+
+    return {
+        "training_step_tokens_per_second": (
+            measured_tokens / measured_seconds if measured_seconds else None
+        ),
+        "throughput_measured_updates": max(0, optimizer_updates - warmup_updates),
     }
 
 
@@ -617,7 +642,6 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     tail_mean = (
         sum(point["loss"] for point in post_update_evaluation[-tail_count:]) / tail_count
     )
-    tokens_per_second = measured_tokens / measured_seconds if measured_seconds else None
     parameter_count = sum(parameter.numel() for parameter in model.parameters())
     peak_vram_bytes, peak_vram_reserved_bytes, optimizer_bytes = (
         snapshot_peak_then_measure_serialized_state(optimizer, device)
@@ -679,12 +703,16 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "tail_eval_count": tail_count,
         "tail_eval_mean": tail_mean,
         "final_train_loss": train_losses[-1],
-        "training_step_tokens_per_second": tokens_per_second,
+        **throughput_measurement_metadata(
+            measured_tokens=measured_tokens,
+            measured_seconds=measured_seconds,
+            optimizer_updates=args.steps,
+            warmup_updates=args.throughput_warmup,
+        ),
         "training_step_timing_scope": (
             "H2D transfer + forward/backward + finite/grad checks + optimizer step + zero_grad; "
             "excludes CPU order lookup/stack/cast and evaluation"
         ),
-        "throughput_measured_updates": max(0, args.steps - args.throughput_warmup),
         "training_batch": batch_metadata,
         "optimizer_serialized_state_bytes": optimizer_bytes,
         "optimizer_serialized_state_bytes_per_parameter": optimizer_bytes / parameter_count,

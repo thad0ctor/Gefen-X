@@ -11,7 +11,12 @@ import sys
 from pathlib import Path
 
 from .cells import ALL_CELLS, CELL_RECIPES, CORE_CELLS
-from .comparison import SOURCE_FINGERPRINT_ENV, canonical_json, source_fingerprint
+from .comparison import (
+    SOURCE_FINGERPRINT_ENV,
+    canonical_json,
+    require_unchanged_source,
+    source_fingerprint,
+)
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -83,9 +88,12 @@ def main(argv: list[str] | None = None) -> int:
     root = Path(__file__).resolve().parents[2]
     env = os.environ.copy()
     env["PYTHONPATH"] = str(root / "src") + os.pathsep + env.get("PYTHONPATH", "")
-    env[SOURCE_FINGERPRINT_ENV] = canonical_json(source_fingerprint(root))
+    captured_source = source_fingerprint(root)
+    env[SOURCE_FINGERPRINT_ENV] = canonical_json(captured_source)
     print(f"# {len(planned)} sequential cells; working tree: {root}")
-    for command in planned:
+    for index, command in enumerate(planned):
+        if args.execute and index:
+            require_unchanged_source(root, captured_source)
         print(shlex.join(command), flush=True)
         if args.execute:
             subprocess.run(command, cwd=root, env=env, check=True)
