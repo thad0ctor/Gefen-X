@@ -1,5 +1,11 @@
  ### `Gefen-X` Fork
 
+<p align="center">
+  <a href="https://pypi.org/project/gefen-x/"><img src="https://img.shields.io/pypi/v/gefen-x?style=flat-square&amp;color=blue" alt="PyPI"></a>
+  <a href="https://pypi.org/project/gefen-x/"><img src="https://img.shields.io/pypi/pyversions/gefen-x?style=flat-square" alt="Python versions"></a>
+  <a href="https://github.com/thad0ctor/Gefen-X/blob/main/LICENSE"><img src="https://img.shields.io/pypi/l/gefen-x?style=flat-square" alt="License"></a>
+</p>
+
 **A fork of [upstream Gefen](https://github.com/ndvbd/Gefen) that fixes critical gaps in the shipped release, adds modern-architecture support, and closes the loss gap to AdamW.**
 
  Gefen is intended to be a drop-in replacement for the AdamW optimizer for memory-efficient training. It keeps the familiar AdamW training recipe while cutting optimizer state to **about 1 byte per parameter** (measured 1.01 B/param) — an 8× reduction versus classic fp32 AdamW state, about 6.5 GiB saved per billion parameters, while maintaining AdamW-level loss. The reduced memory footprint enables training larger models and larger batch sizes for added throughput.
@@ -48,9 +54,13 @@ All measured numbers live in [Benchmarks](#benchmarks) and the lever sections be
  
 ## Installation
 
-> **This fork is not on PyPI.** `pip install gefen` fetches the *upstream* release, which does **not** include the fixes/improvements above — install this fork from source instead.
+```bash
+pip install gefen-x          # imports as `gefen`
+```
 
-Build from source (editable install):
+> **It's `gefen-x`, not `gefen`.** This fork publishes as **`gefen-x`** and imports as `gefen`. `pip install gefen` fetches the *upstream* package, which does **not** include the fixes/improvements above.
+
+For development, install editable from source instead:
 
 ```bash
 git clone https://github.com/thad0ctor/Gefen-X
@@ -314,7 +324,7 @@ trainer = Trainer(model=model, args=training_args, train_dataset=train_dataset,
 - **`optimizer: gefenx`** — the core quantized AdamW drop-in (`Gefen`).
 - **`optimizer: gefenx_muon`** — the whole-model Muon hybrid (`GefenMuonHybrid`): Muon on 2D hidden weights, Gefen on embeddings / LM head / norms / biases, at the same ≈1 B/param footprint.
 
-> **Install this fork from source**, not the PyPI `gefen` — which is **upstream** Gefen, *without* this fork's fixes (the modern-arch `period==1` memory fallback, the ≈2× fused kernels, the Muon hybrid): `git clone https://github.com/thad0ctor/Gefen-X && cd Gefen-X && pip install -e .` (see [Installation](#installation)).
+> **Install `gefen-x`** (`pip install gefen-x`), not the PyPI `gefen` — which is **upstream** Gefen, *without* this fork's fixes (the modern-arch `period==1` memory fallback, the ≈2× fused kernels, the Muon hybrid). See [Installation](#installation).
 
 **`gefenx` — memory-efficient AdamW drop-in (recommended):**
 
