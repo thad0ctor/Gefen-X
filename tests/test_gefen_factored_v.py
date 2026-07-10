@@ -13,6 +13,8 @@ close in aggregate, not bit-for-bit.
 Run: python tests/test_gefen_factored_v.py
 """
 
+from unittest import mock
+
 import torch  # noqa: E402
 import torch.nn as nn  # noqa: E402
 
@@ -22,6 +24,7 @@ except ImportError:  # pragma: no cover
     pytest = None
 
 from gefen import Gefen  # noqa: E402
+import gefen.gefen as gefen_mod  # noqa: E402
 
 
 def _run(fused, steps=6, shape=(768, 512), seed=3, **opt_kwargs):
@@ -109,11 +112,13 @@ def check_state_and_flag_hygiene():
     return True
 
 
-def check_noncontiguous_fused_copyback():
+def check_noncontiguous_fused_copyback(capturable=False):
     """A strided 2D Parameter must stay on the factored CUDA path.
 
     Compare it with a contiguous tensor carrying identical values/gradients;
-    this covers the contiguous-work-buffer update and copy-back end to end.
+    spy on the fused call to prove that every step receives a distinct
+    contiguous work tensor rather than the strided Parameter itself.  This
+    covers both the contiguous-work-buffer update and copy-back end to end.
     """
     torch.manual_seed(17)
     rows, cols = 256, 192
@@ -126,15 +131,46 @@ def check_noncontiguous_fused_copyback():
     p_ref = nn.Parameter(init.clone())
     p_nc = nn.Parameter(noncontig.detach())
     before = p_nc.detach().clone()
-    opt_ref = Gefen([("w", p_ref)], lr=1e-3, fused=True, factored_v_2d=True)
-    opt_nc = Gefen([("w", p_nc)], lr=1e-3, fused=True, factored_v_2d=True)
+    opt_ref = Gefen(
+        [("w", p_ref)], lr=1e-3, fused=True, factored_v_2d=True,
+        capturable=capturable,
+    )
+    opt_nc = Gefen(
+        [("w", p_nc)], lr=1e-3, fused=True, factored_v_2d=True,
+        capturable=capturable,
+    )
     torch.manual_seed(18)
-    for _ in range(3):
-        grad = torch.randn(rows, cols, device="cuda").bfloat16() * 1e-3
+    grads = [
+        torch.randn(rows, cols, device="cuda").bfloat16() * 1e-3
+        for _ in range(3)
+    ]
+    for grad in grads:
         p_ref.grad = grad.clone()
-        p_nc.grad = grad.clone()
         opt_ref.step()
-        opt_nc.step()
+
+    fused_update = gefen_mod._gefen_factored_update_cuda
+    with mock.patch.object(
+        gefen_mod, "_gefen_factored_update_cuda", wraps=fused_update
+    ) as fused_spy:
+        for step, grad in enumerate(grads, start=1):
+            calls_before = fused_spy.call_count
+            p_nc.grad = grad.clone()
+            opt_nc.step()
+            assert fused_spy.call_count == calls_before + 1, (
+                f"step {step} did not issue exactly one fused factored update"
+            )
+
+    assert fused_spy.call_count == len(grads)
+    for step, call in enumerate(fused_spy.call_args_list, start=1):
+        p_kernel = call.args[0]
+        assert p_kernel.is_contiguous(), f"step {step} kernel input is strided"
+        assert p_kernel is not p_nc, f"step {step} passed the Parameter directly"
+        assert p_kernel.data_ptr() != p_nc.data_ptr(), (
+            f"step {step} kernel input aliases the strided Parameter storage"
+        )
+        assert (call.kwargs.get("step_scalars") is not None) is capturable, (
+            f"step {step} did not use the expected capturable scalar path"
+        )
 
     assert not p_nc.is_contiguous()
     assert not torch.equal(before, p_nc)
@@ -208,6 +244,10 @@ def run():
         ("transient_memory_bounded", check_transient_memory_bounded),
         ("state_and_flag_hygiene", check_state_and_flag_hygiene),
         ("noncontiguous_fused_copyback", check_noncontiguous_fused_copyback),
+        (
+            "noncontiguous_fused_copyback_capturable",
+            lambda: check_noncontiguous_fused_copyback(capturable=True),
+        ),
         ("pre_factored_checkpoint_resume", check_pre_factored_checkpoint_resume),
         ("tall_matrix_grid_stride", check_tall_matrix_grid_stride),
     ]
@@ -243,8 +283,9 @@ if pytest is not None:
         assert check_state_and_flag_hygiene()
 
     @_skip
-    def test_noncontiguous_fused_copyback():
-        assert check_noncontiguous_fused_copyback()
+    @pytest.mark.parametrize("capturable", [False, True])
+    def test_noncontiguous_fused_copyback(capturable):
+        assert check_noncontiguous_fused_copyback(capturable=capturable)
 
     @_skip
     def test_pre_factored_checkpoint_resume():
