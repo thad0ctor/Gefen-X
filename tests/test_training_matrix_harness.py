@@ -26,14 +26,22 @@ from benchmarks.training_matrix.cells import (
     build_optimizer,
     resolve_cell,
 )
+import benchmarks.training_matrix.comparison as comparison_module
+import benchmarks.training_matrix.consistency_2x2 as consistency_driver
+import benchmarks.training_matrix.run_matrix as matrix_driver
 from benchmarks.training_matrix.consistency_2x2 import build_plan
 from benchmarks.training_matrix.comparison import (
+    SOURCE_FINGERPRINT_ENV,
     attach_comparison,
+    canonical_json,
     comparison_key,
     source_fingerprint,
 )
 from benchmarks.training_matrix.data import build_dataset
-from benchmarks.training_matrix.hf_sft import accumulate_hf_microbatches
+from benchmarks.training_matrix.hf_sft import (
+    _local_model_manifest_sha256,
+    accumulate_hf_microbatches,
+)
 from benchmarks.training_matrix.run_matrix import commands as matrix_commands
 from benchmarks.training_matrix.run_matrix import parse_args as parse_matrix_args
 from benchmarks.training_matrix.schedule import GroupLRSchedule
@@ -52,6 +60,7 @@ from benchmarks.training_matrix.train import (
     run,
     snapshot_peak_then_measure_serialized_state,
     training_batch_metadata,
+    throughput_measurement_metadata,
     validate_and_clip_gradients,
 )
 from gefen import Gefen, GefenMuon, GefenMuonHybrid, split_params_for_muon
@@ -207,6 +216,35 @@ def test_training_batch_metadata_counts_optimizer_updates_not_microsteps():
         "tokens_per_optimizer_update": 131_072,
         "optimizer_updates": 500,
     }
+
+
+def test_throughput_metadata_is_shared_and_counts_post_warmup_updates():
+    assert throughput_measurement_metadata(
+        measured_tokens=12_288,
+        measured_seconds=3.0,
+        optimizer_updates=20,
+        warmup_updates=5,
+    ) == {
+        "training_step_tokens_per_second": 4096.0,
+        "throughput_measured_updates": 15,
+    }
+    assert throughput_measurement_metadata(
+        measured_tokens=0,
+        measured_seconds=0.0,
+        optimizer_updates=5,
+        warmup_updates=5,
+    ) == {
+        "training_step_tokens_per_second": None,
+        "throughput_measured_updates": 0,
+    }
+
+
+def test_save_optimizer_help_is_explicitly_archival_only(capsys):
+    with pytest.raises(SystemExit, match="0"):
+        parse_args(["--help"])
+    rendered = " ".join(capsys.readouterr().out.split())
+    assert "archive optimizer state for external inspection only" in rendered
+    assert "does not restore optimizer/scheduler/update state for training resume" in rendered
 
 
 def test_token_weighted_accumulation_matches_full_batch_with_uneven_masks():
@@ -486,6 +524,34 @@ def test_accumulation_helpers_do_not_materialize_device_scalars_per_microstep(mo
     accumulate_hf_microbatches(hf, microbatches, torch.device("cpu"))
 
 
+def test_local_model_manifest_streams_full_same_size_and_nested_contents(
+    tmp_path, monkeypatch
+):
+    model_dir = tmp_path / "local-model"
+    tokenizer_dir = model_dir / "tokenizer"
+    tokenizer_dir.mkdir(parents=True)
+    (model_dir / "config.json").write_text('{"hidden_size": 8}', encoding="utf-8")
+    shard = model_dir / "model-00001-of-00001.safetensors"
+    shard.write_bytes(b"weight-A")
+    tokenizer = tokenizer_dir / "tokenizer.json"
+    tokenizer.write_bytes(b"tokenizer-A")
+
+    def forbidden_read_bytes(*_args, **_kwargs):
+        raise AssertionError("local manifests must stream files instead of read_bytes()")
+
+    monkeypatch.setattr(Path, "read_bytes", forbidden_read_bytes)
+    original = _local_model_manifest_sha256(str(model_dir))
+
+    shard.write_bytes(b"weight-B")  # Same filename and byte count, different weights.
+    changed_weights = _local_model_manifest_sha256(str(model_dir))
+    assert changed_weights != original
+
+    tokenizer.write_bytes(b"tokenizer-B")  # Nested tokenizer content is covered too.
+    changed_tokenizer = _local_model_manifest_sha256(str(model_dir))
+    assert changed_tokenizer not in {original, changed_weights}
+    assert _local_model_manifest_sha256(str(tmp_path / "missing")) is None
+
+
 def test_nonfinite_loss_and_gradients_are_rejected_before_optimizer_mutation():
     parameter = torch.nn.Parameter(torch.tensor([1.0]))
     optimizer = torch.optim.AdamW([parameter], lr=0.1)
@@ -748,6 +814,99 @@ def test_generated_outputs_do_not_change_source_fingerprint():
     artifact.unlink()
     output_dir.rmdir()
     assert after == before
+
+
+def test_source_change_guard_rejects_a_new_revision(monkeypatch):
+    captured = {"commit": "abc", "diff_sha256": "clean", "dirty": False}
+    state = {"current": captured.copy()}
+    monkeypatch.setattr(
+        comparison_module,
+        "source_fingerprint",
+        lambda _root: state["current"].copy(),
+    )
+    comparison_module.require_unchanged_source(ROOT, captured)
+
+    state["current"] = {"commit": "abc", "diff_sha256": "edited", "dirty": True}
+    with pytest.raises(RuntimeError, match="refusing to launch the next cell"):
+        comparison_module.require_unchanged_source(ROOT, captured)
+
+
+def test_matrix_launcher_preserves_capture_and_guards_before_second_cell(
+    tmp_path, monkeypatch
+):
+    captured = {"commit": "abc", "diff_sha256": "diff", "dirty": True}
+    launches = []
+    checks = []
+    monkeypatch.setattr(matrix_driver, "source_fingerprint", lambda _root: captured.copy())
+
+    def reject_next(_root, expected):
+        checks.append(expected)
+        raise RuntimeError("source changed")
+
+    def fake_run(command, *, cwd, env, check):
+        launches.append((command, cwd, env.copy(), check))
+        return SimpleNamespace(returncode=0)
+
+    monkeypatch.setattr(matrix_driver, "require_unchanged_source", reject_next)
+    monkeypatch.setattr(matrix_driver.subprocess, "run", fake_run)
+    with pytest.raises(RuntimeError, match="source changed"):
+        matrix_driver.main(
+            [
+                "--cells",
+                "adamw,torch_muon_adamw",
+                "--output-dir",
+                str(tmp_path),
+                "--execute",
+            ]
+        )
+    assert len(launches) == 1
+    assert checks == [captured]
+    assert launches[0][2][SOURCE_FINGERPRINT_ENV] == canonical_json(captured)
+
+
+def test_consistency_launcher_preserves_capture_and_guards_before_second_job(
+    tmp_path, monkeypatch
+):
+    config = {
+        "pretrain_cells": ["adamw", "gefen_hybrid_recommended"],
+        "sft_cells": ["adamw", "gefen_hybrid_recommended"],
+        "pretrain": {"source": "synthetic", "steps": 1},
+        "sft": {"source": "synthetic", "steps": 1},
+    }
+    config_path = tmp_path / "consistency.json"
+    config_path.write_text(json.dumps(config), encoding="utf-8")
+    captured = {"commit": "def", "diff_sha256": "diff", "dirty": True}
+    launches = []
+    checks = []
+    monkeypatch.setattr(
+        consistency_driver,
+        "source_fingerprint",
+        lambda _root: captured.copy(),
+    )
+
+    def reject_next(_root, expected):
+        checks.append(expected)
+        raise RuntimeError("source changed")
+
+    def fake_run(command, *, cwd, env, check):
+        launches.append((command, cwd, env.copy(), check))
+        return SimpleNamespace(returncode=0)
+
+    monkeypatch.setattr(consistency_driver, "require_unchanged_source", reject_next)
+    monkeypatch.setattr(consistency_driver.subprocess, "run", fake_run)
+    with pytest.raises(RuntimeError, match="source changed"):
+        consistency_driver.main(
+            [
+                "--config",
+                str(config_path),
+                "--output-dir",
+                str(tmp_path / "out"),
+                "--execute",
+            ]
+        )
+    assert len(launches) == 1
+    assert checks == [captured]
+    assert launches[0][2][SOURCE_FINGERPRINT_ENV] == canonical_json(captured)
 
 
 def test_consistency_plan_is_two_pretrains_crossed_with_four_sft_runs(tmp_path):
