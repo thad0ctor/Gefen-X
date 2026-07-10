@@ -47,11 +47,15 @@ def bench(fn, args, iters=300, warmup=80):
 
 
 def run_v1(a):
-    mod.automatic_gefen_fused_update_cuda(a[0].clone(), a[1], a[2].clone(), a[3].clone(), a[4], codebook, False, 0.9, 5e-5)
+    mod.automatic_gefen_fused_update_cuda(
+        a[0], a[1], a[2], a[3], a[4], codebook, False, 0.9, 5e-5
+    )
 
 
 def run_v2(a):
-    mod.automatic_gefen_fused_update_v2_cuda(a[0].clone(), a[1], a[2].clone(), a[3].clone(), a[4], codebook, False, 0.9, 5e-5)
+    mod.automatic_gefen_fused_update_v2_cuda(
+        a[0], a[1], a[2], a[3], a[4], codebook, False, 0.9, 5e-5
+    )
 
 
 print(f"=== {name}  sm_{cap[0]}{cap[1]}  SMs={sm} ===")
@@ -61,8 +65,14 @@ for numel in NUMELS:
     rows = []
     while period <= numel // 2:
         a = make(numel, period)
-        t1 = bench(run_v1, (a,))
-        t2 = bench(run_v2, (a,))
+        # Clone each mutable input ONCE per variant, outside the timed loop.
+        # Cloning p/sign/magnitude inside run_v* used to charge tens of MiB of
+        # allocation + D2D copies to every kernel call and corrupted the
+        # crossover this script exists to measure.
+        a1 = tuple(x.clone() for x in a)
+        a2 = tuple(x.clone() for x in a)
+        t1 = bench(run_v1, (a1,))
+        t2 = bench(run_v2, (a2,))
         nb = numel // period
         ratio = t1 / t2
         win = "v2" if ratio > 1.0 else "v1"

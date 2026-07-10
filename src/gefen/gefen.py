@@ -40,7 +40,7 @@ from gefen.kernels.automatic_gefen_fused import (
 from gefen.kernels.automatic_gefen_fused import (
     gefen_factored_update_cuda as _gefen_factored_update_cuda,
 )
-from gefen.kernels.automatic_gefen_fused import _should_use_v2
+from gefen.kernels.automatic_gefen_fused import _should_use_v2_full
 from gefen.kernels.automatic_gefen_fused import _CAPT_V1_FULL_TINY_NUMEL
 from gefen.kernels.automatic_gefen_fused import _codebook_search_lut
 from gefen.kernels.automatic_gefen_fused import (
@@ -57,11 +57,10 @@ FUSE_AUTOMATIC_VMEAN_UPDATE = True
 FUSE_GEFEN_AUTOMATIC_STEP = True
 FUSE_HISTOGRAM_FOR_EXACT = True
 
-# Dispatch between the two bit-identical fused update kernels (v1 single-pass,
-# v2 two-phase) is decided per call inside automatic_gefen_fused_update_cuda from
-# the param's num_blocks / period vs the device SM count -- the real driver of
-# which kernel is faster (the old arch allowlist was a proxy for this). Env
-# GEFEN_UPDATE_V2 still hard-forces the choice. See fused_bench/PERF.md.
+# Dispatch is shape-driven: the legacy partial-update pair uses its original
+# occupancy predicate, while the production fully-fused pair uses a separately
+# calibrated predicate because later multi-row/vectorized kernels moved the
+# crossover. ``GEFEN_UPDATE_V2`` still hard-forces either pair for diagnostics.
 
 
 def automatic_partition_view(flat_tensor: torch.Tensor, period: int) -> torch.Tensor:
@@ -1636,11 +1635,21 @@ class Gefen(torch.optim.Optimizer):
     def _gefen_codebook_lut_on(
         self, device: torch.device
     ) -> Optional[torch.Tensor]:
-        # Compiled-capturable plumbing: the prebuilt (static-marked) search
-        # LUT for this device, or None before the first eager capturable step
-        # populated it -- the kernel wrappers then fall back to their internal
-        # lazily-built LUT exactly as before.
-        return self._gefen_codebook_lut_by_device.get(device)
+        # Resolve once per device and retain the tensor on the optimizer.  The
+        # eager Muon momentum path calls this per matrix; returning a stable
+        # cached tensor avoids rebuilding the data_ptr/version cache key in the
+        # public kernel wrapper hundreds of times per step.  Capturable compile
+        # additionally marks this same tensor static in
+        # _mark_state_static_for_compile, so no allocation enters the graph.
+        cached = self._gefen_codebook_lut_by_device.get(device)
+        if cached is not None:
+            return cached
+        codebook = self._gefen_codebook_on(device)
+        if codebook is None:
+            return None
+        cached = _codebook_search_lut(codebook)
+        self._gefen_codebook_lut_by_device[device] = cached
+        return cached
 
     def _gefen_nearest_indices(self, normalized_vals: torch.Tensor) -> torch.Tensor:
 
@@ -1966,7 +1975,6 @@ class Gefen(torch.optim.Optimizer):
         if (
             self._use_fused_gefen_automatic_step()
             and p.is_cuda
-            and p.is_contiguous()
             and p.dtype != torch.float64
         ):
             # Fused path. Phase 1 of the kernel computes the per-block absmax
@@ -1981,6 +1989,14 @@ class Gefen(torch.optim.Optimizer):
                     "Expected Gefen codebook to be initialized before the "
                     "factored update."
                 )
+            # The raw kernel flat-indexes a contiguous matrix.  A strided leaf
+            # Parameter is uncommon but valid (and can arise from model surgery
+            # or a view-backed weight); falling all the way to the decomposed
+            # PyTorch path is an order-of-magnitude regression.  Mirror the
+            # block-vmean fused path: update a contiguous logical copy, then
+            # copy it back into the original storage.  State/grad geometry is
+            # unchanged and the direct contiguous case remains allocation-free.
+            p_kernel = p if p.is_contiguous() else p.contiguous()
             if self.capturable:
                 # Capturable: the per-step-varying scalars flow through the
                 # device buffer ([lr, 1/bc2, 1/bc1, wd_factor]; the kernel
@@ -1991,7 +2007,7 @@ class Gefen(torch.optim.Optimizer):
                     state, group, "factored_step", sqrt_bc2=False
                 )
                 _gefen_factored_update_cuda(
-                    p,
+                    p_kernel,
                     grad_view,
                     state["m_codebook"],
                     state["m_magnitude"],
@@ -2012,6 +2028,8 @@ class Gefen(torch.optim.Optimizer):
                     codebook_lut=self._gefen_codebook_lut_on(p.device),
                     seed_dev=self._sr_seed_on(p.device),
                 )
+                if p_kernel is not p:
+                    p.copy_(p_kernel)
                 return
             # bc1 corrects the (possibly checkpoint-restored, older) momentum
             # EMA; bc2 must correct the factored v EMA's own age.
@@ -2024,7 +2042,7 @@ class Gefen(torch.optim.Optimizer):
                 lr = self._lr_scalar(group)
             weight_decay_factor = 1.0 - lr * group["weight_decay"]
             _gefen_factored_update_cuda(
-                p,
+                p_kernel,
                 grad_view,
                 state["m_codebook"],
                 state["m_magnitude"],
@@ -2042,6 +2060,8 @@ class Gefen(torch.optim.Optimizer):
                 self._stochastic_round,
                 self._kernel_rng_seed(),
             )
+            if p_kernel is not p:
+                p.copy_(p_kernel)
             return
 
         # bc1 corrects the (possibly checkpoint-restored, older) momentum EMA;
@@ -2255,6 +2275,7 @@ class Gefen(torch.optim.Optimizer):
             self._stochastic_round,
             self._kernel_rng_seed(),
             seed_dev=self._sr_seed_on(grad_view.device),
+            codebook_lut=self._gefen_codebook_lut_on(grad_view.device),
         )
         return momentum_out
 
@@ -2643,13 +2664,13 @@ class Gefen(torch.optim.Optimizer):
                 step.clone() if torch.is_tensor(step) else step
             )
 
-        # Tier-1: well-occupied (v1-regime) params take the fully-fused kernel,
-        # which folds the vmean EMA + per-block stepsize math (and, after K3,
-        # weight decay) into the single update kernel -- skipping the separate
-        # vmean kernel and the host sqrt/div/reciprocal/mul launches. Tiny-period
-        # / few-block params stay on the decomposed v2 path, and the non-fused
-        # path stays decomposed. The routing predicate is the same one the v1/v2
-        # update dispatch uses, so the choice is consistent.
+        # Tier-1 uses a separately calibrated predicate for the current full
+        # v1/v2 kernels. Both fold the vmean EMA, per-block stepsize math, and
+        # weight decay into the update path; v1 is one kernel while v2 splits
+        # the work into several launches. Their grad^2 reductions have different
+        # orders, so rerouted tensors may differ at sub-ULP scale in vmean/p;
+        # momentum indices and magnitudes remain bit-identical. The older
+        # partial-update pair keeps its own historical crossover.
         # Per-tensor device/dtype gating: the fused update kernels take a raw
         # CUDA pointer launch, so a CPU-resident param (device_map spill / CPU
         # offload) would crash in the binding, and an fp64 param would be
@@ -2663,7 +2684,7 @@ class Gefen(torch.optim.Optimizer):
             and grad_view.is_cuda
             and grad_view.dtype != torch.float64
         )
-        route_v2 = _should_use_v2(
+        route_v2 = _should_use_v2_full(
             grad_view.shape[0], automatic_period, grad_view.device
         )
         if (
@@ -2671,12 +2692,11 @@ class Gefen(torch.optim.Optimizer):
             and self.capturable
             and flat_grad.numel() <= _CAPT_V1_FULL_TINY_NUMEL
         ):
-            # Capturable-only: tiny params are launch-bound, so the ONE-kernel
-            # v1-full path beats the 4-5-launch v2-full path inside a
-            # captured/replayed graph regardless of occupancy. Not applied to
-            # capturable=False (v1-full and v2-full differ at ulp level in the
-            # vmean reduction order, and the non-capturable path is under a
-            # bit-exact-vs-history contract). See _CAPT_V1_FULL_TINY_NUMEL.
+            # Capturable-specific extension: tiny params are launch-bound, so
+            # the ONE-kernel v1-full path beats the 4-5-launch v2-full path
+            # inside a captured/replayed graph regardless of occupancy. Eager
+            # execution already uses the general full-kernel routing above.
+            # See _CAPT_V1_FULL_TINY_NUMEL.
             route_v2 = False
         use_full_fused = fused_step and not route_v2
         use_v2_full = fused_step and route_v2

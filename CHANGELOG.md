@@ -4,6 +4,30 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+Performance:
+
+- Muon's fused quantized-momentum path now switches medium/large periods to the
+  split magnitude reducer and emits eight adjacent values per thread with
+  vectorized memory traffic plus the bit-exact codebook-search LUT. On the RTX
+  3090 386M-parameter census this cuts momentum time by about 36% and the full
+  3-iteration Muon step by about 1.7%.
+- Fully-fused v1/v2 routing is calibrated against the current full kernels
+  instead of reusing the legacy partial-update crossover, avoiding 1.2-3.5x
+  misroutes in the measured tiny/medium/large-period regimes.
+- Non-contiguous 2D parameters stay on the factored fused CUDA path through a
+  contiguous work buffer and copy-back (2.19 ms to 0.18 ms for a 2048x2048
+  bf16 parameter on RTX 3090) instead of falling back to decomposed PyTorch.
+- The v1/v2 sweep no longer clones all mutable tensors inside the timed loop.
+
+Numerics:
+
+- Fully-fused v1/v2 routing now prioritizes the faster current kernel for eager
+  as well as capturable execution. Because the two kernels reduce block-vmean
+  sums in different orders, tensors whose route changes may follow a sub-ULP
+  different vmean/parameter trajectory after upgrading; quantized momentum
+  indices and magnitudes remain bit-identical. `GEFEN_UPDATE_V2=0` or `1`
+  can isolate either path for diagnostics.
+
 ## [0.2.0] - 2026-07-08
 
 Renames the distribution to `gefen-x` and lands a production-readiness pass ahead of proposing Gefen as an optimizer for training platforms. `gefen-x` is a maintained fork of the original [Gefen](https://github.com/ndvbd/Gefen), published under a distinct distribution name so it can evolve independently on PyPI; the import name remains `gefen`.

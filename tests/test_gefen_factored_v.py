@@ -109,6 +109,45 @@ def check_state_and_flag_hygiene():
     return True
 
 
+def check_noncontiguous_fused_copyback():
+    """A strided 2D Parameter must stay on the factored CUDA path.
+
+    Compare it with a contiguous tensor carrying identical values/gradients;
+    this covers the contiguous-work-buffer update and copy-back end to end.
+    """
+    torch.manual_seed(17)
+    rows, cols = 256, 192
+    init = (torch.randn(rows, cols, device="cuda") * 0.02).bfloat16()
+    parent = torch.empty(rows, cols * 2, device="cuda", dtype=init.dtype)
+    noncontig = parent[:, ::2]
+    noncontig.copy_(init)
+    assert not noncontig.is_contiguous()
+
+    p_ref = nn.Parameter(init.clone())
+    p_nc = nn.Parameter(noncontig.detach())
+    before = p_nc.detach().clone()
+    opt_ref = Gefen([("w", p_ref)], lr=1e-3, fused=True, factored_v_2d=True)
+    opt_nc = Gefen([("w", p_nc)], lr=1e-3, fused=True, factored_v_2d=True)
+    torch.manual_seed(18)
+    for _ in range(3):
+        grad = torch.randn(rows, cols, device="cuda").bfloat16() * 1e-3
+        p_ref.grad = grad.clone()
+        p_nc.grad = grad.clone()
+        opt_ref.step()
+        opt_nc.step()
+
+    assert not p_nc.is_contiguous()
+    assert not torch.equal(before, p_nc)
+    assert torch.equal(p_ref, p_nc)
+    sr = opt_ref.state[p_ref]
+    sn = opt_nc.state[p_nc]
+    assert torch.equal(sr["m_codebook"], sn["m_codebook"])
+    assert torch.equal(sr["m_magnitude"], sn["m_magnitude"])
+    assert torch.allclose(sr["v_row"], sn["v_row"], rtol=2e-6, atol=1e-12)
+    assert torch.allclose(sr["v_col"], sn["v_col"], rtol=2e-6, atol=1e-12)
+    return True
+
+
 def check_tall_matrix_grid_stride():
     """rows > 65535 * TILE_ROWS exceeds CUDA's grid.y with one tile per
     block-row; the stats kernel must cover the tail via its y-grid-stride.
@@ -168,6 +207,7 @@ def run():
         ("single_step_adjacency", check_single_step_adjacency),
         ("transient_memory_bounded", check_transient_memory_bounded),
         ("state_and_flag_hygiene", check_state_and_flag_hygiene),
+        ("noncontiguous_fused_copyback", check_noncontiguous_fused_copyback),
         ("pre_factored_checkpoint_resume", check_pre_factored_checkpoint_resume),
         ("tall_matrix_grid_stride", check_tall_matrix_grid_stride),
     ]
@@ -201,6 +241,10 @@ if pytest is not None:
     @_skip
     def test_state_and_flag_hygiene():
         assert check_state_and_flag_hygiene()
+
+    @_skip
+    def test_noncontiguous_fused_copyback():
+        assert check_noncontiguous_fused_copyback()
 
     @_skip
     def test_pre_factored_checkpoint_resume():

@@ -26,7 +26,10 @@ from gefen.gefen import (
     gefen_automatic_fused_update,
     gefen_dequantize_unpacked_indices,
 )
-from gefen.kernels.automatic_gefen_fused import gefen_quantized_momentum_update_cuda
+from gefen.kernels.automatic_gefen_fused import (
+    _codebook_search_lut,
+    gefen_quantized_momentum_update_cuda,
+)
 
 BETA1 = 0.9
 DTYPES = {"bf16": torch.bfloat16, "fp16": torch.float16, "fp32": torch.float32}
@@ -39,6 +42,8 @@ CASES = [
     (1024 * 1024, 256),
     (2048 * 1024, 1024),
     (1024 * 3072, 98304),
+    (1009 * 127, 127),  # non-power-of-eight period + tail chunk
+    (513 * 65, 65),     # a chunk crosses block boundaries repeatedly
 ]
 
 
@@ -81,11 +86,19 @@ def _old_recipe(grad_view, m_sign, m_magnitude, codebook, beta1):
     return ms, mm, mom
 
 
-def _new_kernel(grad_view, m_sign, m_magnitude, codebook, beta1):
+def _new_kernel(
+    grad_view, m_sign, m_magnitude, codebook, beta1, codebook_lut=None,
+    *, stochastic_round=False, rng_seed=0,
+):
     ms = m_sign.clone()
     mm = m_magnitude.clone()
     mom = torch.empty(grad_view.shape, dtype=grad_view.dtype, device=grad_view.device)
-    gefen_quantized_momentum_update_cuda(grad_view, ms, mm, codebook, mom, beta1)
+    gefen_quantized_momentum_update_cuda(
+        grad_view, ms, mm, codebook, mom, beta1,
+        stochastic_round=stochastic_round,
+        rng_seed=rng_seed,
+        codebook_lut=codebook_lut,
+    )
     return ms, mm, mom
 
 
@@ -95,20 +108,59 @@ def _check(numel, period, dtype_name, device):
     gv, ms0, mm0 = _make(numel, period, dtype, device, seed=period + len(dtype_name))
 
     old_sign, old_mag, old_mom = _old_recipe(gv, ms0, mm0, cb, BETA1)
-    new_sign, new_mag, new_mom = _new_kernel(gv, ms0, mm0, cb, BETA1)
+    lut_real = _codebook_search_lut(cb)
+    lut_empty = torch.empty(0, dtype=torch.int16, device=device)
+    for lut_name, lut in (("lut", lut_real), ("nolut", lut_empty)):
+        new_sign, new_mag, new_mom = _new_kernel(
+            gv, ms0, mm0, cb, BETA1, codebook_lut=lut
+        )
 
-    assert torch.equal(new_sign, old_sign), (
-        f"m_sign mismatch [{dtype_name} numel={numel} period={period}]: "
-        f"{(new_sign != old_sign).sum().item()} elems differ"
+        assert torch.equal(new_sign, old_sign), (
+            f"m_sign mismatch [{dtype_name} numel={numel} period={period} "
+            f"{lut_name}]: {(new_sign != old_sign).sum().item()} elems differ"
+        )
+        assert torch.equal(new_mag, old_mag), (
+            f"m_magnitude mismatch [{dtype_name} numel={numel} period={period} "
+            f"{lut_name}]: max|d|={(new_mag - old_mag).abs().max().item():.3e}"
+        )
+        assert torch.equal(new_mom, old_mom), (
+            f"dense momentum mismatch [{dtype_name} numel={numel} period={period} "
+            f"{lut_name}]: max|d|="
+            f"{(new_mom.float() - old_mom.float()).abs().max().item():.3e}"
+        )
+    return True
+
+
+def _check_stochastic_lut_parity(device):
+    cb = _codebook(device, seed=11)
+    gv, ms0, mm0 = _make(1009 * 127, 127, torch.bfloat16, device, seed=19)
+    real = _codebook_search_lut(cb)
+    empty = torch.empty(0, dtype=torch.int16, device=device)
+    a = _new_kernel(
+        gv, ms0, mm0, cb, BETA1, real,
+        stochastic_round=True, rng_seed=12345,
     )
-    assert torch.equal(new_mag, old_mag), (
-        f"m_magnitude mismatch [{dtype_name} numel={numel} period={period}]: "
-        f"max|d|={(new_mag - old_mag).abs().max().item():.3e}"
+    b = _new_kernel(
+        gv, ms0, mm0, cb, BETA1, empty,
+        stochastic_round=True, rng_seed=12345,
     )
-    assert torch.equal(new_mom, old_mom), (
-        f"dense momentum mismatch [{dtype_name} numel={numel} period={period}]: "
-        f"max|d|={(new_mom.float() - old_mom.float()).abs().max().item():.3e}"
+    assert all(torch.equal(x, y) for x, y in zip(a, b))
+    return True
+
+
+def _check_unaligned_contiguous_view(device):
+    """A contiguous storage-offset view must take the scalar chunk fallback."""
+    cb = _codebook(device, seed=23)
+    gv, ms0, mm0 = _make(1009 * 127, 127, torch.bfloat16, device, seed=29)
+    backing = torch.empty(gv.numel() + 1, dtype=gv.dtype, device=device)
+    gv_offset = backing[1:].view_as(gv)
+    gv_offset.copy_(gv)
+    assert gv_offset.is_contiguous() and gv_offset.data_ptr() % 16 != 0
+    old = _old_recipe(gv_offset, ms0, mm0, cb, BETA1)
+    new = _new_kernel(
+        gv_offset, ms0, mm0, cb, BETA1, _codebook_search_lut(cb)
     )
+    assert all(torch.equal(x, y) for x, y in zip(old, new))
     return True
 
 
@@ -138,6 +190,14 @@ if pytest is not None:
     )
     def test_muon_momentum_kernel_bit_exact(dtype_name, case):
         assert _check(case[0], case[1], dtype_name, "cuda")
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+    def test_muon_momentum_stochastic_lut_parity():
+        assert _check_stochastic_lut_parity("cuda")
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+    def test_muon_momentum_unaligned_contiguous_view():
+        assert _check_unaligned_contiguous_view("cuda")
 
 
 if __name__ == "__main__":
