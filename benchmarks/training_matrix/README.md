@@ -280,7 +280,7 @@ Suggested starting grids (refine around the winner):
 
 | Knob | From-scratch screen | Qwen HF SFT |
 |---|---|---|
-| main LR | `3e-4, 6e-4, 1e-3, 2e-3` | `2e-5, 3e-5, 5e-5, 8e-5` |
+| main LR | `3e-4, 6e-4, 1e-3, 2e-3, 3e-3, 4e-3` | `2e-5, 3e-5, 5e-5, 8e-5` |
 | matched weight decay | `0, 0.01, 0.1` | `0, 0.01, 0.1` |
 | backup LR fraction | `0.25, 0.5, 0.75, 1.0` | same |
 | schedule | `constant`, `warmup_cosine` | same |
