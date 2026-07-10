@@ -667,13 +667,15 @@ class Gefen(torch.optim.Optimizer):
         # replays fresh seeds. Not serialized: load_state_dict clears the dict
         # and the seeds rebuild from the restored gefen_global_step.
         self._sr_seed_by_device = {}
-        # Batched capturable refresh (capturable=True only): per-device stacked
-        # buffers that hold every registered param's step counters ([2, N]
-        # fp32; row 0 = the bc2 counter, row 1 = step) and kernel-scalar rows
-        # ([N, 4] fp32) as the backing store of the per-param state views, so
-        # ONE short vectorized op chain per step replaces the ~10 microscopic
-        # per-param launches of counter increments + scalar-refresh chains.
-        # None until the first post-init capturable step builds it; see
+        # Batched capturable refresh (capturable=True only): each device maps
+        # to an ordered tuple of scalar-HYPERPARAMETER cohorts. Every cohort
+        # holds its registered params' step counters ([2, N] fp32; row 0 = the
+        # bc2 counter, row 1 = step) and kernel-scalar rows ([N, 4] fp32) as the
+        # backing store of the per-param state views. One short vectorized op
+        # chain per distinct lr/weight-decay cohort replaces the ~10
+        # microscopic launches per param while still allowing ordinary
+        # decay/no-decay and layerwise-lr parameter groups. None until the
+        # first capturable prologue builds the registry; see
         # _capt_build_stacks / _capt_batched_refresh.
         self._capt_stacks = None
         # Identity fingerprint of the last _mark_state_static_for_compile
@@ -1105,13 +1107,12 @@ class Gefen(torch.optim.Optimizer):
         # tensors static too so cudagraph trees treats their addresses as
         # stable across compiled steps.
         if self._capt_stacks:
-            for stack in self._capt_stacks.values():
-                if not stack:
-                    continue
-                for key in ("steps2d", "consts2d", "scal2d", "sqrt_mask"):
-                    value = stack.get(key)
-                    if torch.is_tensor(value):
-                        mark(value)
+            for device_stacks in self._capt_stacks.values():
+                for stack in device_stacks:
+                    for key in ("steps2d", "consts2d", "scal2d", "sqrt_mask"):
+                        value = stack.get(key)
+                        if torch.is_tensor(value):
+                            mark(value)
         # Recompute AFTER the pass: the LUT prebuild above may have populated
         # _gefen_codebook_lut_by_device, which the fingerprint includes.
         self._static_mark_sig = self._static_mark_signature()
@@ -1248,24 +1249,25 @@ class Gefen(torch.optim.Optimizer):
     # a ~250-param model those ~2500 tiny kernels dominate the capturable
     # step's GPU time (they are what made captured/compiled stepping slower
     # than the plain eager step). The machinery below instead keeps each
-    # registered param's counters and scalar buffer as VIEWS into per-device
+    # registered param's counters and scalar buffer as VIEWS into per-cohort
     # stacked buffers (steps2d [2, N] fp32, scal2d [N, 4] fp32) and advances /
     # refreshes ALL rows with one short vectorized chain per step (~10
-    # launches total, independent of N). The chain is elementwise identical
-    # to _refresh_capturable_step_scalars (same float64 pow -> 1-x -> sqrt ->
-    # reciprocal ops, fp32 cast only at the buffer write), so eager,
+    # launches per distinct lr/weight-decay cohort, independent of N). The
+    # chain is elementwise identical to _refresh_capturable_step_scalars (same
+    # float64 pow -> 1-x -> sqrt -> reciprocal ops, fp32 cast only at the
+    # buffer write), so eager,
     # manually-captured and compiled capturable stepping keep their exact
     # numerics -- the anti-freeze tests assert the buffer values exactly.
     #
     # State-dict semantics are preserved: counter views serialize through
     # state_dict's _compact pass (non-owning views are cloned into independent
-    # tensors), "_capt_scalars"/"_capt_row" are scratch and stripped from
-    # checkpoints, and load_state_dict tears the stacks down (counters come
-    # back as independent 0-dim tensors); the stacks lazily rebuild on the
-    # next eager capturable step. Registration is validated against the
-    # live stepping set every step and torn down on any mismatch, so grad-set
-    # changes, param device moves and state surgery all fall back to the
-    # bit-identical per-param path instead of desyncing.
+    # tensors), "_capt_scalars"/"_capt_stack"/"_capt_row" are scratch and
+    # stripped from checkpoints, and load_state_dict tears the stacks down
+    # (counters come back as independent 0-dim tensors); the stacks lazily
+    # rebuild on the next eager capturable step. Registration is validated
+    # against the live stepping set every step and torn down on any mismatch,
+    # so grad-set changes, param device moves and state surgery all fall back
+    # to the bit-identical per-param path instead of desyncing.
     # ------------------------------------------------------------------
 
     def _capt_row_info(self, p: torch.Tensor):
@@ -1311,13 +1313,13 @@ class Gefen(torch.optim.Optimizer):
         self._capt_stacks = None
         if not stacks:
             return
-        for stack in stacks.values():
-            if not stack:
-                continue
-            for p in stack["rows"]:
-                state = self.state.get(p)
-                if state is not None:
-                    state.pop("_capt_row", None)
+        for device_stacks in stacks.values():
+            for stack in device_stacks:
+                for p in stack["rows"]:
+                    state = self.state.get(p)
+                    if state is not None:
+                        state.pop("_capt_stack", None)
+                        state.pop("_capt_row", None)
 
     @torch._dynamo.disable
     def _capt_build_stacks(self) -> bool:
@@ -1326,111 +1328,127 @@ class Gefen(torch.optim.Optimizer):
         # nor trace-safe); callers skip the rebuild under capture/compile and
         # step per-param instead.
         self._capt_invalidate()
+        # Python dict insertion order gives deterministic device/cohort/row
+        # order from the public optimizer group order. Tensor lrs are keyed by
+        # OBJECT identity (and retained strongly by the stack), because two
+        # equal-valued tensors can be scheduled independently. Float lrs are
+        # keyed by their current value when cohorts are first formed; a cohort
+        # may subsequently move together to a new float without rebuilding,
+        # while divergence is caught by _capt_batched_ready and repartitioned.
         per_dev = {}
         for group in self.param_groups:
             for p in group["params"]:
                 info = self._capt_row_info(p)
                 if info is None:
                     continue
-                d = per_dev.setdefault(
-                    p.device, {"rows": [], "groups": [], "keys": [], "sqrt": []}
-                )
+                lr = group["lr"]
+                if torch.is_tensor(lr):
+                    lr_key = ("tensor", id(lr))
+                else:
+                    lr_key = ("float", float(lr))
+                cohort_key = (lr_key, group["weight_decay"])
+                cohorts = per_dev.setdefault(p.device, {})
+                d = cohorts.get(cohort_key)
+                if d is None:
+                    d = {
+                        "cohort_key": cohort_key,
+                        "rows": [],
+                        "groups": [],
+                        "keys": [],
+                        "sqrt": [],
+                        "betas": [],
+                        # Strong ref for tensor-lr identity/lifetime. For float
+                        # cohorts this is only the build-time value; refresh
+                        # reads the live value from row_groups[0].
+                        "lr0": lr,
+                        "weight_decay0": group["weight_decay"],
+                    }
+                    cohorts[cohort_key] = d
                 d["rows"].append(p)
                 d["groups"].append(group)
                 d["keys"].append(info[0])
                 d["sqrt"].append(info[1])
+                d["betas"].append((group["beta1"], group["beta2"]))
         stacks = {}
-        built_any = False
-        for device, d in per_dev.items():
-            groups = d["groups"]
-            # The chain writes ONE lr / weight-decay factor per device stack,
-            # so the rows must share the lr spec: either every group holds the
-            # SAME lr tensor object (in-place schedules flow on device), or
-            # every group holds an equal python float (schedulers that assign
-            # group["lr"] floats keep working -- the refresh reads the live,
-            # per-step-validated value). Heterogeneous specs keep the
-            # per-param path for this device (marked None so validation does
-            # not rebuild-thrash every step).
-            lr0 = groups[0]["lr"]
-            wd0 = groups[0]["weight_decay"]
-            if torch.is_tensor(lr0):
-                homogeneous = all(
-                    g["lr"] is lr0 and g["weight_decay"] == wd0 for g in groups
+        for device, cohorts in per_dev.items():
+            device_stacks = []
+            for stack_index, d in enumerate(cohorts.values()):
+                groups = d["groups"]
+                rows = d["rows"]
+                n = len(rows)
+                steps2d = torch.empty((2, n), dtype=torch.float32, device=device)
+                steps2d[0].copy_(
+                    torch.stack(
+                        [
+                            self.state[p][key].detach()
+                            for p, key in zip(rows, d["keys"])
+                        ]
+                    )
                 )
-            else:
-                homogeneous = all(
-                    not torch.is_tensor(g["lr"])
-                    and g["lr"] == lr0
-                    and g["weight_decay"] == wd0
-                    for g in groups
+                steps2d[1].copy_(
+                    torch.stack([self.state[p]["step"].detach() for p in rows])
                 )
-            if not homogeneous:
-                stacks[device] = None
-                continue
-            rows = d["rows"]
-            n = len(rows)
-            steps2d = torch.empty((2, n), dtype=torch.float32, device=device)
-            steps2d[0].copy_(
-                torch.stack(
+                consts2d = torch.tensor(
                     [
-                        self.state[p][key].detach()
-                        for p, key in zip(rows, d["keys"])
-                    ]
+                        [g["beta2"] for g in groups],
+                        [g["beta1"] for g in groups],
+                    ],
+                    dtype=torch.float64,
+                    device=device,
                 )
-            )
-            steps2d[1].copy_(
-                torch.stack([self.state[p]["step"].detach() for p in rows])
-            )
-            consts2d = torch.tensor(
-                [
-                    [g["beta2"] for g in groups],
-                    [g["beta1"] for g in groups],
-                ],
-                dtype=torch.float64,
-                device=device,
-            )
-            flags = d["sqrt"]
-            if all(flags):
-                sqrt_mode, sqrt_mask = "all", None
-            elif not any(flags):
-                sqrt_mode, sqrt_mask = "none", None
-            else:
-                sqrt_mode = "mixed"
-                sqrt_mask = torch.tensor(flags, dtype=torch.bool, device=device)
-            scal2d = torch.ones((n, 4), dtype=torch.float32, device=device)
-            step_views = []
-            bc2_views = []
-            for i, p in enumerate(rows):
-                state = self.state[p]
-                bc2_view = steps2d[0, i]
-                step_view = steps2d[1, i]
-                state[d["keys"][i]] = bc2_view
-                state["step"] = step_view
-                state["_capt_scalars"] = scal2d[i]
-                state.pop("_capt_consts", None)
-                state["_capt_row"] = i
-                step_views.append(step_view)
-                bc2_views.append(bc2_view)
-            stacks[device] = {
-                "rows": rows,
-                "row_groups": groups,
-                "keys": d["keys"],
-                "steps2d": steps2d,
-                "consts2d": consts2d,
-                "sqrt_mode": sqrt_mode,
-                "sqrt_mask": sqrt_mask,
-                "scal2d": scal2d,
-                "step_views": step_views,
-                "bc2_views": bc2_views,
-                "tensor_lr": torch.is_tensor(lr0),
-                "lr0": lr0,
-            }
-            built_any = True
-        if not built_any:
-            self._capt_stacks = None
-            return False
+                flags = d["sqrt"]
+                if all(flags):
+                    sqrt_mode, sqrt_mask = "all", None
+                elif not any(flags):
+                    sqrt_mode, sqrt_mask = "none", None
+                else:
+                    sqrt_mode = "mixed"
+                    sqrt_mask = torch.tensor(flags, dtype=torch.bool, device=device)
+                scal2d = torch.ones((n, 4), dtype=torch.float32, device=device)
+                step_views = []
+                bc2_views = []
+                scalar_views = []
+                for i, p in enumerate(rows):
+                    state = self.state[p]
+                    bc2_view = steps2d[0, i]
+                    step_view = steps2d[1, i]
+                    scalar_view = scal2d[i]
+                    state[d["keys"][i]] = bc2_view
+                    state["step"] = step_view
+                    state["_capt_scalars"] = scalar_view
+                    state.pop("_capt_consts", None)
+                    state["_capt_stack"] = stack_index
+                    state["_capt_row"] = i
+                    step_views.append(step_view)
+                    bc2_views.append(bc2_view)
+                    scalar_views.append(scalar_view)
+                device_stacks.append(
+                    {
+                        "cohort_key": d["cohort_key"],
+                        "rows": rows,
+                        "row_groups": groups,
+                        "keys": d["keys"],
+                        "betas": d["betas"],
+                        "weight_decay0": d["weight_decay0"],
+                        "steps2d": steps2d,
+                        "consts2d": consts2d,
+                        "sqrt_mode": sqrt_mode,
+                        "sqrt_mask": sqrt_mask,
+                        "scal2d": scal2d,
+                        "step_views": step_views,
+                        "bc2_views": bc2_views,
+                        "scalar_views": scalar_views,
+                        "tensor_lr": torch.is_tensor(d["lr0"]),
+                        "lr0": d["lr0"],
+                    }
+                )
+            stacks[device] = tuple(device_stacks)
+        # Keep an EMPTY registry as a stable "currently no eligible rows"
+        # sentinel. If lazy init or a grad-set change later makes rows eligible,
+        # validation detects the missing device/stack and rebuilds once; a
+        # permanently empty stepping set no longer rebuild-thrashes every step.
         self._capt_stacks = stacks
-        return True
+        return bool(stacks)
 
     @torch._dynamo.disable
     def _capt_batched_prologue(self) -> None:
@@ -1478,7 +1496,7 @@ class Gefen(torch.optim.Optimizer):
                 return False
             return self._capt_build_stacks()
         counts = {}
-        lr_now = {}
+        live_specs = {}
         ok = True
         for group in self.param_groups:
             if not ok:
@@ -1487,23 +1505,34 @@ class Gefen(torch.optim.Optimizer):
                 info = self._capt_row_info(p)
                 if info is None:
                     continue
-                stack = stacks.get(p.device, False)
-                if stack is None:
-                    # Known heterogeneous-lr device: stays per-param.
-                    continue
-                if stack is False:
+                device_stacks = stacks.get(p.device)
+                state = self.state[p]
+                stack_index = state.get("_capt_stack")
+                if (
+                    device_stacks is None
+                    or not isinstance(stack_index, int)
+                    or stack_index < 0
+                    or stack_index >= len(device_stacks)
+                ):
                     ok = False
                     break
-                i = counts.get(p.device, 0)
+                stack = device_stacks[stack_index]
+                count_key = (p.device, stack_index)
+                i = counts.get(count_key, 0)
                 rows = stack["rows"]
-                state = self.state[p]
                 if (
                     i >= len(rows)
                     or rows[i] is not p
+                    or stack["row_groups"][i] is not group
                     or stack["keys"][i] != info[0]
+                    or state.get("_capt_stack") != stack_index
                     or state.get("_capt_row") != i
                     or state["step"] is not stack["step_views"][i]
                     or state.get(info[0]) is not stack["bc2_views"][i]
+                    or state.get("_capt_scalars") is not stack["scalar_views"][i]
+                    or stack["betas"][i]
+                    != (group["beta1"], group["beta2"])
+                    or group["weight_decay"] != stack["weight_decay0"]
                 ):
                     ok = False
                     break
@@ -1515,24 +1544,20 @@ class Gefen(torch.optim.Optimizer):
                 elif torch.is_tensor(lr):
                     ok = False
                     break
-                lrwd = lr_now.get(p.device)
-                if lrwd is None:
-                    lr_now[p.device] = (lr, group["weight_decay"])
-                elif not stack["tensor_lr"] and (
-                    lr != lrwd[0] or group["weight_decay"] != lrwd[1]
-                ):
+                live = live_specs.get(count_key)
+                if live is None:
+                    live_specs[count_key] = lr
+                elif not stack["tensor_lr"] and lr != live:
                     ok = False
                     break
-                elif stack["tensor_lr"] and group["weight_decay"] != lrwd[1]:
-                    ok = False
-                    break
-                counts[p.device] = i + 1
+                counts[count_key] = i + 1
         if ok:
-            for device, stack in stacks.items():
-                if stack is not None and counts.get(device, 0) != len(
-                    stack["rows"]
-                ):
-                    ok = False
+            for device, device_stacks in stacks.items():
+                for stack_index, stack in enumerate(device_stacks):
+                    if counts.get((device, stack_index), 0) != len(stack["rows"]):
+                        ok = False
+                        break
+                if not ok:
                     break
         if ok:
             return True
@@ -1542,7 +1567,7 @@ class Gefen(torch.optim.Optimizer):
         return self._capt_build_stacks()
 
     def _capt_batched_refresh(self) -> None:
-        # One short vectorized op chain per device stack replaces every
+        # One short vectorized op chain per device/cohort stack replaces every
         # registered param's counter increments + scalar-refresh chain. Only
         # ever called from the dynamo-disabled prologue (see
         # _capt_batched_prologue for why it must stay out of traced frames).
@@ -1559,33 +1584,32 @@ class Gefen(torch.optim.Optimizer):
         # every step, so captured graphs replay fresh values; a python-float
         # lr is written with host fill_s whose values a captured graph bakes,
         # exactly as the per-param path baked them.
-        for stack in self._capt_stacks.values():
-            if stack is None:
-                continue
-            steps2d = stack["steps2d"]
-            steps2d += 1
-            bc = 1.0 - torch.pow(stack["consts2d"], steps2d)
-            bc2 = bc[0]
-            sqrt_mode = stack["sqrt_mode"]
-            if sqrt_mode == "all":
-                bc2 = bc2.sqrt()
-            elif sqrt_mode == "mixed":
-                bc2 = torch.where(stack["sqrt_mask"], bc2.sqrt(), bc2)
-            scal2d = stack["scal2d"]
-            scal2d[:, 1].copy_(bc2.reciprocal())
-            scal2d[:, 2].copy_(bc[1].reciprocal())
-            group0 = stack["row_groups"][0]
-            lr = group0["lr"]
-            weight_decay = group0["weight_decay"]
-            if torch.is_tensor(lr):
-                scal2d[:, 0].copy_(lr)
-                if weight_decay:
-                    scal2d[:, 3].copy_(1.0 - lr.double() * weight_decay)
+        for device_stacks in self._capt_stacks.values():
+            for stack in device_stacks:
+                steps2d = stack["steps2d"]
+                steps2d += 1
+                bc = 1.0 - torch.pow(stack["consts2d"], steps2d)
+                bc2 = bc[0]
+                sqrt_mode = stack["sqrt_mode"]
+                if sqrt_mode == "all":
+                    bc2 = bc2.sqrt()
+                elif sqrt_mode == "mixed":
+                    bc2 = torch.where(stack["sqrt_mask"], bc2.sqrt(), bc2)
+                scal2d = stack["scal2d"]
+                scal2d[:, 1].copy_(bc2.reciprocal())
+                scal2d[:, 2].copy_(bc[1].reciprocal())
+                group0 = stack["row_groups"][0]
+                lr = stack["lr0"] if stack["tensor_lr"] else group0["lr"]
+                weight_decay = stack["weight_decay0"]
+                if torch.is_tensor(lr):
+                    scal2d[:, 0].copy_(lr)
+                    if weight_decay:
+                        scal2d[:, 3].copy_(1.0 - lr.double() * weight_decay)
+                    else:
+                        scal2d[:, 3].fill_(1.0)
                 else:
-                    scal2d[:, 3].fill_(1.0)
-            else:
-                scal2d[:, 0].fill_(float(lr))
-                scal2d[:, 3].fill_(1.0 - float(lr) * weight_decay)
+                    scal2d[:, 0].fill_(float(lr))
+                    scal2d[:, 3].fill_(1.0 - float(lr) * weight_decay)
 
     def _automatic_vmean_update(
         self,
@@ -3092,6 +3116,7 @@ class Gefen(torch.optim.Optimizer):
             # Batched-refresh registration marker (a host int): scratch like
             # the buffers it indexes into; leaking it into a checkpoint would
             # falsely mark restored params as batch-covered.
+            "_capt_stack",
             "_capt_row",
         )
 
