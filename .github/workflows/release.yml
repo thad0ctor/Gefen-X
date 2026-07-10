@@ -44,7 +44,9 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-          cache: pip
+          # No pip cache in this privileged publish workflow: GitHub caches are
+          # branch-scoped and writable by less-trusted runs, so a poisoned cache
+          # could taint the wheel uploaded to PyPI. Build tooling installs fast.
 
       - name: Install build tooling
         run: python -m pip install --upgrade pip build twine
