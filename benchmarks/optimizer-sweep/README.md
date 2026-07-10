@@ -31,7 +31,8 @@ For each (model, optimizer) it measures, under one fixed regime:
 - Each optimizer runs at **its own fair LR** (see below)
 
 Optimizers (`--opt`): `adamw_bf16`, `adamw8bit` (bitsandbytes), `adamw4bit`
-(torchao), `gefen_fused`, `gefen_nonfused`, `gefen_muon` (GefenMuonHybrid). The
+(torchao), `gefen_fused`, `gefen_nonfused`, `gefen_muon` (GefenMuonHybrid with
+the balanced SFT AdamW backup). The
 default set run by `run.sh` is `adamw_bf16 adamw8bit adamw4bit gefen_fused
 gefen_muon` — pass `--no-muon` to drop the (slow) Newton-Schulz `gefen_muon`.
 
@@ -118,6 +119,9 @@ Then set e.g. `gpus: "1,2,4,5,7"` (or `--gpus "1,2,4,5,7"`).
 - Add `--lr-sweep` to run a short per-optimizer LR sweep first and use each
   optimizer's best LR for the finals (instead of the documented defaults).
 - `gefen_muon` is in the default set; add `--no-muon` to skip it, or set `--opts "..."`.
+- The SFT default is `--muon-backup-optimizer adamw` at full backup LR. Use
+  `--muon-backup-optimizer gefen`, `--muon-backup-lr-frac 0.5`, and
+  `--muon-backup-1d` for the lower-memory Gefen-backup recipe.
 - Use `--model <tag>=<path>` (repeatable) for arbitrary models/tags.
 - `--arch` is your GPU's compute capability (`8.6` Ampere, `12.0` Blackwell).
 - Run `./run.sh -h` for the full flag list. Missing required settings fail cleanly.
@@ -149,11 +153,10 @@ Written to `--out`:
   noise is not estimated. Re-run with other seeds to bound it.
 - **`gefen_muon` needs `--muon-adjust match_rms_adamw`** to share the AdamW LR
   scale; with the original Muon scaling its LR is on a different footing.
-- **`gefen_muon` follows the shipped `GefenMuonHybrid` defaults** unless
-  overridden — including `normuon` (per-neuron 2nd moment on the Newton-Schulz
-  output, on by default). Pass `--no-muon-normuon` to disable it; the effective
-  value is recorded in each result line (`muon_flags.normuon` /
-  `normuon_explicit`).
+- **`gefen_muon` is an SFT-specific row**, not the literal constructor default:
+  it uses the AdamW backup at full LR plus the hybrid's tuned3/NorMuon defaults.
+  Pass `--no-muon-normuon` to disable NorMuon. The effective backup, schedule,
+  and normalization are recorded in each result line (`muon_flags`).
 - **`gefen_fused`/`gefen_nonfused` run the shipped defaults** (which include
   `factored_v_2d`, the AdamW-parity second moment, fair LR ≈0.6× AdamW's);
   the remaining opt-in levers (`--gefen-period-one-substrings`,

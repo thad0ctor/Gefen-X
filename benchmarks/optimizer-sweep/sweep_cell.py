@@ -28,8 +28,10 @@ import argparse
 import json
 import os
 import random
+import subprocess
 import sys
 import time
+from pathlib import Path
 
 def positive_int(value):
     value = int(value)
@@ -55,6 +57,8 @@ ap.add_argument("--seed", type=int, default=0)
 ap.add_argument("--steps", type=positive_int, default=2000)
 ap.add_argument("--seq", type=positive_int, default=2048)
 ap.add_argument("--gpu", type=int, required=True, help="CUDA device index to pin")
+ap.add_argument("--expected-cuda-uuid", default=None,
+                help="optional physical GPU guard, with or without the GPU- prefix")
 ap.add_argument("--arch", default="8.6",
                 help="TORCH_CUDA_ARCH_LIST value, e.g. 8.6 (Ampere), 12.0 (Blackwell)")
 ap.add_argument("--tag", required=True, help="short model tag used to group results, e.g. qwen1p7b")
@@ -73,6 +77,9 @@ ap.add_argument("--muon-adjust", default="match_rms_adamw",
 # --- recommended loss-recovery flags (gefen_muon only) ---
 ap.add_argument("--variant", default=None,
                 help="free-form label recorded in the result line; defaults to opt name")
+ap.add_argument("--muon-backup-optimizer", choices=("gefen", "adamw"), default="adamw",
+                help="GefenMuonHybrid backup for embeddings/head/norms/biases; "
+                     "the SFT sweep defaults to the balanced AdamW-backup recipe")
 ap.add_argument("--muon-lr", type=float, default=None,
                 help="GefenMuonHybrid muon_lr override (default: shared --lr)")
 ap.add_argument("--backup-lr", type=float, default=None,
@@ -132,12 +139,41 @@ from transformers import AutoModelForCausalLM, AutoTokenizer  # noqa: E402
 
 # --- GPU POLICY GUARD: never run on an RTX PRO 6000 (reserved) ---
 dev_name = torch.cuda.get_device_name(0)
-print(f"[gpu] CUDA_VISIBLE_DEVICES={args.gpu} -> {dev_name}", flush=True)
+dev_uuid = f"GPU-{torch.cuda.get_device_properties(0).uuid}"
+print(f"[gpu] CUDA_VISIBLE_DEVICES={args.gpu} -> {dev_name} ({dev_uuid})", flush=True)
 if "RTX PRO 6000" in dev_name:
     sys.exit(f"ABORT: refusing to run on forbidden GPU {dev_name}")
+if args.expected_cuda_uuid is not None:
+    expected_uuid = args.expected_cuda_uuid
+    if not expected_uuid.startswith("GPU-"):
+        expected_uuid = f"GPU-{expected_uuid}"
+    if dev_uuid.lower() != expected_uuid.lower():
+        sys.exit(
+            f"ABORT: expected CUDA UUID {expected_uuid}, got {dev_uuid} ({dev_name})"
+        )
 
 BLOCK = args.seq
 torch.manual_seed(args.seed)
+
+
+def git_provenance():
+    """Return the exact source revision measured by this checkout."""
+    root = Path(__file__).resolve().parents[2]
+    try:
+        commit = subprocess.run(
+            ["git", "rev-parse", "HEAD"], cwd=root, check=True,
+            capture_output=True, text=True,
+        ).stdout.strip()
+        dirty = bool(subprocess.run(
+            ["git", "status", "--porcelain"], cwd=root, check=True,
+            capture_output=True, text=True,
+        ).stdout.strip())
+        return {"commit": commit, "dirty": dirty}
+    except (OSError, subprocess.CalledProcessError):
+        return {"commit": None, "dirty": None}
+
+
+SOURCE_GIT = git_provenance()
 
 ALPACA_PROMPT_NO_INPUT = (
     "Below is an instruction that describes a task. Write a response that "
@@ -308,6 +344,7 @@ elif args.opt == "gefen_muon":
     _hybrid_kwargs = dict(
         lr=lr,
         muon_lr=args.muon_lr, backup_lr=args.backup_lr,
+        backup_optimizer=args.muon_backup_optimizer,
         adjust_lr_fn=_adj, fused=True,
         backup_1d_period_one=args.backup_1d_period_one,
         backup_2d_period_one=args.backup_2d_period_one,
@@ -335,7 +372,8 @@ elif args.opt == "gefen_muon":
         str(_resolved_normuon) if args.muon_normuon is not None
         else f"{_resolved_normuon} (default)"
     )
-    print(f"[gefen_muon] adjust_lr_fn={_adj!r} muon_lr={args.muon_lr} "
+    print(f"[gefen_muon] adjust_lr_fn={_adj!r} backup_optimizer={args.muon_backup_optimizer} "
+          f"muon_lr={args.muon_lr} "
           f"backup_lr={args.backup_lr} backup_1d_period_one={args.backup_1d_period_one} "
           f"backup_2d_period_one={args.backup_2d_period_one} ns_schedule={_eff_ns} "
           f"no_decay={_no_decay} stochastic_round={args.stochastic_round} "
@@ -440,6 +478,7 @@ res = {
     "muon_flags": (
         {
             "muon_lr": args.muon_lr, "backup_lr": args.backup_lr,
+            "backup_optimizer": args.muon_backup_optimizer,
             "backup_1d_period_one": args.backup_1d_period_one,
             "backup_2d_period_one": args.backup_2d_period_one,
             "ns_schedule": _resolved_ns,
@@ -453,7 +492,10 @@ res = {
         else None
     ),
     "steps": args.steps, "seq": BLOCK, "params_B": round(n_params / 1e9, 4),
-    "gpu": dev_name, "final_train_ema": round(ema, 4),
+    "gpu": dev_name, "gpu_uuid": dev_uuid,
+    "torch_version": torch.__version__, "torch_cuda_version": torch.version.cuda,
+    "git": SOURCE_GIT,
+    "final_train_ema": round(ema, 4),
     "eval0": round(eval0, 4), "final_eval": round(final_eval, 4),
     "tok_per_s": round(tok_s, 1), "peak_vram_gib": round(peak, 2),
     "peak_vram_reserved_gib": round(peak_reserved, 2),

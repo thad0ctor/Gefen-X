@@ -18,7 +18,8 @@ from matplotlib.patches import Patch  # noqa: E402
 ORDER = ["adamw_bf16", "adamw8bit", "adamw4bit", "gefen_fused", "gefen_nonfused", "gefen_muon"]
 LABEL = {"adamw_bf16": "AdamW\n(bf16)", "adamw8bit": "AdamW\n8-bit",
          "adamw4bit": "AdamW\n4-bit", "gefen_fused": "Gefen\n(fused)",
-         "gefen_nonfused": "Gefen\n(non-fused)", "gefen_muon": "Gefen\nMuon"}
+         "gefen_nonfused": "Gefen\n(non-fused)",
+         "gefen_muon": "Gefen Muon\n+ AdamW"}
 COLOR = {"adamw_bf16": "#9aa7b5", "adamw8bit": "#6b8cae", "adamw4bit": "#4a6fa5",
          "gefen_fused": "#e07b39", "gefen_nonfused": "#d68a4e", "gefen_muon": "#c25b1f"}
 
@@ -31,7 +32,8 @@ PANELS = [
 
 CONFIG = ("Full fine-tune . bf16 master weights . grad-checkpointing . seq 2048 . "
           "micro-batch 1 . Alpaca (packed) . constant LR\n"
-          "Each optimizer at its own fair LR . green outline / star = best in panel")
+          "Muon row = tuned3 + NorMuon + AdamW backup . "
+          "green outline / star = best in panel")
 
 
 def best_idx(vals, direction):

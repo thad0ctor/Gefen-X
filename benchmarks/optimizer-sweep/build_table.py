@@ -128,8 +128,8 @@ def main():
     md.append("- tok/s and peak VRAM are LR-independent; compare within a model on one GPU type.")
     md.append("- opt-state B/param for adamw4bit counts the real packed codes/scale/qmap "
               "(torchao OptimState4bit), not the logical bf16 view.")
-    md.append("- gefen_muon needs --muon-adjust match_rms_adamw to share the AdamW LR scale; "
-              "Muon's Newton-Schulz orthogonalization makes it slower per step.")
+    md.append("- gefen_muon is the balanced SFT recipe: tuned3 + NorMuon with an "
+              "AdamW backup at full LR; its Newton-Schulz work makes it slower per step.")
 
     md_path = os.path.join(args.out_dir, "comparison_table.md")
     with open(md_path, "w") as f:

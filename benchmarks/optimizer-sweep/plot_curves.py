@@ -23,12 +23,12 @@ from matplotlib.lines import Line2D  # noqa: E402
 ORDER = ["adamw_bf16", "adamw8bit", "adamw4bit", "gefen_fused", "gefen_nonfused", "gefen_muon"]
 NAME = {"adamw_bf16": "AdamW (bf16)", "adamw8bit": "AdamW 8-bit", "adamw4bit": "AdamW 4-bit",
         "gefen_fused": "Gefen (fused)", "gefen_nonfused": "Gefen (non-fused)",
-        "gefen_muon": "Gefen Muon"}
+        "gefen_muon": "Gefen Muon + AdamW"}
 COLOR = {"adamw_bf16": "#9aa7b5", "adamw8bit": "#6b8cae", "adamw4bit": "#3f5e8c",
          "gefen_fused": "#e07b39", "gefen_nonfused": "#d68a4e", "gefen_muon": "#c25b1f"}
 
 CONFIG = ("Full fine-tune . bf16 master . grad-checkpointing . seq 2048 . mbs 1 . "
-          "Alpaca (packed) . constant LR . each optimizer at its own fair LR")
+          "Alpaca (packed) . constant LR . Muon = tuned3 + NorMuon + AdamW backup")
 
 
 def parse_log(path):
