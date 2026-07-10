@@ -19,7 +19,11 @@ current literal-vs-recommended behavior explicit.
 
 Generated result rows, checkpoints, and run-specific reports are intentionally
 untracked. This document defines the reproducible protocol and output schema.
-Generated JSONL artifacts remain intentionally untracked.
+
+GefenMuon cells with an AdamW auxiliary are constructed through the public
+`GefenMuonHybrid(..., backup_optimizer="adamw")` selector. Their historical
+cell names remain stable so new rows compare directly with prior artifacts;
+resolved recipe metadata records `backup_optimizer` explicitly.
 
 ## Seven core cells
 

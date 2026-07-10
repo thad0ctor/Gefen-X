@@ -110,6 +110,155 @@ def test_backup_substrings_override_on_module_form():
     assert not any("hidden.weight" in n for n in muon_names)
 
 
+# ---- Configurable Gefen / AdamW backup -----------------------------------
+
+def test_hybrid_backup_optimizer_selector_preserves_names_and_repr():
+    default_model = TinyLM()
+    default = GefenMuonHybrid.from_model(default_model, lr=1e-3, fused=False)
+    assert isinstance(default.backup, Gefen)
+    assert default.backup_optimizer == "gefen"
+
+    adamw_model = TinyLM()
+    adamw = GefenMuonHybrid.from_model(
+        adamw_model, lr=1e-3, backup_optimizer="adamw", fused=False
+    )
+    assert isinstance(adamw.backup, torch.optim.AdamW)
+    assert adamw.backup_optimizer == "adamw"
+    assert _param_names(adamw.backup.param_groups) == {
+        name
+        for name, param in adamw_model.named_parameters()
+        if param is not adamw_model.hidden.weight
+    }
+    rendered = repr(adamw)
+    assert "muon_params=1" in rendered
+    assert "backup_params=5" in rendered
+    assert "backup_optimizer='adamw'" in rendered
+
+
+def test_hybrid_rejects_unknown_backup_optimizer():
+    with pytest.raises(ValueError, match="backup_optimizer.*gefen.*adamw"):
+        GefenMuonHybrid.from_model(
+            TinyLM(), lr=1e-3, backup_optimizer="sgd", fused=False
+        )
+
+
+@pytest.mark.parametrize(("fused", "capturable"), [(False, False), (True, True)])
+def test_hybrid_adamw_backup_forwards_execution_flags(fused, capturable):
+    param = nn.Parameter(torch.ones(4))
+    opt = GefenMuonHybrid(
+        [],
+        [("bias", param)],
+        lr=1e-3,
+        backup_optimizer="adamw",
+        fused=fused,
+        capturable=capturable,
+    )
+    group = opt.backup.param_groups[0]
+    assert group["fused"] is fused
+    assert group["capturable"] is capturable
+
+
+def test_hybrid_adamw_backup_matches_standalone_with_named_no_decay_groups():
+    torch.manual_seed(13)
+    initial_decay = torch.randn(5, 3)
+    initial_no_decay = torch.randn(5)
+    hybrid_decay = nn.Parameter(initial_decay.clone())
+    hybrid_no_decay = nn.Parameter(initial_no_decay.clone())
+    reference_decay = nn.Parameter(initial_decay.clone())
+    reference_no_decay = nn.Parameter(initial_no_decay.clone())
+    lr = 4e-4
+    betas = (0.8, 0.95)
+    eps = 2e-7
+    weight_decay = 0.2
+
+    opt = GefenMuonHybrid(
+        [],
+        [("proj.weight", hybrid_decay), ("norm.bias", hybrid_no_decay)],
+        lr=1e-3,
+        backup_lr=lr,
+        backup_weight_decay=weight_decay,
+        backup_optimizer="adamw",
+        no_decay_substrings=("bias",),
+        backup_1d_period_one=True,
+        backup_2d_period_one=True,
+        betas=betas,
+        eps=eps,
+        fused=False,
+    )
+    reference = torch.optim.AdamW(
+        [
+            {
+                "params": [reference_decay],
+                "lr": lr,
+                "betas": betas,
+                "eps": eps,
+                "weight_decay": weight_decay,
+            },
+            {
+                "params": [reference_no_decay],
+                "lr": lr,
+                "betas": betas,
+                "eps": eps,
+                "weight_decay": 0.0,
+            },
+        ],
+        lr=lr,
+        betas=betas,
+        eps=eps,
+        weight_decay=weight_decay,
+        fused=False,
+    )
+
+    assert [group["param_names"] for group in opt.backup.param_groups] == [
+        ["proj.weight"],
+        ["norm.bias"],
+    ]
+    assert [group["weight_decay"] for group in opt.backup.param_groups] == [
+        weight_decay,
+        0.0,
+    ]
+    assert all(group["lr"] == lr for group in opt.backup.param_groups)
+    assert all(group["betas"] == betas for group in opt.backup.param_groups)
+    assert all(group["eps"] == eps for group in opt.backup.param_groups)
+
+    generator = torch.Generator().manual_seed(19)
+    for _ in range(4):
+        grad_decay = torch.randn(hybrid_decay.shape, generator=generator)
+        grad_no_decay = torch.randn(hybrid_no_decay.shape, generator=generator)
+        hybrid_decay.grad = grad_decay.clone()
+        reference_decay.grad = grad_decay.clone()
+        hybrid_no_decay.grad = grad_no_decay.clone()
+        reference_no_decay.grad = grad_no_decay.clone()
+        opt.step()
+        reference.step()
+        opt.zero_grad()
+        reference.zero_grad()
+
+    torch.testing.assert_close(hybrid_decay, reference_decay, rtol=0, atol=0)
+    torch.testing.assert_close(hybrid_no_decay, reference_no_decay, rtol=0, atol=0)
+    assert opt.backup.state[hybrid_decay]["exp_avg_sq"].shape == hybrid_decay.shape
+    assert opt.backup.state[hybrid_no_decay]["exp_avg_sq"].shape == hybrid_no_decay.shape
+
+
+def test_hybrid_adamw_backup_scheduler_preserves_split_lr_ratio():
+    model = TinyLM()
+    opt = GefenMuonHybrid.from_model(
+        model,
+        lr=1e-3,
+        backup_lr=2.5e-4,
+        backup_optimizer="adamw",
+        fused=False,
+    )
+    scheduler = torch.optim.lr_scheduler.StepLR(opt, step_size=1, gamma=0.1)
+    _step(opt, model)
+    scheduler.step()
+
+    assert [group["lr"] for group in opt.muon.param_groups] == pytest.approx([1e-4])
+    assert [group["lr"] for group in opt.backup.param_groups] == pytest.approx(
+        [2.5e-5]
+    )
+
+
 # ---- Issue #44: public param_groups preserve caller grouping --------------
 
 def test_gefen_preserves_user_param_groups_for_integrations():

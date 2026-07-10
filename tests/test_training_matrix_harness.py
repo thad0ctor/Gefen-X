@@ -127,6 +127,9 @@ def test_resolved_lr_and_weight_decay_are_explicit_and_tunable():
     assert recommended["muon_weight_decay"] == pytest.approx(0.03)
     assert recommended["backup_weight_decay"] == pytest.approx(0.03)
     assert classic["ns_schedule"] == "standard"
+    assert classic["backup_optimizer"] == "adamw"
+    assert recommended["backup_optimizer"] == "gefen"
+    assert resolve_cell("adamw", config)["backup_optimizer"] is None
     assert classic["ns_steps"] == 5
     assert classic["normuon"] is False
     assert classic["adjust_lr_fn"] == "match_rms_adamw"
@@ -438,17 +441,19 @@ def test_every_available_cell_takes_a_real_cpu_step(cell):
         assert resolved["primary_fused"] is None
         assert optimizer.auxiliary.param_groups[0]["fused"] is resolved["auxiliary_fused"]
     elif cell.startswith("gefen_muon_") and cell.endswith("_adamw"):
-        assert isinstance(optimizer, OptimizerPair)
-        assert isinstance(optimizer.primary, GefenMuon)
-        assert isinstance(optimizer.auxiliary, torch.optim.AdamW)
-        assert optimizer.primary.param_groups[0]["eps"] == resolved["muon_eps"]
-        assert optimizer.auxiliary.param_groups[0]["eps"] == resolved["backup_eps"]
-        assert optimizer.primary.fused is resolved["primary_fused"]
-        assert optimizer.primary.param_groups[0]["batched_ns"] is False
-        assert optimizer.auxiliary.param_groups[0]["fused"] is resolved["auxiliary_fused"]
+        assert isinstance(optimizer, GefenMuonHybrid)
+        assert isinstance(optimizer.muon, GefenMuon)
+        assert isinstance(optimizer.backup, torch.optim.AdamW)
+        assert optimizer.backup_optimizer == "adamw"
+        assert optimizer.muon.param_groups[0]["eps"] == resolved["muon_eps"]
+        assert optimizer.backup.param_groups[0]["eps"] == resolved["backup_eps"]
+        assert optimizer.muon.fused is resolved["primary_fused"]
+        assert optimizer.muon.param_groups[0]["batched_ns"] is False
+        assert optimizer.backup.param_groups[0]["fused"] is resolved["auxiliary_fused"]
     elif cell.startswith("gefen_hybrid"):
         assert isinstance(optimizer, GefenMuonHybrid)
         assert isinstance(optimizer.backup, Gefen)
+        assert optimizer.backup_optimizer == "gefen"
         assert optimizer.muon.param_groups[0]["eps"] == resolved["muon_eps"]
         assert optimizer.backup.param_groups[0]["eps"] == resolved["backup_eps"]
         assert optimizer.muon.fused is resolved["primary_fused"]
@@ -461,6 +466,60 @@ def test_every_available_cell_takes_a_real_cpu_step(cell):
         primary = optimizer.muon if isinstance(optimizer, GefenMuonHybrid) else optimizer.primary
         assert resolved["ns_steps"] == 3
         assert primary.param_groups[0]["ns_steps"] == 3
+
+
+def test_public_adamw_backup_matches_prior_optimizer_pair_construction():
+    """The new public selector preserves the already-retained cell arithmetic."""
+    config = CellBuildConfig(lr=1e-3, weight_decay=0.01, fused=False)
+    hybrid_model = _model()
+    pair_model = _model()
+    hybrid, resolved = build_optimizer(
+        hybrid_model, "gefen_muon_normuon_adamw", config
+    )
+
+    muon_named, backup_named = split_params_for_muon(pair_model)
+    pair = OptimizerPair(
+        GefenMuon(
+            muon_named,
+            lr=resolved["primary_lr"],
+            weight_decay=resolved["muon_weight_decay"],
+            momentum=config.momentum,
+            nesterov=config.nesterov,
+            eps=config.muon_eps,
+            ns_steps=resolved["ns_steps"],
+            ns_schedule=resolved["ns_schedule"],
+            adjust_lr_fn=resolved["adjust_lr_fn"],
+            normuon=resolved["normuon"],
+            fused=False,
+        ),
+        torch.optim.AdamW(
+            [parameter for _, parameter in backup_named],
+            lr=resolved["backup_lr"],
+            betas=config.betas,
+            eps=config.backup_eps,
+            weight_decay=resolved["backup_weight_decay"],
+            fused=False,
+        ),
+    )
+
+    for step in range(3):
+        ids = (torch.arange(8) + step).remainder(256)[None]
+        hybrid_loss = hybrid_model(ids, labels=ids).loss
+        pair_loss = pair_model(ids, labels=ids).loss
+        torch.testing.assert_close(hybrid_loss, pair_loss, rtol=0, atol=0)
+        hybrid_loss.backward()
+        pair_loss.backward()
+        hybrid.step()
+        pair.step()
+        hybrid.zero_grad(set_to_none=True)
+        pair.zero_grad(set_to_none=True)
+
+    for hybrid_parameter, pair_parameter in zip(
+        hybrid_model.parameters(), pair_model.parameters()
+    ):
+        torch.testing.assert_close(
+            hybrid_parameter, pair_parameter, rtol=0, atol=0
+        )
 
 
 def test_warmup_cosine_preserves_recommended_split_lr_ratio():

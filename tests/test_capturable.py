@@ -219,12 +219,14 @@ def test_parity_muon():
     )
 
 
-def test_parity_hybrid():
+@pytest.mark.parametrize("backup_optimizer", ["gefen", "adamw"])
+def test_parity_hybrid(backup_optimizer):
     def build(capturable):
         muon_named = _named_params(0, HYBRID_MUON_SPECS)
         backup_named = _named_params(1, HYBRID_BACKUP_SPECS)
         opt = GefenMuonHybrid(
             muon_named, backup_named, lr=1e-3, backup_lr=5e-4,
+            backup_optimizer=backup_optimizer,
             weight_decay=0.01, capturable=capturable,
         )
         return muon_named + backup_named, opt
@@ -239,7 +241,9 @@ def test_parity_hybrid():
                 p.grad = g.clone()
             opt.step()
         results.append([p.detach().clone() for _, p in params])
-    _assert_params_close(results[1], results[0], what="hybrid")
+    _assert_params_close(
+        results[1], results[0], what=f"hybrid-{backup_optimizer}"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -486,17 +490,23 @@ def test_graph_capture_muon_fused_nesterov_preserves_momentum_state():
     assert nesterov_effect > 1e-5, nesterov_effect
 
 
-def test_graph_capture_hybrid():
+@pytest.mark.parametrize("backup_optimizer", ["gefen", "adamw"])
+def test_graph_capture_hybrid(backup_optimizer):
     specs = HYBRID_MUON_SPECS + HYBRID_BACKUP_SPECS
 
     def make(ps, lr):
         muon_named = ps[: len(HYBRID_MUON_SPECS)]
         backup_named = ps[len(HYBRID_MUON_SPECS):]
         return GefenMuonHybrid(
-            muon_named, backup_named, lr=lr, weight_decay=0.01, capturable=True,
+            muon_named, backup_named, lr=lr,
+            backup_optimizer=backup_optimizer,
+            weight_decay=0.01, capturable=True,
         )
 
-    _capture_replay_case(make, specs, rtol=5e-2, atol=5e-3, what="hybrid-graph")
+    _capture_replay_case(
+        make, specs, rtol=5e-2, atol=5e-3,
+        what=f"hybrid-{backup_optimizer}-graph",
+    )
 
 
 def test_compile_reduce_overhead_gefen():

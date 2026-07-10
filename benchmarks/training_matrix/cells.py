@@ -385,6 +385,13 @@ def resolve_cell(name: str, config: CellBuildConfig) -> dict[str, Any]:
         resolved["adjust_lr_fn"] = config.adjust_lr_fn
     resolved.update(
         {
+            "backup_optimizer": (
+                "adamw"
+                if recipe.auxiliary == "torch.optim.AdamW"
+                else "gefen"
+                if recipe.auxiliary == "gefen.Gefen"
+                else None
+            ),
             "lr": config.lr,
             "primary_lr": primary_lr,
             "backup_lr": backup_lr,
@@ -511,30 +518,29 @@ def build_optimizer(model: torch.nn.Module, name: str, config: CellBuildConfig):
         "gefen_muon_normuon_adamw",
         "gefen_muon_recommended_adamw",
     }:
-        primary = GefenMuon(
+        optimizer = GefenMuonHybrid(
             muon_named,
-            lr=resolved["primary_lr"],
-            weight_decay=resolved["muon_weight_decay"],
+            backup_named,
+            lr=resolved["lr"],
+            muon_lr=resolved["primary_lr"],
+            backup_lr=resolved["backup_lr"],
+            backup_optimizer=resolved["backup_optimizer"],
+            weight_decay=resolved["weight_decay"],
+            muon_weight_decay=resolved["muon_weight_decay"],
+            backup_weight_decay=resolved["backup_weight_decay"],
+            betas=config.betas,
+            eps=config.backup_eps,
+            fused=config.fused,
             momentum=config.momentum,
             nesterov=config.nesterov,
-            eps=config.muon_eps,
             ns_steps=resolved["ns_steps"],
             ns_schedule=resolved["ns_schedule"],
             adjust_lr_fn=resolved["adjust_lr_fn"],
             normuon=resolved["normuon"],
-            fused=config.fused,
             batched_ns=resolved["batched_ns"],
             batched_ns_workspace_bytes=resolved["batched_ns_workspace_bytes"],
         )
-        auxiliary = torch.optim.AdamW(
-            _params(backup_named),
-            lr=resolved["backup_lr"],
-            betas=config.betas,
-            eps=config.backup_eps,
-            weight_decay=resolved["backup_weight_decay"],
-            fused=config.fused,
-        )
-        return OptimizerPair(primary, auxiliary), resolved
+        return optimizer, resolved
 
     optimizer = GefenMuonHybrid(
         muon_named,
@@ -542,6 +548,7 @@ def build_optimizer(model: torch.nn.Module, name: str, config: CellBuildConfig):
         lr=resolved["lr"],
         muon_lr=resolved["primary_lr"],
         backup_lr=resolved["backup_lr"],
+        backup_optimizer=resolved["backup_optimizer"],
         weight_decay=resolved["weight_decay"],
         muon_weight_decay=resolved["muon_weight_decay"],
         backup_weight_decay=resolved["backup_weight_decay"],

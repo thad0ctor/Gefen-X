@@ -1,64 +1,57 @@
-"""Hybrid optimizer: GefenMuon on 2D hidden weights, Gefen on everything else.
+"""Hybrid optimizer: GefenMuon on 2D hidden weights, with a configurable backup.
 
 GefenMuon is a Muon-style optimizer: it only accepts 2D parameters and has no
 fallback path for embeddings, the LM head, or 1D (norm/bias) parameters. This
 composite routes the 2D hidden weight matrices to GefenMuon and routes the rest
-(embeddings, LM head, norms, biases) to plain Gefen, exposing a single
+(embeddings, LM head, norms, biases) to plain Gefen by default, or to AdamW when
+``backup_optimizer="adamw"`` is selected. It exposes a single
 ``torch.optim.Optimizer``-compatible interface so it drops straight into the
 Hugging Face Trainer / accelerate single-GPU path.
 
-Both sub-optimizers keep per-parameter names in optimizer state (and mirror them
-in each public group's ``param_names`` list), so parameters SHOULD be supplied as
-``(name, param)`` pairs with unique names. Bare tensors get positional auto-names
-("param_0", ...), so the split validation loses its real names and checkpoint
-state can only be re-matched by construction order, which silently breaks on any
-reordering.
+Both backup choices mirror per-parameter names in each public group's
+``param_names`` list (Gefen also keeps them in its per-parameter state), so
+parameters SHOULD be supplied as ``(name, param)`` pairs with unique names. Bare
+tensors get positional auto-names ("param_0", ...), so the split validation loses
+its real names and checkpoint state can only be re-matched by construction order,
+which silently breaks on any reordering.
 
 Scope: single-GPU / DDP and FSDP2 (fully_shard / DTensor). Under FSDP2 each rank
-holds only a shard of every parameter, so the backup (plain Gefen) params update
-per-shard directly, while the Muon 2D matrices all-gather their gradient to the
-full matrix per step (GefenMuon._step_automatic), run the quantized-momentum +
-Newton-Schulz pipeline on the full matrix so the numerics match the single-GPU
-reference, then slice the orthogonalized update back to the local shard. Tensor
-parallelism / multi-dim (HSDP x TP) meshes are not validated.
+holds only a shard of every parameter, so the selected backup optimizer updates
+its params per-shard directly, while the Muon 2D matrices all-gather their
+gradient to the full matrix per step (GefenMuon._step_automatic), run the
+quantized-momentum + Newton-Schulz pipeline on the full matrix so the numerics
+match the single-GPU reference, then slice the orthogonalized update back to the
+local shard. Tensor parallelism / multi-dim (HSDP x TP) meshes are not validated.
 
-Recommended configuration (minimizes divergence vs AdamW at matched LR -- see the
-loss-recovery sweep; Qwen3-0.6B/1.7B): keep the Muon half at AdamW scale and lower
-only the backup half, plus per-element 2nd moment on the 1D backup tensors. Both
-are free on throughput; ``ns_schedule`` defaults to ``"tuned3"`` (loss-neutral,
-~+28% step throughput)::
+The retained validation is task-dependent. For balanced SFT, use tuned3 plus
+NorMuon and a full-LR AdamW backup::
 
     opt = GefenMuonHybrid(
-        *split_params_for_muon(model),
-        lr=ADAMW_LR,                  # Muon (2D) half stays at AdamW scale
-        backup_lr=0.5 * ADAMW_LR,     # backup half ~0.4-0.6x (tune); the main LR lever
+        model,
+        lr=MUON_LR,
+        backup_optimizer="adamw",
+        backup_lr=MUON_LR,
+        ns_schedule="tuned3",
+        normuon=True,
         adjust_lr_fn="match_rms_adamw",
-        backup_1d_period_one=True,    # AdamW-like per-element 2nd moment on norms/biases
     )
 
-This beats AdamW at 0.6B and trails it only slightly at 1.7B while keeping ~1.0
-B/param optimizer state. ``normuon`` (NorMuon-style per-row 2nd-moment
-normalization of the Newton-Schulz output, Frobenius-norm-preserving so the
-match_rms_adamw calibration is untouched) is ON BY DEFAULT in this hybrid (the
-raw ``GefenMuon`` keeps it off, mirroring the tuned3-vs-standard split): it is
-throughput-free and ~free on memory (one fp32 scalar per output neuron,
-~+0.002 B/param); in the fair-LR ablation (same config, normuon on vs off) it
-was worth -0.007/-0.010 final eval at 0.6B on both seeds (beating AdamW
-outright) and cut the residual
-1.7B gap to AdamW by ~1/3 (tail-mean of the last 10 evals). Disable with
-``normuon=False``. Resuming a checkpoint saved without normuon state is safe:
-the per-row state initializes lazily with bias correction, so the first steps
-just apply a near-uniform normalization while the EMA warms up. To CLOSE the
-residual 1.7B gap to AdamW, add
-``backup_2d_period_one=True`` -- per-element 2nd moment on the embedding/LM-head
-too -- which matches AdamW's loss at ~2.45 B/param (still 0.6x AdamW), a
-loss/memory trade. ``stochastic_round=True`` is a free (throughput-neutral,
-loss-neutral) opt-in that debiases the 8-bit momentum quantization. ``cautious``
-(sign-agreement masking) is exposed for experimentation but LOST clearly in the
-same sweep (+0.06 eval at 0.6B) -- leave it off. The remaining constructor
-defaults stay parity-preserving (period-1 off, shared lr, stochastic_round off)
-except ``ns_schedule="tuned3"`` and ``normuon=True``; set the rest explicitly
-to opt in.
+For quality-first pretraining, keep the AdamW backup but select
+``ns_schedule="standard"`` / ``ns_steps=5`` and ``normuon=False``. For the
+smallest state, retain ``backup_optimizer="gefen"`` (the backward-compatible
+selector default), use a half-LR backup, and enable ``backup_1d_period_one``.
+AdamW backup state is conventional rather than quantized, so it spends more
+memory on the routed parameters. ``fused`` is independent of this choice: it
+selects each child's fused implementation, not the backup algorithm.
+
+``normuon`` is ON by default in this hybrid and essentially free in throughput
+and memory; raw ``GefenMuon`` keeps it off. Resuming a checkpoint saved without
+NorMuon state is safe because the per-row state initializes lazily with bias
+correction. ``stochastic_round=True`` remains a throughput-neutral opt-in;
+``cautious`` lost clearly in validation and should remain off. The remaining
+constructor defaults stay backward-compatible (Gefen backup, shared LR,
+period-one off, stochastic rounding off), with ``ns_schedule="tuned3"`` and
+``normuon=True`` as the hybrid-specific defaults.
 """
 import logging
 from collections import OrderedDict
@@ -79,7 +72,7 @@ logger = logging.getLogger(__name__)
 
 
 class GefenMuonHybrid(torch.optim.Optimizer):
-    """Composite optimizer: GefenMuon on the 2D hidden weights, Gefen on the rest.
+    """Composite optimizer: GefenMuon on 2D hidden weights, a backup on the rest.
 
     See the module docstring for the recommended configuration. Two composite
     quirks to be aware of:
@@ -96,10 +89,12 @@ class GefenMuonHybrid(torch.optim.Optimizer):
       ``torch.optim.Optimizer`` instances and their steps are what torch wraps.
 
     * ``state_dict()`` schema: NOT the standard ``{"state", "param_groups"}``
-      layout, but ``{"muon": <GefenMuon state_dict or None>, "backup": <Gefen
-      state_dict or None>}``. ``load_state_dict`` only accepts that nested
-      schema; checkpoints consolidated/converted to the flat torch layout (e.g.
-      by FSDP/DeepSpeed tooling) are rejected rather than silently ignored.
+      layout, but ``{"muon": <GefenMuon state_dict or None>, "backup":
+      <backup state_dict or None>, "backup_optimizer": "gefen" | "adamw"}``.
+      ``load_state_dict`` only accepts that nested schema; checkpoints
+      consolidated/converted to the flat torch layout (e.g. by FSDP/DeepSpeed
+      tooling) are rejected rather than silently ignored. Legacy nested
+      checkpoints without ``backup_optimizer`` are treated as Gefen-backed.
     """
 
     def __init__(
@@ -111,6 +106,7 @@ class GefenMuonHybrid(torch.optim.Optimizer):
         backup_substrings=None,
         muon_lr=None,
         backup_lr=None,
+        backup_optimizer="gefen",
         weight_decay=0.0,
         muon_weight_decay=None,
         backup_weight_decay=None,
@@ -160,9 +156,9 @@ class GefenMuonHybrid(torch.optim.Optimizer):
                 the single-argument form, this is instead the ``nn.Module`` or
                 the named-param iterable to split.
             backup_named_params: ``(name, param)`` pairs for everything else --
-                embeddings, LM/classifier heads, norms, biases (plain-Gefen
-                half). May be empty (muon-only hybrid). Leave as ``None`` to use
-                the single-argument form.
+                embeddings, LM/classifier heads, norms, biases (backup half).
+                May be empty (muon-only hybrid). Leave as ``None`` to use the
+                single-argument form.
             lr: shared learning rate for both halves (AdamW scale under the
                 default ``adjust_lr_fn="match_rms_adamw"``).
             backup_substrings: single-argument form only -- override the
@@ -171,6 +167,9 @@ class GefenMuonHybrid(torch.optim.Optimizer):
                 two-list form is an error.
             muon_lr / backup_lr: per-half overrides of ``lr``. Lowering only
                 ``backup_lr`` (~0.4-0.6x AdamW) is the validated loss lever.
+            backup_optimizer: backup algorithm for embeddings, heads, norms,
+                and biases: ``"gefen"`` (default, quantized state) or
+                ``"adamw"`` (``torch.optim.AdamW`` with conventional state).
             weight_decay: shared decoupled (AdamW-style) weight decay, default
                 0.0; ``muon_weight_decay`` / ``backup_weight_decay`` override it
                 per half.
@@ -179,16 +178,21 @@ class GefenMuonHybrid(torch.optim.Optimizer):
                 decay on norms/biases" semantics). Default: off.
             backup_1d_period_one / backup_2d_period_one: per-element 2nd moment
                 on the backup's 1D / 2D tensors (loss levers; memory trade for
-                the 2D one).
-            betas, eps: Adam betas / epsilon for the backup Gefen half.
-            fused: use the fused CUDA kernels in both halves (default True).
+                the 2D one). AdamW already keeps a per-element second moment, so
+                these remain accepted but are no-ops with
+                ``backup_optimizer="adamw"``.
+            betas, eps: Adam betas / epsilon for the backup half.
+            fused: use the fused implementation in both halves (the Gefen CUDA
+                kernel or ``torch.optim.AdamW(fused=True)``; default True).
             momentum, nesterov, ns_steps, ns_schedule, adjust_lr_fn,
             sharded_mode, fp8_ns, fp8_ns_compile, batched_ns,
             batched_ns_workspace_bytes, normuon, normuon_beta2, normuon_eps,
             cautious: forwarded to GefenMuon (see its docstring).
                 Note ``normuon=True`` and ``ns_schedule="tuned3"`` are the
                 hybrid's defaults, unlike raw GefenMuon.
-            stochastic_round, capturable, verbose: forwarded to BOTH halves.
+            capturable: forwarded to both halves. ``stochastic_round`` and
+                ``verbose`` are forwarded to Gefen children; with an AdamW
+                backup they apply only to the Muon half.
         """
         if backup_named_params is None:
             # Single-argument convenience form: the first arg is a model or a
@@ -205,6 +209,13 @@ class GefenMuonHybrid(torch.optim.Optimizer):
         backup_named_params = list(backup_named_params)
         if not muon_named_params and not backup_named_params:
             raise ValueError("GefenMuonHybrid received no parameters to optimize")
+        if backup_optimizer not in ("gefen", "adamw"):
+            raise ValueError(
+                "backup_optimizer must be 'gefen' or 'adamw' but is: {!r}".format(
+                    backup_optimizer
+                )
+            )
+        self.backup_optimizer = backup_optimizer
         # Catch the silent footguns: a param routed to both halves (stepped
         # twice) or a duplicate name (codebook cache key collision). Completeness
         # (a trainable param in neither list) needs the model, so it is checked in
@@ -233,7 +244,7 @@ class GefenMuonHybrid(torch.optim.Optimizer):
         # Per-half learning rates. The shared ``lr`` keeps the documented
         # single-LR behavior; ``muon_lr`` / ``backup_lr`` override it per half so
         # the Muon matrices (with ``adjust_lr_fn`` rescaling them to AdamW-RMS)
-        # and the backup-Gefen norms/embeddings/head can be tuned independently.
+        # and the backup norms/embeddings/head can be tuned independently.
         # NOTE: an LR scheduler that overwrites every group to one absolute value
         # collapses the split; a multiplicative scheduler (the common case)
         # preserves the muon/backup ratio because each sub-optimizer's groups
@@ -315,39 +326,60 @@ class GefenMuonHybrid(torch.optim.Optimizer):
                 )
                 if g is not None
             ]
-            self.backup = Gefen(backup_groups, lr=backup_lr, betas=betas, eps=eps,
-                                 weight_decay=backup_weight_decay, fused=fused,
-                                 force_1d_period_one=backup_1d_period_one,
-                                 force_2d_period_one=backup_2d_period_one,
-                                 # Pin the plain-Gefen factored-v default OFF for
-                                 # the backup half: the hybrid's validated recipe
-                                 # (split LR + period-one levers) was measured
-                                 # with block-vmean on embed/LM-head, and
-                                 # factored-v x muon-backup is an untested
-                                 # combination. Revisit deliberately, not by
-                                 # default drift.
-                                 factored_v_2d=False,
-                                 stochastic_round=stochastic_round,
-                                 capturable=capturable,
-                                 verbose=verbose)
         else:
-            self.backup = (
-                Gefen(
-                    backup_named_params,
-                    lr=backup_lr,
-                    betas=betas,
-                    eps=eps,
-                    weight_decay=backup_weight_decay,
-                    fused=fused,
-                    force_1d_period_one=backup_1d_period_one,
-                    force_2d_period_one=backup_2d_period_one,
-                    factored_v_2d=False,  # see the pinned-off note above
-                    stochastic_round=stochastic_round,
-                    capturable=capturable,
-                    verbose=verbose,
-                )
-                if backup_named_params
-                else None
+            backup_groups = backup_named_params
+
+        if not backup_named_params:
+            self.backup = None
+        elif backup_optimizer == "gefen":
+            self.backup = Gefen(
+                backup_groups,
+                lr=backup_lr,
+                betas=betas,
+                eps=eps,
+                weight_decay=backup_weight_decay,
+                fused=fused,
+                force_1d_period_one=backup_1d_period_one,
+                force_2d_period_one=backup_2d_period_one,
+                # Pin plain Gefen's factored-v default off for the backup: the
+                # hybrid recipe was measured with block-vmean on the
+                # embedding/head, not the untested factored-v combination.
+                factored_v_2d=False,
+                stochastic_round=stochastic_round,
+                capturable=capturable,
+                verbose=verbose,
+            )
+        else:
+            # Keep names in conventional torch param groups. Passing tensors
+            # plus a parallel ``param_names`` list works across the supported
+            # torch range and makes AdamW checkpoints retain the same routing
+            # metadata as Gefen checkpoints.
+            if no_decay_substrings:
+                adamw_groups = []
+                for group in backup_groups:
+                    named = group["params"]
+                    adamw_groups.append(
+                        {
+                            **{k: v for k, v in group.items() if k != "params"},
+                            "params": [param for _, param in named],
+                            "param_names": [name for name, _ in named],
+                        }
+                    )
+            else:
+                adamw_groups = [
+                    {
+                        "params": [param for _, param in backup_groups],
+                        "param_names": [name for name, _ in backup_groups],
+                    }
+                ]
+            self.backup = torch.optim.AdamW(
+                adamw_groups,
+                lr=backup_lr,
+                betas=betas,
+                eps=eps,
+                weight_decay=backup_weight_decay,
+                fused=fused,
+                capturable=capturable,
             )
         self._subopts = [o for o in (self.muon, self.backup) if o is not None]
 
@@ -428,6 +460,7 @@ class GefenMuonHybrid(torch.optim.Optimizer):
         state_dict = {
             "muon": self.muon.state_dict() if self.muon is not None else None,
             "backup": self.backup.state_dict() if self.backup is not None else None,
+            "backup_optimizer": self.backup_optimizer,
         }
         for post_hook in self._optimizer_state_dict_post_hooks.values():
             hook_result = post_hook(self, state_dict)
@@ -452,8 +485,9 @@ class GefenMuonHybrid(torch.optim.Optimizer):
         if "muon" not in state_dict and "backup" not in state_dict:
             raise ValueError(
                 "GefenMuonHybrid.load_state_dict expects the hybrid's own nested "
-                'schema {{"muon": <GefenMuon state_dict or None>, "backup": '
-                '<Gefen state_dict or None>}} (what GefenMuonHybrid.state_dict() '
+                'schema {{"muon": <GefenMuon state dict or None>, "backup": '
+                '<backup state dict or None>, "backup_optimizer": "gefen" | '
+                '"adamw"}} (what GefenMuonHybrid.state_dict() '
                 "saves), but got keys {}. Consolidated/converted checkpoints in "
                 'the standard {{"state", "param_groups"}} layout are not '
                 "supported; resume from the hybrid-saved checkpoint "
@@ -477,6 +511,22 @@ class GefenMuonHybrid(torch.optim.Optimizer):
                     "GefenMuonHybrid.load_state_dict: this optimizer has a "
                     '"{}" half but the checkpoint carries none; loading would '
                     "silently reset its momentum/state".format(attr)
+                )
+        # Old hybrid checkpoints predate the selector and necessarily contain a
+        # Gefen backup. Guard the backend before loading either child: torch's
+        # optimizer loader otherwise accepts the other backend's group/state
+        # layout and fails only on a later step (or, worse, misinterprets state).
+        if self.backup is not None:
+            checkpoint_backup_optimizer = state_dict.get(
+                "backup_optimizer", "gefen"
+            )
+            if checkpoint_backup_optimizer != self.backup_optimizer:
+                raise ValueError(
+                    "GefenMuonHybrid.load_state_dict: checkpoint backup_optimizer "
+                    "is {!r}, but this optimizer uses {!r}; construct the hybrid "
+                    "with the checkpoint's backup_optimizer instead.".format(
+                        checkpoint_backup_optimizer, self.backup_optimizer
+                    )
                 )
         if self.muon is not None:
             self.muon.load_state_dict(state_dict["muon"])
@@ -559,6 +609,17 @@ class GefenMuonHybrid(torch.optim.Optimizer):
         )
 
     def __repr__(self):
-        nm = len(self.muon.param_groups) if self.muon is not None else 0
-        nb = len(self.backup.param_groups) if self.backup is not None else 0
-        return f"GefenMuonHybrid(muon_params={nm}, backup_params={nb})"
+        nm = (
+            sum(len(group["params"]) for group in self.muon.param_groups)
+            if self.muon is not None
+            else 0
+        )
+        nb = (
+            sum(len(group["params"]) for group in self.backup.param_groups)
+            if self.backup is not None
+            else 0
+        )
+        return (
+            f"GefenMuonHybrid(muon_params={nm}, backup_params={nb}, "
+            f"backup_optimizer={self.backup_optimizer!r})"
+        )

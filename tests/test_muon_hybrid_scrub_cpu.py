@@ -2,8 +2,8 @@
 
 Covers, in order:
   * GefenMuonHybrid.load_state_dict schema guard (standard {"state",
-    "param_groups"} checkpoints and half-mismatches raise instead of silently
-    resuming with zeroed momentum);
+    "param_groups"} checkpoints, half-mismatches, and backup-optimizer
+    mismatches raise instead of silently resuming with invalid state);
   * module-type-aware embedding/head routing in split_params_for_muon
     (GPT-2-like wte/wpe + tied lm_head, T5-like `shared`, classifier heads,
     tied heads under non-suggestive names) + the split summary log;
@@ -100,6 +100,79 @@ def test_hybrid_single_half_roundtrip_still_works():
     backup_only = GefenMuonHybrid([], backup_named, lr=1e-3, fused=False)
     _step_once(backup_only, model)
     backup_only.load_state_dict(backup_only.state_dict())
+
+
+@pytest.mark.parametrize(
+    ("source_backend", "target_backend"),
+    [("gefen", "adamw"), ("adamw", "gefen")],
+)
+def test_hybrid_load_rejects_backup_optimizer_mismatch_before_child_load(
+    source_backend, target_backend
+):
+    source_model = _tiny_model()
+    source = GefenMuonHybrid.from_model(
+        source_model,
+        lr=1e-3,
+        backup_optimizer=source_backend,
+        fused=False,
+    )
+    _step_once(source, source_model)
+
+    target = GefenMuonHybrid.from_model(
+        _tiny_model(1),
+        lr=1e-3,
+        backup_optimizer=target_backend,
+        fused=False,
+    )
+    with (
+        mock.patch.object(target.muon, "load_state_dict") as muon_load,
+        mock.patch.object(target.backup, "load_state_dict") as backup_load,
+        pytest.raises(ValueError, match="backup_optimizer"),
+    ):
+        target.load_state_dict(source.state_dict())
+    muon_load.assert_not_called()
+    backup_load.assert_not_called()
+
+
+def test_hybrid_legacy_untagged_checkpoint_is_gefen_not_adamw():
+    source_model = _tiny_model()
+    source = GefenMuonHybrid.from_model(source_model, lr=1e-3, fused=False)
+    _step_once(source, source_model)
+    legacy_state = source.state_dict()
+    legacy_state.pop("backup_optimizer")
+
+    target = GefenMuonHybrid.from_model(
+        _tiny_model(1),
+        lr=1e-3,
+        backup_optimizer="adamw",
+        fused=False,
+    )
+    with pytest.raises(ValueError, match="backup_optimizer"):
+        target.load_state_dict(legacy_state)
+
+
+def test_hybrid_backup_optimizer_tag_is_ignored_without_backup_half():
+    source_params = _params_2d(seed=3)
+    target_params = _params_2d(seed=4)
+    source = GefenMuonHybrid(
+        source_params, [], lr=1e-3, backup_optimizer="gefen", fused=False
+    )
+    source_params[0][1].grad = torch.randn_like(source_params[0][1])
+    source.step()
+
+    target = GefenMuonHybrid(
+        target_params, [], lr=1e-3, backup_optimizer="adamw", fused=False
+    )
+    target.load_state_dict(source.state_dict())
+
+
+def test_hybrid_load_rejects_unknown_backup_optimizer_tag():
+    model = _tiny_model()
+    source = GefenMuonHybrid.from_model(model, lr=1e-3, fused=False)
+    state = source.state_dict()
+    state["backup_optimizer"] = "sgd"
+    with pytest.raises(ValueError, match="backup_optimizer"):
+        source.load_state_dict(state)
 
 
 # ---------------------------------------------------------------------------
@@ -253,7 +326,11 @@ def test_hybrid_instance_hooks_fire_exactly_once():
     assert calls["sd_pre"] == [opt]
     assert len(calls["sd_post"]) == 1
     assert calls["sd_post"][0][0] is opt
-    assert set(calls["sd_post"][0][1]) == {"muon", "backup"}
+    assert set(calls["sd_post"][0][1]) == {
+        "muon",
+        "backup",
+        "backup_optimizer",
+    }
     assert len(calls["lsd_pre"]) == 1
     assert calls["lsd_pre"][0][0] is opt
     assert calls["lsd_post"] == [opt]

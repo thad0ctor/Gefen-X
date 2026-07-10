@@ -423,19 +423,56 @@ def test_counter_normalization_across_capturable_toggle():
             assert isinstance(opt_plain.state[p]["step"], int)
 
 
-def test_hybrid_state_dict_roundtrip():
+@pytest.mark.parametrize("backup_optimizer", ["gefen", "adamw"])
+def test_hybrid_state_dict_roundtrip(backup_optimizer):
     model = _small_model()
-    opt = GefenMuonHybrid.from_model(model, lr=1e-3, fused=False)
+    opt = GefenMuonHybrid.from_model(
+        model,
+        lr=1e-3,
+        backup_optimizer=backup_optimizer,
+        fused=False,
+    )
     for step_grads in _synthetic_grads(model, 2):
         _apply_grads(model, step_grads)
         opt.step()
         opt.zero_grad()
-    sd = opt.state_dict()
-    assert set(sd.keys()) == {"muon", "backup"}
+    sd = copy.deepcopy(opt.state_dict())
+    assert set(sd.keys()) == {"muon", "backup", "backup_optimizer"}
+    assert sd["backup_optimizer"] == backup_optimizer
 
     model_b = _small_model()
-    opt_b = GefenMuonHybrid.from_model(model_b, lr=1e-3, fused=False)
+    with torch.no_grad():
+        for param_b, param in zip(model_b.parameters(), model.parameters()):
+            param_b.copy_(param)
+    opt_b = GefenMuonHybrid.from_model(
+        model_b,
+        lr=1e-3,
+        backup_optimizer=backup_optimizer,
+        fused=False,
+    )
     opt_b.load_state_dict(sd)
+
+    next_grads = _synthetic_grads(model, 1, seed=987)[0]
+    _apply_grads(model, next_grads)
+    _apply_grads(model_b, next_grads)
+    opt.step()
+    opt_b.step()
+    for param, param_b in zip(model.parameters(), model_b.parameters()):
+        assert torch.equal(param, param_b)
+
+
+def test_hybrid_loads_untagged_legacy_gefen_checkpoint():
+    model = _small_model()
+    opt = GefenMuonHybrid.from_model(model, lr=1e-3, fused=False)
+    _apply_grads(model, _synthetic_grads(model, 1)[0])
+    opt.step()
+    legacy_state = copy.deepcopy(opt.state_dict())
+    legacy_state.pop("backup_optimizer")
+
+    restored_model = _small_model()
+    restored = GefenMuonHybrid.from_model(restored_model, lr=1e-3, fused=False)
+    restored.load_state_dict(legacy_state)
+    assert restored.backup_optimizer == "gefen"
 
 
 if __name__ == "__main__":
