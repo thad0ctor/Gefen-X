@@ -9,9 +9,10 @@ Performance:
 - Add an explicit `batched_ns=True` Muon experiment that groups repeated small
   bf16 matrices into strided-batched Newton--Schulz GEMMs. It is conservatively
   gated (batch >= 8, min dimension <= 512, <= 2^20 elements/matrix), chunks to
-  a 256 MiB tensor-workspace budget, and leaves undersized tails on the serial
-  path. End-to-end benefit depends on how much of the model is eligible and
-  remains something to benchmark, rather than an unconditional speedup.
+  a configurable tensor-workspace budget (256 MiB by default via
+  `batched_ns_workspace_bytes`), and leaves undersized tails on the serial path.
+  End-to-end benefit depends on how much of the model is eligible and remains
+  something to benchmark, rather than an unconditional speedup.
 - Muon's fused quantized-momentum path now switches medium/large periods to the
   split magnitude reducer and emits eight adjacent values per thread with
   vectorized memory traffic plus the bit-exact codebook-search LUT. On the RTX

@@ -4,7 +4,7 @@ The batched path changes GEMM reduction order, so this reports numerical deltas
 alongside speed and the conservative workspace estimate. ``--full-step`` runs a
 paired GefenMuon comparison with the shipped hybrid-side settings (tuned3,
 NorMuon and Nesterov). Retained numbers must be run on an otherwise-idle GPU;
-the project uses the RTX 3090 UUID documented in ``benchmarks/README.md``.
+record the physical GPU UUID with the retained artifact.
 """
 import argparse
 import math
