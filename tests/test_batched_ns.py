@@ -359,6 +359,73 @@ def test_optimizer_batched_ns_preserves_momentum_state_and_stays_close(shape):
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_batched_ns_consumes_exact_fused_nesterov_output(monkeypatch):
+    """Batch input is the exact old host Nesterov result, state stays EMA."""
+    momentum = 0.9
+    torch.manual_seed(33)
+    initial = [
+        (torch.randn(32, 64, device="cuda") * 0.02).bfloat16()
+        for _ in range(8)
+    ]
+    grads = [
+        (torch.randn(32, 64, device="cuda") * 1e-3).bfloat16()
+        for _ in range(8)
+    ]
+    captured = []
+    original = gm._zeropower_via_newtonschulz_batched
+
+    def capture_input(inputs, *args, **kwargs):
+        # The helper consumes its bf16 stack in place; clone before forwarding.
+        captured.append(inputs.clone())
+        return original(inputs, *args, **kwargs)
+
+    monkeypatch.setattr(
+        gm, "_zeropower_via_newtonschulz_batched", capture_input
+    )
+
+    def run(nesterov):
+        params = [
+            (f"p{i}", torch.nn.Parameter(value.clone()))
+            for i, value in enumerate(initial)
+        ]
+        opt = GefenMuon(
+            params,
+            lr=0.05,
+            momentum=momentum,
+            nesterov=nesterov,
+            fused=True,
+            ns_schedule="tuned3",
+            batched_ns=True,
+        )
+        assert opt._fused_kernels_available()
+        for (_, p), grad in zip(params, grads):
+            p.grad = grad.clone()
+        opt.step()
+        torch.cuda.synchronize()
+        return params, opt
+
+    plain_params, plain_opt = run(False)
+    nested_params, nested_opt = run(True)
+    assert len(captured) == 2
+    expected = captured[0].clone()
+    expected.mul_(momentum).add_(torch.stack(grads), alpha=1 - momentum)
+    assert torch.equal(captured[1], expected)
+
+    effect = 0.0
+    for (_, plain), (_, nested) in zip(plain_params, nested_params):
+        plain_state = plain_opt.state[plain]
+        nested_state = nested_opt.state[nested]
+        assert torch.equal(
+            nested_state["m_codebook"], plain_state["m_codebook"]
+        )
+        assert torch.equal(
+            nested_state["m_magnitude"], plain_state["m_magnitude"]
+        )
+        effect = max(effect, (nested - plain).abs().max().item())
+    assert effect > 0.0
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 def test_batched_helper_peak_stays_under_conservative_workspace_model():
     inputs = torch.randn(
         8, 128, 256, device="cuda", dtype=torch.bfloat16
@@ -400,6 +467,7 @@ def test_capturable_opt_in_never_enters_batched_helper(monkeypatch):
         params, lr=1e-3, fused=True, capturable=True,
         ns_schedule="tuned3", batched_ns=True,
     )
+    assert opt.param_groups[0]["nesterov"] is True
     for (_, p), grad in zip(params, static_grads):
         p.grad = grad
     for _ in range(3):
