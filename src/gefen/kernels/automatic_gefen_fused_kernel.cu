@@ -860,7 +860,26 @@ __global__ void gefen_update_flat_kernel(
 //     fp32 product rounded back to scalar_t). So: cast codebook value to
 //     scalar_t FIRST, multiply by the fp32 magnitude, then cast the product to
 //     scalar_t. For fp32 params both casts are no-ops.
+//   * when nesterov is requested, only the DENSE output is advanced again; the
+//     quantized state remains the underlying EMA.  The host expression is two
+//     in-place TensorIterator kernels, `m.mul_(beta).add_(g, alpha=1-beta)`.
+//     Preserve both scalar-dtype rounds explicitly.  In particular, fp32 needs
+//     __fmul_rn to prevent contraction across the first round, and the final
+//     add is the same round-to-nearest FMA as TensorIterator.
 // ---------------------------------------------------------------------------
+template <typename scalar_t>
+__device__ __forceinline__ scalar_t gefen_nesterov_momentum(
+    scalar_t dense_momentum,
+    float grad,
+    float beta1,
+    float alpha
+) {
+    const scalar_t rounded_momentum = static_cast<scalar_t>(
+        __fmul_rn(static_cast<float>(dense_momentum), beta1));
+    return static_cast<scalar_t>(__fmaf_rn(
+        alpha, grad, static_cast<float>(rounded_momentum)));
+}
+
 template <typename scalar_t>
 __global__ void gefen_momentum_emit_flat_kernel(
     const scalar_t* __restrict__ grad_view,
@@ -873,6 +892,8 @@ __global__ void gefen_momentum_emit_flat_kernel(
     int64_t period,
     int64_t total_numel,
     float beta1,
+    float nesterov_alpha,
+    bool nesterov,
     bool stochastic_round,
     uint64_t rng_seed,
     const int64_t* __restrict__ rng_seed_dev
@@ -906,7 +927,20 @@ __global__ void gefen_momentum_emit_flat_kernel(
         // Dense quantized momentum, rounded exactly as the old host
         // `codebook[idx].to(scalar_t).mul_(m_magnitude)` two-step round.
         const scalar_t coeff = static_cast<scalar_t>(s_codebook[static_cast<int>(quantized_index)]);
-        momentum_out[idx] = static_cast<scalar_t>(static_cast<float>(coeff) * new_mag);
+        if (nesterov) {
+            // The explicit multiply also forces the fp32 dense-momentum round
+            // that the unfused path gets by storing the emitter output before
+            // launching its separate Nesterov kernels.
+            const scalar_t dense_momentum = static_cast<scalar_t>(
+                __fmul_rn(static_cast<float>(coeff), new_mag));
+            momentum_out[idx] = gefen_nesterov_momentum(
+                dense_momentum, static_cast<float>(grad_view[idx]), beta1,
+                nesterov_alpha);
+        } else {
+            // Leave the historical non-Nesterov expression untouched.
+            momentum_out[idx] = static_cast<scalar_t>(
+                static_cast<float>(coeff) * new_mag);
+        }
     }
 }
 
@@ -1447,6 +1481,8 @@ __global__ __launch_bounds__(256) void gefen_momentum_emit_chunked_kernel(
     int64_t period,
     int64_t total_numel,
     float beta1,
+    float nesterov_alpha,
+    bool nesterov,
     bool stochastic_round,
     uint64_t rng_seed,
     const int64_t* __restrict__ rng_seed_dev
@@ -1504,8 +1540,16 @@ __global__ __launch_bounds__(256) void gefen_momentum_emit_chunked_kernel(
             sign_out[k] = quantized_index;
             const scalar_t quantized_coeff = static_cast<scalar_t>(
                 s_codebook[static_cast<int>(quantized_index)]);
-            momentum_v[k] = static_cast<scalar_t>(
-                static_cast<float>(quantized_coeff) * new_mag);
+            if (nesterov) {
+                const scalar_t dense_momentum = static_cast<scalar_t>(
+                    __fmul_rn(static_cast<float>(quantized_coeff), new_mag));
+                momentum_v[k] = gefen_nesterov_momentum(
+                    dense_momentum, g_f[k], beta1, nesterov_alpha);
+            } else {
+                // Leave the historical non-Nesterov expression untouched.
+                momentum_v[k] = static_cast<scalar_t>(
+                    static_cast<float>(quantized_coeff) * new_mag);
+            }
 
             if (++pin == period) {
                 pin = 0;
@@ -2815,7 +2859,8 @@ void gefen_quantized_momentum_update_cuda(
     double beta1,
     bool stochastic_round,
     int64_t rng_seed,
-    c10::optional<at::Tensor> seed_dev
+    c10::optional<at::Tensor> seed_dev,
+    bool nesterov
 ) {
     if (!grad_view.is_cuda() || !m_sign.is_cuda() || !m_magnitude.is_cuda() ||
         !codebook.is_cuda() || !momentum_out.is_cuda()) {
@@ -2894,6 +2939,11 @@ void gefen_quantized_momentum_update_cuda(
     auto new_magnitude = at::zeros_like(m_magnitude);
 
     const int codebook_size = static_cast<int>(codebook.numel());
+    const float beta1_f = static_cast<float>(beta1);
+    // Match Python's `1 - momentum`: subtraction happens in double, then
+    // TensorIterator narrows the scalar to its fp32 opmath type.  Computing
+    // `1.0f - beta1_f` would differ for ordinary betas such as 0.9/0.95/0.99.
+    const float nesterov_alpha = static_cast<float>(1.0 - beta1);
     const int threads = 256;
     const int sm_count = cached_sm_count(grad_view.get_device());
     const int64_t flat_blocks_cap = static_cast<int64_t>(sm_count) * 32;
@@ -2916,7 +2966,7 @@ void gefen_quantized_momentum_update_cuda(
                     grad_view.data_ptr<scalar_t>(), m_sign.data_ptr<uint8_t>(),
                     m_magnitude.data_ptr<float>(), codebook.data_ptr<float>(),
                     new_magnitude.data_ptr<float>(), codebook_size, period, total_numel,
-                    static_cast<float>(beta1));
+                    beta1_f);
             } else {
                 int blocks_per_row = static_cast<int>((period + threads * 64 - 1) / (threads * 64));
                 if (blocks_per_row < 1) blocks_per_row = 1;
@@ -2929,7 +2979,7 @@ void gefen_quantized_momentum_update_cuda(
                     grad_view.data_ptr<scalar_t>(), m_sign.data_ptr<uint8_t>(),
                     m_magnitude.data_ptr<float>(), codebook.data_ptr<float>(),
                     new_magnitude.data_ptr<float>(), codebook_size, period, num_blocks, blocks_per_row,
-                    static_cast<float>(beta1));
+                    beta1_f);
             }
         });
     C10_CUDA_KERNEL_LAUNCH_CHECK();
@@ -2949,7 +2999,8 @@ void gefen_quantized_momentum_update_cuda(
                     grad_view.data_ptr<scalar_t>(), m_sign.data_ptr<uint8_t>(),
                     m_magnitude.data_ptr<float>(), new_magnitude.data_ptr<float>(),
                     codebook.data_ptr<float>(), momentum_out.data_ptr<scalar_t>(),
-                    codebook_size, period, total_numel, static_cast<float>(beta1),
+                    codebook_size, period, total_numel, beta1_f,
+                    nesterov_alpha, nesterov,
                     stochastic_round, static_cast<uint64_t>(rng_seed),
                     seed_dev_ptr);
                 return;
@@ -2966,7 +3017,7 @@ void gefen_quantized_momentum_update_cuda(
                 use_lut ? lut.data_ptr<int16_t>() : nullptr,
                 use_lut ? static_cast<int>(lut.numel() - 1) : 0,
                 momentum_out.data_ptr<scalar_t>(), codebook_size,
-                period, total_numel, static_cast<float>(beta1),
+                period, total_numel, beta1_f, nesterov_alpha, nesterov,
                 stochastic_round, static_cast<uint64_t>(rng_seed),
                 seed_dev_ptr);
         });

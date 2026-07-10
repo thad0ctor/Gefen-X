@@ -648,14 +648,20 @@ class GefenMuon(Gefen):
         state,
         grad_view: torch.Tensor,
         momentum: float,
+        *,
+        nesterov: bool = False,
     ) -> torch.Tensor:
         # Single-pass Muon momentum update: the kernel advances the quantized
         # momentum state and emits the dense quantized momentum for Newton-Schulz
         # directly, so the old lr==0 dummy-stepsize call into the generic update
         # kernel followed by a second full-size codebook gather is gone. The
-        # emitted momentum is bit-identical to the old
-        # `dequantize(m_codebook) * m_magnitude`.
-        return self._gefen_quantized_momentum_update(state, grad_view, momentum)
+        # emitted base momentum is bit-identical to the old
+        # `dequantize(m_codebook) * m_magnitude`; when requested, the kernel
+        # additionally reproduces the old host Nesterov mul/add bit-for-bit in
+        # this same output write without changing the stored EMA state.
+        return self._gefen_quantized_momentum_update(
+            state, grad_view, momentum, nesterov=nesterov
+        )
 
     @staticmethod
     def _is_sharded(p: torch.Tensor) -> bool:
@@ -776,6 +782,7 @@ class GefenMuon(Gefen):
         automatic_period = state["automatic_period"]
         grad_view = self._automatic_view(flat_grad, automatic_period)
 
+        nesterov_emitted = False
         if (
             self._fused_kernels_available()
             and grad_view.is_cuda
@@ -798,7 +805,9 @@ class GefenMuon(Gefen):
                 state,
                 grad_view,
                 momentum,
+                nesterov=group["nesterov"],
             )
+            nesterov_emitted = group["nesterov"]
         else:
             momentum_update = self._gefen_dequantize_m_coefficients(state, grad_view)
             momentum_update.mul_(state["m_magnitude"])
@@ -807,7 +816,7 @@ class GefenMuon(Gefen):
 
         state["step"] += 1
 
-        if group["nesterov"]:
+        if group["nesterov"] and not nesterov_emitted:
             momentum_update.mul_(momentum).add_(grad_view, alpha=1 - momentum)
         update = momentum_update.view_as(grad)
 

@@ -130,7 +130,12 @@ def main():
         if args.fused:
             mom_fn = opt._fused_quantized_momentum_update
             # baseline signature: (p, state, grad_view, momentum); this branch drops p.
-            takes_p = len(inspect.signature(mom_fn).parameters) == 4
+            # Detect the historical positional scratch explicitly: optional
+            # keyword-only controls (for example exact fused Nesterov emission)
+            # must not make the modern signature look like the four-positional
+            # baseline again.
+            parameters = tuple(inspect.signature(mom_fn).parameters)
+            takes_p = bool(parameters) and parameters[0] == "p"
             primed = []  # (p_or_None, state, grad_view, momentum) precomputed once
             for (_, p), g in zip(params, grads):
                 state = opt.state[p]
