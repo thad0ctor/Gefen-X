@@ -375,6 +375,7 @@ def _quantized_momentum_update_impl(
     rng_seed: int = 0,
     seed_dev: Optional[torch.Tensor] = None,
     codebook_lut: Optional[torch.Tensor] = None,
+    nesterov: bool = False,
 ) -> None:
     grad_c = grad_view if grad_view.is_contiguous() else grad_view.contiguous()
     cb_c = codebook if codebook.is_contiguous() else codebook.contiguous()
@@ -385,7 +386,7 @@ def _quantized_momentum_update_impl(
         codebook_lut if codebook_lut is not None
         else _codebook_search_lut(cb_c),
         momentum_out, beta1,
-        stochastic_round, rng_seed, seed_dev
+        stochastic_round, rng_seed, seed_dev, nesterov
     )
 
 
@@ -660,6 +661,7 @@ def gefen_quantized_momentum_update_cuda(
     rng_seed: int = 0,
     seed_dev: Optional[torch.Tensor] = None,
     codebook_lut: Optional[torch.Tensor] = None,
+    nesterov: bool = False,
 ) -> None:
     """Muon-specific quantized-momentum update: advance the quantized momentum
     state (m_sign / m_magnitude) AND emit the dense quantized momentum
@@ -674,7 +676,11 @@ def gefen_quantized_momentum_update_cuda(
 
     ``seed_dev`` (capturable stochastic rounding): 0-dim/[1] int64 device
     tensor with the per-step rounding seed; overrides the host ``rng_seed``
-    when given (see ``automatic_gefen_fused_full_update_cuda``)."""
+    when given (see ``automatic_gefen_fused_full_update_cuda``).
+
+    ``nesterov=True`` changes only ``momentum_out`` to the bit-exact result of
+    ``momentum_out.mul_(beta1).add_(grad_view, alpha=1-beta1)``.  The stored
+    quantized momentum remains the underlying (non-Nesterov) EMA."""
     # registration flag first: False on torch builds too old to have
     # torch.compiler.is_compiling, whose evaluation would raise -- and this
     # wrapper runs on the DEFAULT (non-capturable) path too.
@@ -688,12 +694,12 @@ def gefen_quantized_momentum_update_cuda(
         # both capturable and non-capturable modes.
         torch.ops.gefen.quantized_momentum_update(
             grad_view, m_sign, m_magnitude, codebook, momentum_out, beta1,
-            stochastic_round, rng_seed, seed_dev, codebook_lut,
+            stochastic_round, rng_seed, seed_dev, codebook_lut, nesterov,
         )
         return
     _quantized_momentum_update_impl(
         grad_view, m_sign, m_magnitude, codebook, momentum_out, beta1,
-        stochastic_round, rng_seed, seed_dev, codebook_lut,
+        stochastic_round, rng_seed, seed_dev, codebook_lut, nesterov,
     )
 
 
