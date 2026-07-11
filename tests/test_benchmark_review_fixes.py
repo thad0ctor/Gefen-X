@@ -247,3 +247,21 @@ def test_published_rows_mark_missing_provenance_as_legacy_context():
         else:
             assert row["provenance_status"] == "legacy_context_only"
             assert all(value is None for value in provenance)
+
+
+def test_muon_recipe_text_distinguishes_missing_normuon_metadata(monkeypatch):
+    monkeypatch.syspath_prepend(str(OPTIMIZER_SWEEP))
+    from optimizer_sweep_plot_helpers import muon_recipe_text
+
+    row = {
+        "variant": "legacy",
+        "muon_ns_schedule": "unspecified",
+        "muon_backup_optimizer": "gefen",
+    }
+    assert "NorMuon unspecified" in muon_recipe_text(row)
+
+    row["muon_normuon"] = False
+    assert "NorMuon off" in muon_recipe_text(row)
+
+    row["muon_normuon"] = "unknown"
+    assert "NorMuon unspecified" in muon_recipe_text(row)

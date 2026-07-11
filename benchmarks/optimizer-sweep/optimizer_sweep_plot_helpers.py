@@ -26,8 +26,11 @@ def muon_recipe_text(row: Mapping[str, Any]) -> str:
     """Summarize the recorded Muon recipe for a result row."""
     variant = row.get("variant", "unspecified") or "unspecified"
     schedule = row.get("muon_ns_schedule", "unspecified") or "unspecified"
-    normuon = str(row.get("muon_normuon", "")).lower() == "true"
-    normuon_text = "NorMuon" if normuon else "NorMuon off"
+    normuon = str(row.get("muon_normuon", "")).strip().lower()
+    normuon_text = {
+        "true": "NorMuon",
+        "false": "NorMuon off",
+    }.get(normuon, "NorMuon unspecified")
     backup = str(row.get("muon_backup_optimizer", "")).strip().lower()
     backup_label = {
         "adamw": "AdamW",
