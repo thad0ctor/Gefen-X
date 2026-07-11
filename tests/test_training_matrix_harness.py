@@ -1204,13 +1204,33 @@ def test_generated_outputs_do_not_change_source_fingerprint():
     assert after == before
 
 
+def test_custom_output_dir_is_excluded_from_source_fingerprint():
+    output_dir = ROOT / "benchmarks" / "training_matrix" / "fingerprint-custom-out"
+    output_dir.mkdir(parents=True, exist_ok=False)
+    artifact = output_dir / "results.jsonl"
+    try:
+        unfiltered_before = source_fingerprint(ROOT)
+        filtered_before = source_fingerprint(ROOT, exclude_dirs=(output_dir,))
+        artifact.write_text('{"generated": true}\n', encoding="utf-8")
+        # Without the exclusion the untracked output counts as a source change;
+        # with it (absolute or root-relative form) the fingerprint is stable.
+        assert source_fingerprint(ROOT) != unfiltered_before
+        assert source_fingerprint(ROOT, exclude_dirs=(output_dir,)) == filtered_before
+        relative = output_dir.relative_to(ROOT).as_posix()
+        assert source_fingerprint(ROOT, exclude_dirs=(relative,)) == filtered_before
+    finally:
+        if artifact.exists():
+            artifact.unlink()
+        output_dir.rmdir()
+
+
 def test_source_change_guard_rejects_a_new_revision(monkeypatch):
     captured = {"commit": "abc", "diff_sha256": "clean", "dirty": False}
     state = {"current": captured.copy()}
     monkeypatch.setattr(
         comparison_module,
         "source_fingerprint",
-        lambda _root: state["current"].copy(),
+        lambda _root, exclude_dirs=(): state["current"].copy(),
     )
     comparison_module.require_unchanged_source(ROOT, captured)
 
@@ -1225,10 +1245,14 @@ def test_matrix_launcher_preserves_capture_and_guards_before_second_cell(
     captured = {"commit": "abc", "diff_sha256": "diff", "dirty": True}
     launches = []
     checks = []
-    monkeypatch.setattr(matrix_driver, "source_fingerprint", lambda _root: captured.copy())
+    monkeypatch.setattr(
+        matrix_driver,
+        "source_fingerprint",
+        lambda _root, exclude_dirs=(): captured.copy(),
+    )
 
-    def reject_next(_root, expected):
-        checks.append(expected)
+    def reject_next(_root, expected, exclude_dirs=()):
+        checks.append((expected, tuple(exclude_dirs)))
         raise RuntimeError("source changed")
 
     def fake_run(command, *, cwd, env, check):
@@ -1248,7 +1272,9 @@ def test_matrix_launcher_preserves_capture_and_guards_before_second_cell(
             ]
         )
     assert len(launches) == 1
-    assert checks == [captured]
+    # The guard receives the fingerprint AND the output dir to exclude, so a
+    # custom --output-dir inside the repo cannot trip the source guard.
+    assert checks == [(captured, (Path(str(tmp_path)),))]
     assert launches[0][2][SOURCE_FINGERPRINT_ENV] == canonical_json(captured)
 
 
@@ -1269,10 +1295,10 @@ def test_consistency_launcher_preserves_capture_and_guards_before_second_job(
     monkeypatch.setattr(
         consistency_driver,
         "source_fingerprint",
-        lambda _root: captured.copy(),
+        lambda _root, exclude_dirs=(): captured.copy(),
     )
 
-    def reject_next(_root, expected):
+    def reject_next(_root, expected, exclude_dirs=()):
         checks.append(expected)
         raise RuntimeError("source changed")
 

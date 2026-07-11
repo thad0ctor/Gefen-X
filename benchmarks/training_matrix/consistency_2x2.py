@@ -128,12 +128,12 @@ def main(argv: list[str] | None = None) -> int:
     root = Path(__file__).resolve().parents[2]
     env = os.environ.copy()
     env["PYTHONPATH"] = str(root / "src") + os.pathsep + env.get("PYTHONPATH", "")
-    captured_source = source_fingerprint(root)
+    captured_source = source_fingerprint(root, exclude_dirs=(output_dir,))
     env[SOURCE_FINGERPRINT_ENV] = canonical_json(captured_source)
     print("# 2 pretraining runs followed by 4 checkpoint-crossed SFT runs")
     for index, command in enumerate(plan):
         if args.execute and index:
-            require_unchanged_source(root, captured_source)
+            require_unchanged_source(root, captured_source, exclude_dirs=(output_dir,))
         print(shlex.join(command), flush=True)
         if args.execute:
             subprocess.run(command, cwd=root, env=env, check=True)

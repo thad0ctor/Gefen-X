@@ -258,6 +258,11 @@ def test_quad_winner_flags_follow_cohort_provenance(monkeypatch):
     assert cohort_flags_winners([complete, complete])
     assert not cohort_flags_winners([complete, legacy])
     assert not cohort_flags_winners([legacy, legacy])
+    # Only the positive "complete" status earns winner markers: incomplete,
+    # unrecorded, and missing statuses all suppress them too.
+    assert not cohort_flags_winners([complete, {"provenance_status": "incomplete"}])
+    assert not cohort_flags_winners([complete, {"provenance_status": "unrecorded"}])
+    assert not cohort_flags_winners([complete, {}])
 
     published_csv = ROOT / "docs/benchmarks/optimizer_comparison_2000steps.csv"
     with published_csv.open(newline="") as handle:

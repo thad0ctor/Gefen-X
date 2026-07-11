@@ -85,15 +85,16 @@ def commands(args: argparse.Namespace) -> list[list[str]]:
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
     planned = commands(args)
+    output = Path(args.output_dir)
     root = Path(__file__).resolve().parents[2]
     env = os.environ.copy()
     env["PYTHONPATH"] = str(root / "src") + os.pathsep + env.get("PYTHONPATH", "")
-    captured_source = source_fingerprint(root)
+    captured_source = source_fingerprint(root, exclude_dirs=(output,))
     env[SOURCE_FINGERPRINT_ENV] = canonical_json(captured_source)
     print(f"# {len(planned)} sequential cells; working tree: {root}")
     for index, command in enumerate(planned):
         if args.execute and index:
-            require_unchanged_source(root, captured_source)
+            require_unchanged_source(root, captured_source, exclude_dirs=(output,))
         print(shlex.join(command), flush=True)
         if args.execute:
             subprocess.run(command, cwd=root, env=env, check=True)

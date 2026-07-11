@@ -6,6 +6,7 @@ import hashlib
 import json
 import os
 import subprocess
+from collections.abc import Iterable
 from pathlib import Path
 from typing import Any
 
@@ -21,10 +22,37 @@ def hash_context(context: dict[str, Any]) -> str:
 SOURCE_FINGERPRINT_ENV = "GEFEN_MATRIX_SOURCE_FINGERPRINT"
 
 
-def source_fingerprint(root: str | Path) -> dict[str, Any]:
-    """Hash commit + tracked diff + untracked non-ignored source content."""
+def _generated_output_dirs(
+    root: Path, exclude_dirs: Iterable[str | Path]
+) -> list[str]:
+    """Repo-relative dirs whose contents are generated, not source.
+
+    Relative entries are taken relative to ``root`` (cells run with that cwd);
+    absolute entries outside the repo need no exclusion and drop out.
+    """
+    excludes = {"benchmarks/training_matrix/out"}
+    for exclude in exclude_dirs:
+        path = Path(exclude)
+        if path.is_absolute():
+            try:
+                path = path.resolve().relative_to(root.resolve())
+            except ValueError:
+                continue
+        excludes.add(path.as_posix().rstrip("/"))
+    return sorted(excludes)
+
+
+def source_fingerprint(
+    root: str | Path, exclude_dirs: Iterable[str | Path] = ()
+) -> dict[str, Any]:
+    """Hash commit + tracked diff + untracked non-ignored source content.
+
+    ``exclude_dirs`` names generated-output directories (e.g. a custom
+    ``--output-dir`` inside the repo) whose files must not count as source.
+    """
 
     root = Path(root)
+    generated = _generated_output_dirs(root, exclude_dirs)
     commit = subprocess.check_output(
         ["git", "rev-parse", "HEAD"], cwd=root, text=True, stderr=subprocess.DEVNULL
     ).strip()
@@ -37,8 +65,8 @@ def source_fingerprint(root: str | Path) -> dict[str, Any]:
             "HEAD",
             "--",
             ".",
-            ":(exclude)benchmarks/training_matrix/out/**",
-        ],
+        ]
+        + [f":(exclude){directory}/**" for directory in generated],
         cwd=root,
         stderr=subprocess.DEVNULL,
     )
@@ -47,7 +75,15 @@ def source_fingerprint(root: str | Path) -> dict[str, Any]:
         cwd=root,
         stderr=subprocess.DEVNULL,
     )
-    untracked = sorted(path for path in untracked_raw.decode().split("\0") if path)
+    untracked = sorted(
+        path
+        for path in untracked_raw.decode().split("\0")
+        if path
+        and not any(
+            path == directory or path.startswith(directory + "/")
+            for directory in generated
+        )
+    )
     digest = hashlib.sha256()
     digest.update(diff)
     for relative in untracked:
@@ -79,11 +115,13 @@ def immutable_source_fingerprint(root: str | Path) -> dict[str, Any]:
 
 
 def require_unchanged_source(
-    root: str | Path, captured: dict[str, Any]
+    root: str | Path,
+    captured: dict[str, Any],
+    exclude_dirs: Iterable[str | Path] = (),
 ) -> None:
     """Abort a sequential matrix before it spans two source revisions."""
 
-    current = source_fingerprint(root)
+    current = source_fingerprint(root, exclude_dirs=exclude_dirs)
     if current != captured:
         raise RuntimeError(
             "source tree changed after the matrix fingerprint was captured; "

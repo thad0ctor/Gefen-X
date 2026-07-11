@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections.abc import Iterable, Mapping
 from typing import Any
 
+COMPLETE_PROVENANCE_STATUS = "complete"
 LEGACY_PROVENANCE_STATUS = "legacy_context_only"
 
 
@@ -12,13 +13,13 @@ def cohort_flags_winners(rows: Iterable[Mapping[str, Any]]) -> bool:
     """Whether best-in-panel winner markers may be drawn for a cohort.
 
     Matches the published-table policy: best-in-column is marked only in a
-    fully provenance-complete cohort. If any row in the cohort is
-    ``legacy_context_only`` (a mixed or fully legacy cohort), no winner is
-    flagged for that cohort at all.
+    fully provenance-complete cohort. Any row that is not ``complete``
+    (``legacy_context_only``, ``incomplete``, ``unrecorded``, or missing)
+    suppresses winner flags for the whole cohort.
     """
     return all(
         str(row.get("provenance_status", "")).strip().lower()
-        != LEGACY_PROVENANCE_STATUS
+        == COMPLETE_PROVENANCE_STATUS
         for row in rows
     )
 
