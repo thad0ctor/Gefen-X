@@ -20,27 +20,11 @@ Outputs land in the configured out-dir: per-cell logs, `results.jsonl`, `compari
 
 ## Reproducing the published Gefen-Muon numbers
 
-`run.sh` applies the **balanced SFT Gefen-Muon config by default** —
-`adjust_lr_fn=match_rms_adamw`, an AdamW backup at the full cell LR, tuned3,
-NorMuon, and no Gefen period-one backup override. Override via config keys
-(`muon_adjust`, `muon_backup_optimizer`, `muon_backup_lr_fraction`,
-`muon_backup_1d`, `muon_normuon`) or the corresponding CLI flags. The
-low-memory alternative selects the Gefen backup, half backup LR, and
-`backup_1d_period_one`; quality-first pretraining uses classic NS5 and disables
-NorMuon. See [the optimizer-sweep README](optimizer-sweep/README.md) for the
-full flag list.
+`run.sh` applies the **balanced SFT Gefen-Muon config by default** — `adjust_lr_fn=match_rms_adamw`, an AdamW backup at the full cell LR, tuned3, NorMuon, and no Gefen period-one backup override. Override via config keys (`muon_adjust`, `muon_backup_optimizer`, `muon_backup_lr_fraction`, `muon_backup_1d`, `muon_normuon`) or the corresponding CLI flags. The low-memory alternative selects the Gefen backup, half backup LR, and `backup_1d_period_one`; quality-first pretraining uses classic NS5 and disables NorMuon. See [the optimizer-sweep README](optimizer-sweep/README.md) for the full flag list.
 
-> The published `gefen_muon` SFT numbers use tuned3 + NorMuon with the AdamW
-> backup at full LR. Pass `--no-muon-normuon` for an ablation; use
-> `--muon-backup-optimizer gefen --muon-backup-lr-frac 0.5
-> --muon-backup-1d` for the low-memory alternative. The effective recipe is
-> recorded in every result line under `muon_flags`.
+> The published `gefen_muon` SFT numbers use tuned3 + NorMuon with the AdamW backup at full LR. Pass `--no-muon-normuon` for an ablation; use `--muon-backup-optimizer gefen --muon-backup-lr-frac 0.5 --muon-backup-1d` for the low-memory alternative. The effective recipe is recorded in every result line under `muon_flags`.
 >
-> **Note on the published `gefen_muon` throughput:** it reflects tuned3, which
-> is the retained SFT schedule and was faster than classic NS5 in the SFT
-> ablation. It is not universally loss-neutral: quality-first pretraining uses
-> `ns_schedule="standard"`, five NS steps, and NorMuon off. The other
-> optimizers' rows are schedule-independent.
+> **Note on the published `gefen_muon` throughput:** it reflects tuned3, which is the retained SFT schedule and was faster than classic NS5 in the SFT ablation. It is not universally loss-neutral: quality-first pretraining uses `ns_schedule="standard"`, five NS steps, and NorMuon off. The other optimizers' rows are schedule-independent.
 
 ## microbench scripts
 
@@ -48,9 +32,7 @@ Run from `benchmarks/microbench/` with `gefen` importable (fp8 paths require an 
 
 - `bench_ns_schedule.py` / `plot_ns_schedule.py` — tuned NS coefficient schedules (tuned3 / tuned4) vs the standard 5-step quintic: per-shape step time + orthogonality.
 - `bench_ns_fp8.py` / `plot_ns_fp8.py` — fp8 (e4m3) NS vs bf16: per-shape step time + orthogonality drift.
-- `bench_batched_ns.py` — serial vs opt-in shape-batched bf16 NS, including
-  speed, relative/max numerical delta, and the conservative workspace estimate;
-  `--full-step` runs a paired tuned3 + NorMuon + Nesterov optimizer comparison.
+- `bench_batched_ns.py` — serial vs opt-in shape-batched bf16 NS, including speed, relative/max numerical delta, and the conservative workspace estimate; `--full-step` runs a paired tuned3 + NorMuon + Nesterov optimizer comparison.
 - `bench_capturable_step.py` — 386M-param optimizer-step timing for eager, capturable eager, manual CUDA graph replay, and `torch.compile(mode="reduce-overhead")`, reporting tail-window CUDA and wall time plus peak allocated memory.
 - `profile_capturable_cohorts.py` — CUDA-activity counts and step latency for uniform, decay/no-decay, and independently scheduled tensor-LR capturable cohorts in eager and CUDA-graph modes.
 - `plot_ns_levers.py` — the consolidated "faster Newton-Schulz" charts (real-training loss + end-to-end throughput across NS variants).

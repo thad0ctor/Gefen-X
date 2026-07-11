@@ -34,6 +34,8 @@ ruff check .
 
 The ruff config lives in `pyproject.toml`. Please do not reformat unrelated code.
 
+In Markdown, do not hard-wrap prose at a fixed column. Keep each paragraph, list item, and blockquote paragraph on one source line; break lines only where Markdown syntax, an intentional hard break, or embedded code requires it.
+
 ## Pull requests
 
 - Keep changes focused; describe what and why.

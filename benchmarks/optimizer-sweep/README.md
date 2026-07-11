@@ -1,9 +1,6 @@
 # Optimizer sweep: AdamW vs Gefen
 
-A self-contained, reproducible benchmark that compares the **Gefen** optimizer
-against the AdamW family (full-precision, 8-bit, 4-bit) on a small full
-fine-tune. Anyone can clone this fork, point the launcher at a model and some
-GPUs, and reproduce the LR sweep -> 2000-step finals -> plots -> table pipeline.
+A self-contained, reproducible benchmark that compares the **Gefen** optimizer against the AdamW family (full-precision, 8-bit, 4-bit) on a small full fine-tune. Anyone can clone this fork, point the launcher at a model and some GPUs, and reproduce the LR sweep -> 2000-step finals -> plots -> table pipeline.
 
 ## 1. What it benchmarks (and the regime)
 
@@ -11,43 +8,25 @@ For each (model, optimizer) it measures, under one fixed regime:
 
 - **Final eval loss** on a 32-example held-out set, plus the train-loss EMA
 - **Throughput** (steady-state tokens/sec, warmup steps excluded)
-- **Peak VRAM** — recorded two ways: `peak_vram_gib` =
-  `torch.cuda.max_memory_allocated` (real tensor bytes; the apples-to-apples
-  optimizer-memory metric and the one the charts use) and
-  `peak_vram_reserved_gib` = `torch.cuda.max_memory_reserved` (caching-allocator
-  pool incl. slack/fragmentation; closer to what `nvidia-smi` reports)
-- **Optimizer-state bytes/param** (real packed bytes, recursing into tensor
-  subclasses so torchao's 4-bit packed state isn't over-counted)
+- **Peak VRAM** — recorded two ways: `peak_vram_gib` = `torch.cuda.max_memory_allocated` (real tensor bytes; the apples-to-apples optimizer-memory metric and the one the charts use) and `peak_vram_reserved_gib` = `torch.cuda.max_memory_reserved` (caching-allocator pool incl. slack/fragmentation; closer to what `nvidia-smi` reports)
+- **Optimizer-state bytes/param** (real packed bytes, recursing into tensor subclasses so torchao's 4-bit packed state isn't over-counted)
 
 **Regime — identical across every cell:**
 
 - Full fine-tune (all parameters trained), **bf16 master weights**
 - `gradient_checkpointing` ON, **micro-batch 1**, sequence length **2048**
-- Dataset **`tatsu-lab/alpaca`**, tokenized with the model's own tokenizer using
-  the standard Alpaca prompt template (prompt tokens masked out of the loss),
-  greedily **packed into exact 2048-token blocks**
+- Dataset **`tatsu-lab/alpaca`**, tokenized with the model's own tokenizer using the standard Alpaca prompt template (prompt tokens masked out of the loss), greedily **packed into exact 2048-token blocks**
 - **Fixed seed**, identical packed-data order across all optimizers within a seed
 - 32-example held-out eval, eval-every 50, constant LR, **2000-step** finals
 - Each optimizer runs at its **documented task-appropriate LR** (see below)
 
-Optimizers (`--opt`): `adamw_bf16`, `adamw8bit` (bitsandbytes), `adamw4bit`
-(torchao), `gefen_fused`, `gefen_nonfused`, `gefen_muon` (GefenMuonHybrid with
-the balanced SFT AdamW backup). The
-default set run by `run.sh` is `adamw_bf16 adamw8bit adamw4bit gefen_fused
-gefen_muon` — pass `--no-muon` to drop the (slow) Newton-Schulz `gefen_muon`.
+Optimizers (`--opt`): `adamw_bf16`, `adamw8bit` (bitsandbytes), `adamw4bit` (torchao), `gefen_fused`, `gefen_nonfused`, `gefen_muon` (GefenMuonHybrid with the balanced SFT AdamW backup). The default set run by `run.sh` is `adamw_bf16 adamw8bit adamw4bit gefen_fused gefen_muon` — pass `--no-muon` to drop the (slow) Newton-Schulz `gefen_muon`.
 
-The documented defaults are: AdamW family `5e-5`; `gefen_fused` /
-`gefen_nonfused` `3e-5` (AdamW/Gefen came from 175-step fair-LR sweeps; the
-legacy block-shared Gefen mode uses `2e-5`); and balanced-SFT `gefen_muon`
-`3e-5` with `--muon-adjust match_rms_adamw`, selected from the retained SFT
-matrix. Pass `--lr-sweep` to re-derive an optimum for your model and regime
-instead of using these defaults.
+The documented defaults are: AdamW family `5e-5`; `gefen_fused` / `gefen_nonfused` `3e-5` (AdamW/Gefen came from 175-step fair-LR sweeps; the legacy block-shared Gefen mode uses `2e-5`); and balanced-SFT `gefen_muon` `3e-5` with `--muon-adjust match_rms_adamw`, selected from the retained SFT matrix. Pass `--lr-sweep` to re-derive an optimum for your model and regime instead of using these defaults.
 
 ## 2. Setup
 
-This suite depends on the Gefen **fork** (the one this directory lives in), which
-carries kernel/throughput fixes that are **not** in the PyPI `gefen` package.
-Install Gefen **from source on this fork**, not from PyPI:
+This suite depends on the Gefen **fork** (the one this directory lives in), which carries kernel/throughput fixes that are **not** in the PyPI `gefen` package. Install Gefen **from source on this fork**, not from PyPI:
 
 ```bash
 git clone https://github.com/thad0ctor/Gefen-X     # this fork
@@ -56,15 +35,11 @@ pip install -e .                                    # builds fused CUDA kernels 
 pip install bitsandbytes torchao matplotlib datasets transformers
 ```
 
-A CUDA toolkit + host compiler compatible with your PyTorch is required (Gefen
-JIT-builds its fused kernels on the first CUDA run).
+A CUDA toolkit + host compiler compatible with your PyTorch is required (Gefen JIT-builds its fused kernels on the first CUDA run).
 
 ## 3. Usage
 
-Drive everything through `run.sh`. It runs the (optional) LR sweep, then the
-finals for every optimizer x model, then the plots and the aggregated table.
-Each (model, optimizer) job is pinned to one GPU round-robin, so within a model
-all optimizers share a GPU type for a clean throughput comparison.
+Drive everything through `run.sh`. It runs the (optional) LR sweep, then the finals for every optimizer x model, then the plots and the aggregated table. Each (model, optimizer) job is pinned to one GPU round-robin, so within a model all optimizers share a GPU type for a clean throughput comparison.
 
 Settings come from CLI flags and/or a YAML config, with
 
@@ -74,8 +49,7 @@ precedence:  CLI flag  >  config.yaml  >  built-in default
 
 ### Config file (recommended)
 
-Copy the template, edit it, and run with no flags — `run.sh` auto-loads
-`./config.yaml` when present (or pass `--config <path>`):
+Copy the template, edit it, and run with no flags — `run.sh` auto-loads `./config.yaml` when present (or pass `--config <path>`):
 
 ```bash
 cd benchmarks/optimizer-sweep
@@ -85,15 +59,11 @@ $EDITOR config.yaml          # set venv, out, gpus, models
 ./run.sh --steps 500 --no-muon   # CLI still overrides individual keys
 ```
 
-`config.yaml` is gitignored, so your local venv/model paths never get committed.
-See `config.example.yaml` for every key. Use `./run.sh --dry-run` to resolve and
-print the effective settings without launching anything.
+`config.yaml` is gitignored, so your local venv/model paths never get committed. See `config.example.yaml` for every key. Use `./run.sh --dry-run` to resolve and print the effective settings without launching anything.
 
 ### GPU selection (PCI-ordered)
 
-GPU indices are **PCI-bus-ordered** — `run.sh` exports
-`CUDA_DEVICE_ORDER=PCI_BUS_ID`, so the indices you put in `gpus:` / `--gpus`
-match `nvidia-smi` and the physical cards the cells pin. List them with:
+GPU indices are **PCI-bus-ordered** — `run.sh` exports `CUDA_DEVICE_ORDER=PCI_BUS_ID`, so the indices you put in `gpus:` / `--gpus` match `nvidia-smi` and the physical cards the cells pin. List them with:
 
 ```bash
 ./run.sh --list-gpus
@@ -117,12 +87,9 @@ Then set e.g. `gpus: "1,2,4,5,7"` (or `--gpus "1,2,4,5,7"`).
   --model-1p7b /path/to/Qwen3-1.7B
 ```
 
-- Add `--lr-sweep` to run a short per-optimizer LR sweep first and use each
-  optimizer's best LR for the finals (instead of the documented defaults).
+- Add `--lr-sweep` to run a short per-optimizer LR sweep first and use each optimizer's best LR for the finals (instead of the documented defaults).
 - `gefen_muon` is in the default set; add `--no-muon` to skip it, or set `--opts "..."`.
-- The SFT default is `--muon-backup-optimizer adamw` at full backup LR. Use
-  `--muon-backup-optimizer gefen`, `--muon-backup-lr-frac 0.5`, and
-  `--muon-backup-1d` for the lower-memory Gefen-backup recipe.
+- The SFT default is `--muon-backup-optimizer adamw` at full backup LR. Use `--muon-backup-optimizer gefen`, `--muon-backup-lr-frac 0.5`, and `--muon-backup-1d` for the lower-memory Gefen-backup recipe.
 - Use `--model <tag>=<path>` (repeatable) for arbitrary models/tags.
 - `--arch` is your GPU's compute capability (`8.6` Ampere, `12.0` Blackwell).
 - Run `./run.sh -h` for the full flag list. Missing required settings fail cleanly.
@@ -140,11 +107,7 @@ You can also run a single cell directly:
 Written to `--out`:
 
 - `results.jsonl` — one JSON line per cell (and `results_lrsweep.jsonl` if swept)
-- `comparison_table.csv` / `comparison_table.md` — the aggregate table + a
-  per-model headline (loss gap, throughput ratio, VRAM saved, opt-state). The
-  CSV retains provenance status and Muon variant/backend/schedule/NorMuon
-  metadata so consumers can distinguish legacy context and plots label balanced
-  and low-memory overrides correctly.
+- `comparison_table.csv` / `comparison_table.md` — the aggregate table + a per-model headline (loss gap, throughput ratio, VRAM saved, opt-state). The CSV retains provenance status and Muon variant/backend/schedule/NorMuon metadata so consumers can distinguish legacy context and plots label balanced and low-memory overrides correctly.
 - Six charts (per model x 3 figures, for 2 models):
   - `quad_<model>.png` — 2x2: eval loss / throughput / peak VRAM / opt-state
   - `loss_curve_<model>.png` — eval-loss curves (solid) + train-EMA (dashed)
@@ -153,36 +116,18 @@ Written to `--out`:
 
 ## 5. Caveats (honest)
 
-- **Single seed** by default (`--seed 0`): 2000 steps is the signal, but seed
-  noise is not estimated. Re-run with other seeds to bound it.
-- **`gefen_muon` needs `--muon-adjust match_rms_adamw`** to share the AdamW LR
-  scale; with the original Muon scaling its LR is on a different footing.
-- **`gefen_muon` is an SFT-specific row**, not the literal constructor default:
-  it uses the AdamW backup at full LR plus the hybrid's tuned3/NorMuon defaults.
-  Pass `--no-muon-normuon` to disable NorMuon. The effective backup, schedule,
-  and normalization are recorded in each result line (`muon_flags`).
-- **`gefen_fused`/`gefen_nonfused` run the shipped defaults** (which include
-  `factored_v_2d`, the AdamW-parity second moment, fair LR ≈0.6× AdamW's);
-  the remaining opt-in levers (`--gefen-period-one-substrings`,
-  `--gefen-force-1d-period-one`, `--gefen-codebook-refresh`, and
-  `--no-gefen-factored-v` for the legacy mode) are off unless passed, so the
-  published rows stay reproducible.
-- **Muon is slower per step** — the Newton-Schulz orthogonalization adds work,
-  so `gefen_muon` trades throughput for its update geometry.
-- **Throughput is per-GPU.** Compare optimizers *within* a model (same GPU
-  type); absolute tok/s across GPU types is not comparable.
-- AdamW/Gefen defaults are short-sweep optima, while the Muon default is the
-  retained balanced-SFT selection; all may change with model or regime, so use
-  `--lr-sweep` for a fresh comparison.
-- `adamw4bit`'s low opt-state bytes do **not** translate to low peak VRAM
-  (torchao's compiled step allocates large transient buffers).
+- **Single seed** by default (`--seed 0`): 2000 steps is the signal, but seed noise is not estimated. Re-run with other seeds to bound it.
+- **`gefen_muon` needs `--muon-adjust match_rms_adamw`** to share the AdamW LR scale; with the original Muon scaling its LR is on a different footing.
+- **`gefen_muon` is an SFT-specific row**, not the literal constructor default: it uses the AdamW backup at full LR plus the hybrid's tuned3/NorMuon defaults. Pass `--no-muon-normuon` to disable NorMuon. The effective backup, schedule, and normalization are recorded in each result line (`muon_flags`).
+- **`gefen_fused`/`gefen_nonfused` run the shipped defaults** (which include `factored_v_2d`, the AdamW-parity second moment, fair LR ≈0.6× AdamW's); the remaining opt-in levers (`--gefen-period-one-substrings`, `--gefen-force-1d-period-one`, `--gefen-codebook-refresh`, and `--no-gefen-factored-v` for the legacy mode) are off unless passed, so the published rows stay reproducible.
+- **Muon is slower per step** — the Newton-Schulz orthogonalization adds work, so `gefen_muon` trades throughput for its update geometry.
+- **Throughput is per-GPU.** Compare optimizers *within* a model (same GPU type); absolute tok/s across GPU types is not comparable.
+- AdamW/Gefen defaults are short-sweep optima, while the Muon default is the retained balanced-SFT selection; all may change with model or regime, so use `--lr-sweep` for a fresh comparison.
+- `adamw4bit`'s low opt-state bytes do **not** translate to low peak VRAM (torchao's compiled step allocates large transient buffers).
 
 ## 6. Using Gefen in training
 
-To train with Gefen in [Axolotl](https://github.com/axolotl-ai-cloud/axolotl),
-see the integration PR: **https://github.com/axolotl-ai-cloud/axolotl/pull/3808**.
-It exposes both optimizer APIs (install Axolotl from that PR until it lands in
-a release):
+To train with Gefen in [Axolotl](https://github.com/axolotl-ai-cloud/axolotl), see the integration PR: **https://github.com/axolotl-ai-cloud/axolotl/pull/3808**. It exposes both optimizer APIs (install Axolotl from that PR until it lands in a release):
 
 ```yaml
 optimizer: gefenx       # plain Gefen
@@ -190,8 +135,4 @@ optim_args:
   fused: true
 ```
 
-Use `optimizer: gefenx_muon` for `GefenMuonHybrid`. The Axolotl factory defaults
-to the low-memory Gefen backup; set `backup_optimizer: adamw` and a full
-`backup_lr` for the balanced SFT recipe measured here. See the top-level
-[Muon recipes](../../README.md#which-muon-recipe-should-i-use) for SFT,
-pretraining, and minimum-state configurations.
+Use `optimizer: gefenx_muon` for `GefenMuonHybrid`. The Axolotl factory defaults to the low-memory Gefen backup; set `backup_optimizer: adamw` and a full `backup_lr` for the balanced SFT recipe measured here. See the top-level [Muon recipes](../../README.md#which-muon-recipe-should-i-use) for SFT, pretraining, and minimum-state configurations.
