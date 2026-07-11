@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import copy
 import importlib.util
+import os
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -667,9 +668,20 @@ def test_pretraining_data_hash_reaches_packed_bulk_hash_path(monkeypatch):
 
 
 TINY_SHAKESPEARE_REVISION = "619106eee01474d8eaa5dd400b4b405eb3734ebe"
-TINY_SHAKESPEARE_CACHE_ROOT = (
-    Path.home() / ".cache/huggingface/datasets/winglian___tiny-shakespeare"
-)
+
+
+def _hf_datasets_cache_dir() -> Path:
+    """Mirror Hugging Face's cache resolution: HF_DATASETS_CACHE, then HF_HOME, then the default."""
+    env_cache = os.environ.get("HF_DATASETS_CACHE")
+    if env_cache:
+        return Path(env_cache)
+    hf_home = os.environ.get("HF_HOME")
+    if hf_home:
+        return Path(hf_home) / "datasets"
+    return Path.home() / ".cache/huggingface/datasets"
+
+
+TINY_SHAKESPEARE_CACHE_ROOT = _hf_datasets_cache_dir() / "winglian___tiny-shakespeare"
 TINY_SHAKESPEARE_REVISION_CACHE = next(
     TINY_SHAKESPEARE_CACHE_ROOT.glob(f"*/*/{TINY_SHAKESPEARE_REVISION}"), None
 )

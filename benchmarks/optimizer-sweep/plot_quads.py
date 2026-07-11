@@ -10,7 +10,11 @@ import csv
 import math
 import os
 
-from optimizer_sweep_plot_helpers import muon_recipe_text, optimizer_label
+from optimizer_sweep_plot_helpers import (
+    cohort_flags_winners,
+    muon_recipe_text,
+    optimizer_label,
+)
 
 ORDER = ["adamw_bf16", "adamw8bit", "adamw4bit", "gefen_fused", "gefen_nonfused", "gefen_muon"]
 LABEL = {"adamw_bf16": "AdamW\n(bf16)", "adamw8bit": "AdamW\n8-bit",
@@ -63,11 +67,19 @@ def main():
         mrows = {r["optimizer"]: r for r in rows if r["tag"] == tag}
         opts = [o for o in ORDER if o in mrows]
         lr = {o: mrows[o]["LR"] for o in opts}
+        # best-in-panel is flagged only in fully provenance-complete cohorts;
+        # mixed cohorts (any legacy_context_only row) get no winner markers.
+        flag_winners = cohort_flags_winners(mrows[o] for o in opts)
         config_lines = [CONFIG]
         recipe_bits = []
         if "gefen_muon" in mrows:
             recipe_bits.append(muon_recipe_text(mrows["gefen_muon"]))
-        recipe_bits.append("green outline / star = best in panel")
+        if flag_winners:
+            recipe_bits.append("green outline / star = best in panel")
+        else:
+            recipe_bits.append(
+                "mixed-provenance cohort (legacy context rows): no best-in-panel marked"
+            )
         config_lines.append(" . ".join(recipe_bits))
         if args.subtitle:
             config_lines.append(args.subtitle)
@@ -80,11 +92,12 @@ def main():
         for ax, (key, title, unit, direction) in zip(axes.flat, PANELS):
             vals = [mrows[o][key] for o in opts]
             colors = [COLOR.get(o, "#888888") for o in opts]
-            bi = best_idx(vals, direction)
+            bi = best_idx(vals, direction) if flag_winners else None
             bars = ax.bar(range(len(opts)), vals, color=colors,
                           edgecolor="black", linewidth=0.6, width=0.66)
-            bars[bi].set_edgecolor("#1a7a1a")
-            bars[bi].set_linewidth(2.4)
+            if bi is not None:
+                bars[bi].set_edgecolor("#1a7a1a")
+                bars[bi].set_linewidth(2.4)
             ax.set_xticks(range(len(opts)))
             ax.set_xticklabels(
                 [

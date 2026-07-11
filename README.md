@@ -10,7 +10,7 @@
 
 **A fork of [upstream Gefen](https://github.com/ndvbd/Gefen) that fixes critical gaps in the shipped release, adds modern-architecture support, and closes the loss gap to AdamW.**
 
- Gefen is intended to be a drop-in replacement for the AdamW optimizer for memory-efficient training. It keeps the familiar AdamW training recipe while cutting optimizer state to **~1 byte per parameter** (measured 1.01 B/param) — an 8× reduction versus classic fp32 AdamW state, about 6.5 GiB saved per billion parameters, while maintaining AdamW-level loss. The reduced memory footprint enables training larger models and larger batch sizes for added throughput. **Gefen-X (fused) currently out-performs AdamW-8bit and AdamW-4bit in throughput, memory, and loss, while staying competitive with full-precision AdamW's loss at roughly a quarter of the optimizer memory.**
+ Gefen is intended to be a drop-in replacement for the AdamW optimizer for memory-efficient training. It keeps the familiar AdamW training recipe while cutting optimizer state to **~1 byte per parameter** (measured 1.01 B/param) — an 8× reduction versus classic fp32 AdamW state, about 6.5 GiB saved per billion parameters, while maintaining AdamW-level loss. The reduced memory footprint enables training larger models and larger batch sizes for added throughput. **Gefen-X (fused) currently out-performs AdamW-8bit and AdamW-4bit in throughput, memory, and loss, while staying competitive with the bf16-state fused AdamW baseline's loss at roughly a quarter of the optimizer memory.**
 
 ### Fork Highlights:
 
@@ -183,7 +183,7 @@ All three optimizers accept `capturable=True` (same meaning as `torch.optim`'s a
 
 **Throughput vs peak VRAM** — the speed/memory frontier (upper-left = faster *and* lighter is better). Gefen-fused holds the lowest-VRAM column at `0.97×` fused-AdamW throughput in the complete 0.6B cohort and `0.96×` within the legacy 1.7B cohort. AdamW-4-bit has the highest peak VRAM in that legacy 1.7B context despite its small optimizer state (torchao transient buffers).
 
-> **Why AdamW-4-bit's peak VRAM is high (and Gefen's isn't).** torchao's 4-bit step [upcasts each parameter's state to fp32 to compute the update](https://github.com/pytorch/ao/tree/main/torchao/optim) ("optimizer step calculations are always done in FP32"), so the peak is set by a transient stack of fp32 buffers sized to the *largest* tensor — here the tied embedding / LM head — not by the tiny 1.06 B/param packed state. With **bf16 master weights** the fused-AdamW baseline is already lean, so that fp32 spike pushes 4-bit's peak *above* even full-precision AdamW (15.11 vs 14.00 GiB at 1.7B). Gefen keeps the same ~1 B/param state *without* the fp32 recompute and holds the lowest peak at both measured scales.
+> **Why AdamW-4-bit's peak VRAM is high (and Gefen's isn't).** torchao's 4-bit step [upcasts each parameter's state to fp32 to compute the update](https://github.com/pytorch/ao/tree/main/torchao/optim) ("optimizer step calculations are always done in FP32"), so the peak is set by a transient stack of fp32 buffers sized to the *largest* tensor — here the tied embedding / LM head — not by the tiny 1.06 B/param packed state. With **bf16 master weights** the fused-AdamW baseline is already lean, so that fp32 spike pushes 4-bit's peak *above* even the bf16-state fused AdamW baseline (15.11 vs 14.00 GiB at 1.7B). Gefen keeps the same ~1 B/param state *without* the fp32 recompute and holds the lowest peak at both measured scales.
 
 Balanced-SFT Gefen-Muon uses less peak VRAM and optimizer state than fused AdamW, but more than plain Gefen because its non-Muon subset keeps conventional AdamW state. Newton–Schulz orthogonalization also makes it the slowest optimizer in this end-to-end table.
 
@@ -435,7 +435,7 @@ optimizer = GefenMuonHybrid(
 This keeps both halves on quantized Gefen state and is the low-memory recommendation, not the quality winner. Exact matrix-run figures and protocol are retained in PR #62 rather than a generated report in the repository.
 
 > **`backup_optimizer` and `fused` are independent.** The former selects Gefen or AdamW for non-Muon parameters. `fused=True` selects each chosen optimizer's fused CUDA implementation; it does not mean “use Gefen as the backup.”
-
+>
 > **Manual control.** For a custom split, `gefen.split_params_for_muon(model)` returns the `(muon_named, backup_named)` `(name, param)` lists; pass them as the two positional arguments (`GefenMuonHybrid(muon_named, backup_named, lr=...)`) and adjust as needed. The single-argument and `from_model` forms cover the common case.
 
 **Muon learning rate — keep `adjust_lr_fn="match_rms_adamw"` (the default).** Muon-native update scaling is not on the same footing as either backup. The default rescale makes an AdamW-scale `lr` meaningful across the whole hybrid, while `muon_lr` and `backup_lr` remain available for deliberate splits:

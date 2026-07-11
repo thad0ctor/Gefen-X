@@ -7,6 +7,7 @@ import torch
 import torch.nn as nn
 
 from gefen import Gefen, GefenMuon, GefenMuonHybrid
+from gefen.gefen_muon import BATCHED_NS_DEFAULT_WORKSPACE_BYTES
 
 
 def _param_names(groups):
@@ -257,6 +258,46 @@ def test_hybrid_adamw_backup_scheduler_preserves_split_lr_ratio():
     assert [group["lr"] for group in opt.backup.param_groups] == pytest.approx(
         [2.5e-5]
     )
+
+
+# ---- Batched-NS ctor kwargs forward to the Muon child ---------------------
+
+def test_hybrid_forwards_batched_ns_opt_in_to_muon_child():
+    model = TinyLM()
+    workspace = 64 << 20  # distinctive non-default cap
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        opt = GefenMuonHybrid.from_model(
+            model,
+            lr=1e-3,
+            fused=False,
+            batched_ns=True,
+            batched_ns_workspace_bytes=workspace,
+        )
+    # Instance config on the GefenMuon child...
+    assert opt.muon._batched_ns is True
+    assert opt.muon._batched_ns_workspace_bytes == workspace
+    # ... and the per-group entries the step path actually consults.
+    for group in opt.muon.param_groups:
+        assert group["batched_ns"] is True
+        assert group["batched_ns_workspace_bytes"] == workspace
+    # The opt-in must not disturb stepping (CPU params are batch-ineligible,
+    # so _batched_ns_key routes them serial).
+    assert _step(opt, model) > 0.0
+
+
+def test_hybrid_default_leaves_batched_ns_off_in_muon_child():
+    model = TinyLM()
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        opt = GefenMuonHybrid.from_model(model, lr=1e-3, fused=False)
+    assert opt.muon._batched_ns is False
+    for group in opt.muon.param_groups:
+        assert group["batched_ns"] is False
+        assert (
+            group["batched_ns_workspace_bytes"]
+            == BATCHED_NS_DEFAULT_WORKSPACE_BYTES
+        )
 
 
 # ---- Issue #44: public param_groups preserve caller grouping --------------

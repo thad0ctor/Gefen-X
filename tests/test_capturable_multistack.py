@@ -267,6 +267,59 @@ def test_beta_and_scalar_state_surgery_force_safe_rebuilds():
     assert opt.state[params[0]]["_capt_scalars"] is third["scalar_views"][0]
 
 
+def test_permanently_ineligible_set_keeps_empty_sentinel_without_thrash():
+    # CPU params under capturable=True are permanently ineligible for the
+    # batched stacks (_capt_row_info requires CUDA). The first prologue then
+    # builds an EMPTY registry, which _capt_build_stacks keeps as a stable
+    # "currently no eligible rows" sentinel: stepping continues on the
+    # per-param path and the builder is NOT re-entered every step.
+    torch.manual_seed(0)
+    params = [
+        torch.nn.Parameter(torch.randn(32, 32) * 0.02) for _ in range(3)
+    ]
+    opt = Gefen(params, lr=1e-3, capturable=True, fused=False)
+
+    builds = 0
+    original_build = opt._capt_build_stacks
+
+    def counted_build():
+        nonlocal builds
+        builds += 1
+        return original_build()
+
+    opt._capt_build_stacks = counted_build
+
+    before = [p.detach().clone() for p in params]
+    for step in range(1, 6):
+        _set_grads(params, step)
+        opt.step()  # (a) no crash
+        # empty-dict sentinel, distinct from the None "never built" state
+        assert opt._capt_stacks == {} and opt._capt_stacks is not None
+    # (c) built once (first prologue), then trusted -- no rebuild storm
+    assert builds == 1
+    sentinel = opt._capt_stacks
+    # (b) stepping still works on the per-param path
+    assert all(
+        not torch.equal(p.detach(), b) for p, b in zip(params, before)
+    )
+    assert all(int(opt.state[p]["step"].item()) == 5 for p in params)
+    assert all("_capt_row" not in opt.state[p] for p in params)
+
+    # The sentinel must not be sticky: once a row becomes eligible (a CUDA
+    # param joins the stepping set), validation sees the missing device stack
+    # and rebuilds exactly once (lazy state init on its first step, rebuild
+    # and registration on its second), then settles again.
+    pc = torch.nn.Parameter(torch.randn(16, 16, device="cuda") * 0.02)
+    opt.add_param_group({"params": [pc]})
+    for step in range(6, 9):
+        _set_grads(params, step)
+        pc.grad = torch.randn_like(pc) * 0.01
+        opt.step()
+    assert builds == 2
+    assert opt._capt_stacks is not sentinel
+    assert "_capt_row" in opt.state[pc]
+
+
 def test_multistack_state_dict_is_compact_and_rebuilds_after_load():
     params = _params(0, [(32, 32)] * 4)
     lr = torch.tensor(1e-3, device="cuda")
@@ -434,3 +487,157 @@ def test_multistack_compile_reduce_overhead():
             assert torch.allclose(a, b, rtol=1e-4, atol=1e-6)
     finally:
         torch._dynamo.reset()
+
+
+# ---------------------------------------------------------------------------
+# Invalidate-under-capture fallback and live-beta consistency
+#
+# When the per-step validation fails INSIDE a torch.cuda.graph capture (a
+# hyperparameter or grad-set change between warmup and capture), the step must
+# tear the stacks down and fall back to the per-param path capture-safely --
+# rebuilding the orphaned scalar/consts buffers instead of raising
+# KeyError("_capt_consts") -- and the per-param path must honor live group
+# betas exactly like the batched path does.
+# ---------------------------------------------------------------------------
+
+
+def _warm_fused_for_capture(grads, n_params=2, warmup=3):
+    torch.manual_seed(0)
+    params = [
+        torch.nn.Parameter(
+            (torch.randn(32, 32, device="cuda") * 0.02).bfloat16()
+        )
+        for _ in range(n_params)
+    ]
+    opt = Gefen(params, lr=1e-3, capturable=True, fused=True)
+    static_grads = [torch.zeros_like(p) for p in params]
+    for p, grad in zip(params, static_grads):
+        p.grad = grad
+    side = torch.cuda.Stream()
+    side.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(side):
+        for i in range(warmup):
+            for static, grad in zip(static_grads, grads[i]):
+                static.copy_(grad)
+            opt.step()
+    torch.cuda.current_stream().wait_stream(side)
+    assert opt._capt_stacks
+    return params, opt, static_grads
+
+
+def _capture_grads(steps, n_params=2, seed=11):
+    torch.manual_seed(seed)
+    return [
+        [
+            torch.randn(32, 32, device="cuda", dtype=torch.bfloat16) * 0.01
+            for _ in range(n_params)
+        ]
+        for _ in range(steps)
+    ]
+
+
+def test_beta_change_under_capture_falls_back_and_uses_live_beta():
+    grads = _capture_grads(5)
+
+    # Eager live-beta reference: same grads, beta1 changed before step 4.
+    torch.manual_seed(0)
+    ref_params = [
+        torch.nn.Parameter(
+            (torch.randn(32, 32, device="cuda") * 0.02).bfloat16()
+        )
+        for _ in range(2)
+    ]
+    ref_opt = Gefen(ref_params, lr=1e-3, capturable=True, fused=True)
+    for i in range(5):
+        if i == 3:
+            ref_opt.param_groups[0]["beta1"] = 0.7
+        for p, grad in zip(ref_params, grads[i]):
+            p.grad = grad.clone()
+        ref_opt.step()
+    torch.cuda.synchronize()
+
+    params, opt, static_grads = _warm_fused_for_capture(grads)
+    opt.param_groups[0]["beta1"] = 0.7
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        opt.step()  # validation fails mid-capture -> per-param fallback
+    assert opt._capt_stacks is None  # torn down during the capture
+
+    for i in range(3, 5):  # replays run steps 4 and 5
+        for static, grad in zip(static_grads, grads[i]):
+            static.copy_(grad)
+        graph.replay()
+    torch.cuda.synchronize()
+
+    for p, ref in zip(params, ref_params):
+        state = opt.state[p]
+        assert int(state["step"].item()) == 5
+        want = _scalar_expected(1e-3, 0.0, 0.7, 0.999, 5, p.ndim != 2)
+        assert state["_capt_scalars"].cpu().tolist() == want
+        assert torch.equal(p.detach(), ref.detach())
+
+
+def test_grad_drop_under_capture_falls_back_and_steps_remaining_rows():
+    grads = _capture_grads(5)
+    params, opt, static_grads = _warm_fused_for_capture(grads)
+    params[1].grad = None
+    frozen = params[1].detach().clone()
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        opt.step()  # validation fails mid-capture -> per-param fallback
+    assert opt._capt_stacks is None
+
+    for i in range(3, 5):  # replays run steps 4 and 5 for params[0]
+        static_grads[0].copy_(grads[i][0])
+        graph.replay()
+    torch.cuda.synchronize()
+
+    assert int(opt.state[params[0]]["step"].item()) == 5
+    assert int(opt.state[params[1]]["step"].item()) == 3
+    assert torch.equal(params[1].detach(), frozen)
+    want = _scalar_expected(1e-3, 0.0, 0.9, 0.999, 5, params[0].ndim != 2)
+    assert opt.state[params[0]]["_capt_scalars"].cpu().tolist() == want
+
+
+def test_per_param_path_honors_live_betas_after_midrun_change():
+    def run(force_per_param):
+        torch.manual_seed(0)
+        params = [
+            torch.nn.Parameter(
+                (torch.randn(32, 32, device="cuda") * 0.02).bfloat16()
+            )
+            for _ in range(3)
+        ]
+        opt = Gefen(
+            params, lr=1e-3, betas=(0.9, 0.999), capturable=True, fused=True
+        )
+        if force_per_param:
+            # Disabling the batched prologue keeps every step on the
+            # per-param refresh path, mirroring the capture-time fallback
+            # without needing a CUDA graph.
+            opt._capt_batched_prologue = lambda: None
+        torch.manual_seed(1)
+        grads = [
+            [torch.randn_like(p) * 0.01 for p in params] for _ in range(6)
+        ]
+        for i in range(6):
+            if i + 1 == 3:
+                opt.param_groups[0]["beta1"] = 0.5
+            for p, grad in zip(params, grads[i]):
+                p.grad = grad.clone()
+            opt.step()
+        torch.cuda.synchronize()
+        inv_bc1 = opt.state[params[0]]["_capt_scalars"][2].item()
+        return [p.detach().clone() for p in params], inv_bc1
+
+    batched_finals, batched_inv = run(False)
+    per_param_finals, per_param_inv = run(True)
+    live = _scalar_expected(1e-3, 0.0, 0.5, 0.999, 6, False)[2]
+    stale = _scalar_expected(1e-3, 0.0, 0.9, 0.999, 6, False)[2]
+    assert batched_inv == live
+    assert per_param_inv == live
+    assert per_param_inv != stale
+    for a, b in zip(batched_finals, per_param_finals):
+        assert torch.equal(a, b)

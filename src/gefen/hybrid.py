@@ -53,6 +53,7 @@ constructor defaults stay backward-compatible (Gefen backup, shared LR,
 period-one off, stochastic rounding off), with ``ns_schedule="tuned3"`` and
 ``normuon=True`` as the hybrid-specific defaults.
 """
+import copy
 import logging
 from collections import OrderedDict
 
@@ -530,10 +531,23 @@ class GefenMuonHybrid(torch.optim.Optimizer):
                         checkpoint_backup_optimizer, self.backup_optimizer
                     )
                 )
+        # Load the two children atomically: torch's optimizer loader can still
+        # reject a child on its internal layout (e.g. a different param count),
+        # and a backup failure after the muon child loaded would leave the
+        # hybrid half-loaded (new muon, old backup). Snapshot the muon child's
+        # state first and roll it back if the backup load raises.
+        muon_snapshot = None
         if self.muon is not None:
+            if self.backup is not None:
+                muon_snapshot = copy.deepcopy(self.muon.state_dict())
             self.muon.load_state_dict(state_dict["muon"])
         if self.backup is not None:
-            self.backup.load_state_dict(state_dict["backup"])
+            try:
+                self.backup.load_state_dict(state_dict["backup"])
+            except Exception:
+                if muon_snapshot is not None:
+                    self.muon.load_state_dict(muon_snapshot)
+                raise
 
         for post_hook in self._optimizer_load_state_dict_post_hooks.values():
             post_hook(self)

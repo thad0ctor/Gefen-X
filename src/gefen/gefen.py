@@ -1206,17 +1206,32 @@ class Gefen(torch.optim.Optimizer):
             # view directly instead of re-running the per-param chain.
             return state["_capt_scalars"]
         buf = state.get("_capt_scalars")
-        if buf is None:
+        consts_key = (group["beta2"], group["beta1"])
+        if buf is None or "_capt_consts" not in state:
+            # Also rebuilds after a stack teardown MID-CAPTURE (validation
+            # failure inside a torch.cuda.graph): the consts must be populated
+            # with host-scalar fill_s -- torch.tensor(..., device=cuda) issues
+            # a pageable H2D copy, which is illegal while capturing (the
+            # allocations themselves draw from the capture pool and are fine).
             device = state["step"].device
             buf = torch.ones(4, dtype=torch.float32, device=device)
             state["_capt_scalars"] = buf
             # [beta2, beta1] in float64, ordered to line up with the
             # [bc2_step, step] stack below.
-            state["_capt_consts"] = torch.tensor(
-                [group["beta2"], group["beta1"]],
-                dtype=torch.float64,
-                device=device,
-            )
+            consts = torch.empty(2, dtype=torch.float64, device=device)
+            consts[0].fill_(consts_key[0])
+            consts[1].fill_(consts_key[1])
+            state["_capt_consts"] = consts
+            state["_capt_consts_key"] = consts_key
+        elif state.get("_capt_consts_key") != consts_key:
+            # Mid-run group beta changes must flow into the cached consts so
+            # the per-param path honors live betas exactly like the batched
+            # and non-capturable paths do (one tuple compare per step;
+            # capture-safe host-scalar fills on mismatch only).
+            consts = state["_capt_consts"]
+            consts[0].fill_(consts_key[0])
+            consts[1].fill_(consts_key[1])
+            state["_capt_consts_key"] = consts_key
         # bc = [1 - beta2**bc2_step, 1 - beta1**step] in float64.
         bc = 1.0 - torch.pow(
             state["_capt_consts"],
@@ -1320,6 +1335,12 @@ class Gefen(torch.optim.Optimizer):
                     if state is not None:
                         state.pop("_capt_stack", None)
                         state.pop("_capt_row", None)
+                        # Drop the stack-row scalar view too: the per-param
+                        # refresh must not write through into a dead stack,
+                        # and (with the consts popped at build time) leaving
+                        # it would make the refresh skip the consts rebuild
+                        # and KeyError on state["_capt_consts"].
+                        state.pop("_capt_scalars", None)
 
     @torch._dynamo.disable
     def _capt_build_stacks(self) -> bool:
@@ -1420,6 +1441,7 @@ class Gefen(torch.optim.Optimizer):
                     state["step"] = step_view
                     state["_capt_scalars"] = scalar_view
                     state.pop("_capt_consts", None)
+                    state.pop("_capt_consts_key", None)
                     if single_cohort_registry:
                         # The fast validator addresses the sole stack directly.
                         # Avoiding 0 in every row also keeps the per-step static-
@@ -3195,6 +3217,7 @@ class Gefen(torch.optim.Optimizer):
             "_h_buf",
             "_capt_scalars",
             "_capt_consts",
+            "_capt_consts_key",
             # Batched-refresh registration marker (a host int): scratch like
             # the buffers it indexes into; leaking it into a checkpoint would
             # falsely mark restored params as batch-covered.

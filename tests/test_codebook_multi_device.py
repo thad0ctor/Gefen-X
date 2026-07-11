@@ -67,6 +67,61 @@ def test_second_device_update_matches_single_device_oracle():
 
 
 @requires_cuda
+def test_lut_cache_stays_fresh_across_codebook_refresh():
+    # codebook_refresh_every=2 relearns the codebook at steps 2 and 4. The
+    # cached per-device search LUT (_gefen_codebook_lut_by_device) must always
+    # describe the LIVE codebook: every codebook assignment site clears the
+    # cache, so a lookup after a refresh rebuilds from the new table instead
+    # of serving a stale one.
+    from gefen.kernels.automatic_gefen_fused import _LUT_BUCKETS
+
+    def expected_lut(codebook):
+        # Independent reconstruction from the LUT definition:
+        # lut[b] = number of codebook entries whose bucket < b.
+        cb = codebook.detach().float().cpu()
+        buckets = torch.clamp(
+            torch.floor((cb + 1.0) * (_LUT_BUCKETS / 2)), 0, _LUT_BUCKETS - 1
+        )
+        return torch.tensor(
+            [int((buckets < b).sum()) for b in range(_LUT_BUCKETS + 1)],
+            dtype=torch.int16,
+        )
+
+    device = torch.device("cuda", 0)
+    torch.manual_seed(0)
+    p = torch.nn.Parameter(
+        (torch.randn(64, 64, device=device) * 0.02).bfloat16()
+    )
+    opt = Gefen([("a", p)], lr=1e-3, codebook_refresh_every=2)
+
+    refresh_changed_codebook = False
+    prev_codebook = None
+    for step in range(1, 6):
+        # Shift the grad distribution each step so the periodic refresh
+        # learns a genuinely different codebook.
+        torch.manual_seed(step)
+        p.grad = torch.randn_like(p) * (0.01 * step)
+        opt.step()
+        lut = opt._gefen_codebook_lut_on(device)
+        codebook = opt._gefen_codebook_on(device)
+        assert torch.equal(lut.cpu(), expected_lut(codebook)), (
+            "cached LUT is stale after step {}".format(step)
+        )
+        # Repeated lookups must return the same cached tensor: the eager Muon
+        # momentum path relies on a stable per-device object, and capturable
+        # compile marks exactly this tensor static.
+        assert opt._gefen_codebook_lut_on(device) is lut
+        if prev_codebook is not None and not torch.equal(
+            codebook.cpu(), prev_codebook
+        ):
+            refresh_changed_codebook = True
+        prev_codebook = codebook.detach().cpu().clone()
+    # The scenario must have exercised a real refresh (a codebook that never
+    # changed would make the staleness assertions vacuous).
+    assert refresh_changed_codebook
+
+
+@requires_cuda
 def test_per_device_cache_cleared_on_codebook_assignment():
     p = _make_param("cuda:0", 0)
     opt = Gefen([("a", p)], lr=5e-5)

@@ -107,6 +107,73 @@ def check_full_heuristic_cuda():
     return ok
 
 
+def check_capturable_tiny_v1_override_cuda():
+    """Capturable tiny params take the ONE-kernel v1-full path where v2 routes.
+
+    ``_CAPT_V1_FULL_TINY_NUMEL`` only applies under ``capturable=True``: tiny
+    params are launch-bound inside a captured/replayed graph, so the optimizer
+    overrides an affirmative ``_should_use_v2_full`` verdict back to v1-full.
+    Spy on the optimizer's two full-update entry points to assert the actual
+    route CHOICE (not just numeric parity).
+    """
+    from gefen.gefen import Gefen
+    import gefen.kernels.automatic_gefen_fused as m
+
+    tiny = m._CAPT_V1_FULL_TINY_NUMEL  # threshold is inclusive (<=)
+    big = tiny * 2
+    dev = torch.device("cuda", 0)
+    # Shape sanity: with force_1d_period_one the grad view is [numel, 1], and
+    # BOTH sizes route v2 by the shape heuristic alone -- so any v1 call below
+    # can only come from the capturable tiny-numel override.
+    assert m._should_use_v2_full(tiny, 1, dev) is True
+    assert m._should_use_v2_full(big, 1, dev) is True
+
+    def routed(numel, capturable):
+        torch.manual_seed(0)
+        p = torch.nn.Parameter(torch.randn(numel, device="cuda") * 0.02)
+        opt = Gefen(
+            [p],
+            lr=1e-3,
+            fused=True,
+            capturable=capturable,
+            force_1d_period_one=True,
+        )
+        calls = []
+        orig_v1 = opt._automatic_gefen_fused_full_update
+        orig_v2 = opt._automatic_gefen_fused_update_v2_full
+
+        def spy_v1(*args, **kwargs):
+            calls.append("v1")
+            return orig_v1(*args, **kwargs)
+
+        def spy_v2(*args, **kwargs):
+            calls.append("v2")
+            return orig_v2(*args, **kwargs)
+
+        opt._automatic_gefen_fused_full_update = spy_v1
+        opt._automatic_gefen_fused_update_v2_full = spy_v2
+        for step in range(1, 4):
+            torch.manual_seed(step)
+            p.grad = torch.randn_like(p) * 0.01
+            opt.step()
+        assert calls, "fused full-update path never engaged"
+        return set(calls)
+
+    ok = True
+    cases = [
+        ("capturable tiny -> v1", tiny, True, {"v1"}),
+        ("capturable above-threshold -> v2", big, True, {"v2"}),
+        ("eager tiny -> v2 (override is capturable-only)", tiny, False, {"v2"}),
+    ]
+    for label, numel, capturable, expect in cases:
+        got = routed(numel, capturable)
+        good = got == expect
+        ok = ok and good
+        print(f"[capt tiny override] {label}: got={sorted(got)} "
+              f"expect={sorted(expect)} {'PASS' if good else 'FAIL'}")
+    return ok
+
+
 if pytest is not None:
 
     def test_env_override_forces_dispatch():
@@ -120,12 +187,17 @@ if pytest is not None:
     def test_full_heuristic_dispatch_cuda():
         assert check_full_heuristic_cuda()
 
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+    def test_capturable_tiny_v1_override_cuda():
+        assert check_capturable_tiny_v1_override_cuda()
+
 
 def main():
     ok = check_env_override()
     if torch.cuda.is_available():
         ok = ok and check_heuristic_cuda()
         ok = ok and check_full_heuristic_cuda()
+        ok = ok and check_capturable_tiny_v1_override_cuda()
     else:
         print("[env unset] no CUDA, skipping heuristic branch")
     print("\nDISPATCH OVERALL:", "PASS" if ok else "FAIL")

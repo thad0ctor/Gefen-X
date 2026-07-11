@@ -249,6 +249,28 @@ def test_published_rows_mark_missing_provenance_as_legacy_context():
             assert all(value is None for value in provenance)
 
 
+def test_quad_winner_flags_follow_cohort_provenance(monkeypatch):
+    monkeypatch.syspath_prepend(str(OPTIMIZER_SWEEP))
+    from optimizer_sweep_plot_helpers import cohort_flags_winners
+
+    complete = {"provenance_status": "complete"}
+    legacy = {"provenance_status": "legacy_context_only"}
+    assert cohort_flags_winners([complete, complete])
+    assert not cohort_flags_winners([complete, legacy])
+    assert not cohort_flags_winners([legacy, legacy])
+
+    published_csv = ROOT / "docs/benchmarks/optimizer_comparison_2000steps.csv"
+    with published_csv.open(newline="") as handle:
+        rows = list(csv.DictReader(handle))
+    cohorts: dict[str, list[dict[str, str]]] = {}
+    for row in rows:
+        cohorts.setdefault(row["tag"], []).append(row)
+    # published policy: best-in-panel only in the provenance-complete 0.6B
+    # cohort; the mixed 1.7B cohort gets no winner markers at all.
+    assert cohort_flags_winners(cohorts["qwen0p6b"])
+    assert not cohort_flags_winners(cohorts["qwen1p7b"])
+
+
 def test_muon_recipe_text_distinguishes_missing_normuon_metadata(monkeypatch):
     monkeypatch.syspath_prepend(str(OPTIMIZER_SWEEP))
     from optimizer_sweep_plot_helpers import muon_recipe_text

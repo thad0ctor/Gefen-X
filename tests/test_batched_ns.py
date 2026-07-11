@@ -37,6 +37,7 @@ def test_shape_gate_boundaries(shape, eligible):
         (8, 8, ([8], 0)),
         (17, 10, ([9, 8], 0)),
         (17, 8, ([8, 8], 1)),
+        (18, 10, ([10, 8], 0)),  # remainder itself is a legal batch, no rebalance
         (15, 8, ([8], 7)),
         (64, 7, ([], 64)),
     ],
@@ -77,6 +78,29 @@ def test_batched_helper_zero_input_is_finite_zero():
     )
     assert torch.isfinite(got).all()
     assert torch.count_nonzero(got) == 0
+
+
+@pytest.mark.parametrize("bad_shape", [(13, 29), (2, 8, 13, 29)])
+def test_batched_helper_rejects_non_stacked_input(bad_shape):
+    inputs = torch.zeros(*bad_shape, dtype=torch.bfloat16)
+    with pytest.raises(ValueError, match=r"\[batch, rows, cols\]"):
+        gm._zeropower_via_newtonschulz_batched(
+            inputs, gm.NS_SCHEDULE_3STEP, 3, 1e-7
+        )
+
+
+def test_plain_constructor_defaults_batched_ns_off():
+    p = torch.nn.Parameter(torch.randn(8, 8))
+    opt = GefenMuon([("w", p)], fused=False)
+    assert opt.param_groups[0]["batched_ns"] is False
+    assert (
+        opt.param_groups[0]["batched_ns_workspace_bytes"]
+        == gm.BATCHED_NS_DEFAULT_WORKSPACE_BYTES
+    )
+
+    q = torch.nn.Parameter(torch.randn(8, 8))
+    h = GefenMuonHybrid([("hidden.weight", q)], [], lr=1e-3, fused=False)
+    assert h.muon.param_groups[0]["batched_ns"] is False
 
 
 def test_constructor_and_hybrid_forward_opt_in():
@@ -145,6 +169,35 @@ def test_sharded_and_compiling_keys_are_forced_serial(monkeypatch):
     assert opt._batched_ns_key(
         (group, "w", p, grad), fused_available=True
     ) is None
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.parametrize("gate", ["fp8_ns", "ndim", "cpu"])
+def test_batched_ns_key_individual_ineligibility_gates(gate):
+    p = torch.nn.Parameter(
+        torch.randn(64, 128, device="cuda", dtype=torch.bfloat16)
+    )
+    opt = GefenMuon([("w", p)], fused=False, batched_ns=True)
+    group = opt.param_groups[0]
+    grad = torch.randn_like(p)
+    # Baseline: an eligible bf16 2D CUDA item batches, so each mutation below
+    # flips exactly one gate.
+    assert opt._batched_ns_key(
+        (group, "w", p, grad), fused_available=True
+    ) is not None
+
+    if gate == "fp8_ns":
+        group["fp8_ns"] = True
+        item = (group, "w", p, grad)
+    elif gate == "ndim":
+        vec = torch.nn.Parameter(
+            torch.randn(128, device="cuda", dtype=torch.bfloat16)
+        )
+        item = (group, "w", vec, torch.randn_like(vec))
+    else:  # non-CUDA device
+        cpu_p = torch.nn.Parameter(p.detach().cpu())
+        item = (group, "w", cpu_p, grad.cpu())
+    assert opt._batched_ns_key(item, fused_available=True) is None
 
 
 @pytest.mark.parametrize("bad", [0, -1, 1.5, True])
@@ -479,3 +532,128 @@ def test_capturable_opt_in_never_enters_batched_helper(monkeypatch):
     graph.replay()
     torch.cuda.synchronize()
     assert calls == []
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.parametrize("shape", [(64, 128), (128, 64)])
+def test_cautious_masking_composes_with_batched_ns(monkeypatch, shape):
+    calls = []
+    original = gm._zeropower_via_newtonschulz_batched
+
+    def wrapped(inputs, *args, **kwargs):
+        calls.append(inputs.shape[0])
+        return original(inputs, *args, **kwargs)
+
+    monkeypatch.setattr(gm, "_zeropower_via_newtonschulz_batched", wrapped)
+    torch.manual_seed(9)
+    initial = [
+        (torch.randn(*shape, device="cuda") * 0.02).bfloat16()
+        for _ in range(8)
+    ]
+    grads = [
+        (torch.randn(*shape, device="cuda") * 1e-3).bfloat16()
+        for _ in range(8)
+    ]
+
+    def run(batched):
+        params = [
+            (f"p{i}", torch.nn.Parameter(value.clone()))
+            for i, value in enumerate(initial)
+        ]
+        opt = GefenMuon(
+            params, lr=0.02, fused=True, ns_schedule="tuned3",
+            cautious=True, batched_ns=batched,
+        )
+        for (_, p), grad in zip(params, grads):
+            p.grad = grad.clone()
+        opt.step()
+        torch.cuda.synchronize()
+        return params, opt
+
+    serial_params, serial_opt = run(False)
+    assert calls == []
+    batch_params, batch_opt = run(True)
+    assert calls == [8]
+    for (_, serial), (_, batched) in zip(serial_params, batch_params):
+        serial_state = serial_opt.state[serial]
+        batch_state = batch_opt.state[batched]
+        assert torch.equal(
+            serial_state["m_codebook"], batch_state["m_codebook"]
+        )
+        assert torch.equal(
+            serial_state["m_magnitude"], batch_state["m_magnitude"]
+        )
+        assert torch.isfinite(batched).all()
+        delta = batched.float() - serial.float()
+        assert delta.abs().max().item() <= 1e-2
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_mixed_step_batches_per_shape_and_keeps_serial_params_bit_equal(
+    monkeypatch,
+):
+    batch_calls = []
+    original = gm._zeropower_via_newtonschulz_batched
+
+    def wrapped(inputs, *args, **kwargs):
+        batch_calls.append(tuple(inputs.shape))
+        return original(inputs, *args, **kwargs)
+
+    monkeypatch.setattr(gm, "_zeropower_via_newtonschulz_batched", wrapped)
+    torch.manual_seed(27)
+    specs = (
+        [(f"wide{i}.weight", (64, 128), torch.bfloat16) for i in range(8)]
+        + [(f"tall{i}.weight", (128, 64), torch.bfloat16) for i in range(9)]
+        + [
+            ("mindim.weight", (513, 2044), torch.bfloat16),  # min dim over gate
+            ("numel.weight", (512, 2049), torch.bfloat16),  # numel over gate
+            ("fp32.weight", (64, 128), torch.float32),  # dtype-ineligible
+        ]
+    )
+    initial = [
+        (name, (torch.randn(*shape, device="cuda") * 0.02).to(dtype))
+        for name, shape, dtype in specs
+    ]
+    grads = [
+        (torch.randn(*shape, device="cuda") * 1e-3).to(dtype)
+        for _, shape, dtype in specs
+    ]
+
+    def run(batched):
+        params = [
+            (name, torch.nn.Parameter(value.clone()))
+            for name, value in initial
+        ]
+        opt = GefenMuon(
+            params, lr=0.02, fused=True, ns_schedule="tuned3",
+            batched_ns=batched,
+        )
+        for (_, p), grad in zip(params, grads):
+            p.grad = grad.clone()
+        opt.step()
+        torch.cuda.synchronize()
+        return params, opt
+
+    serial_params, serial_opt = run(False)
+    assert batch_calls == []
+    batch_params, batch_opt = run(True)
+    # One homogeneous bucket per shape; the ineligible stragglers never batch.
+    # The tall (128, 64) bucket is oriented wide before stacking, so both
+    # helper calls see [batch, 64, 128].
+    assert batch_calls == [(8, 64, 128), (9, 64, 128)]
+    for (name, serial), (_, batched) in zip(serial_params, batch_params):
+        serial_state = serial_opt.state[serial]
+        batch_state = batch_opt.state[batched]
+        assert torch.equal(
+            serial_state["m_codebook"], batch_state["m_codebook"]
+        )
+        assert torch.equal(
+            serial_state["m_magnitude"], batch_state["m_magnitude"]
+        )
+        if name.split(".")[0].rstrip("0123456789") in ("mindim", "numel", "fp32"):
+            # Serially-routed items must stay on the bit-identical path even
+            # when batching engages for their step-mates.
+            assert torch.equal(batched, serial)
+        else:
+            delta = batched.float() - serial.float()
+            assert delta.abs().max().item() <= 1e-2
