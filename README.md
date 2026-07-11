@@ -10,11 +10,11 @@
 
 **A fork of [upstream Gefen](https://github.com/ndvbd/Gefen) that fixes critical gaps in the shipped release, adds modern-architecture support, and closes the loss gap to AdamW.**
 
- Gefen is intended to be a drop-in replacement for the AdamW optimizer for memory-efficient training. It keeps the familiar AdamW training recipe while cutting optimizer state to **about 1 byte per parameter** (measured 1.01 B/param) — an 8× reduction versus classic fp32 AdamW state, about 6.5 GiB saved per billion parameters, while maintaining AdamW-level loss. The reduced memory footprint enables training larger models and larger batch sizes for added throughput.
+ Gefen is intended to be a drop-in replacement for the AdamW optimizer for memory-efficient training. It keeps the familiar AdamW training recipe while cutting optimizer state to **~1 byte per parameter** (measured 1.01 B/param) — an 8× reduction versus classic fp32 AdamW state, about 6.5 GiB saved per billion parameters, while maintaining AdamW-level loss. The reduced memory footprint enables training larger models and larger batch sizes for added throughput. **Gefen-X (fused) currently out-performs AdamW-8bit and AdamW-4bit in throughput, memory, and loss, while staying competitive with full-precision AdamW's loss at roughly a quarter of the optimizer memory.**
 
-**Fork Highlights:**
+### Fork Highlights:
 
- - **Fine-tuning, not just pre-training** — upstream Gefen was validated for pre-training; this fork makes it a drop-in optimizer for fine-tuning: full fine-tune (FFT), LoRA, and QLoRA, with a [VRAM sizing guide](https://github.com/thad0ctor/Gefen-X/blob/main/docs/hardware.md).
+ - **Fine-tuning and pre-training** — upstream Gefen was validated for pre-training; this fork makes it a drop-in optimizer for fine-tuning: full fine-tune (FFT), LoRA, and QLoRA, with a [VRAM sizing guide](https://github.com/thad0ctor/Gefen-X/blob/main/docs/hardware.md).
  - **New: matches AdamW's loss out of the box** at about a quarter of its optimizer memory (default `factored_v_2d`). See [Benchmarks](#benchmarks) and [the factored-v lever](#quality-lever-factored-second-moment-on-2d-params-factored_v_2d).
  - **Works on modern decoders** (Qwen3, Llama-3, Mistral). Upstream loses its memory advantage on these architectures (≈9 B/param — worse than AdamW); this fork keeps the intended ≈1 B/param.
  - **Validated across 2026 architectures** — two dozen modern LLMs, VLMs, and image/video/audio media-gen models full-fine-tuned on 24 GB GPUs, plus 20-30B MoEs via LoRA. See the [compatibility matrix](https://github.com/thad0ctor/Gefen-X/blob/main/COMPATIBILITY.md).
@@ -22,8 +22,6 @@
  - **Whole-model Muon option** (`GefenMuonHybrid`) with a selectable AdamW quality backup or ≈1 B/param Gefen low-memory backup, plus task-specific [SFT and pretraining recipes](#which-muon-recipe-should-i-use).
  - **Reliable checkpoint save/resume and FSDP2 support** — broken or absent in the shipped release.
  - **Hardened against crashes** (device/dtype guards, bounds checks, race fixes) with a bit-exact test suite.
-
- See **[Benchmarks](#benchmarks)** for the full optimizer comparison (loss · speed · memory) with raw logs. All measured numbers live in [Benchmarks](#benchmarks) and the lever sections below.
 
 <details>
 <summary><span style="font-size: 1.25em;"><b>Detailed Fork Improvements</b> (vs upstream)</span></summary>
@@ -50,15 +48,17 @@
 
 </details>
 
+<br>
+
 ---
 # Basic Usage
-#### Installation
+## Installation
 
 ```bash
 pip install gefen-x          # imports as `gefen`
 ```
 
-> [!NOTE]
+> [!IMPORTANT]
 > **It's `gefen-x`, not `gefen`.** This fork publishes as **`gefen-x`** and imports as `gefen`. `pip install gefen` fetches the *upstream* package, which does **not** include the fixes/improvements above.
 
 For development and latest source, install editable from source instead:
@@ -69,9 +69,10 @@ git clone https://github.com/thad0ctor/Gefen-X && cd Gefen-X && pip install -e .
 
 The package is pure-Python at install time, the fused kernels (CUDA required) are **built on first use** via PyTorch JIT (`torch.utils.cpp_extension`) + `nvcc`. The first CUDA run takes a few minutes; later runs reuse the cached build keyed on your environment. Force a rebuild with `GEFEN_FORCE_REBUILD=1`.
 
-**Requirements:** a CUDA toolkit and host compiler compatible with your PyTorch build (the JIT compiles for your GPU's compute capability; set `TORCH_CUDA_ARCH_LIST` to target arch or a multi-arch build).
+#### Requirements
+CUDA toolkit and host compiler compatible with your PyTorch build (the JIT compiles for your GPU's compute capability; set `TORCH_CUDA_ARCH_LIST` to target arch or a multi-arch build).
 
-**Supported versions**
+#### Supported versions
 
 | | |
 |---|---|
@@ -81,7 +82,7 @@ The package is pure-Python at install time, the fused kernels (CUDA required) ar
 
 The Hugging Face Trainer flow, the `find_lr` tool, and the `examples/` all use `transformers` and `datasets`, which are not core dependencies — install them alongside (`pip install transformers datasets`). Optional benchmark baselines: `bitsandbytes` (AdamW-8bit), `torchao` (AdamW-4bit).
 
-#### Compatibility
+## Compatibility
 
 Validated with full-parameter fine-tune smoke tests on 24 GB GPUs across modern LLMs/VLMs and media-generation models — Gemma 4, Qwen3-VL, Mistral 3, MiniCPM-V 4.6, LFM2.5 (+VL), SDXL, Stable Diffusion 3.5, FLUX.1-dev (12B via FSDP2), FLUX.2-klein, Z-Image (6B via FSDP2), Anima, and ACE-Step 1.5 — and on 20-30B MoEs (GPT-OSS-20B, GLM-4.7-Flash) via LoRA adapter training. **Per-model results, method, and hardware footprints: [COMPATIBILITY.md](https://github.com/thad0ctor/Gefen-X/blob/main/COMPATIBILITY.md).**
 
@@ -89,7 +90,7 @@ Validated with full-parameter fine-tune smoke tests on 24 GB GPUs across modern 
 
 **Want a real end-to-end run?** See **[`examples/toy-finetune/`](https://github.com/thad0ctor/Gefen-X/blob/main/examples/toy-finetune/README.md)** — fine-tune a small model in about four minutes on one 24 GB GPU, with a before/after check that makes success obvious.
 
-#### Learning rate (when porting an AdamW config)
+## Learning rate (when porting an AdamW config)
 
 Use **≈0.6× your AdamW learning rate** (e.g. AdamW at `5e-5` → Gefen at `3e-5`). That is Gefen's measured optimum on the models tested (Qwen3 0.6B–8B), and at it Gefen matches AdamW's loss. Don't creep the LR back up toward the AdamW value — Gefen is less tolerant of a too-hot LR than AdamW is.
 
@@ -110,17 +111,19 @@ One knock-on effect: weight decay in AdamW-style optimizers is applied as `lr ×
 
 </details>
 
-#### Distributed Training
+## Distributed Training
 
 Gefen drops into standard distributed training like any other PyTorch optimizer, with either `fused=True` or `fused=False`. Validated setups: single-GPU, PyTorch DDP, and FSDP2 (`fully_shard` / DTensor). DeepSpeed ZeRO is not yet validated.
 
-#### CUDA Graphs & torch.compile (`capturable`)
+## CUDA Graphs & torch.compile (`capturable`)
 
 All three optimizers accept `capturable=True` (same meaning as `torch.optim`'s argument): `opt.step()` can then be captured in a `torch.cuda.CUDAGraph` or wrapped in `torch.compile(mode="reduce-overhead")` at no step-time cost — and the compiled hybrid step is about 10% faster than eager. Usage, caveats, and measured numbers: [COMPATIBILITY.md](https://github.com/thad0ctor/Gefen-X/blob/main/COMPATIBILITY.md#cuda-graphs--torchcompile-capturable).
 
+<br>
+
 ---
 
-# Benchmarks
+# Benchmarks:
 
 <details>
 <summary><b>Methodology</b> (settings and environment)</summary>
@@ -193,9 +196,11 @@ Balanced-SFT Gefen-Muon uses less peak VRAM and optimizer state than fused AdamW
 
 **Review the raw runs:** per-cell training logs (step-by-step loss, throughput, VRAM) in [`docs/benchmarks/logs/`](https://github.com/thad0ctor/Gefen-X/tree/main/docs/benchmarks/logs/) · aggregated metrics as [CSV](https://github.com/thad0ctor/Gefen-X/blob/main/docs/benchmarks/optimizer_comparison_2000steps.csv) and [JSONL](https://github.com/thad0ctor/Gefen-X/blob/main/docs/benchmarks/optimizer_comparison_2000steps.jsonl).
 
+<br>
+
 ---
 
-# Basic Usage:
+# Gefen-X Integrations:
 
 ## Using Gefen with Axolotl
 
@@ -351,20 +356,22 @@ from gefen import GefenMuonHybrid
 optimizer = GefenMuonHybrid(model, lr=ADAMW_LR)               # single-argument form
 optimizer = GefenMuonHybrid.from_model(model, lr=ADAMW_LR)    # equivalent explicit classmethod
 ```
+<br>
+
 ---
 
-# Advanced Usage
+# Advanced Usage:
 
 > [!NOTE]
 > Advanced tuning levers are available for advanced users. These features are largely experimental in nature and deviate from default settings - often trading tokens/sec throughput for accuracy.
 
 ## Gefen Muon
 
-#### Which Muon recipe should I use?
+### Which Muon recipe should I use?
 
 There is no single winner across tasks. The retained RTX 3090 matrix supports three distinct choices. Treat the learning rates below as roles, not universal constants: the SFT run selected `3e-5`, while the small pretraining protocol selected `3e-3`; tune `MUON_LR` for your model and data.
 
-##### SFT: balanced Muon recipe
+### SFT: balanced Muon recipe
 
 Use tuned three-step Newton–Schulz plus NorMuon and a full-LR AdamW backup:
 
@@ -384,7 +391,7 @@ optimizer = GefenMuonHybrid(
 
 The retained schedule ablation selected this combination over classic NS5 for SFT. In the curated end-to-end Qwen3-0.6B comparison it tied fused AdamW's loss with 55% less optimizer state, but was 33% slower. The provenance-complete 1.7B Muon run reached 1.2434 eval loss; its non-Muon baselines are legacy context, so no strict cross-cohort loss gap is claimed. This is the recommended way to run *Muon for SFT*, while plain Gefen-fused remains the stronger overall SFT default on the measured models.
 
-##### Pretraining: quality first
+### Pretraining: quality first
 
 Keep classic five-step Newton–Schulz, disable NorMuon, and use AdamW on the non-Muon parameters:
 
@@ -404,9 +411,9 @@ optimizer = GefenMuonHybrid(
 ```
 
 > [!NOTE]
-> Classic NS5 won the replicated 33M and 134M pretraining comparisons, so the faster SFT schedule is not promoted as a universal default. The evidence is small-scale and replicated, not a scaling-law claim.
+> **Classic NS5** won the replicated 33M and 134M pretraining comparisons, so the faster SFT schedule is not promoted as a universal default. The evidence is small-scale and replicated, not a scaling-law claim.
 
-##### Lowest optimizer memory
+### Lowest optimizer memory
 
 Keep the default Gefen backup when capacity matters more than the last quality increment:
 
@@ -548,7 +555,7 @@ opt = GefenMuonHybrid(
 )
 ```
 
-An older Qwen3-1.7B sweep closed a small AdamW gap at 2.45 B/param. In the newer controlled matrix, the 2D variants made only small loss changes while clearly increasing state, peak VRAM, and step cost. Leave it off for the low-memory recipe; select the AdamW backup directly when quality is the objective.
+A Qwen3-1.7B sweep closed a small AdamW gap at 2.45 B/param. In the newer controlled matrix, the 2D variants made only small loss changes while clearly increasing state, peak VRAM, and step cost. Leave it off for the low-memory recipe; select the AdamW backup directly when quality is the objective.
 
 ![Gefen-Muon — per-element 2nd moment on embed/LM-head closes the AdamW gap](https://raw.githubusercontent.com/thad0ctor/Gefen-X/main/docs/benchmarks/muon_l5_loss_qwen1p7b.png)
 
@@ -583,7 +590,11 @@ opt = GefenMuonHybrid(
 
 Measured (Qwen3-0.6B, 2 and 4 GPUs): `"distributed"` is a free speedup at identical results (1.06× / 1.12×); `"approx"` is faster still (1.25× / 1.39×) but visibly costs training quality, and the cost grows with GPU count. The `"distributed"` win grows with model size.
 
----
+<br>
+
+--- 
+
+# Current Gaps and Roadmap:
 
 ## Param Groups and Integrations
 
@@ -603,7 +614,20 @@ Measured (Qwen3-0.6B, 2 and 4 GPUs): `"distributed"` is a free speedup at identi
 | Out of memory | See [Hardware Requirements](https://github.com/thad0ctor/Gefen-X/blob/main/docs/hardware.md) for measured peak VRAM per model size and method. |
 | Anything else | Create a [New Issue](https://github.com/thad0ctor/Gefen-X/issues) |
 
-## Citation:
+## Roadmap
+
+| Feature | Status |
+|---|---|
+| ROCm Support | Planned, pending availability of hardware |
+| MLX | Planned, pending availability of hardware |
+
+<br>
+
+---
+
+# Credit (Upstream Gefen):
+
+## Citation (Gefen Upstream):
 
 If you found this library useful, please consider citing our work:
 
@@ -616,6 +640,6 @@ If you found this library useful, please consider citing our work:
 }
 ```
 
-## Paper:
+## Paper (Gefen Upstream):
 
-# [Gefen: Optimized Stochastic Optimizer](https://arxiv.org/pdf/2606.13894)
+### [Gefen: Optimized Stochastic Optimizer](https://arxiv.org/pdf/2606.13894)
