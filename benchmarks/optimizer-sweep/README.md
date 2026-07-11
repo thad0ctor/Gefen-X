@@ -28,7 +28,7 @@ For each (model, optimizer) it measures, under one fixed regime:
   greedily **packed into exact 2048-token blocks**
 - **Fixed seed**, identical packed-data order across all optimizers within a seed
 - 32-example held-out eval, eval-every 50, constant LR, **2000-step** finals
-- Each optimizer runs at **its own fair LR** (see below)
+- Each optimizer runs at its **documented task-appropriate LR** (see below)
 
 Optimizers (`--opt`): `adamw_bf16`, `adamw8bit` (bitsandbytes), `adamw4bit`
 (torchao), `gefen_fused`, `gefen_nonfused`, `gefen_muon` (GefenMuonHybrid with
@@ -36,11 +36,12 @@ the balanced SFT AdamW backup). The
 default set run by `run.sh` is `adamw_bf16 adamw8bit adamw4bit gefen_fused
 gefen_muon` — pass `--no-muon` to drop the (slow) Newton-Schulz `gefen_muon`.
 
-The fair default LRs (175-step fair-sweep optima): AdamW family `5e-5`,
-`gefen_fused` / `gefen_nonfused` `3e-5` (the shipped `factored_v_2d` default;
-the legacy block-shared mode's fair LR is `2e-5`), `gefen_muon` `3e-5` (with
-`--muon-adjust match_rms_adamw`). Pass `--lr-sweep` to re-derive each
-optimizer's optimum on your hardware instead of using these defaults.
+The documented defaults are: AdamW family `5e-5`; `gefen_fused` /
+`gefen_nonfused` `3e-5` (AdamW/Gefen came from 175-step fair-LR sweeps; the
+legacy block-shared Gefen mode uses `2e-5`); and balanced-SFT `gefen_muon`
+`3e-5` with `--muon-adjust match_rms_adamw`, selected from the retained SFT
+matrix. Pass `--lr-sweep` to re-derive an optimum for your model and regime
+instead of using these defaults.
 
 ## 2. Setup
 
@@ -140,7 +141,9 @@ Written to `--out`:
 
 - `results.jsonl` — one JSON line per cell (and `results_lrsweep.jsonl` if swept)
 - `comparison_table.csv` / `comparison_table.md` — the aggregate table + a
-  per-model headline (loss gap, throughput ratio, VRAM saved, opt-state)
+  per-model headline (loss gap, throughput ratio, VRAM saved, opt-state). The
+  CSV retains Muon variant/backend/schedule/NorMuon metadata so plots label
+  balanced and low-memory overrides correctly.
 - Six charts (per model x 3 figures, for 2 models):
   - `quad_<model>.png` — 2x2: eval loss / throughput / peak VRAM / opt-state
   - `loss_curve_<model>.png` — eval-loss curves (solid) + train-EMA (dashed)
@@ -167,22 +170,27 @@ Written to `--out`:
   so `gefen_muon` trades throughput for its update geometry.
 - **Throughput is per-GPU.** Compare optimizers *within* a model (same GPU
   type); absolute tok/s across GPU types is not comparable.
-- The fair default LRs are short-sweep optima; the true long-run optimum may
-  differ, so use `--lr-sweep` for a hardware-honest comparison.
+- AdamW/Gefen defaults are short-sweep optima, while the Muon default is the
+  retained balanced-SFT selection; all may change with model or regime, so use
+  `--lr-sweep` for a fresh comparison.
 - `adamw4bit`'s low opt-state bytes do **not** translate to low peak VRAM
   (torchao's compiled step allocates large transient buffers).
 
 ## 6. Using Gefen in training
 
-To actually train with Gefen in [Axolotl](https://github.com/axolotl-ai-cloud/axolotl),
-see the integration PR: **https://github.com/axolotl-ai-cloud/axolotl/pull/3755**
-(currently a **draft**). It wires Gefen in as an optimizer:
+To train with Gefen in [Axolotl](https://github.com/axolotl-ai-cloud/axolotl),
+see the integration PR: **https://github.com/axolotl-ai-cloud/axolotl/pull/3808**.
+It exposes both optimizer APIs (install Axolotl from that PR until it lands in
+a release):
 
 ```yaml
-optimizer: gefen
+optimizer: gefenx       # plain Gefen
 optim_args:
   fused: true
 ```
 
-Note: `gefen_muon` / GefenMuonHybrid is **not yet exposed** through that Axolotl
-integration — it is benchmarked here directly against the optimizer API.
+Use `optimizer: gefenx_muon` for `GefenMuonHybrid`. The Axolotl factory defaults
+to the low-memory Gefen backup; set `backup_optimizer: adamw` and a full
+`backup_lr` for the balanced SFT recipe measured here. See the top-level
+[Muon recipes](../../README.md#which-muon-recipe-should-i-use) for SFT,
+pretraining, and minimum-state configurations.

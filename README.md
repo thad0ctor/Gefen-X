@@ -46,7 +46,7 @@
 | Crash safety | missing device / edge-case guards | guarded against wrong-device, empty-tensor, and race bugs |
 | Tested correctness | no fused-kernel tests | bit-exact + distributed parity test suite |
 | Getting started | no Axolotl / fork-install guidance | Axolotl how-to + fair loss/speed/memory benchmarks |
-| Muon loss vs AdamW | Muon trails AdamW | task-specific SFT/pretraining recipes pair quantized Muon with an AdamW backup; a Gefen backup remains available for minimum state — [details](#which-muon-recipe-should-i-use) |
+| Muon guidance | no whole-model recipe or task split | measured SFT/pretraining recipes pair quantized Muon with an AdamW backup and document the observed quality/throughput tradeoff; a Gefen backup remains available for minimum state — [details](#which-muon-recipe-should-i-use) |
 | Muon (Newton-Schulz) speed | fixed 5-step schedule | tunable `ns_schedule`; tuned3 is the balanced SFT choice, while quality-first pretraining retains classic NS5 — [details](#experimental-lever-faster-newton-schulz-ns_schedule-fp8_ns) |
 | Low-precision orthogonalization | bf16 only | opt-in `fp8_ns` for large matrices on newer GPUs, safe fallback elsewhere — [details](#experimental-lever-faster-newton-schulz-ns_schedule-fp8_ns) |
 | Sharded Muon under FSDP2 | every GPU redundantly repeats the same work | `sharded_mode="distributed"` splits the work across GPUs at identical results — [details](#experimental-lever-sharded-newton-schulz-under-fsdp2-sharded_mode) |
@@ -159,18 +159,24 @@ Measured on a Qwen3-4B full fine-tune: at its own ≈0.6× optimum Gefen ties Ad
 
 ## Benchmarks
 
-Optimizer comparison on a full fine-tune, **with each optimizer at its own fair learning-rate optimum** (from a per-optimizer LR sweep), 2000 steps.
+Optimizer comparison on a full fine-tune, with **documented task-appropriate
+learning rates**, 2000 steps. AdamW and plain Gefen use their short-sweep fair
+optima; the Muon row uses the retained balanced-SFT recipe and LR.
 
-You can run these yourself — see [`benchmarks/`](https://github.com/thad0ctor/Gefen-X/blob/main/benchmarks/README.md) for what each suite measures and how to reproduce the tables/plots (`bash benchmarks/optimizer-sweep/run.sh` regenerates this comparison, with the recommended Gefen-Muon config applied by default).
+You can run these yourself — see [`benchmarks/`](https://github.com/thad0ctor/Gefen-X/blob/main/benchmarks/README.md) for what each suite measures and how to reproduce the tables/plots (`bash benchmarks/optimizer-sweep/run.sh` regenerates this comparison, with the balanced-SFT Gefen-Muon config applied by default).
 
 **Testing environment**
-- **Hardware:** NVIDIA RTX 3090 for Qwen3-1.7B and RTX 3090 Ti for Qwen3-0.6B (Ampere, sm_86), single GPU per run; compare optimizers within a model, not tok/s across models.
+- **Hardware:** NVIDIA RTX 3090 (Ampere, sm_86), single GPU per run. Every
+  Qwen3-0.6B row and the impacted Qwen3-1.7B Muon row were rerun on the main
+  physical card, UUID `GPU-22becb18-bef9-4f98-4eee-5fc4bb8c7a53`; the unchanged
+  Qwen3-1.7B baselines are retained from prior RTX 3090 runs. Compare
+  throughput within a model/GPU class, not across model sizes.
 - **Software:** PyTorch 2.12.0 (cu133), Python 3.12; Gefen fused CUDA kernels JIT-built for sm_86.
 - **Models:** Qwen3-0.6B and Qwen3-1.7B — full fine-tune (all weights trained, no adapters).
 - **Regime:** bf16 master weights, gradient checkpointing, sequence length 2048, micro-batch 1, Alpaca greedy-packed to 2048-token blocks, 2000 steps, identical data order across optimizers, 32-example held-out eval.
 - **Noise:** single seed; the eval metric moves about ±0.005–0.007 between reruns (bf16 nondeterminism), so treat eval differences under 0.01 as a tie.
-- **Learning rate (each at its own fair optimum):** AdamW family `5e-5`; Gefen
-  `3e-5`; balanced-SFT Gefen-Muon `3e-5`.
+- **Learning rate:** AdamW family `5e-5`; plain Gefen's short-sweep optimum
+  `3e-5`; balanced-SFT Gefen-Muon's retained task LR `3e-5`.
 - **Optimizers:** `adamw_bf16` = torch fused AdamW · `adamw8bit` =
   bitsandbytes · `adamw4bit` = torchao · `gefen_fused` =
   `Gefen(fused=True)` · `gefen_muon` = the balanced SFT
@@ -182,18 +188,23 @@ You can run these yourself — see [`benchmarks/`](https://github.com/thad0ctor/
 
 | Model | Optimizer | LR | Eval loss | tok/s | Peak VRAM (GiB) | Opt-state B/param |
 |---|---|---|---|---|---|---|
-| Qwen3-0.6B | adamw_bf16 | 5e-5 | 1.433 | 5600 | 6.95 | 4.00 |
-| Qwen3-0.6B | adamw8bit | 5e-5 | 1.474 | 5284 | 5.87 | 2.03 |
-| Qwen3-0.6B | adamw4bit | 5e-5 | 1.472 | 4987 | 6.32 | 1.06 |
-| Qwen3-0.6B | **gefen_fused** | 3e-5 | **1.420** | 5376 | **5.30** | **1.01** |
-| Qwen3-0.6B | **gefen_muon** | 5e-5 | 1.425 | 3614 | **5.30** | **1.01** |
+| Qwen3-0.6B | adamw_bf16 | 5e-5 | 1.4360 | **5910** | 6.95 | 4.000 |
+| Qwen3-0.6B | adamw8bit | 5e-5 | 1.4785 | 5509 | 5.87 | 2.033 |
+| Qwen3-0.6B | adamw4bit | 5e-5 | 1.4613 | 5367 | 6.32 | 1.063 |
+| Qwen3-0.6B | **gefen_fused** | 3e-5 | **1.4251** | 5716 | **5.30** | **1.014** |
+| Qwen3-0.6B | **gefen_muon + AdamW** | 3e-5 | 1.4368 | 3969 | 5.73 | 1.794 |
 | Qwen3-1.7B | adamw_bf16 | 5e-5 | **1.217** | 2985 | 14.00 | 4.00 |
 | Qwen3-1.7B | adamw8bit | 5e-5 | 1.240 | 2704 | 10.84 | 2.03 |
 | Qwen3-1.7B | adamw4bit | 5e-5 | 1.242 | 2622 | 15.11 | 1.06 |
 | Qwen3-1.7B | **gefen_fused** | 3e-5 | **1.226** | 2870 | **9.21** | **1.01** |
-| Qwen3-1.7B | **gefen_muon** | 5e-5 | 1.241 | 1314 | 9.20 | **1.01** |
+| Qwen3-1.7B | **gefen_muon + AdamW** | 3e-5 | 1.2434 | 1373 | 10.07 | 1.550 |
 
-> `gefen_fused` uses the shipped defaults; `gefen_muon` uses the [recommended hybrid recipe](#full-models-gefenmuonhybrid) (`backup_lr` ≈0.5× `lr`, `backup_1d_period_one=True`). Both run at their own best learning rate. Older (pre-default) behaviors are still available behind flags — see the lever sections below for what each default does and how to switch it off.
+> `gefen_fused` uses the shipped defaults. `gefen_muon + AdamW` is the
+> [balanced SFT Muon recipe](#sft-balanced-muon-recipe):
+> tuned3 + NorMuon, `backup_optimizer="adamw"`, and a full-LR backup. The Muon
+> row answers “if I want Muon, how should I run it?”; it is not the fastest or
+> lowest-state optimizer in this table. Use the separate Gefen-backup recipe
+> when minimum optimizer state is the priority.
 
 </details>
 
@@ -202,23 +213,31 @@ You can run these yourself — see [`benchmarks/`](https://github.com/thad0ctor/
 
 **Loss curves** — loss over the 2000 steps. For each optimizer (distinguished by **color**), there are two lines: **solid = held-out eval loss** (the 32-example validation set, logged every 50 steps — this is the comparison metric in the table above) and **dashed = train-loss EMA** (exponential moving average of the training loss). 
 
-**Gefen-fused (with the `factored_v_2d` default) sits on the AdamW cluster at both scales** — best-in-table at 0.6B (1.4199, −0.014 below the best AdamW) and a statistical tie at 1.7B (1.2257 vs 1.2169; each eval number moves ±0.005–0.007 between reruns, so gaps under ≈0.01 are ties). Gefen-Muon matches at 0.6B (1.4249, a tie) and lands +0.024 above the best AdamW at 1.7B (1.2411 vs 1.2169).
+**Gefen-fused (with the `factored_v_2d` default) sits on the AdamW cluster at both scales** — best in this 0.6B seed (1.4251 vs 1.4360 for fused AdamW) and a statistical tie at 1.7B (1.2257 vs 1.2169; each eval number moves ±0.005–0.007 between reruns, so gaps under ≈0.01 are ties). Balanced-SFT Gefen-Muon + AdamW ties fused AdamW at 0.6B (1.4368 vs 1.4360) and lands +0.0265 above it at 1.7B (1.2434 vs 1.2169). These are single-seed outcomes, not universal optimizer rankings.
 
 ![Qwen3-1.7B loss curves](https://raw.githubusercontent.com/thad0ctor/Gefen-X/main/docs/benchmarks/loss_curve_qwen1p7b.png)
 ![Qwen3-0.6B loss curves](https://raw.githubusercontent.com/thad0ctor/Gefen-X/main/docs/benchmarks/loss_curve_qwen0p6b.png)
 
-**Throughput vs peak VRAM** — the speed/memory frontier (upper-left = faster *and* lighter is better). Gefen-fused holds the lowest-VRAM column at ≈0.96× the fused-AdamW throughput at both scales; AdamW-4-bit is worst on *both* axes despite its small optimizer state (torchao transient buffers). 
+**Throughput vs peak VRAM** — the speed/memory frontier (upper-left = faster *and* lighter is better). Gefen-fused holds the lowest-VRAM column at `0.96–0.97×` fused-AdamW throughput across the two scales. AdamW-4-bit has the highest peak VRAM at 1.7B despite its small optimizer state (torchao transient buffers).
 
-> **Why AdamW-4-bit's peak VRAM is high (and Gefen's isn't).** torchao's 4-bit step [upcasts each parameter's state to fp32 to compute the update](https://github.com/pytorch/ao/tree/main/torchao/optim) ("optimizer step calculations are always done in FP32"), so the peak is set by a transient stack of fp32 buffers sized to the *largest* tensor — here the tied embedding / LM head — not by the tiny 1.06 B/param packed state. With **bf16 master weights** the fused-AdamW baseline is already lean, so that fp32 spike pushes 4-bit's peak *above* even full-precision AdamW (15.11 vs 14.00 GiB at 1.7B). Gefen keeps the same ≈1 B/param state *without* the fp32 recompute, so it holds the lowest peak in the table — the smaller-model / large-vocab regime where 4-bit's spike is largest is exactly where Gefen's VRAM lead is widest.
+> **Why AdamW-4-bit's peak VRAM is high (and Gefen's isn't).** torchao's 4-bit step [upcasts each parameter's state to fp32 to compute the update](https://github.com/pytorch/ao/tree/main/torchao/optim) ("optimizer step calculations are always done in FP32"), so the peak is set by a transient stack of fp32 buffers sized to the *largest* tensor — here the tied embedding / LM head — not by the tiny 1.06 B/param packed state. With **bf16 master weights** the fused-AdamW baseline is already lean, so that fp32 spike pushes 4-bit's peak *above* even full-precision AdamW (15.11 vs 14.00 GiB at 1.7B). Gefen keeps the same ≈1 B/param state *without* the fp32 recompute and holds the lowest peak at both measured scales.
 
-Gefen-Muon shares Gefen-fused's lowest-VRAM column but sits far lower on throughput — the Newton-Schulz orthogonalization makes it the slowest optimizer.
+Balanced-SFT Gefen-Muon uses less peak VRAM and optimizer state than fused
+AdamW, but more than plain Gefen because its non-Muon subset keeps conventional
+AdamW state. Newton–Schulz orthogonalization also makes it the slowest optimizer
+in this end-to-end table.
 
 ![Qwen3-1.7B throughput vs VRAM](https://raw.githubusercontent.com/thad0ctor/Gefen-X/main/docs/benchmarks/tput_vram_qwen1p7b.png)
 ![Qwen3-0.6B throughput vs VRAM](https://raw.githubusercontent.com/thad0ctor/Gefen-X/main/docs/benchmarks/tput_vram_qwen0p6b.png)
 
-**Gefen-fused** is the recommended configuration: **AdamW-level loss with the lowest peak VRAM and the lowest optimizer state in the table**, at ≈0.96× AdamW's speed. (AdamW-4-bit's optimizer state is also small, but its peak VRAM is the *highest* in the table because of its transient buffers — Gefen is the real memory winner.)
+**Gefen-fused** is the recommended SFT configuration overall: **AdamW-level loss with the lowest peak VRAM and the lowest optimizer state in the table**, at `0.96–0.97×` AdamW's speed. (AdamW-4-bit's optimizer state is also small, but its peak VRAM is the *highest* at 1.7B because of transient buffers — Gefen is the real memory winner.)
 
-**Gefen-Muon** reaches the same loss level at the same memory footprint, but at roughly half the speed (Muon's orthogonalization step is expensive). Choose it if you specifically want Muon-style updates; otherwise Gefen-fused gives the same quality faster.
+**Gefen-Muon + AdamW** is the balanced recipe when you specifically want
+Muon-style updates: it ties fused AdamW's loss at 0.6B while using 55% less
+optimizer state, but it is 33% slower; at 1.7B it uses 61% less state and is
+54% slower, with a +0.0265 loss gap in this seed. For minimum-state Muon, use
+the Gefen backup recipe below; otherwise plain Gefen-fused is the stronger SFT
+default.
 
 **Review the raw runs:** per-cell training logs (step-by-step loss, throughput, VRAM) in [`docs/benchmarks/logs/`](https://github.com/thad0ctor/Gefen-X/tree/main/docs/benchmarks/logs/) · aggregated metrics as [CSV](https://github.com/thad0ctor/Gefen-X/blob/main/docs/benchmarks/optimizer_comparison_2000steps.csv) and [JSONL](https://github.com/thad0ctor/Gefen-X/blob/main/docs/benchmarks/optimizer_comparison_2000steps.jsonl).
 
@@ -261,7 +280,7 @@ Gefen drops into standard distributed training like any other PyTorch optimizer,
 
 `GefenMuon` adds a [Muon](https://kellerjordan.github.io/posts/muon/)-style pseudo-orthogonalization step (Keller Jordan et al., "Muon", 2024) on the first moment (skipping the second moment), then quantizes those first moments to 8-bit with Gefen's partitioning quantization.
 
-> **Scope — read this first.** Like Muon, `GefenMuon` optimizes **2D hidden weight matrices only**. It has *no* code path for embeddings, the LM head, or 1D parameters (norms, biases) — feeding it those will fail or misbehave. For a full model, use [`GefenMuonHybrid`](#full-models-gefenmuonhybrid) below, which routes the non-Muon parameters to `Gefen` for you.
+> **Scope — read this first.** Like Muon, `GefenMuon` optimizes **2D hidden weight matrices only**. It has *no* code path for embeddings, the LM head, or 1D parameters (norms, biases) — feeding it those will fail or misbehave. For a full model, use [`GefenMuonHybrid`](#full-models-gefenmuonhybrid) below, which routes the non-Muon parameters to your selected Gefen or AdamW backup.
 >
 > **Pass `(name, param)` pairs, not bare tensors.** `GefenMuon` keys its 8-bit codebook cache on each parameter's name. If you strip the names (e.g. `[p for _, p in pairs]`) every parameter collapses to the name `"none"` and the cache is corrupted. Always pass the named pairs through:
 
@@ -301,7 +320,7 @@ three distinct choices. Treat the learning rates below as roles, not universal
 constants: the SFT run selected `3e-5`, while the small pretraining protocol
 selected `3e-3`; tune `MUON_LR` for your model and data.
 
-###### SFT: balanced quality, memory, and throughput
+###### SFT: balanced Muon recipe
 
 Use tuned three-step Newton–Schulz plus NorMuon and a full-LR AdamW backup:
 
@@ -319,9 +338,12 @@ optimizer = GefenMuonHybrid(
 )
 ```
 
-In the 2,000-update Qwen3-0.6B SFT run, this recipe matched classic NS5's
-endpoint/tail within `0.0002` while running **1.165x** as fast. That frontier is
-one seed, so regard tiny loss differences as ties rather than a universal win.
+The retained schedule ablation selected this combination over classic NS5 for
+SFT. In the curated end-to-end Qwen3-0.6B comparison it tied fused AdamW's loss
+with 55% less optimizer state, but was 33% slower; at 1.7B it left a `+0.0265`
+single-seed loss gap. This is the recommended way to run *Muon for SFT*, while
+plain Gefen-fused remains the stronger overall SFT default on the measured
+models.
 
 ###### Pretraining: quality first
 
@@ -343,10 +365,10 @@ optimizer = GefenMuonHybrid(
 )
 ```
 
-Classic NS5 won the replicated 33M and 134M pretraining comparisons. On the
-same main RTX 3090, the 134M AdamW control was only 1.41% faster but finished
-17.0% worse and used 3.96x the optimizer state. This is still a two-seed result,
-not a scaling-law claim.
+Classic NS5 won the replicated 33M and 134M pretraining comparisons, so the
+faster SFT schedule is not promoted as a universal default. The evidence is
+small-scale and replicated, not a scaling-law claim; protocol and headline
+figures are retained in PR #62 rather than a generated report in the repo.
 
 ###### Lowest optimizer memory
 
@@ -368,9 +390,9 @@ optimizer = GefenMuonHybrid(
 )
 ```
 
-This measured 0.561 GiB of serialized optimizer state on Qwen3-0.6B SFT versus
-0.996 GiB for the AdamW-backup Muon recipe and 2.220 GiB for all-AdamW. It is
-the low-memory recommendation, not the quality winner.
+This keeps both halves on quantized Gefen state and is the low-memory
+recommendation, not the quality winner. Exact matrix-run figures and protocol
+are retained in PR #62 rather than a generated report in the repository.
 
 > **`backup_optimizer` and `fused` are independent.** The former selects Gefen
 > or AdamW for non-Muon parameters. `fused=True` selects each chosen optimizer's
@@ -436,37 +458,49 @@ optim_args:
   factored_v_2d: true    # Adafactor-style 2D 2nd moment — matches AdamW loss (default)
 ```
 
-**`gefenx_muon` — whole-model Muon hybrid, same ≈1 B/param footprint:**
+**`gefenx_muon` — whole-model Muon hybrid (balanced SFT):**
 
 ```yaml
 optimizer: gefenx_muon
-learning_rate: 5.0e-5    # Muon tolerates a hotter LR than plain gefenx
+learning_rate: 3.0e-5    # tune for your model/data; this is the retained SFT LR
 bf16: true
 optim_args:
   fused: true
-  backup_optimizer: gefen # low-memory backup; use adamw for the balanced SFT recipe
-  backup_lr: 2.5e-5      # Gefen LR for embed / head / norms; defaults to 0.5 × learning_rate
+  backup_optimizer: adamw
+  backup_lr: 3.0e-5      # full LR for embed / head / norms in the balanced recipe
+  ns_schedule: tuned3
+  normuon: true
   sharded_mode: exact    # "distributed" splits Newton-Schulz across GPUs under FSDP2
 ```
 
-The Axolotl adapter's defaults select the low-memory Gefen recipe
-(`backup_lr = 0.5 × lr`, `backup_1d_period_one`,
-`adjust_lr_fn="match_rms_adamw"`). For balanced SFT, set
-`backup_optimizer: adamw` and `backup_lr` equal to `learning_rate`; for
-quality-first pretraining also set `ns_schedule: standard` and `normuon: false`.
-All are overridable under `optim_args`.
+The Axolotl factory currently defaults to the low-memory Gefen recipe. To select
+it explicitly, change the balanced block above to:
 
-**How config maps:** `learning_rate`, `weight_decay`, `adam_beta1`/`adam_beta2`, `adam_epsilon` forward to the constructor; anything under `optim_args` (`fused`, `factored_v_2d`, `backup_lr`, `sharded_mode`, …) passes through as extra constructor kwargs (string values are coerced to type). To set the LR properly instead of the `≈0.6×` heuristic, run the finder: `python -m gefen.tools.find_lr --model <path> --optimizer gefen --method sweep` — see [`tools/README.md`](https://github.com/thad0ctor/Gefen-X/blob/main/src/gefen/tools/README.md).
+```yaml
+optim_args:
+  fused: true
+  backup_optimizer: gefen
+  backup_lr: 1.5e-5      # 0.5 × learning_rate
+  backup_1d_period_one: true
+  ns_schedule: tuned3
+  normuon: true
+```
+
+For quality-first pretraining, keep the AdamW backup at full LR and set
+`ns_schedule: standard` plus `normuon: false`. In every recipe,
+`adjust_lr_fn="match_rms_adamw"` keeps Muon updates on the AdamW LR scale.
+
+**How config maps:** `learning_rate`, `weight_decay`, `adam_beta1`/`adam_beta2`, and `adam_epsilon` forward to the selected constructor. Under `optim_args`, `fused` applies to both optimizer names; `factored_v_2d` is `gefenx`-only; and `backup_optimizer`, `backup_lr`, `ns_schedule`, `normuon`, and `sharded_mode` are `gefenx_muon`-only. String values are coerced to type. For plain Gefen, measure the LR instead of relying only on the `≈0.6×` heuristic: `python -m gefen.tools.find_lr --model <path> --optimizer gefen --method sweep` — see [`tools/README.md`](https://github.com/thad0ctor/Gefen-X/blob/main/src/gefen/tools/README.md).
 
 | Lever | axolotl config | Notes |
 |---|---|---|
 | Select Gefen / Muon hybrid | `optimizer: gefenx` / `gefenx_muon` | core drop-in / whole-model hybrid |
 | Muon backup optimizer | `optim_args: { backup_optimizer: adamw }` | AdamW for SFT/pretraining quality; `gefen` for minimum state |
-| Fused kernels | `optim_args: { fused: true }` | ≈2× faster `opt.step`; bit-exact; default on |
+| Fused execution | `optim_args: { fused: true }` | selects each chosen optimizer's fused path; Gefen kernels measured ≈2× faster `opt.step`; default on |
 | Factored 2D 2nd moment | `optim_args: { factored_v_2d: true }` | matches AdamW loss; default on |
-| Muon backup LR | `optim_args: { backup_lr: <lr> }` | Gefen LR for embed / head / norms; defaults to `0.5 × learning_rate` |
+| Muon backup LR | `optim_args: { backup_lr: <lr> }` | LR for the selected Gefen/AdamW backup; the Axolotl factory defaults to `0.5 × learning_rate`, while balanced SFT/pretraining use full LR |
 | Sharded Newton-Schulz | `optim_args: { sharded_mode: exact }` | `exact` (default) or `distributed` (splits NS across GPUs under FSDP2) |
-| Learning rate | `learning_rate: <≈0.6× AdamW>` | heuristic — better, measure with the LR finder. Background: [Learning rate](#learning-rate-when-porting-an-adamw-config) |
+| Learning rate | `learning_rate: <lr>` | the ≈0.6× heuristic applies to plain Gefen; tune Muon by task. Background: [Learning rate](#learning-rate-when-porting-an-adamw-config) |
 | `period==1` memory fallback | *on by default in this fork* | restores ≈1 B/param on modern decoders; module flag `MEMORY_SAFE_FALLBACK`, not a YAML key |
 
 ## Quality Lever: factored second moment on 2D params (`factored_v_2d`)
@@ -481,21 +515,24 @@ opt = Gefen(model.named_parameters(), lr=0.6 * ADAMW_LR, fused=True)  # factored
 
 | | **Gefen (default)** | AdamW bf16 | Gefen legacy (`factored_v_2d=False`) |
 |---|---|---|---|
-| Qwen3-0.6B eval loss | **1.420** | 1.433 | 1.497 |
+| Qwen3-0.6B eval loss | **1.425** | 1.436 | 1.497 |
 | Qwen3-1.7B eval loss | **1.226** | 1.217 | 1.286 |
 | Qwen3-1.7B tok/s | 2870 | 2985 | 2996 |
 | Optimizer state | **1.01 B/param** | 4.00 | 1.01 |
 
 ![Gefen factored-v ablation — eval loss vs AdamW, factored-v on vs off](https://raw.githubusercontent.com/thad0ctor/Gefen-X/main/docs/benchmarks/gefen_factored_v_loss.png)
 
-> Chart from the original factored-v ablation run; the table above cites the current benchmark re-runs (per-cell logs, including the legacy-mode cell, in [`docs/benchmarks/logs/`](https://github.com/thad0ctor/Gefen-X/tree/main/docs/benchmarks/logs/)).
+> Chart from the original factored-v ablation run. The table combines the
+> current retained optimizer rows with that ablation; current per-cell logs and
+> the retained Qwen3-1.7B legacy-mode log live in
+> [`docs/benchmarks/logs/`](https://github.com/thad0ctor/Gefen-X/tree/main/docs/benchmarks/logs/).
 
 <details>
 <summary>Details: validation, checkpoint migration, and limits</summary>
 
 - Validated at both scales in the fair-LR regime, with a second-seed replication at 0.6B and a learning-rate sweep at 1.7B (best LR `3e-5` ≈ 0.6× AdamW's, matching Gefen's documented heuristic). The fused kernel computes the per-element step size in registers (no extra temporaries; step transients measured 0 MiB) and is covered by `tests/test_gefen_factored_v.py`.
 - Checkpoints migrate automatically in both directions (old checkpoints work with the new default and vice versa; the second-moment statistics re-warm briefly and harmlessly).
-- `GefenMuonHybrid`'s backup half stays on the legacy path (that combination hasn't been benchmarked), and under FSDP2 sharded 2D params fall back to the legacy path as well.
+- With `backup_optimizer="gefen"`, `GefenMuonHybrid` pins the backup half to Gefen's legacy block-vmean path (the factored-v combination has not been benchmarked). With `backup_optimizer="adamw"`, the backup uses conventional per-element AdamW state. Under FSDP2, sharded 2D Gefen params also fall back to the legacy path.
 - Two sibling experiments from the same investigation ship off by default because they measured **no effect**: `period_one_substrings` (per-element state on name-matched tensors) and `codebook_refresh_every` (periodic codebook refit).
 
 </details>
@@ -524,9 +561,10 @@ opt = GefenMuonHybrid(
 ```
 
 Measured: `fp8_ns` pays off on larger models (≈1.2× end-to-end at Qwen3-4B)
-and its built-in size gate avoids the penalty on small ones. `tuned3` runs about
-1.4× faster end to end, but its quality is task-dependent: pair it with NorMuon
-for SFT, and retain classic NS5 for quality-first pretraining.
+and its built-in size gate avoids the penalty on small ones. `tuned3` improves
+end-to-end throughput, but its quality is task-dependent: pair it with NorMuon
+for SFT, and retain classic NS5 for quality-first pretraining. The exact
+retained schedule comparison is documented in PR #62.
 
 ![Gefen-Muon faster Newton-Schulz — real-training loss (AdamW + variants)](https://raw.githubusercontent.com/thad0ctor/Gefen-X/main/docs/benchmarks/muon_ns_loss.png)
 ![Gefen-Muon faster Newton-Schulz — end-to-end throughput (tok/s)](https://raw.githubusercontent.com/thad0ctor/Gefen-X/main/docs/benchmarks/muon_ns_throughput.png)

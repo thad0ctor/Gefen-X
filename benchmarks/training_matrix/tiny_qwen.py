@@ -89,7 +89,7 @@ def preset_config(
 
 
 def expected_parameter_count(config: TinyQwenConfig) -> int:
-    """Analytic count for the exact bias-free/tied architecture."""
+    """Analytic count for the exact bias-free architecture."""
 
     head_dim = config.hidden_size // config.num_attention_heads
     kv_width = config.num_key_value_heads * head_dim
@@ -101,7 +101,13 @@ def expected_parameter_count(config: TinyQwenConfig) -> int:
     )
     mlp = 3 * config.hidden_size * config.intermediate_size
     layer_norms = 2 * config.hidden_size
-    return embedding + config.num_hidden_layers * (attention + mlp + layer_norms) + config.hidden_size
+    lm_head = 0 if config.tie_word_embeddings else embedding
+    return (
+        embedding
+        + lm_head
+        + config.num_hidden_layers * (attention + mlp + layer_norms)
+        + config.hidden_size
+    )
 
 
 class RMSNorm(nn.Module):

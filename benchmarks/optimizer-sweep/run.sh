@@ -77,7 +77,8 @@ list_gpus() {
     --format=csv,noheader | awk -F', ' '{printf "  %s  %-28s  %s  used %s / %s\n",$1,$2,$3,$4,$5}'
 }
 
-# fair default LRs (each optimizer's own optimum); overridden by --lr-sweep
+# documented task LRs (AdamW/Gefen short-sweep optima; Muon retained SFT LR);
+# overridden by --lr-sweep
 fair_lr() {
   case "$1" in
     adamw_bf16|adamw8bit|adamw4bit) echo "5e-5" ;;
@@ -146,7 +147,7 @@ Options:
   --no-muon-normuon      force OFF gefen_muon normuon.
   --eval-every N         Intermediate eval-logging cadence (default $EVAL_EVERY).
   --lr-sweep             Run a short per-optimizer LR sweep first and use each
-                         optimizer's best LR for the finals (default: documented fair LRs).
+                         optimizer's best LR for the finals (default: documented task LRs).
   --sweep-steps N        Steps per LR-sweep cell (default $SWEEP_STEPS).
   -h, --help             This help.
 
@@ -343,14 +344,18 @@ run_cell() { # gpu tag model opt lr steps out logfile
     # Label the two documented task recipes; anything else is custom. An empty
     # MUON_NORMUON follows the hybrid default (on), so it belongs to either
     # recipe just like an explicit 1.
+    is_frac() {
+      awk -v f="$MUON_BACKUP_LR_FRACTION" -v target="$1" \
+        'BEGIN { exit !((f + 0) == (target + 0)) }'
+    }
     if [ "$MUON_ADJUST" = "match_rms_adamw" ] \
        && [ "$MUON_BACKUP_OPTIMIZER" = "adamw" ] \
-       && [ "$MUON_BACKUP_LR_FRACTION" = "1.0" ] \
+       && is_frac 1.0 \
        && [ "$MUON_BACKUP_1D" = "0" ] && [ "$MUON_NORMUON" != "0" ]; then
       muon_flags+=(--variant sft-balanced)
     elif [ "$MUON_ADJUST" = "match_rms_adamw" ] \
          && [ "$MUON_BACKUP_OPTIMIZER" = "gefen" ] \
-         && [ "$MUON_BACKUP_LR_FRACTION" = "0.5" ] \
+         && is_frac 0.5 \
          && [ "$MUON_BACKUP_1D" = "1" ] && [ "$MUON_NORMUON" != "0" ]; then
       muon_flags+=(--variant low-memory)
     else

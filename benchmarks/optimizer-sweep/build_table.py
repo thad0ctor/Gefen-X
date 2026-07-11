@@ -47,8 +47,12 @@ def main():
     def label(tag):
         return label_map.get(tag, tag)
 
-    cols = ["model", "tag", "optimizer", "LR", "final_eval_loss", "final_train_ema",
-            "tok_per_s", "peak_vram_gib", "peak_vram_reserved_gib", "opt_state_bpp"]
+    cols = [
+        "model", "tag", "optimizer", "variant", "muon_backup_optimizer",
+        "muon_ns_schedule", "muon_normuon", "LR", "final_eval_loss",
+        "final_train_ema", "tok_per_s", "peak_vram_gib",
+        "peak_vram_reserved_gib", "opt_state_bpp",
+    ]
 
     csv_rows = []
     for tag in tag_order:
@@ -56,8 +60,12 @@ def main():
             r = by.get((tag, opt))
             if not r:
                 continue
+            muon_flags = r.get("muon_flags") or {}
             csv_rows.append([
-                label(tag), tag, opt, f"{r['lr']:.0e}",
+                label(tag), tag, opt, r.get("variant", opt),
+                muon_flags.get("backup_optimizer", ""),
+                muon_flags.get("ns_schedule", ""),
+                muon_flags.get("normuon", ""), f"{r['lr']:.0e}",
                 r["final_eval"], r["final_train_ema"],
                 r["tok_per_s"], r["peak_vram_gib"],
                 r.get("peak_vram_reserved_gib", ""), r["opt_state_bpp"],
@@ -66,13 +74,13 @@ def main():
     os.makedirs(args.out_dir, exist_ok=True)
     csv_path = os.path.join(args.out_dir, "comparison_table.csv")
     with open(csv_path, "w", newline="") as f:
-        w = csv.writer(f)
+        w = csv.writer(f, lineterminator="\n")
         w.writerow(cols)
         w.writerows(csv_rows)
 
     md = [
-        "# Gefen fair-LR optimizer bench\n",
-        "Each optimizer at its own fair LR. Full fine-tune, bf16 master weights, "
+        "# Gefen task-LR optimizer bench\n",
+        "Each optimizer uses its documented task-appropriate LR. Full fine-tune, bf16 master weights, "
         "grad-checkpointing, seq 2048, micro-batch 1, Alpaca packed to 2048-tok blocks, "
         "constant LR, fixed seed, identical data order within a model.\n",
     ]
@@ -123,13 +131,23 @@ def main():
 
     md.append("\n## Caveats\n")
     md.append("- Single seed unless you swept several (n=1 does not estimate seed noise).")
-    md.append("- LRs are each optimizer's own fair-sweep optimum at the sweep step budget; "
-              "the long-run optimum may differ.")
+    md.append("- AdamW/Gefen defaults come from short fair-LR sweeps; the Muon row "
+              "uses the retained SFT recipe. Re-sweep for a new model or regime.")
     md.append("- tok/s and peak VRAM are LR-independent; compare within a model on one GPU type.")
     md.append("- opt-state B/param for adamw4bit counts the real packed codes/scale/qmap "
               "(torchao OptimState4bit), not the logical bf16 view.")
-    md.append("- gefen_muon is the balanced SFT recipe: tuned3 + NorMuon with an "
-              "AdamW backup at full LR; its Newton-Schulz work makes it slower per step.")
+    for tag in tag_order:
+        muon = by.get((tag, "gefen_muon"))
+        if not muon:
+            continue
+        flags = muon.get("muon_flags") or {}
+        md.append(
+            f"- {label(tag)} gefen_muon recipe: variant={muon.get('variant', 'unspecified')}, "
+            f"backup={flags.get('backup_optimizer', 'unspecified')}, "
+            f"ns_schedule={flags.get('ns_schedule', 'unspecified')}, "
+            f"normuon={flags.get('normuon', 'unspecified')}. Its Newton-Schulz "
+            "work makes it slower per step."
+        )
 
     md_path = os.path.join(args.out_dir, "comparison_table.md")
     with open(md_path, "w") as f:

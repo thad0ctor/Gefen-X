@@ -2,8 +2,8 @@
 
 Covers, in order:
   * GefenMuonHybrid.load_state_dict schema guard (standard {"state",
-    "param_groups"} checkpoints, half-mismatches, and backup-optimizer
-    mismatches raise instead of silently resuming with invalid state);
+    "param_groups"} checkpoints, half-presence mismatches, and backup-optimizer
+    mismatches raise before either child is loaded);
   * module-type-aware embedding/head routing in split_params_for_muon
     (GPT-2-like wte/wpe + tied lm_head, T5-like `shared`, classifier heads,
     tied heads under non-suggestive names) + the split summary log;

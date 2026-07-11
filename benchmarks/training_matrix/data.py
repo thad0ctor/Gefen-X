@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import hashlib
-import itertools
 import json
 import random
 from dataclasses import dataclass
@@ -260,16 +259,32 @@ def deterministic_order(num_blocks: int, updates: int, batch_size: int, seed: in
     return order[:needed]
 
 
-def _hash_blocks(blocks: Iterable[Block]) -> str:
-    digest = hashlib.sha256()
+def _update_blocks_hash(digest, blocks: Iterable[Block]) -> None:
+    """Append logical ``(input_ids, labels)`` bytes in block order."""
+
     if isinstance(blocks, PackedPretrainingBlocks):
-        payload = blocks.rows.numpy().tobytes()
-        digest.update(payload)
-        digest.update(payload)
-        return digest.hexdigest()
+        # Labels alias inputs for packed next-byte data. Repeat each row next
+        # to itself so this bulk path is byte-for-byte equivalent to iterating
+        # logical ``(row, row)`` block tuples, while avoiding the Python loop.
+        digest.update(blocks.rows.numpy().repeat(2, axis=0).tobytes())
+        return
     for input_ids, labels in blocks:
         digest.update(input_ids.numpy().tobytes())
         digest.update(labels.numpy().tobytes())
+
+
+def _hash_blocks(blocks: Iterable[Block]) -> str:
+    digest = hashlib.sha256()
+    _update_blocks_hash(digest, blocks)
+    return digest.hexdigest()
+
+
+def _combined_blocks_hash(*block_sets: Iterable[Block]) -> str:
+    """Hash ordered block sets while preserving the legacy logical digest."""
+
+    digest = hashlib.sha256()
+    for blocks in block_sets:
+        _update_blocks_hash(digest, blocks)
     return digest.hexdigest()
 
 
@@ -488,7 +503,7 @@ def build_dataset(
                 validation_blocks=validation,
                 order=order,
                 order_sha256=order_digest,
-                data_sha256=_hash_blocks(itertools.chain(validation, train)),
+                data_sha256=_combined_blocks_hash(validation, train),
                 source_metadata=metadata,
                 batch_size=batch_size,
                 training_source_ids=training_pack["source_ids"],
@@ -496,6 +511,9 @@ def build_dataset(
                 training_source_hashes=training_pack["source_hashes"],
                 validation_source_hashes=validation_pack["source_hashes"],
             )
+        # This fallback materializes the full HF split and is intended for
+        # small datasets. Large corpora should provide an official validation
+        # split so _pack_ordered_hf_text_rows can stream rows instead.
         records = [dict(record) for record in hf_train]
         if phase == "pretrain":
             try:
@@ -586,7 +604,7 @@ def build_dataset(
         validation_blocks=validation,
         order=order,
         order_sha256=order_digest,
-        data_sha256=_hash_blocks(itertools.chain(validation, train)),
+        data_sha256=_combined_blocks_hash(validation, train),
         source_metadata=metadata,
         batch_size=batch_size,
         training_source_ids=training_ids,

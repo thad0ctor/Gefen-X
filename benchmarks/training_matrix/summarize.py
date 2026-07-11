@@ -50,10 +50,13 @@ def render_markdown(rows: list[dict[str, Any]], baseline_cell: str = "adamw") ->
             "optimizer_serialized_state_bytes_per_parameter",
             row.get("optimizer_state_bytes_per_parameter"),
         )
+        tail_text = f"{tail:.6f}" if tail is not None else "—"
+        final_text = f"{final:.6f}" if final is not None else "—"
+        state_bpp_text = f"{state_bpp:.3f}" if state_bpp is not None else "—"
         lines.append(
             f"| {row.get('run_name')} | {row.get('cell')} | "
-            f"{tail:.6f} | {final:.6f} | {throughput_text} | {speedup_text} | "
-            f"{state_bpp:.3f} | {row.get('runtime', {}).get('device_name')} |"
+            f"{tail_text} | {final_text} | {throughput_text} | {speedup_text} | "
+            f"{state_bpp_text} | {row.get('runtime', {}).get('device_name')} |"
         )
     return "\n".join(lines)
 

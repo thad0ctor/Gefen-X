@@ -18,8 +18,7 @@ from matplotlib.patches import Patch  # noqa: E402
 ORDER = ["adamw_bf16", "adamw8bit", "adamw4bit", "gefen_fused", "gefen_nonfused", "gefen_muon"]
 LABEL = {"adamw_bf16": "AdamW\n(bf16)", "adamw8bit": "AdamW\n8-bit",
          "adamw4bit": "AdamW\n4-bit", "gefen_fused": "Gefen\n(fused)",
-         "gefen_nonfused": "Gefen\n(non-fused)",
-         "gefen_muon": "Gefen Muon\n+ AdamW"}
+         "gefen_nonfused": "Gefen\n(non-fused)"}
 COLOR = {"adamw_bf16": "#9aa7b5", "adamw8bit": "#6b8cae", "adamw4bit": "#4a6fa5",
          "gefen_fused": "#e07b39", "gefen_nonfused": "#d68a4e", "gefen_muon": "#c25b1f"}
 
@@ -31,9 +30,26 @@ PANELS = [
 ]
 
 CONFIG = ("Full fine-tune . bf16 master weights . grad-checkpointing . seq 2048 . "
-          "micro-batch 1 . Alpaca (packed) . constant LR\n"
-          "Muon row = tuned3 + NorMuon + AdamW backup . "
-          "green outline / star = best in panel")
+          "micro-batch 1 . Alpaca (packed) . constant LR")
+
+
+def optimizer_label(opt, row, *, multiline=False):
+    if opt != "gefen_muon":
+        return LABEL.get(opt, opt)
+    backup = row.get("muon_backup_optimizer", "").strip().lower()
+    suffix = {"adamw": "AdamW", "gefen": "Gefen"}.get(backup, "hybrid")
+    separator = "\n+ " if multiline else " + "
+    return f"Gefen Muon{separator}{suffix}"
+
+
+def muon_recipe_text(row):
+    variant = row.get("variant", "unspecified") or "unspecified"
+    schedule = row.get("muon_ns_schedule", "unspecified") or "unspecified"
+    normuon = str(row.get("muon_normuon", "")).lower() == "true"
+    normuon_text = "NorMuon" if normuon else "NorMuon off"
+    backup = row.get("muon_backup_optimizer", "").strip().lower()
+    backup_label = {"adamw": "AdamW", "gefen": "Gefen"}.get(backup, "unspecified")
+    return f"Muon row = {variant}: {schedule} + {normuon_text} + {backup_label} backup"
 
 
 def best_idx(vals, direction):
@@ -47,8 +63,6 @@ def main():
     ap.add_argument("--subtitle", default="",
                     help="optional extra footer line (e.g. hardware / date / LRs)")
     args = ap.parse_args()
-    config_text = CONFIG + ("\n" + args.subtitle if args.subtitle else "")
-
     rows = list(csv.DictReader(open(args.csv)))
     for r in rows:
         for k in ("final_eval_loss", "final_train_ema", "tok_per_s",
@@ -65,6 +79,15 @@ def main():
         mrows = {r["optimizer"]: r for r in rows if r["tag"] == tag}
         opts = [o for o in ORDER if o in mrows]
         lr = {o: mrows[o]["LR"] for o in opts}
+        config_lines = [CONFIG]
+        recipe_bits = []
+        if "gefen_muon" in mrows:
+            recipe_bits.append(muon_recipe_text(mrows["gefen_muon"]))
+        recipe_bits.append("green outline / star = best in panel")
+        config_lines.append(" . ".join(recipe_bits))
+        if args.subtitle:
+            config_lines.append(args.subtitle)
+        config_text = "\n".join(config_lines)
 
         fig, axes = plt.subplots(2, 2, figsize=(12.5, 9.5))
         fig.suptitle(f"{disp} - optimizer comparison  (loss . speed . memory)",
@@ -79,7 +102,10 @@ def main():
             bars[bi].set_edgecolor("#1a7a1a")
             bars[bi].set_linewidth(2.4)
             ax.set_xticks(range(len(opts)))
-            ax.set_xticklabels([LABEL.get(o, o) for o in opts], fontsize=9.5)
+            ax.set_xticklabels(
+                [optimizer_label(o, mrows[o], multiline=True) for o in opts],
+                fontsize=9.5,
+            )
             ax.set_ylabel(unit, fontsize=10)
             arrow = "lower is better" if direction == "lower" else "higher is better"
             ax.set_title(f"{title}   ({arrow})", fontsize=12, fontweight="bold")
@@ -97,7 +123,7 @@ def main():
             ax.set_axisbelow(True)
 
         handles = [Patch(facecolor=COLOR.get(o, "#888888"), edgecolor="black",
-                         label=f"{LABEL.get(o, o).replace(chr(10), ' ')}  (lr {lr[o]})")
+                         label=f"{optimizer_label(o, mrows[o])}  (lr {lr[o]})")
                    for o in opts]
         fig.legend(handles=handles, loc="lower center", ncol=len(opts), fontsize=9.5,
                    frameon=False, bbox_to_anchor=(0.5, 0.04))

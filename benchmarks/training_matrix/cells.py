@@ -12,7 +12,7 @@ from typing import Any, Iterable
 
 import torch
 
-from gefen import GefenMuon, GefenMuonHybrid, split_params_for_muon
+from gefen import GefenMuonHybrid, split_params_for_muon
 
 
 BATCHED_NS_DEFAULT_WORKSPACE_BYTES = 256 << 20
@@ -449,9 +449,14 @@ def resolve_cell(name: str, config: CellBuildConfig) -> dict[str, Any]:
         and batched_ns_supported
     ):
         overrides.append("batched_ns_workspace_bytes")
-    resolved["unsupported_requests"] = (
-        ["batched_ns"] if config.batched_ns and not batched_ns_supported else []
-    )
+    unsupported_requests = []
+    if config.batched_ns and not batched_ns_supported:
+        unsupported_requests.append("batched_ns")
+    if config.muon_lr is not None and recipe.ns_steps is None:
+        unsupported_requests.append("muon_lr")
+    if config.backup_lr is not None and recipe.backup_lr_multiplier is None:
+        unsupported_requests.append("backup_lr")
+    resolved["unsupported_requests"] = unsupported_requests
     resolved["recipe_overrides"] = overrides
     resolved["effective_label"] = (
         recipe.label

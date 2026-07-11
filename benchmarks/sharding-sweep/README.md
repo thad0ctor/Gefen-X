@@ -165,6 +165,7 @@ the log, falling back to the log filename.
 
 To train with Gefen in [Axolotl](https://github.com/axolotl-ai-cloud/axolotl),
 see the integration PR:
-**https://github.com/axolotl-ai-cloud/axolotl/pull/3755** (draft). Note:
-`GefenMuonHybrid` (this benchmark's optimizer) is **not yet exposed** through
-that Axolotl integration — it is benchmarked here directly against the API.
+**https://github.com/axolotl-ai-cloud/axolotl/pull/3808**. Select
+`optimizer: gefenx_muon` and pass `sharded_mode: exact` or `distributed` under
+`optim_args`; see the top-level README for the complete SFT, pretraining, and
+minimum-state recipes.

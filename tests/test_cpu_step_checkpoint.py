@@ -461,18 +461,42 @@ def test_hybrid_state_dict_roundtrip(backup_optimizer):
         assert torch.equal(param, param_b)
 
 
-def test_hybrid_loads_untagged_legacy_gefen_checkpoint():
+def test_hybrid_loads_untagged_legacy_gefen_checkpoint_bit_exact():
     model = _small_model()
     opt = GefenMuonHybrid.from_model(model, lr=1e-3, fused=False)
-    _apply_grads(model, _synthetic_grads(model, 1)[0])
-    opt.step()
+    grads = _synthetic_grads(model, 4, seed=456)
+    for step_grads in grads[:2]:
+        _apply_grads(model, step_grads)
+        opt.step()
+        opt.zero_grad()
+
     legacy_state = copy.deepcopy(opt.state_dict())
     legacy_state.pop("backup_optimizer")
+    assert "backup_optimizer" not in legacy_state
 
-    restored_model = _small_model()
+    restored_model = _small_model(seed=1)
+    with torch.no_grad():
+        for restored_param, param in zip(
+            restored_model.parameters(), model.parameters()
+        ):
+            restored_param.copy_(param)
     restored = GefenMuonHybrid.from_model(restored_model, lr=1e-3, fused=False)
     restored.load_state_dict(legacy_state)
-    assert restored.backup_optimizer == "gefen"
+
+    for step_grads in grads[2:]:
+        _apply_grads(model, step_grads)
+        _apply_grads(restored_model, step_grads)
+        opt.step()
+        restored.step()
+        opt.zero_grad()
+        restored.zero_grad()
+
+    for param, restored_param in zip(
+        model.parameters(), restored_model.parameters()
+    ):
+        assert torch.equal(param, restored_param), (
+            "legacy untagged checkpoint diverged after resume"
+        )
 
 
 if __name__ == "__main__":

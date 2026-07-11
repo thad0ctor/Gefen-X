@@ -20,11 +20,27 @@ Outputs land in the configured out-dir: per-cell logs, `results.jsonl`, `compari
 
 ## Reproducing the published Gefen-Muon numbers
 
-`run.sh` applies the **recommended Gefen-Muon config by default** — `adjust_lr_fn=match_rms_adamw`, `backup_lr = 0.5 × the cell LR`, `backup_1d_period_one`, and (via the `GefenMuonHybrid` default) `normuon`, the throughput-free per-neuron 2nd moment on the Newton-Schulz output (see the `GefenMuonHybrid` docstring). Override via config keys (`muon_adjust`, `muon_backup_lr_fraction`, `muon_backup_1d`, `muon_normuon`) or flags (`--muon-adjust`, `--muon-backup-lr-frac`, `--no-muon-backup-1d`, `--no-muon-normuon`). See [the optimizer-sweep README](optimizer-sweep/README.md) for the full flag list.
+`run.sh` applies the **balanced SFT Gefen-Muon config by default** —
+`adjust_lr_fn=match_rms_adamw`, an AdamW backup at the full cell LR, tuned3,
+NorMuon, and no Gefen period-one backup override. Override via config keys
+(`muon_adjust`, `muon_backup_optimizer`, `muon_backup_lr_fraction`,
+`muon_backup_1d`, `muon_normuon`) or the corresponding CLI flags. The
+low-memory alternative selects the Gefen backup, half backup LR, and
+`backup_1d_period_one`; quality-first pretraining uses classic NS5 and disables
+NorMuon. See [the optimizer-sweep README](optimizer-sweep/README.md) for the
+full flag list.
 
-> The published `gefen_muon` numbers use the shipped defaults, including `normuon`. Pass `--no-muon-normuon` to disable it (results are then labeled `recommended-no-normuon`); the isolated normuon ablation (0.6B: −0.007/−0.010 final eval over two seeds; 1.7B: ≈⅓ of the residual gap to AdamW on the tail-mean of the last 10 evals) is documented in the main README's normuon section.
+> The published `gefen_muon` SFT numbers use tuned3 + NorMuon with the AdamW
+> backup at full LR. Pass `--no-muon-normuon` for an ablation; use
+> `--muon-backup-optimizer gefen --muon-backup-lr-frac 0.5
+> --muon-backup-1d` for the low-memory alternative. The effective recipe is
+> recorded in every result line under `muon_flags`.
 
-> **Note on the published `gefen_muon` throughput:** it reflects the current `GefenMuonHybrid` default `ns_schedule="tuned3"` (loss-neutral, ≈1.4× the classic quintic — measured +38%/+39% on the 3090-class GPUs used). `run.sh` reproduces it (tuned3 is the default); pass `--ns-schedule standard` to `sweep_cell` for the bit-identical classic quintic (≈0.7× the throughput, same loss). The other optimizers' rows are schedule-independent.
+> **Note on the published `gefen_muon` throughput:** it reflects tuned3, which
+> is the retained SFT schedule and was faster than classic NS5 in the SFT
+> ablation. It is not universally loss-neutral: quality-first pretraining uses
+> `ns_schedule="standard"`, five NS steps, and NorMuon off. The other
+> optimizers' rows are schedule-independent.
 
 ## microbench scripts
 

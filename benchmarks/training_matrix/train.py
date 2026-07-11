@@ -438,6 +438,7 @@ def _nvidia_driver_version(cuda_visible_devices: str | None) -> str | None:
             ],
             text=True,
             stderr=subprocess.DEVNULL,
+            timeout=10,
         )
         rows = [row.strip().split(", ", 1) for row in output.splitlines() if row.strip()]
         if cuda_visible_devices:
@@ -445,7 +446,7 @@ def _nvidia_driver_version(cuda_visible_devices: str | None) -> str | None:
                 if uuid == cuda_visible_devices:
                     return version
         return rows[0][1] if rows else None
-    except (OSError, subprocess.CalledProcessError, IndexError):
+    except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired, IndexError):
         return None
 
 

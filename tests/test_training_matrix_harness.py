@@ -29,7 +29,9 @@ from benchmarks.training_matrix.cells import (
 )
 import benchmarks.training_matrix.comparison as comparison_module
 import benchmarks.training_matrix.consistency_2x2 as consistency_driver
+import benchmarks.training_matrix.data as data_module
 import benchmarks.training_matrix.run_matrix as matrix_driver
+import benchmarks.training_matrix.train as train_module
 from benchmarks.training_matrix.consistency_2x2 import build_plan
 from benchmarks.training_matrix.comparison import (
     SOURCE_FINGERPRINT_ENV,
@@ -271,6 +273,17 @@ def test_stock_cells_record_batched_ns_request_as_unsupported(cell):
     assert all("batched_ns" not in group for group in optimizer.param_groups)
 
 
+def test_unsupported_lr_overrides_are_recorded_in_resolved_recipe():
+    resolved = resolve_cell(
+        "adamw",
+        CellBuildConfig(lr=1e-3, muon_lr=2e-3, backup_lr=3e-3),
+    )
+    assert resolved["primary_lr"] == pytest.approx(1e-3)
+    assert resolved["backup_lr"] is None
+    assert resolved["unsupported_requests"] == ["muon_lr", "backup_lr"]
+    assert resolved["recipe_overrides"] == []
+
+
 def test_auxiliary_only_isolation_edges_hold_hidden_recipe_fixed():
     config = CellBuildConfig(lr=2e-3, weight_decay=0.01)
     normuon_adamw = resolve_cell("gefen_muon_normuon_adamw", config)
@@ -308,6 +321,15 @@ def test_documented_screening_and_pretraining_preset_counts():
         pretrain_model = TinyQwenForCausalLM(pretrain)
     assert sum(parameter.numel() for parameter in screen_model.parameters()) == 33_169_408
     assert sum(parameter.numel() for parameter in pretrain_model.parameters()) == 134_216_576
+
+    untied = TinyQwenConfig(
+        **{**screen.to_dict(), "tie_word_embeddings": False}
+    )
+    expected_untied = 33_169_408 + untied.vocab_size * untied.hidden_size
+    with torch.device("meta"):
+        untied_model = TinyQwenForCausalLM(untied)
+    assert expected_parameter_count(untied) == expected_untied
+    assert sum(parameter.numel() for parameter in untied_model.parameters()) == expected_untied
 
 
 def test_training_batch_metadata_counts_optimizer_updates_not_microsteps():
@@ -563,6 +585,41 @@ def test_dataset_seed_fixes_validation_and_training_order():
     )
     assert set(first.training_source_ids).isdisjoint(first.validation_source_ids)
     assert set(first.training_source_hashes).isdisjoint(first.validation_source_hashes)
+
+
+def test_pretraining_data_hash_reaches_packed_bulk_hash_path(monkeypatch):
+    reference = build_dataset(
+        phase="pretrain",
+        source="synthetic",
+        sequence_length=16,
+        validation_blocks=8,
+        updates=2,
+        batch_size=1,
+        seed=3,
+    )
+    logical_blocks = [*reference.validation_blocks, *reference.train_blocks]
+    legacy_logical_hash = data_module._hash_blocks(logical_blocks)
+    assert data_module._hash_blocks(reference.validation_blocks) == (
+        data_module._hash_blocks(list(reference.validation_blocks))
+    )
+    assert data_module._hash_blocks(reference.train_blocks) == (
+        data_module._hash_blocks(list(reference.train_blocks))
+    )
+
+    def forbidden_iter(_self):
+        raise AssertionError("packed hashing must not iterate Python block tuples")
+
+    monkeypatch.setattr(data_module.PackedPretrainingBlocks, "__iter__", forbidden_iter)
+    bundle = build_dataset(
+        phase="pretrain",
+        source="synthetic",
+        sequence_length=16,
+        validation_blocks=8,
+        updates=2,
+        batch_size=1,
+        seed=3,
+    )
+    assert bundle.data_sha256 == legacy_logical_hash
 
 
 TINY_SHAKESPEARE_CACHE = (
@@ -894,6 +951,26 @@ def test_mixed_tiny_and_hf_result_schemas_summarize_without_crashing():
     rendered = render_markdown(rows)
     assert "tiny-gefen" in rendered and "1.250x" in rendered
     assert "hf-gefen" in rendered and "1.100x" in rendered
+
+    incomplete = rows[0].copy()
+    incomplete.pop("tail_eval_mean")
+    incomplete.pop("final_eval_loss")
+    incomplete.pop("optimizer_state_bytes_per_parameter")
+    rendered = render_markdown([incomplete])
+    assert rendered.count("—") == 3
+
+
+def test_nvidia_driver_probe_times_out_instead_of_blocking(monkeypatch):
+    observed = {}
+
+    def timeout(*_args, **kwargs):
+        observed["timeout"] = kwargs.get("timeout")
+        raise train_module.subprocess.TimeoutExpired("nvidia-smi", kwargs["timeout"])
+
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(train_module.subprocess, "check_output", timeout)
+    assert train_module._nvidia_driver_version(None) is None
+    assert observed["timeout"] == 10
 
 
 def test_strict_fallback_comparison_rejects_every_changed_invariant():

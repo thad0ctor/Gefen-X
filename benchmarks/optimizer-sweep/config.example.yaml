@@ -47,7 +47,7 @@ opts: "adamw_bf16 adamw8bit adamw4bit gefen_fused gefen_muon"
 no_muon: false
 
 # Re-derive each optimizer's best LR on this hardware before the finals,
-# instead of the documented fair LRs.
+# instead of the documented task LRs.
 lr_sweep: false
 
 # Models to benchmark. tag groups results; label is the display name in the

@@ -50,9 +50,14 @@ def build_case(case: str, count: int, size: int):
 
 
 def warm(opt, steps: int) -> None:
-    for _ in range(steps):
-        opt.step()
-    torch.cuda.synchronize()
+    current = torch.cuda.current_stream()
+    side = torch.cuda.Stream()
+    side.wait_stream(current)
+    with torch.cuda.stream(side):
+        for _ in range(steps):
+            opt.step()
+    side.synchronize()
+    current.wait_stream(side)
 
 
 def profile_cuda_activities(fn) -> int:
@@ -95,7 +100,13 @@ def run(case: str, mode: str, args) -> dict[str, object]:
         calls = args.replays
     activities = profile_cuda_activities(fn)
     cuda_ms, wall_ms = time_calls(fn, calls)
-    cohorts = sum(len(device_stacks) for device_stacks in opt._capt_stacks.values())
+    # One warmup step initializes state but does not yet build the optional
+    # stacked registry. In that valid CLI configuration graph capture uses the
+    # per-parameter fallback, so report zero cohorts instead of crashing while
+    # introspecting the absent registry.
+    cohorts = sum(
+        len(device_stacks) for device_stacks in (opt._capt_stacks or {}).values()
+    )
     del opt, params
     torch.cuda.empty_cache()
     return {

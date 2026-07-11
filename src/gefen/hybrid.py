@@ -165,8 +165,10 @@ class GefenMuonHybrid(torch.optim.Optimizer):
                 substrings that force a 2D weight to the backup half (defaults to
                 ``gefen.params.DEFAULT_BACKUP_SUBSTRINGS``). Passing it with the
                 two-list form is an error.
-            muon_lr / backup_lr: per-half overrides of ``lr``. Lowering only
-                ``backup_lr`` (~0.4-0.6x AdamW) is the validated loss lever.
+            muon_lr / backup_lr: per-half overrides of ``lr``. The low-memory
+                Gefen-backup recipe lowers ``backup_lr`` to ~0.5x the shared /
+                Muon rate; the quality-oriented AdamW-backup recipe keeps a
+                full-rate ``backup_lr`` equal to that shared / Muon rate.
             backup_optimizer: backup algorithm for embeddings, heads, norms,
                 and biases: ``"gefen"`` (default, quantized state) or
                 ``"adamw"`` (``torch.optim.AdamW`` with conventional state).
@@ -493,10 +495,10 @@ class GefenMuonHybrid(torch.optim.Optimizer):
                 "supported; resume from the hybrid-saved checkpoint "
                 "instead.".format(sorted(map(str, state_dict.keys())))
             )
-        # Each half must round-trip: a half present here but missing/None in
-        # the checkpoint (or vice versa) would silently resume that half from
-        # scratch (zeroed momentum), so raise instead of skipping. Validate
-        # BOTH halves before loading either, so a mismatch never half-loads.
+        # A half present here but missing/None in the checkpoint (or vice
+        # versa) would silently resume that half from scratch (zeroed
+        # momentum), so reject those presence mismatches before loading either
+        # child. The backup-backend check below runs before child loads too.
         for attr in ("muon", "backup"):
             sub = getattr(self, attr)
             sub_state = state_dict.get(attr)

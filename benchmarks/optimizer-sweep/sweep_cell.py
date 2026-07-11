@@ -83,7 +83,8 @@ ap.add_argument("--muon-backup-optimizer", choices=("gefen", "adamw"), default="
 ap.add_argument("--muon-lr", type=float, default=None,
                 help="GefenMuonHybrid muon_lr override (default: shared --lr)")
 ap.add_argument("--backup-lr", type=float, default=None,
-                help="GefenMuonHybrid backup_lr override; recommended ~0.5x --lr")
+                help="GefenMuonHybrid backup_lr override; use full --lr for the "
+                     "balanced AdamW backup or ~0.5x for low-memory Gefen")
 ap.add_argument("--backup-1d-period-one", action="store_true",
                 help="force period==1 (per-element 2nd moment) for 1D backup params")
 ap.add_argument("--backup-2d-period-one", action="store_true",
@@ -163,13 +164,15 @@ def git_provenance():
         commit = subprocess.run(
             ["git", "rev-parse", "HEAD"], cwd=root, check=True,
             capture_output=True, text=True,
+            timeout=10,
         ).stdout.strip()
         dirty = bool(subprocess.run(
             ["git", "status", "--porcelain"], cwd=root, check=True,
             capture_output=True, text=True,
+            timeout=10,
         ).stdout.strip())
         return {"commit": commit, "dirty": dirty}
-    except (OSError, subprocess.CalledProcessError):
+    except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired):
         return {"commit": None, "dirty": None}
 
 

@@ -4,6 +4,17 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+API and compatibility:
+
+- `GefenMuonHybrid` now accepts `backup_optimizer="gefen" | "adamw"`.
+  Gefen remains the backward-compatible, minimum-state default; AdamW provides
+  conventional per-element state for embeddings, heads, norms, and biases in
+  the measured SFT/pretraining quality recipes. This choice is independent of
+  `fused` execution.
+- Hybrid checkpoints record the selected backup backend. Untagged legacy
+  checkpoints retain Gefen semantics, while cross-backend loads fail before
+  either child is loaded.
+
 Performance:
 
 - Add an explicit `batched_ns=True` Muon experiment that groups repeated small
