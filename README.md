@@ -58,7 +58,8 @@
 pip install gefen-x          # imports as `gefen`
 ```
 
-!!! **It's `gefen-x`, not `gefen`.** This fork publishes as **`gefen-x`** and imports as `gefen`. `pip install gefen` fetches the *upstream* package, which does **not** include the fixes/improvements above.
+> [!NOTE]
+> **It's `gefen-x`, not `gefen`.** This fork publishes as **`gefen-x`** and imports as `gefen`. `pip install gefen` fetches the *upstream* package, which does **not** include the fixes/improvements above.
 
 For development and latest source, install editable from source instead:
 
@@ -128,7 +129,7 @@ All three optimizers accept `capturable=True` (same meaning as `torch.optim`'s a
 
 >Optimizer comparison on a full fine-tune, with **documented task-appropriate learning rates**, 2000 steps. AdamW and plain Gefen use their short-sweep fair optima; the Muon row uses the retained balanced-SFT recipe and LR.
 >
->You can run these yourself — see [`benchmarks/`](https://github.com/thad0ctor/Gefen-X/blob/main/benchmarks/README.md) for what each suite measures and how to reproduce the tables/plots (`bash benchmarks/optimizer-sweep/run.sh` regenerates this comparison, with the alanced-SFT Gefen-Muon config applied by default).
+>You can run these yourself — see [`benchmarks/`](https://github.com/thad0ctor/Gefen-X/blob/main/benchmarks/README.md) for what each suite measures and how to reproduce the tables/plots (`bash benchmarks/optimizer-sweep/run.sh` regenerates this comparison, with the balanced-SFT Gefen-Muon config applied by default).
 >
 >**Testing environment**
 >- **Hardware:** NVIDIA RTX 3090 (Ampere, sm_86), single GPU per run.
@@ -153,15 +154,15 @@ All three optimizers accept `capturable=True` (same meaning as `torch.optim`'s a
 >| Qwen3-0.6B | adamw4bit | complete | 5e-5 | 1.4613 | 5367 | 6.32 | 1.063 |
 >| Qwen3-0.6B | **gefen_fused** | complete | 3e-5 | **1.4251** | 5716 | **5.30** | **1.014** |
 >| Qwen3-0.6B | **gefen_muon + AdamW** | complete | 3e-5 | 1.4368 | 3969 | 5.73 | 1.794 |
->| Qwen3-1.7B | adamw_bf16 | legacy context | 5e-5 | **1.217** | 2985 | 14.00 | 4.00 |
+>| Qwen3-1.7B | adamw_bf16 | legacy context | 5e-5 | 1.217 | 2985 | 14.00 | 4.00 |
 >| Qwen3-1.7B | adamw8bit | legacy context | 5e-5 | 1.240 | 2704 | 10.84 | 2.03 |
 >| Qwen3-1.7B | adamw4bit | legacy context | 5e-5 | 1.242 | 2622 | 15.11 | 1.06 |
->| Qwen3-1.7B | **gefen_fused** | legacy context | 3e-5 | **1.226** | 2870 | **9.21** | **1.01** |
+>| Qwen3-1.7B | **gefen_fused** | legacy context | 3e-5 | 1.226 | 2870 | 9.21 | 1.01 |
 >| Qwen3-1.7B | **gefen_muon + AdamW** | complete | 3e-5 | 1.2434 | 1373 | 10.07 | 1.550 |
 >
 > `gefen_fused` uses the shipped defaults. `gefen_muon + AdamW` is the [balanced SFT Muon recipe](#sft-balanced-muon-recipe): tuned3 + NorMuon, `backup_optimizer="adamw"`, and a full-LR backup. The Muon row answers “if I want Muon, how should I run it?”; it is not the fastest or lowest-state optimizer in this table. Use the separate Gefen-backup recipe when minimum optimizer state is the priority.
 >
-> `legacy context` rows lack captured physical UUID, runtime, and source revision. Their raw values remain useful historically, but do not use them for strict loss/throughput deltas against the provenance-complete 1.7B Muon rerun.
+> `legacy context` rows lack captured physical UUID, runtime, and source revision. Their raw values remain useful historically, but do not use them for strict loss/throughput deltas against the provenance-complete 1.7B Muon rerun. Best-in-column is marked only in the fully provenance-complete 0.6B cohort; no winner is flagged across the mixed 1.7B block.
 
 <br>
 
@@ -354,7 +355,8 @@ optimizer = GefenMuonHybrid.from_model(model, lr=ADAMW_LR)    # equivalent expli
 
 # Advanced Usage
 
-!!! note Advanced tuning levers are available for advanced users. There features are largely experimental in nature and deviate from default settings - often trading tokens/sec throughput for accuracy.
+> [!NOTE]
+> Advanced tuning levers are available for advanced users. These features are largely experimental in nature and deviate from default settings - often trading tokens/sec throughput for accuracy.
 
 ## Gefen Muon
 
@@ -401,7 +403,8 @@ optimizer = GefenMuonHybrid(
 )
 ```
 
-!!! note Classic NS5 won the replicated 33M and 134M pretraining comparisons, so the faster SFT schedule is not promoted as a universal default. The evidence is small-scale and replicated, not a scaling-law claim.
+> [!NOTE]
+> Classic NS5 won the replicated 33M and 134M pretraining comparisons, so the faster SFT schedule is not promoted as a universal default. The evidence is small-scale and replicated, not a scaling-law claim.
 
 ##### Lowest optimizer memory
 
@@ -463,7 +466,8 @@ trainer = Trainer(model=model, args=training_args, train_dataset=train_dataset,
 
 ## Quality Lever: factored second moment on 2D params (`factored_v_2d`)
 
-!!! note **On by default** — this is what makes plain Gefen match AdamW's loss. Set `factored_v_2d=False` for the legacy behavior: ≈4% faster end-to-end at 1.7B (on par with fused AdamW's throughput), about 0.06 worse eval loss, and a lower best learning rate (`2e-5` instead of `3e-5` at the benchmarked scales).
+> [!NOTE]
+> **On by default** — this is what makes plain Gefen match AdamW's loss. Set `factored_v_2d=False` for the legacy behavior: ≈4% faster end-to-end at 1.7B (on par with fused AdamW's throughput), about 0.06 worse eval loss, and a lower best learning rate (`2e-5` instead of `3e-5` at the benchmarked scales).
 
 Gefen historically shared one adaptive step size across each *block* of parameters, where AdamW keeps one per parameter — that granularity difference was the ≈0.06 loss gap. `factored_v_2d` gives every parameter of a weight matrix its own step size by tracking just one statistic per row and one per column (the [Adafactor](https://arxiv.org/abs/1804.04235) idea) and combining them on the fly inside the update kernel. The stored state is only rows + columns per matrix, so the ≈1 B/param memory story is unchanged.
 
@@ -494,7 +498,8 @@ opt = Gefen(model.named_parameters(), lr=0.6 * ADAMW_LR, fused=True)  # factored
 
 ## Experimental Lever: faster Newton-Schulz (`ns_schedule`, `fp8_ns`)
 
-!!!  note `GefenMuonHybrid` defaults to `ns_schedule="tuned3"` for throughput. Keep it for the balanced SFT recipe; use `ns_schedule="standard"` for quality-first pretraining. `fp8_ns` is off by default.
+> [!NOTE]
+> `GefenMuonHybrid` defaults to `ns_schedule="tuned3"` for throughput. Keep it for the balanced SFT recipe; use `ns_schedule="standard"` for quality-first pretraining. `fp8_ns` is off by default.
 
 The orthogonalization step is ≈90% of a Muon step, so it has two speed levers:
 
@@ -517,7 +522,8 @@ opt = GefenMuonHybrid(
 
 ## Quality Lever: per-neuron 2nd moment on the Newton-Schulz output (`normuon`)
 
-!!! note On by default in `GefenMuonHybrid`; free on speed and memory. Disable with `normuon=False`.
+> [!NOTE]
+> On by default in `GefenMuonHybrid`; free on speed and memory. Disable with `normuon=False`.
 
 Muon's orthogonalization step leaves some output neurons taking slightly bigger steps than others. `normuon` (after [NorMuon](https://arxiv.org/abs/2510.05491)) evens that out by tracking a running average per neuron and normalizing against it — at essentially zero cost in speed or memory.
 
@@ -527,7 +533,8 @@ Muon's orthogonalization step leaves some output neurons taking slightly bigger 
 
 ## Experimental Lever: per-element Gefen-backup state on embed / LM-head (`backup_2d_period_one`)
 
-!!! note Opt-in, default off. Unlike the levers above, this one **costs memory** — it's a deliberate loss-for-memory trade.
+> [!NOTE]
+> Opt-in, default off. Unlike the levers above, this one **costs memory** — it's a deliberate loss-for-memory trade.
 
 With a Gefen backup, this knob gives embeddings and the LM head full per-element statistics, like AdamW keeps everywhere. It is a deliberate loss/memory experiment and has no effect in AdamW-backup mode because AdamW is already per-element.
 
@@ -549,7 +556,8 @@ A related opt-in, `stochastic_round=True`, switches the 8-bit momentum to unbias
 
 ## Experimental Lever: sharded Newton-Schulz under FSDP2 (`sharded_mode`)
 
-!!! note Opt-in. Default is `sharded_mode="exact"` (single-GPU parity).
+> [!NOTE]
+> Opt-in. Default is `sharded_mode="exact"` (single-GPU parity).
 
 Under FSDP2, Muon's orthogonalization needs each full weight matrix, but every GPU only holds a slice. Three strategies:
 
