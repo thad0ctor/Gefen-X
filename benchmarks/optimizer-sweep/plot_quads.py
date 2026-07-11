@@ -10,11 +10,6 @@ import csv
 import math
 import os
 
-import matplotlib
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt  # noqa: E402
-from matplotlib.patches import Patch  # noqa: E402
-
 ORDER = ["adamw_bf16", "adamw8bit", "adamw4bit", "gefen_fused", "gefen_nonfused", "gefen_muon"]
 LABEL = {"adamw_bf16": "AdamW\n(bf16)", "adamw8bit": "AdamW\n8-bit",
          "adamw4bit": "AdamW\n4-bit", "gefen_fused": "Gefen\n(fused)",
@@ -57,6 +52,12 @@ def best_idx(vals, direction):
 
 
 def main():
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from matplotlib.patches import Patch
+
     ap = argparse.ArgumentParser()
     ap.add_argument("--csv", required=True)
     ap.add_argument("--out-dir", required=True)

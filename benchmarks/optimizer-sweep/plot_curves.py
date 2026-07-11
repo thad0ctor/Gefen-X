@@ -15,11 +15,6 @@ import math
 import os
 import re
 
-import matplotlib
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt  # noqa: E402
-from matplotlib.lines import Line2D  # noqa: E402
-
 ORDER = ["adamw_bf16", "adamw8bit", "adamw4bit", "gefen_fused", "gefen_nonfused", "gefen_muon"]
 NAME = {"adamw_bf16": "AdamW (bf16)", "adamw8bit": "AdamW 8-bit", "adamw4bit": "AdamW 4-bit",
         "gefen_fused": "Gefen (fused)", "gefen_nonfused": "Gefen (non-fused)"}
@@ -62,6 +57,12 @@ def parse_log(path):
 
 
 def main():
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from matplotlib.lines import Line2D
+
     ap = argparse.ArgumentParser()
     ap.add_argument("--csv", required=True)
     ap.add_argument("--logs", required=True, help="dir with <tag>_<opt>.log files")
