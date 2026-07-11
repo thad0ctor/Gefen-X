@@ -35,7 +35,7 @@ full flag list.
 > `--muon-backup-optimizer gefen --muon-backup-lr-frac 0.5
 > --muon-backup-1d` for the low-memory alternative. The effective recipe is
 > recorded in every result line under `muon_flags`.
-
+>
 > **Note on the published `gefen_muon` throughput:** it reflects tuned3, which
 > is the retained SFT schedule and was faster than classic NS5 in the SFT
 > ablation. It is not universally loss-neutral: quality-first pretraining uses

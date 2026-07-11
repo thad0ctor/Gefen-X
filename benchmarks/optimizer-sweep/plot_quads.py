@@ -10,6 +10,8 @@ import csv
 import math
 import os
 
+from optimizer_sweep_plot_helpers import muon_recipe_text, optimizer_label
+
 ORDER = ["adamw_bf16", "adamw8bit", "adamw4bit", "gefen_fused", "gefen_nonfused", "gefen_muon"]
 LABEL = {"adamw_bf16": "AdamW\n(bf16)", "adamw8bit": "AdamW\n8-bit",
          "adamw4bit": "AdamW\n4-bit", "gefen_fused": "Gefen\n(fused)",
@@ -26,25 +28,6 @@ PANELS = [
 
 CONFIG = ("Full fine-tune . bf16 master weights . grad-checkpointing . seq 2048 . "
           "micro-batch 1 . Alpaca (packed) . constant LR")
-
-
-def optimizer_label(opt, row, *, multiline=False):
-    if opt != "gefen_muon":
-        return LABEL.get(opt, opt)
-    backup = row.get("muon_backup_optimizer", "").strip().lower()
-    suffix = {"adamw": "AdamW", "gefen": "Gefen"}.get(backup, "hybrid")
-    separator = "\n+ " if multiline else " + "
-    return f"Gefen Muon{separator}{suffix}"
-
-
-def muon_recipe_text(row):
-    variant = row.get("variant", "unspecified") or "unspecified"
-    schedule = row.get("muon_ns_schedule", "unspecified") or "unspecified"
-    normuon = str(row.get("muon_normuon", "")).lower() == "true"
-    normuon_text = "NorMuon" if normuon else "NorMuon off"
-    backup = row.get("muon_backup_optimizer", "").strip().lower()
-    backup_label = {"adamw": "AdamW", "gefen": "Gefen"}.get(backup, "unspecified")
-    return f"Muon row = {variant}: {schedule} + {normuon_text} + {backup_label} backup"
 
 
 def best_idx(vals, direction):
@@ -104,7 +87,12 @@ def main():
             bars[bi].set_linewidth(2.4)
             ax.set_xticks(range(len(opts)))
             ax.set_xticklabels(
-                [optimizer_label(o, mrows[o], multiline=True) for o in opts],
+                [
+                    optimizer_label(
+                        o, mrows[o], base_labels=LABEL, multiline=True
+                    )
+                    for o in opts
+                ],
                 fontsize=9.5,
             )
             ax.set_ylabel(unit, fontsize=10)
@@ -124,7 +112,7 @@ def main():
             ax.set_axisbelow(True)
 
         handles = [Patch(facecolor=COLOR.get(o, "#888888"), edgecolor="black",
-                         label=f"{optimizer_label(o, mrows[o])}  (lr {lr[o]})")
+                         label=f"{optimizer_label(o, mrows[o], base_labels=LABEL)}  (lr {lr[o]})")
                    for o in opts]
         fig.legend(handles=handles, loc="lower center", ncol=len(opts), fontsize=9.5,
                    frameon=False, bbox_to_anchor=(0.5, 0.04))

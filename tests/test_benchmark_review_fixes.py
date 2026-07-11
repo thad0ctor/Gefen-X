@@ -5,7 +5,6 @@ from __future__ import annotations
 import ast
 import csv
 import json
-import runpy
 import subprocess
 import sys
 from pathlib import Path
@@ -17,11 +16,11 @@ from benchmarks.microbench import profile_capturable_cohorts as cohort_profile
 
 
 ROOT = Path(__file__).resolve().parents[1]
-RUN_SH = ROOT / "benchmarks/optimizer-sweep/run.sh"
-SWEEP_CELL = ROOT / "benchmarks/optimizer-sweep/sweep_cell.py"
-BUILD_TABLE = ROOT / "benchmarks/optimizer-sweep/build_table.py"
-PLOT_QUADS = ROOT / "benchmarks/optimizer-sweep/plot_quads.py"
-PLOT_CURVES = ROOT / "benchmarks/optimizer-sweep/plot_curves.py"
+OPTIMIZER_SWEEP = ROOT / "benchmarks/optimizer-sweep"
+RUN_SH = OPTIMIZER_SWEEP / "run.sh"
+SWEEP_CELL = OPTIMIZER_SWEEP / "sweep_cell.py"
+BUILD_TABLE = OPTIMIZER_SWEEP / "build_table.py"
+PUBLISHED_RESULTS = ROOT / "docs/benchmarks/optimizer_comparison_2000steps.jsonl"
 
 
 def test_capturable_cohort_warmup_uses_synchronized_side_stream(monkeypatch):
@@ -174,7 +173,9 @@ if pathlib.Path(sys.argv[1]).name == "sweep_cell.py":
     assert cell_args[cell_args.index("--variant") + 1] == expected_variant
 
 
-def test_low_memory_recipe_metadata_drives_table_and_plot_labels(tmp_path):
+def test_low_memory_recipe_metadata_drives_table_and_plot_labels(
+    tmp_path, monkeypatch
+):
     result = {
         "tag": "tiny",
         "opt": "gefen_muon",
@@ -185,6 +186,7 @@ def test_low_memory_recipe_metadata_drives_table_and_plot_labels(tmp_path):
             "ns_schedule": "tuned3",
             "normuon": True,
         },
+        "provenance_status": "complete",
         "final_eval": 1.0,
         "final_train_ema": 1.1,
         "tok_per_s": 100.0,
@@ -211,14 +213,37 @@ def test_low_memory_recipe_metadata_drives_table_and_plot_labels(tmp_path):
     with (tmp_path / "comparison_table.csv").open(newline="") as handle:
         row = next(csv.DictReader(handle))
     assert row["variant"] == "low-memory"
+    assert row["provenance_status"] == "complete"
     assert row["muon_backup_optimizer"] == "gefen"
     assert row["muon_ns_schedule"] == "tuned3"
     assert row["muon_normuon"] == "True"
     assert "backup=gefen" in (tmp_path / "comparison_table.md").read_text()
 
-    quad = runpy.run_path(str(PLOT_QUADS))
-    curves = runpy.run_path(str(PLOT_CURVES))
-    assert quad["optimizer_label"]("gefen_muon", row) == "Gefen Muon + Gefen"
-    assert curves["optimizer_label"]("gefen_muon", row) == "Gefen Muon + Gefen"
-    assert "low-memory" in quad["muon_recipe_text"](row)
-    assert "Gefen backup" in curves["muon_recipe_text"](row)
+    monkeypatch.syspath_prepend(str(OPTIMIZER_SWEEP))
+    from optimizer_sweep_plot_helpers import muon_recipe_text, optimizer_label
+
+    assert optimizer_label("gefen_muon", row) == "Gefen Muon + Gefen"
+    assert "low-memory" in muon_recipe_text(row)
+    assert "Gefen backup" in muon_recipe_text(row)
+
+
+def test_published_rows_mark_missing_provenance_as_legacy_context():
+    rows = [
+        json.loads(line)
+        for line in PUBLISHED_RESULTS.read_text(encoding="utf-8").splitlines()
+        if line
+    ]
+
+    for row in rows:
+        provenance = (
+            row.get("gpu_uuid"),
+            row.get("torch_version"),
+            row.get("torch_cuda_version"),
+            (row.get("git") or {}).get("commit"),
+            (row.get("git") or {}).get("dirty"),
+        )
+        if row["provenance_status"] == "complete":
+            assert all(value is not None for value in provenance)
+        else:
+            assert row["provenance_status"] == "legacy_context_only"
+            assert all(value is None for value in provenance)

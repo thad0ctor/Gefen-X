@@ -15,6 +15,8 @@ import math
 import os
 import re
 
+from optimizer_sweep_plot_helpers import muon_recipe_text, optimizer_label
+
 ORDER = ["adamw_bf16", "adamw8bit", "adamw4bit", "gefen_fused", "gefen_nonfused", "gefen_muon"]
 NAME = {"adamw_bf16": "AdamW (bf16)", "adamw8bit": "AdamW 8-bit", "adamw4bit": "AdamW 4-bit",
         "gefen_fused": "Gefen (fused)", "gefen_nonfused": "Gefen (non-fused)"}
@@ -23,24 +25,6 @@ COLOR = {"adamw_bf16": "#9aa7b5", "adamw8bit": "#6b8cae", "adamw4bit": "#3f5e8c"
 
 CONFIG = ("Full fine-tune . bf16 master . grad-checkpointing . seq 2048 . mbs 1 . "
           "Alpaca (packed) . constant LR")
-
-
-def optimizer_label(opt, row):
-    if opt != "gefen_muon":
-        return NAME.get(opt, opt)
-    backup = row.get("muon_backup_optimizer", "").strip().lower()
-    suffix = {"adamw": "AdamW", "gefen": "Gefen"}.get(backup, "hybrid")
-    return f"Gefen Muon + {suffix}"
-
-
-def muon_recipe_text(row):
-    variant = row.get("variant", "unspecified") or "unspecified"
-    schedule = row.get("muon_ns_schedule", "unspecified") or "unspecified"
-    normuon = str(row.get("muon_normuon", "")).lower() == "true"
-    normuon_text = "NorMuon" if normuon else "NorMuon off"
-    backup = row.get("muon_backup_optimizer", "").strip().lower()
-    backup_label = {"adamw": "AdamW", "gefen": "Gefen"}.get(backup, "unspecified")
-    return f"Muon row = {variant}: {schedule} + {normuon_text} + {backup_label} backup"
 
 
 def parse_log(path):
@@ -104,7 +88,7 @@ def main():
             lw = 2.6 if o.startswith("gefen") else 1.8
             row = by_tag_opt[(tag, o)]
             ax.plot(s, ev, "-o", color=COLOR.get(o, "#888"), lw=lw, ms=3.5,
-                    label=f"{optimizer_label(o, row)}  "
+                    label=f"{optimizer_label(o, row, base_labels=NAME)}  "
                           f"(lr {lr_of[(tag, o)]})  -> {ev[-1]:.3f}")
             xe = [a for a, b in zip(s, ema) if b is not None]
             ye = [b for b in ema if b is not None]
@@ -150,7 +134,7 @@ def main():
             ax.scatter(x, y, s=320 if big else 200, color=COLOR.get(o, "#888"),
                        edgecolor="black", linewidth=1.4, zorder=3,
                        marker="*" if big else "o")
-            ax.annotate(f"{optimizer_label(o, r)}\n{y:.0f} tok/s . {x:.1f} GiB . "
+            ax.annotate(f"{optimizer_label(o, r, base_labels=NAME)}\n{y:.0f} tok/s . {x:.1f} GiB . "
                         f"{r['opt_state_bpp']} B/param",
                         (x, y), textcoords="offset points", xytext=(9, 6), fontsize=8.5,
                         fontweight="bold" if big else "normal")

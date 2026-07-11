@@ -177,6 +177,20 @@ def git_provenance():
 
 
 SOURCE_GIT = git_provenance()
+PROVENANCE_STATUS = (
+    "complete"
+    if all(
+        value is not None
+        for value in (
+            dev_uuid,
+            torch.__version__,
+            torch.version.cuda,
+            SOURCE_GIT["commit"],
+            SOURCE_GIT["dirty"],
+        )
+    )
+    else "incomplete"
+)
 
 ALPACA_PROMPT_NO_INPUT = (
     "Below is an instruction that describes a task. Write a response that "
@@ -497,7 +511,7 @@ res = {
     "steps": args.steps, "seq": BLOCK, "params_B": round(n_params / 1e9, 4),
     "gpu": dev_name, "gpu_uuid": dev_uuid,
     "torch_version": torch.__version__, "torch_cuda_version": torch.version.cuda,
-    "git": SOURCE_GIT,
+    "git": SOURCE_GIT, "provenance_status": PROVENANCE_STATUS,
     "final_train_ema": round(ema, 4),
     "eval0": round(eval0, 4), "final_eval": round(final_eval, 4),
     "tok_per_s": round(tok_s, 1), "peak_vram_gib": round(peak, 2),

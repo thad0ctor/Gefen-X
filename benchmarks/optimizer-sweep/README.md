@@ -142,8 +142,9 @@ Written to `--out`:
 - `results.jsonl` — one JSON line per cell (and `results_lrsweep.jsonl` if swept)
 - `comparison_table.csv` / `comparison_table.md` — the aggregate table + a
   per-model headline (loss gap, throughput ratio, VRAM saved, opt-state). The
-  CSV retains Muon variant/backend/schedule/NorMuon metadata so plots label
-  balanced and low-memory overrides correctly.
+  CSV retains provenance status and Muon variant/backend/schedule/NorMuon
+  metadata so consumers can distinguish legacy context and plots label balanced
+  and low-memory overrides correctly.
 - Six charts (per model x 3 figures, for 2 models):
   - `quad_<model>.png` — 2x2: eval loss / throughput / peak VRAM / opt-state
   - `loss_curve_<model>.png` — eval-loss curves (solid) + train-EMA (dashed)
