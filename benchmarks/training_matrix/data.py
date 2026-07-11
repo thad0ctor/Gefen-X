@@ -369,7 +369,7 @@ def build_dataset(
     max_train_blocks: int | None = None,
     max_train_bytes: int | None = None,
 ) -> DatasetBundle:
-    """Build a fixed validation set and exact per-update training order."""
+    """Build the exact requested validation set and per-update order, or raise."""
 
     if phase not in {"pretrain", "sft"}:
         raise ValueError("phase must be pretrain or sft")

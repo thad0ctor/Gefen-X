@@ -86,12 +86,17 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=8192,
         help="maximum disjoint packed training blocks before deterministic epoch cycling",
     )
-    parser.add_argument("--validation-blocks", type=_positive_int, default=256)
+    parser.add_argument(
+        "--validation-blocks",
+        type=_positive_int,
+        default=256,
+        help="exact held-out block count; abort if the reserved examples cannot supply it",
+    )
     parser.add_argument(
         "--validation-examples",
         type=_positive_int,
         default=8192,
-        help="disjoint shuffled examples reserved to build the validation blocks",
+        help="disjoint shuffled candidate pool used to build the exact validation-block count",
     )
     parser.add_argument("--eval-every", type=_positive_int, default=100)
     parser.add_argument("--tail-evals", type=_positive_int, default=10)

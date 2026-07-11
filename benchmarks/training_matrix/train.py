@@ -89,7 +89,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="microbatches per optimizer update (default gives 131k tokens/update at batch=4, seq=256)",
     )
     parser.add_argument("--seq-len", type=_positive_int, default=256)
-    parser.add_argument("--validation-blocks", type=_positive_int, default=256)
+    parser.add_argument(
+        "--validation-blocks",
+        type=_positive_int,
+        default=256,
+        help="exact held-out block count; abort if the data source cannot supply it",
+    )
     parser.add_argument("--eval-every", type=_positive_int, default=50)
     parser.add_argument("--tail-evals", type=_positive_int, default=10)
     parser.add_argument("--throughput-warmup", type=_nonnegative_int, default=5)

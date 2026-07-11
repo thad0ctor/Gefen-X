@@ -205,6 +205,25 @@ def test_batched_ns_cli_defaults_off_with_an_explicit_workspace_cap():
     assert enabled.batched_ns_workspace_bytes == 123456
 
 
+def test_validation_cli_defaults_request_exact_blocks_and_8192_candidate_examples():
+    tiny = parse_args(["--cell", "adamw"])
+    hf = parse_hf_sft_args(
+        [
+            "--cell",
+            "adamw",
+            "--model",
+            "unused",
+            "--lr",
+            "0.001",
+            "--results",
+            "unused.jsonl",
+        ]
+    )
+    assert tiny.validation_blocks == 256
+    assert hf.validation_blocks == 256
+    assert hf.validation_examples == 8192
+
+
 @pytest.mark.parametrize("cell", ALL_CELLS)
 def test_batched_ns_resolved_default_is_off_and_support_is_honest(cell):
     resolved = resolve_cell(cell, CellBuildConfig(lr=1e-3))
@@ -309,6 +328,12 @@ def test_auxiliary_only_isolation_edges_hold_hidden_recipe_fixed():
     }
     assert normuon_adamw["auxiliary"] == "torch.optim.AdamW"
     assert literal_hybrid["auxiliary"] == "gefen.Gefen"
+    assert recommended_adamw["auxiliary"] == "torch.optim.AdamW"
+    assert split_lr_hybrid["auxiliary"] == "gefen.Gefen"
+    assert normuon_adamw["backup_lr"] == literal_hybrid["backup_lr"] == pytest.approx(config.lr)
+    assert recommended_adamw["backup_lr"] == split_lr_hybrid["backup_lr"] == pytest.approx(
+        config.lr * 0.5
+    )
 
 
 def test_documented_screening_and_pretraining_preset_counts():
@@ -587,6 +612,25 @@ def test_dataset_seed_fixes_validation_and_training_order():
     assert set(first.training_source_hashes).isdisjoint(first.validation_source_hashes)
 
 
+def test_hf_split_fails_instead_of_returning_partial_validation(monkeypatch):
+    monkeypatch.setattr(
+        data_module,
+        "_load_hf",
+        lambda *args, **kwargs: [{"text": "abcdefgh"}, {"text": "ijklmnop"}],
+    )
+    with pytest.raises(ValueError, match=r"packed only 0/1 validation blocks"):
+        build_dataset(
+            phase="pretrain",
+            source="hf",
+            hf_dataset="example/too-small",
+            sequence_length=16,
+            validation_blocks=1,
+            updates=1,
+            batch_size=1,
+            seed=0,
+        )
+
+
 def test_pretraining_data_hash_reaches_packed_bulk_hash_path(monkeypatch):
     reference = build_dataset(
         phase="pretrain",
@@ -622,20 +666,25 @@ def test_pretraining_data_hash_reaches_packed_bulk_hash_path(monkeypatch):
     assert bundle.data_sha256 == legacy_logical_hash
 
 
-TINY_SHAKESPEARE_CACHE = (
+TINY_SHAKESPEARE_REVISION = "619106eee01474d8eaa5dd400b4b405eb3734ebe"
+TINY_SHAKESPEARE_CACHE_ROOT = (
     Path.home() / ".cache/huggingface/datasets/winglian___tiny-shakespeare"
+)
+TINY_SHAKESPEARE_REVISION_CACHE = next(
+    TINY_SHAKESPEARE_CACHE_ROOT.glob(f"*/*/{TINY_SHAKESPEARE_REVISION}"), None
 )
 
 
 @pytest.mark.skipif(
-    not TINY_SHAKESPEARE_CACHE.exists(),
-    reason="cached Tiny Shakespeare is an optional local integration asset",
+    TINY_SHAKESPEARE_REVISION_CACHE is None,
+    reason="the pinned Tiny Shakespeare revision is an optional local integration asset",
 )
 def test_cached_tiny_shakespeare_hash_groups_are_disjoint():
     bundle = build_dataset(
         phase="pretrain",
         source="hf",
         hf_dataset="winglian/tiny-shakespeare",
+        hf_revision=TINY_SHAKESPEARE_REVISION,
         hf_split="train",
         text_column="text",
         cache_only=True,
@@ -646,9 +695,11 @@ def test_cached_tiny_shakespeare_hash_groups_are_disjoint():
         seed=0,
     )
     assert len(bundle.validation_blocks) == 256
+    assert len(bundle.train_blocks) == 551
     assert set(bundle.training_source_ids).isdisjoint(bundle.validation_source_ids)
     assert set(bundle.training_source_hashes).isdisjoint(bundle.validation_source_hashes)
     assert bundle.source_metadata["original_row_count"] == 472
+    assert bundle.source_metadata["hf_revision"] == TINY_SHAKESPEARE_REVISION
     assert bundle.source_metadata["unitization_method"] == "whole_row_content_hash_groups"
 
 
