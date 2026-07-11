@@ -521,20 +521,16 @@ def _assert_state_dict_deep_equal(actual, expected, path="state_dict"):
         assert actual == expected, path
 
 
-@pytest.mark.parametrize(
-    ("target_backend", "checkpoint_backend"),
-    [("gefen", "adamw"), ("adamw", "gefen")],
-)
-def test_hybrid_rejected_cross_backend_load_is_a_true_no_op(
-    target_backend, checkpoint_backend
+def _assert_rejected_load_is_true_no_op(
+    foreign_model, checkpoint_backend, target_backend, raises_match
 ):
-    """A rejected cross-backend load must be a true no-op: state_dict deep-equal
-    to the pre-attempt snapshot, and subsequent steps bit-exact vs a control
-    optimizer that never attempted the load."""
+    """Prove a rejected load is a true no-op: save a foreign checkpoint from
+    ``foreign_model``, attempt to load it into a target hybrid (expecting
+    ``raises_match``), then assert the target's state_dict is deep-equal to
+    the pre-attempt snapshot and its subsequent steps stay bit-exact vs a
+    control optimizer that never attempted the load."""
     grads_all = _synthetic_grads(_small_model(), 5)
 
-    # Foreign checkpoint saved by a hybrid on the OTHER backup backend.
-    foreign_model = _small_model(seed=1)
     foreign = GefenMuonHybrid.from_model(
         foreign_model,
         lr=1e-3,
@@ -563,7 +559,7 @@ def test_hybrid_rejected_cross_backend_load_is_a_true_no_op(
             opt.zero_grad()
 
     snapshot = copy.deepcopy(opt_t.state_dict())
-    with pytest.raises(ValueError, match="backup_optimizer"):
+    with pytest.raises(ValueError, match=raises_match):
         opt_t.load_state_dict(foreign_sd)
 
     # (a) Optimizer state is fully intact after the rejected load.
@@ -577,8 +573,27 @@ def test_hybrid_rejected_cross_backend_load_is_a_true_no_op(
             opt.zero_grad()
     for param_t, param_c in zip(model_t.parameters(), model_c.parameters()):
         assert torch.equal(param_t, param_c), (
-            "rejected cross-backend load perturbed subsequent training"
+            "rejected load perturbed subsequent training"
         )
+
+
+@pytest.mark.parametrize(
+    ("target_backend", "checkpoint_backend"),
+    [("gefen", "adamw"), ("adamw", "gefen")],
+)
+def test_hybrid_rejected_cross_backend_load_is_a_true_no_op(
+    target_backend, checkpoint_backend
+):
+    """A rejected cross-backend load must be a true no-op: state_dict deep-equal
+    to the pre-attempt snapshot, and subsequent steps bit-exact vs a control
+    optimizer that never attempted the load."""
+    # Foreign checkpoint saved by a hybrid on the OTHER backup backend.
+    _assert_rejected_load_is_true_no_op(
+        _small_model(seed=1),
+        checkpoint_backend,
+        target_backend,
+        raises_match="backup_optimizer",
+    )
 
 
 @pytest.mark.parametrize("backup_optimizer", ["gefen", "adamw"])
@@ -588,8 +603,6 @@ def test_hybrid_rejected_backup_layout_load_is_a_true_no_op(backup_optimizer):
     snapshot, and subsequent steps bit-exact vs a control that never attempted
     the load. (The muon child loads first, so without rollback the hybrid was
     left half-loaded: new muon, old backup.)"""
-    grads_all = _synthetic_grads(_small_model(), 5)
-
     # Foreign checkpoint: identical muon half (same 2D linear weights), but an
     # extra LayerNorm adds two 1D params to the backup half, so the muon child
     # loads cleanly while the backup child's layout is rejected.
@@ -600,50 +613,12 @@ def test_hybrid_rejected_backup_layout_load_is_a_true_no_op(backup_optimizer):
         nn.Linear(48, 16),
         nn.LayerNorm(16),
     )
-    foreign = GefenMuonHybrid.from_model(
+    _assert_rejected_load_is_true_no_op(
         foreign_model,
-        lr=1e-3,
-        backup_optimizer=backup_optimizer,
-        fused=False,
+        backup_optimizer,
+        backup_optimizer,
+        raises_match="parameter group",
     )
-    for step_grads in _synthetic_grads(foreign_model, 2, seed=321):
-        _apply_grads(foreign_model, step_grads)
-        foreign.step()
-        foreign.zero_grad()
-    foreign_sd = copy.deepcopy(foreign.state_dict())
-
-    # Target and control: identical init, stepped on identical grads.
-    model_t = _small_model()
-    model_c = _small_model()
-    opt_t = GefenMuonHybrid.from_model(
-        model_t, lr=1e-3, backup_optimizer=backup_optimizer, fused=False
-    )
-    opt_c = GefenMuonHybrid.from_model(
-        model_c, lr=1e-3, backup_optimizer=backup_optimizer, fused=False
-    )
-    for step_grads in grads_all[:2]:
-        for model, opt in ((model_t, opt_t), (model_c, opt_c)):
-            _apply_grads(model, step_grads)
-            opt.step()
-            opt.zero_grad()
-
-    snapshot = copy.deepcopy(opt_t.state_dict())
-    with pytest.raises(ValueError, match="parameter group"):
-        opt_t.load_state_dict(foreign_sd)
-
-    # (a) Optimizer state is fully intact after the rejected load.
-    _assert_state_dict_deep_equal(opt_t.state_dict(), snapshot)
-
-    # (b) Subsequent steps stay bit-exact vs the control run.
-    for step_grads in grads_all[2:]:
-        for model, opt in ((model_t, opt_t), (model_c, opt_c)):
-            _apply_grads(model, step_grads)
-            opt.step()
-            opt.zero_grad()
-    for param_t, param_c in zip(model_t.parameters(), model_c.parameters()):
-        assert torch.equal(param_t, param_c), (
-            "rejected mismatched-backup load perturbed subsequent training"
-        )
 
 
 if __name__ == "__main__":

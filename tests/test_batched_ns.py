@@ -650,7 +650,7 @@ def test_mixed_step_batches_per_shape_and_keeps_serial_params_bit_equal(
         assert torch.equal(
             serial_state["m_magnitude"], batch_state["m_magnitude"]
         )
-        if name.split(".")[0].rstrip("0123456789") in ("mindim", "numel", "fp32"):
+        if name.split(".")[0] in ("mindim", "numel", "fp32"):
             # Serially-routed items must stay on the bit-identical path even
             # when batching engages for their step-mates.
             assert torch.equal(batched, serial)
