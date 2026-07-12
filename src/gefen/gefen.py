@@ -550,6 +550,16 @@ class Gefen(torch.optim.Optimizer):
             nearest-rounding accumulates in the EMA momentum over a long
             horizon. Only the fused CUDA automatic-step kernels honor it; a
             warning fires when the fused path is off.
+        deterministic (bool, default False): require replica-exact update
+            arithmetic on identical devices and inputs. Automatic block periods
+            use fixed-order GPU reductions instead of the atomic CUDA search.
+            Fused block-vmean parameters stay fused but use the fixed-order v1
+            reduction instead of the atomic v2-full path. Fused factored-v
+            parameters use the deterministic decomposed factored update because
+            the fast fused stats kernel accumulates column sums with unordered
+            floating-point atomics. This is an explicit throughput-for-
+            reproducibility mode; the default keeps the existing performance
+            routing unchanged.
         capturable (bool, default False): CUDA-graph capturability (mirrors
             torch.optim's argument). Everything that varies across steps --
             step counters, bias corrections, kernel scalars -- lives in device
@@ -579,9 +589,19 @@ class Gefen(torch.optim.Optimizer):
         factored_v_2d: bool = True,
         codebook_refresh_every: int = 0,
         stochastic_round: bool = False,
+        deterministic: bool = False,
         capturable: bool = False,
         verbose: bool = False,
     ):
+        if not isinstance(deterministic, bool):
+            raise TypeError("deterministic must be a bool")
+        if deterministic and factored_v_2d and stochastic_round:
+            raise ValueError(
+                "deterministic=True with factored_v_2d=True cannot honor "
+                "stochastic_round=True: the replica-exact factored path uses "
+                "deterministic nearest-codeword quantization. Disable stochastic "
+                "rounding or factored_v_2d."
+            )
         if fused and not torch.cuda.is_available():
             warnings.warn(
                 "Gefen optimizer got fused=True, but CUDA is not available. "
@@ -609,6 +629,7 @@ class Gefen(torch.optim.Optimizer):
             s.lower() for s in period_one_substrings
         )
         self._factored_v_2d = factored_v_2d
+        self._deterministic = deterministic
         if codebook_refresh_every < 0:
             raise ValueError(
                 "codebook_refresh_every must be >= 0 but is: {}".format(
@@ -1833,20 +1854,31 @@ class Gefen(torch.optim.Optimizer):
         self, param_name: str, param: torch.Tensor, grad: torch.Tensor
     ) -> int:
         backend = _resolve_find_period_backend(grad)
+        # The dedicated CUDA period-search kernel finishes each candidate's
+        # cross-block variance reduction with a floating-point atomicAdd. Its
+        # scheduling-dependent last bits normally do not affect the selected
+        # period, but a near tie can route otherwise-identical replicas to
+        # different state geometries before their first update. Deterministic
+        # mode therefore uses PyTorch's fixed-order CUDA reductions, including
+        # when a process-wide FIND_PERIOD_BACKEND override requested the faster
+        # atomic kernel.
+        if self._deterministic and backend == "cuda_kernel":
+            backend = "gpu"
         # ``fused=False`` is an explicit request for a pure-PyTorch optimizer
         # step, so it must not cross a different lazy-JIT boundary merely to
         # choose the block period. A failed fused-kernel probe has the same
-        # requirement. Keep honoring an explicit FIND_PERIOD_BACKEND override;
-        # callers that deliberately select ``cuda_kernel`` accept its JIT.
+        # requirement. Outside deterministic mode, keep honoring an explicit
+        # FIND_PERIOD_BACKEND override; callers that deliberately select
+        # ``cuda_kernel`` accept its JIT.
+        grad_work = grad.to_local() if hasattr(grad, "to_local") else grad
         if (
             backend == "cuda_kernel"
             and FIND_PERIOD_BACKEND is None
-            and grad.device.type == "cuda"
+            and grad_work.device.type == "cuda"
             and (not self.fused or self._fused_build_ok is False)
         ):
             backend = "gpu"
         if backend == "cuda_kernel":
-            grad_work = grad.to_local() if hasattr(grad, "to_local") else grad
             grad_flat = grad_work.detach().reshape(-1)
             try:
                 return find_period_by_block_variance(
@@ -1878,11 +1910,13 @@ class Gefen(torch.optim.Optimizer):
                 )
 
         if backend == "cpu":
-            period_input = grad.detach().float().square().reshape(-1).cpu().numpy()
+            period_input = (
+                grad_work.detach().float().square().reshape(-1).cpu().numpy()
+            )
         elif backend == "gpu":
-            if grad.device.type != "cuda":
+            if grad_work.device.type != "cuda":
                 raise ValueError("FIND_PERIOD_BACKEND='gpu' requires a CUDA tensor")
-            period_input = grad.detach().float().square().reshape(-1)
+            period_input = grad_work.detach().float().square().reshape(-1)
         else:
             raise ValueError("Unexpected FIND_PERIOD_BACKEND: {}".format(backend))
         return find_period_by_block_variance(
@@ -2102,6 +2136,7 @@ class Gefen(torch.optim.Optimizer):
             self._use_fused_gefen_automatic_step()
             and p.is_cuda
             and p.dtype != torch.float64
+            and not self._deterministic
         ):
             # Fused path. Phase 1 of the kernel computes the per-block absmax
             # AND the raw row/col grad^2 sums in ONE pass over grad + m_sign;
@@ -2197,9 +2232,13 @@ class Gefen(torch.optim.Optimizer):
         bias_correction_1 = 1 - beta1 ** state["step"]
         bias_correction_2 = 1 - beta2 ** state["factored_step"]
 
-        # Decomposed fallback (CPU / fused disabled). Row/col mean-square EMAs
-        # over bounded fp32 row-chunks (one chunk serves both reductions, so
-        # the transient stays ~a few chunk sizes), then whole-tensor torch ops.
+        # Decomposed fallback (CPU / fused disabled / deterministic factored-v).
+        # The fast factored CUDA stats kernel uses unordered floating-point
+        # atomicAdd operations for row/column partials, so deterministic mode
+        # deliberately reaches this fixed-order reduction path while block-vmean
+        # parameters continue using the fused v1 kernel. Row/col mean-square
+        # EMAs run over bounded fp32 row-chunks (one chunk serves both reductions,
+        # so the transient stays ~a few chunk sizes), then whole-tensor torch ops.
         grad2d = grad.detach()
         row_ms = torch.empty(rows, dtype=torch.float32, device=p.device)
         col_sq = torch.zeros(cols, dtype=torch.float32, device=p.device)
@@ -2222,7 +2261,7 @@ class Gefen(torch.optim.Optimizer):
         state["v_row"].mul_(beta2).add_(row_ms, alpha=1 - beta2)
         state["v_col"].mul_(beta2).add_(col_sq, alpha=1 - beta2)
 
-        # Decomposed fallback (CPU / fused disabled): whole-tensor torch ops.
+        # Decomposed fallback: whole-tensor torch ops.
         # The kernel above is the canonical numerics; this matches it within
         # float tolerance (different op association), not bit-for-bit.
         v_hat = torch.outer(state["v_row"], state["v_col"]).div_(
@@ -2813,7 +2852,13 @@ class Gefen(torch.optim.Optimizer):
             and grad_view.is_cuda
             and grad_view.dtype != torch.float64
         )
-        route_v2 = _should_use_v2_full(
+        # v2-full forms each block's grad^2 sum through floating-point atomics.
+        # The result is convergence-equivalent but not replica-exact because
+        # independent launches may observe a different accumulation order.
+        # Deterministic mode keeps the fused update and selects v1-full, whose
+        # fixed thread tree produces bit-identical vmean/parameter writes for
+        # identical inputs on a homogeneous architecture.
+        route_v2 = False if self._deterministic else _should_use_v2_full(
             grad_view.shape[0], automatic_period, grad_view.device
         )
         if (
@@ -3197,10 +3242,11 @@ class Gefen(torch.optim.Optimizer):
         Beyond the base ``torch.optim.Optimizer.state_dict`` contents (per-param
         state keyed by index and caller-preserved ``param_groups``), the dict
         carries each parameter's stable ``name`` in its state, plus
-        ``gefen_global_step`` and the frozen exact-DP ``gefen_codebook`` (without
-        it a resume would re-learn the codebook and desync the restored block
-        periods). Per-step scratch buffers are stripped, and non-owning state
-        views are compacted to tight clones so checkpoints stay small.
+        ``gefen_global_step``, the frozen exact-DP ``gefen_codebook`` (without it
+        a resume would re-learn the codebook and desync the restored block
+        periods), and the replica-determinism policy. Per-step scratch buffers
+        are stripped, and non-owning state views are compacted to tight clones
+        so checkpoints stay small.
 
         Only state entries whose parameter is still reachable from
         ``param_groups`` are serialized. Wrappers like DeepSpeed ZeRO-1/2
@@ -3287,6 +3333,7 @@ class Gefen(torch.optim.Optimizer):
             for pid, pstate in state_dict["state"].items()
         }
         state_dict["gefen_global_step"] = self._gefen_global_step
+        state_dict["gefen_deterministic"] = self._deterministic
         # The exact-DP codebook is learned once on the first step and then frozen
         # for the rest of the run. It is not per-param state, so persist it
         # explicitly; without it resume re-learns the codebook (see
@@ -3307,6 +3354,7 @@ class Gefen(torch.optim.Optimizer):
             "format_version": 1,
             "global_step": self._gefen_global_step,
             "codebook": self._gefen_codebook,
+            "deterministic": self._deterministic,
         }
         for group in state_dict["param_groups"]:
             group["_gefen_checkpoint_metadata"] = checkpoint_metadata
@@ -3378,13 +3426,16 @@ class Gefen(torch.optim.Optimizer):
         """Restore optimizer state saved by :meth:`state_dict`.
 
         On top of the base load this restores ``gefen_global_step`` and the
-        frozen codebook, and undoes the base class's dtype coercion of aux
-        state: ``torch.optim`` casts every floating state tensor to the owning
-        param's dtype, which would corrupt Gefen's fp32 moments and uint8
-        momentum indices on bf16 models, so each aux tensor is written back in
-        its ORIGINAL saved dtype. Step counters are normalized to this
-        optimizer's ``capturable`` mode (host ints vs 0-dim device tensors), so
-        checkpoints are portable across the toggle in either direction.
+        frozen codebook, verifies that an explicitly tagged checkpoint uses the
+        same replica-determinism policy as this optimizer, and undoes the base
+        class's dtype coercion of aux state: ``torch.optim`` casts every floating
+        state tensor to the owning param's dtype, which would corrupt Gefen's
+        fp32 moments and uint8 momentum indices on bf16 models, so each aux
+        tensor is written back in its ORIGINAL saved dtype. Step counters are
+        normalized to this optimizer's ``capturable`` mode (host ints vs 0-dim
+        device tensors), so checkpoints are portable across that toggle in
+        either direction. Legacy checkpoints with no deterministic tag remain
+        loadable and retain the live optimizer's configured policy.
         """
         # Shallow-copy so the pop()s below don't mutate the caller's checkpoint
         # dict (torch.optim.Optimizer.load_state_dict leaves its input intact);
@@ -3403,6 +3454,13 @@ class Gefen(torch.optim.Optimizer):
 
         gefen_global_step = state_dict.pop("gefen_global_step", None)
         gefen_codebook = state_dict.pop("gefen_codebook", None)
+        has_top_level_deterministic = "gefen_deterministic" in state_dict
+        gefen_deterministic = state_dict.pop("gefen_deterministic", None)
+        if has_top_level_deterministic and type(gefen_deterministic) is not bool:
+            raise ValueError(
+                "Gefen checkpoint top-level deterministic policy must be a bool, "
+                "got {!r}".format(gefen_deterministic)
+            )
         if group_metadata:
             if len(group_metadata) != len(state_dict["param_groups"]):
                 raise ValueError(
@@ -3415,6 +3473,15 @@ class Gefen(torch.optim.Optimizer):
                         first_metadata.get("format_version")
                     )
                 )
+            for metadata in group_metadata:
+                if (
+                    "deterministic" in metadata
+                    and type(metadata["deterministic"]) is not bool
+                ):
+                    raise ValueError(
+                        "Gefen checkpoint parameter-group deterministic policy "
+                        "must be a bool, got {!r}".format(metadata["deterministic"])
+                    )
             for metadata in group_metadata[1:]:
                 same_step = metadata.get("global_step") == first_metadata.get(
                     "global_step"
@@ -3429,13 +3496,17 @@ class Gefen(torch.optim.Optimizer):
                         and torch.equal(left_codebook, right_codebook)
                     )
                 )
-                if not same_step or not same_codebook:
+                same_deterministic = metadata.get(
+                    "deterministic"
+                ) == first_metadata.get("deterministic")
+                if not same_step or not same_codebook or not same_deterministic:
                     raise ValueError(
                         "Gefen checkpoint parameter groups carry inconsistent "
                         "optimizer metadata"
                     )
             metadata_step = first_metadata.get("global_step", 0)
             metadata_codebook = first_metadata.get("codebook")
+            metadata_deterministic = first_metadata.get("deterministic")
             if gefen_global_step is None:
                 gefen_global_step = metadata_step
             elif gefen_global_step != metadata_step:
@@ -3454,6 +3525,32 @@ class Gefen(torch.optim.Optimizer):
             ):
                 raise ValueError(
                     "Gefen checkpoint top-level and parameter-group codebooks disagree"
+                )
+            if gefen_deterministic is None:
+                gefen_deterministic = metadata_deterministic
+            elif (
+                metadata_deterministic is not None
+                and gefen_deterministic != metadata_deterministic
+            ):
+                raise ValueError(
+                    "Gefen checkpoint top-level and parameter-group deterministic "
+                    "policies disagree"
+                )
+        if gefen_deterministic is not None:
+            if type(gefen_deterministic) is not bool:
+                raise ValueError(
+                    "Gefen checkpoint deterministic policy must be a bool, got "
+                    "{!r}".format(gefen_deterministic)
+                )
+            if gefen_deterministic != self._deterministic:
+                raise ValueError(
+                    "Gefen checkpoint deterministic={!r}, but this optimizer was "
+                    "constructed with deterministic={!r}. Resuming under a "
+                    "different replica-determinism policy requires an intentional "
+                    "state migration or a fresh optimizer restart; refusing to "
+                    "change the policy silently.".format(
+                        gefen_deterministic, self._deterministic
+                    )
                 )
         if gefen_global_step is None:
             gefen_global_step = 0

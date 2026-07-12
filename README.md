@@ -118,6 +118,14 @@ Gefen drops into standard distributed training like any other PyTorch optimizer,
 
 > **DeepSpeed ZeRO config.** Set `"zero_allow_untested_optimizer": true` and leave the config's `optimizer` section unset. With optimizer CPU-offload, also set `"zero_force_ds_cpu_optimizer": false` — otherwise raw DeepSpeed refuses to initialize, and accelerate-based launchers (axolotl) silently swap in DeepSpeed's own CPU Adam. ZeRO steps flattened 1-D partitions, so `GefenMuon`/`GefenMuonHybrid` raise a clear error under ZeRO; use FSDP2, DDP, or single-GPU for the Muon family.
 
+## Replica-exact fused updates (`deterministic`)
+
+Set `deterministic=True` when data-parallel replicas must remain bit-exact on homogeneous GPUs. Automatic block periods are selected with fixed-order GPU reductions instead of the faster atomic CUDA search, block-vmean parameters remain fused through the fixed-order v1 CUDA reduction, and factored-v parameters use the deterministic decomposed factored update instead of the fused stats kernel's unordered floating-point atomics. The default is `False`, so existing performance routing is unchanged. Tagged checkpoints must resume with the same deterministic policy; legacy checkpoints without a tag remain loadable. Plain Gefen does not allow `deterministic=True`, `factored_v_2d=True`, and `stochastic_round=True` together because the deterministic factored fallback uses nearest-codeword quantization.
+
+```python
+optimizer = Gefen(model.named_parameters(), lr=3e-4, fused=True, deterministic=True)
+```
+
 ## CUDA Graphs & torch.compile (`capturable`)
 
 All three optimizers accept `capturable=True` (same meaning as `torch.optim`'s argument): `opt.step()` can then be captured in a `torch.cuda.CUDAGraph` or wrapped in `torch.compile(mode="reduce-overhead")` at no step-time cost — and the compiled hybrid step is about 10% faster than eager. Usage, caveats, and measured numbers: [COMPATIBILITY.md](https://github.com/thad0ctor/Gefen-X/blob/main/COMPATIBILITY.md#cuda-graphs--torchcompile-capturable).
@@ -457,6 +465,7 @@ This keeps both halves on quantized Gefen state and is the low-memory recommenda
 | `normuon` | `True` | free per-neuron 2nd moment on the NS output; recovers tuned3 quality in SFT — [details](#quality-lever-per-neuron-2nd-moment-on-the-newton-schulz-output-normuon) | keep on for SFT; disable for classic pretraining |
 | `backup_2d_period_one` | `False` | per-element 2nd moment on a Gefen-backed embedding/LM head — extra memory — [details](#experimental-lever-per-element-gefen-backup-state-on-embed--lm-head-backup_2d_period_one) | Gefen backup only; AdamW already keeps per-element moments |
 | `stochastic_round` | `False` | unbiased rounding for the 8-bit momentum (free, loss-neutral) | optional |
+| `deterministic` | `False` | replica-exact fused routing on homogeneous GPUs; persists in child checkpoints | enable when distributed replica hashes must match bit-for-bit |
 | `capturable` | `False` | CUDA-graph-capturable `step()`, like `torch.optim`'s `capturable` — [details](https://github.com/thad0ctor/Gefen-X/blob/main/COMPATIBILITY.md#cuda-graphs--torchcompile-capturable) | turn on to capture `step()` in a `torch.cuda.CUDAGraph` |
 
 It supports `step()`, `zero_grad()`, `state_dict()`/`load_state_dict()`, and LR schedulers (e.g. `torch.optim.lr_scheduler.StepLR(optimizer, ...)`) like any optimizer. Because it splits params at construction rather than taking a single iterable, build it yourself and hand it to the Hugging Face `Trainer` via `optimizers=` (not `optimizer_cls_and_kwargs`):

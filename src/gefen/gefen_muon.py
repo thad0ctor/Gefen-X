@@ -508,6 +508,11 @@ class GefenMuon(Gefen):
             opt-in path's approximate numerical result.
         stochastic_round: stochastically round the 8-bit momentum quantization
             (debiases it; throughput-neutral opt-in).
+        deterministic: persist and enforce Gefen's replica-determinism policy
+            across checkpoints. GefenMuon's fused momentum reduction is already
+            replica-exact on homogeneous GPUs (it uses order-independent max
+            reductions); the flag is forwarded so hybrid Muon/backup children
+            share one explicit policy.
         normuon: NorMuon-style per-row 2nd-moment normalization of the NS
             output (default False here; GefenMuonHybrid turns it on).
         normuon_beta2: EMA coefficient in [0, 1) for the normuon row statistic.
@@ -539,6 +544,7 @@ class GefenMuon(Gefen):
         batched_ns: bool = False,
         batched_ns_workspace_bytes: int = BATCHED_NS_DEFAULT_WORKSPACE_BYTES,
         stochastic_round: bool = False,
+        deterministic: bool = False,
         normuon: bool = False,
         normuon_beta2: float = 0.95,
         normuon_eps: float = 1e-8,
@@ -719,7 +725,13 @@ class GefenMuon(Gefen):
             eps=eps,
             weight_decay=weight_decay,
             fused=fused,
+            # GefenMuon owns its second-moment/update pipeline; plain Gefen's
+            # factored-v routing is unused here. Pinning it off also keeps the
+            # valid deterministic+stochastic-round Muon combination distinct
+            # from plain Gefen's deterministic factored fallback.
+            factored_v_2d=False,
             stochastic_round=stochastic_round,
+            deterministic=deterministic,
             capturable=capturable,
             verbose=verbose,
         )

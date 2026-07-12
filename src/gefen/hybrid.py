@@ -252,6 +252,7 @@ class GefenMuonHybrid(torch.optim.Optimizer):
         batched_ns=False,
         batched_ns_workspace_bytes=256 << 20,
         stochastic_round=False,
+        deterministic=False,
         normuon=True,
         normuon_beta2=0.95,
         normuon_eps=1e-8,
@@ -318,9 +319,13 @@ class GefenMuonHybrid(torch.optim.Optimizer):
                 Note ``normuon=True`` and ``ns_schedule="tuned3"`` are the
                 hybrid's defaults, unlike raw GefenMuon.
             capturable: forwarded to both halves. ``stochastic_round`` and
-                ``verbose`` are forwarded to Gefen children; with an AdamW
-                backup they apply only to the Muon half.
+                ``deterministic`` are forwarded to Gefen children; with an
+                AdamW backup they apply only to the Muon half. ``verbose`` is
+                likewise forwarded to Gefen children.
         """
+        if not isinstance(deterministic, bool):
+            raise TypeError("deterministic must be a bool")
+        self._deterministic = deterministic
         if backup_named_params is None:
             # Single-argument convenience form: the first arg is a model or a
             # named-param iterable to split internally.
@@ -438,6 +443,7 @@ class GefenMuonHybrid(torch.optim.Optimizer):
                 batched_ns=batched_ns,
                 batched_ns_workspace_bytes=batched_ns_workspace_bytes,
                 stochastic_round=stochastic_round,
+                deterministic=deterministic,
                 normuon=normuon,
                 normuon_beta2=normuon_beta2,
                 normuon_eps=normuon_eps,
@@ -506,6 +512,7 @@ class GefenMuonHybrid(torch.optim.Optimizer):
                 # embedding/head, not the untested factored-v combination.
                 factored_v_2d=False,
                 stochastic_round=stochastic_round,
+                deterministic=deterministic,
                 capturable=capturable,
                 verbose=verbose,
             )
