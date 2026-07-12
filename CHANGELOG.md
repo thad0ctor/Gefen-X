@@ -4,6 +4,24 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+API and compatibility:
+
+- `GefenMuonHybrid` now accepts `backup_optimizer="gefen" | "adamw"`. Gefen remains the backward-compatible, minimum-state default; AdamW provides conventional per-element state for embeddings, heads, norms, and biases in the measured SFT/pretraining quality recipes. This choice is independent of `fused` execution.
+- Hybrid checkpoints record the selected backup backend. Untagged legacy checkpoints retain Gefen semantics, while cross-backend loads fail before either child is loaded.
+
+Performance:
+
+- Add an explicit `batched_ns=True` Muon experiment that groups repeated small bf16 matrices into strided-batched Newton--Schulz GEMMs. It is conservatively gated (batch >= 8, min dimension <= 512, <= 2^20 elements/matrix), chunks to a configurable tensor-workspace budget (256 MiB by default via `batched_ns_workspace_bytes`), and leaves undersized tails on the serial path. End-to-end benefit depends on how much of the model is eligible and remains something to benchmark, rather than an unconditional speedup.
+- Muon's fused quantized-momentum path now switches medium/large periods to the split magnitude reducer and emits eight adjacent values per thread with vectorized memory traffic plus the bit-exact codebook-search LUT. On the RTX 3090 386M-parameter census this cuts momentum time by about 36% and the full 3-iteration Muon step by about 1.7% (reproduce with `benchmarks/microbench/profile_muon_step.py --layers 8`).
+- Fully-fused v1/v2 routing is calibrated against the current full kernels instead of reusing the legacy partial-update crossover, avoiding 1.2-3.5x misroutes in the measured tiny/medium/large-period regimes.
+- Non-contiguous 2D parameters stay on the factored fused CUDA path through a contiguous work buffer and copy-back (2.19 ms to 0.18 ms for a 2048x2048 bf16 parameter on RTX 3090) instead of falling back to decomposed PyTorch.
+- The v1/v2 sweep no longer clones all mutable tensors inside the timed loop.
+
+Numerics:
+
+- `batched_ns` is off by default because strided-batched GEMMs change reduction order. The quantized momentum state remains unchanged, but the NS output is close rather than bit-identical; batch membership and workspace chunking can also change that approximation. Enable it only for measured training trials.
+- Fully-fused v1/v2 routing now prioritizes the faster current kernel for eager as well as capturable execution. Because the two kernels reduce block-vmean sums in different orders, tensors whose route changes may follow a sub-ULP different vmean/parameter trajectory after upgrading; quantized momentum indices and magnitudes remain bit-identical. `GEFEN_UPDATE_V2=0` or `1` can isolate either path for diagnostics.
+
 ## [0.2.0] - 2026-07-08
 
 Renames the distribution to `gefen-x` and lands a production-readiness pass ahead of proposing Gefen as an optimizer for training platforms. `gefen-x` is a maintained fork of the original [Gefen](https://github.com/ndvbd/Gefen), published under a distinct distribution name so it can evolve independently on PyPI; the import name remains `gefen`.

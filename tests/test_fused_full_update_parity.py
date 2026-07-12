@@ -42,6 +42,7 @@ CASES = [
     (64 * 333, 64),      # rows=4, num_blocks % 4 == 1
     (100 * 555, 100),    # non-pow2 period (tpr=128, rows=2), odd num_blocks
     (8 * 129, 8),        # rows=32, tiny period + remainder
+    (2048 * 1024, 1),    # eager tiny-tail routing may select v1 at period one
 ]
 STEPS = [1, 2, 7, 50]  # bias corrections vary with step
 

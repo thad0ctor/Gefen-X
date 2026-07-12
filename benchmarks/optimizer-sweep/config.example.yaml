@@ -18,6 +18,8 @@ out: ./out
 # These are PCI-bus-ordered indices (run.sh exports CUDA_DEVICE_ORDER=PCI_BUS_ID,
 # so they match the Index column of `./run.sh --list-gpus` / nvidia-smi).
 gpus: "1,2,4,5,7"
+# Optional physical-device guard for retained single-GPU runs.
+# expected_cuda_uuid: GPU-22becb18-bef9-4f98-4eee-5fc4bb8c7a53
 
 # Regime / run knobs (all optional; shown with their built-in defaults).
 steps: 2000              # final-run steps per cell
@@ -27,10 +29,12 @@ seed: 0                  # data order / RNG seed
 dataset: tatsu-lab/alpaca
 eval_every: 50           # intermediate eval-logging cadence
 muon_adjust: match_rms_adamw
-# gefen_muon recommended config (the published table/plots use these): split LR
-# (backup_lr = fraction x the cell LR) + per-element 2nd moment on 1D params.
-muon_backup_lr_fraction: 0.5
-muon_backup_1d: true
+# This is an SFT suite, so the default Gefen-Muon row uses the balanced SFT
+# recipe: tuned3 + NorMuon with a full-LR AdamW backup. For the ~1 B/param
+# low-memory recipe, select gefen, fraction 0.5, and muon_backup_1d: true.
+muon_backup_optimizer: adamw
+muon_backup_lr_fraction: 1.0
+muon_backup_1d: false
 # per-neuron 2nd moment on the NS output (throughput-free loss lever, ON by
 # default in GefenMuonHybrid; comment the key out to follow the shipped
 # default, or set false to disable)
@@ -43,7 +47,7 @@ opts: "adamw_bf16 adamw8bit adamw4bit gefen_fused gefen_muon"
 no_muon: false
 
 # Re-derive each optimizer's best LR on this hardware before the finals,
-# instead of the documented fair LRs.
+# instead of the documented task LRs.
 lr_sweep: false
 
 # Models to benchmark. tag groups results; label is the display name in the

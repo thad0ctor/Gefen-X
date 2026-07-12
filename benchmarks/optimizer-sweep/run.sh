@@ -21,11 +21,17 @@ set -u
 export CUDA_DEVICE_ORDER=PCI_BUS_ID
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
+REPO_ROOT="$(cd "$HERE/../.." && pwd)"
+# Always benchmark the checkout containing this launcher. The selected venv may
+# have another Gefen worktree installed editable, which would silently measure
+# stale defaults without this explicit source precedence.
+export PYTHONPATH="$REPO_ROOT/src${PYTHONPATH:+:$PYTHONPATH}"
 
 # ---- built-in defaults (overridden by config.yaml, then by CLI) ----
 PY=""
 OUT=""
 GPUS=""
+EXPECTED_CUDA_UUID=""
 STEPS=2000
 SEQ=2048
 ARCH="8.6"
@@ -35,10 +41,12 @@ EVAL_EVERY=50
 LR_SWEEP=0
 SWEEP_STEPS=175
 MUON_ADJUST="match_rms_adamw"
-# gefen_muon recommended config (the published table/plots use these): split LR
-# (backup_lr = fraction x the cell LR) + per-element 2nd moment on 1D params.
-MUON_BACKUP_LR_FRACTION="0.5"
-MUON_BACKUP_1D=1
+# The optimizer sweep is SFT, so its Gefen-Muon row follows the balanced SFT
+# recipe: tuned3 + NorMuon with a full-LR AdamW backup. The constructor itself
+# remains backward-compatible and defaults to the lower-memory Gefen backup.
+MUON_BACKUP_OPTIMIZER="adamw"
+MUON_BACKUP_LR_FRACTION="1.0"
+MUON_BACKUP_1D=0
 # per-neuron 2nd moment on the NS output (throughput-free; see hybrid docstring).
 # ""=follow the shipped GefenMuonHybrid default (ON), 1=force on, 0=force off.
 MUON_NORMUON=""
@@ -69,12 +77,13 @@ list_gpus() {
     --format=csv,noheader | awk -F', ' '{printf "  %s  %-28s  %s  used %s / %s\n",$1,$2,$3,$4,$5}'
 }
 
-# fair default LRs (each optimizer's own optimum); overridden by --lr-sweep
+# documented task LRs (AdamW/Gefen short-sweep optima; Muon retained SFT LR);
+# overridden by --lr-sweep
 fair_lr() {
   case "$1" in
     adamw_bf16|adamw8bit|adamw4bit) echo "5e-5" ;;
     gefen_fused|gefen_nonfused)     echo "3e-5" ;;  # factored-v default (block-v legacy: 2e-5)
-    gefen_muon)                     echo "5e-5" ;;
+    gefen_muon)                     echo "3e-5" ;;
     *) echo "5e-5" ;;
   esac
 }
@@ -84,7 +93,7 @@ sweep_grid() {
   case "$1" in
     adamw_bf16|adamw8bit|adamw4bit) echo "1e-5 2e-5 5e-5 1e-4" ;;
     gefen_fused|gefen_nonfused)     echo "1e-5 2e-5 3e-5 5e-5" ;;
-    gefen_muon)                     echo "1e-5 2e-5 5e-5 1e-4" ;;
+    gefen_muon)                     echo "1e-5 2e-5 3e-5 5e-5" ;;
     *) echo "1e-5 2e-5 5e-5" ;;
   esac
 }
@@ -106,6 +115,7 @@ Required (here or in the config):
                          datasets, transformers.
   --out <dir>            Output dir for results.jsonl, logs/, table, charts.
   --gpus "a,b,c"         PCI-ordered CUDA device indices to use (round-robin).
+  --expected-cuda-uuid U Physical GPU guard for retained single-GPU runs.
   At least one model:
     --model <tag>=<path>   Repeatable. tag groups results (e.g. qwen1p7b=/models/Qwen3-1.7B).
     --model-0p6b <path>    Convenience for --model qwen0p6b=<path>.
@@ -126,8 +136,10 @@ Options:
   --no-muon              Drop gefen_muon from the run (it is in the default set but is
                          the slowest optimizer; use this to skip the Newton-Schulz cost).
   --muon-adjust MODE     gefen_muon adjust_lr_fn (default $MUON_ADJUST).
+  --muon-backup-optimizer NAME  backup for embed/head/norm/bias: adamw or gefen
+                         (SFT sweep default: $MUON_BACKUP_OPTIMIZER).
   --muon-backup-lr-frac F  gefen_muon backup_lr as a fraction of the cell LR (default $MUON_BACKUP_LR_FRACTION).
-  --muon-backup-1d       enable gefen_muon backup_1d_period_one (default: on).
+  --muon-backup-1d       enable Gefen-backup 1D period-one (SFT default: off).
   --no-muon-backup-1d    disable gefen_muon backup_1d_period_one.
   --muon-normuon         force ON gefen_muon normuon (per-neuron 2nd moment on
                          the Newton-Schulz output; throughput-free). Default:
@@ -135,7 +147,7 @@ Options:
   --no-muon-normuon      force OFF gefen_muon normuon.
   --eval-every N         Intermediate eval-logging cadence (default $EVAL_EVERY).
   --lr-sweep             Run a short per-optimizer LR sweep first and use each
-                         optimizer's best LR for the finals (default: documented fair LRs).
+                         optimizer's best LR for the finals (default: documented task LRs).
   --sweep-steps N        Steps per LR-sweep cell (default $SWEEP_STEPS).
   -h, --help             This help.
 
@@ -162,6 +174,7 @@ while [ $# -gt 0 ]; do
     --venv)        PY="$2"; CLI_SET[venv]=1; shift 2 ;;
     --out)         OUT="$2"; CLI_SET[out]=1; shift 2 ;;
     --gpus)        GPUS="$2"; CLI_SET[gpus]=1; shift 2 ;;
+    --expected-cuda-uuid) EXPECTED_CUDA_UUID="$2"; CLI_SET[expected_cuda_uuid]=1; shift 2 ;;
     --steps)       STEPS="$2"; CLI_SET[steps]=1; shift 2 ;;
     --seq)         SEQ="$2"; CLI_SET[seq]=1; shift 2 ;;
     --arch)        ARCH="$2"; CLI_SET[arch]=1; shift 2 ;;
@@ -170,6 +183,7 @@ while [ $# -gt 0 ]; do
     --opts)        OPTS="$2"; CLI_SET[opts]=1; shift 2 ;;
     --no-muon)     NO_MUON=1; CLI_SET[no_muon]=1; shift ;;
     --muon-adjust) MUON_ADJUST="$2"; CLI_SET[muon_adjust]=1; shift 2 ;;
+    --muon-backup-optimizer) MUON_BACKUP_OPTIMIZER="$2"; CLI_SET[muon_backup_optimizer]=1; shift 2 ;;
     --muon-backup-lr-frac) MUON_BACKUP_LR_FRACTION="$2"; CLI_SET[muon_backup_lr_fraction]=1; shift 2 ;;
     --muon-backup-1d) MUON_BACKUP_1D=1; CLI_SET[muon_backup_1d]=1; shift ;;
     --no-muon-backup-1d) MUON_BACKUP_1D=0; CLI_SET[muon_backup_1d]=1; shift ;;
@@ -208,6 +222,7 @@ if [ -n "$CONFIG" ]; then
       venv)        set_if_unset venv PY "$v1" ;;
       out)         set_if_unset out OUT "$v1" ;;
       gpus)        set_if_unset gpus GPUS "$v1" ;;
+      expected_cuda_uuid) set_if_unset expected_cuda_uuid EXPECTED_CUDA_UUID "$v1" ;;
       steps)       set_if_unset steps STEPS "$v1" ;;
       seq)         set_if_unset seq SEQ "$v1" ;;
       arch)        set_if_unset arch ARCH "$v1" ;;
@@ -215,6 +230,7 @@ if [ -n "$CONFIG" ]; then
       dataset)     set_if_unset dataset DATASET "$v1" ;;
       opts)        set_if_unset opts OPTS "$v1" ;;
       muon_adjust) set_if_unset muon_adjust MUON_ADJUST "$v1" ;;
+      muon_backup_optimizer) set_if_unset muon_backup_optimizer MUON_BACKUP_OPTIMIZER "$v1" ;;
       muon_backup_lr_fraction) set_if_unset muon_backup_lr_fraction MUON_BACKUP_LR_FRACTION "$v1" ;;
       muon_backup_1d) [ -n "${CLI_SET[muon_backup_1d]:-}" ] || { [ "$v1" = "false" ] && MUON_BACKUP_1D=0 || MUON_BACKUP_1D=1; } ;;
       muon_normuon) [ -n "${CLI_SET[muon_normuon]:-}" ] || { [ "$v1" = "true" ] && MUON_NORMUON=1 || MUON_NORMUON=0; } ;;
@@ -246,6 +262,10 @@ fi
 IFS=',' read -r -a GPU_ARR <<< "$GPUS"
 [ "${#GPU_ARR[@]}" -gt 0 ] || die "no GPUs parsed from '$GPUS'"
 validate_float muon_backup_lr_fraction "$MUON_BACKUP_LR_FRACTION"
+case "$MUON_BACKUP_OPTIMIZER" in
+  gefen|adamw) : ;;
+  *) die "muon_backup_optimizer must be gefen or adamw, got '$MUON_BACKUP_OPTIMIZER'" ;;
+esac
 
 # Tables/plots compare optimizers within a model side by side, which is only
 # apples-to-apples on one GPU type; round-robin pins by index, not model, so warn
@@ -271,9 +291,11 @@ echo "config:  ${CONFIG:-<none>}"
 echo "venv:    $PY"
 echo "out:     $OUT"
 echo "gpus:    ${GPU_ARR[*]}  (PCI order)"
+[ -n "$EXPECTED_CUDA_UUID" ] && echo "uuid:    $EXPECTED_CUDA_UUID"
 echo "models:  ${TAGS[*]}"
 echo "opts:    $OPTS"
 echo "steps:   $STEPS   lr_sweep: $LR_SWEEP"
+echo "muon:    backup=$MUON_BACKUP_OPTIMIZER backup_lr_fraction=$MUON_BACKUP_LR_FRACTION backup_1d=$MUON_BACKUP_1D"
 [ "$DRY" -eq 1 ] && { echo "(dry run: config resolved OK; not launching)"; exit 0; }
 
 mkdir -p "$OUT" "$OUT/logs"
@@ -308,23 +330,34 @@ next_gpu() { # echoes a free gpu id, blocking until one frees
 
 run_cell() { # gpu tag model opt lr steps out logfile
   local gpu="$1" tag="$2" model="$3" opt="$4" lr="$5" steps="$6" out="$7" log="$8"
-  # gefen_muon: apply the recommended config (split backup LR + 1D period-one).
+  # gefen_muon: apply the selected task recipe and record it explicitly.
   local muon_flags=()
+  local uuid_flags=()
+  [ -n "$EXPECTED_CUDA_UUID" ] && uuid_flags+=(--expected-cuda-uuid "$EXPECTED_CUDA_UUID")
   if [ "$opt" = "gefen_muon" ]; then
     local blr
     blr=$(awk -v l="$lr" -v f="$MUON_BACKUP_LR_FRACTION" 'BEGIN{printf "%g", l*f}')
-    muon_flags+=(--backup-lr "$blr")
+    muon_flags+=(--muon-backup-optimizer "$MUON_BACKUP_OPTIMIZER" --backup-lr "$blr")
     [ "$MUON_BACKUP_1D" = "1" ] && muon_flags+=(--backup-1d-period-one)
     [ "$MUON_NORMUON" = "1" ] && muon_flags+=(--muon-normuon)
     [ "$MUON_NORMUON" = "0" ] && muon_flags+=(--no-muon-normuon)
-    # only label the run "recommended" when the config matches the defaults
-    # (normuon ""/1 both mean on -- the shipped default); label the explicit
-    # opt-out "recommended-no-normuon" and anything else "custom" so
-    # overridden runs aren't mislabeled.
-    if [ "$MUON_ADJUST" = "match_rms_adamw" ] && [ "$MUON_BACKUP_LR_FRACTION" = "0.5" ] \
-       && [ "$MUON_BACKUP_1D" = "1" ]; then
-      [ "$MUON_NORMUON" = "0" ] && muon_flags+=(--variant recommended-no-normuon) \
-        || muon_flags+=(--variant recommended)
+    # Label the two documented task recipes; anything else is custom. An empty
+    # MUON_NORMUON follows the hybrid default (on), so it belongs to either
+    # recipe just like an explicit 1.
+    is_frac() {
+      awk -v f="$MUON_BACKUP_LR_FRACTION" -v target="$1" \
+        'BEGIN { exit !((f + 0) == (target + 0)) }'
+    }
+    if [ "$MUON_ADJUST" = "match_rms_adamw" ] \
+       && [ "$MUON_BACKUP_OPTIMIZER" = "adamw" ] \
+       && is_frac 1.0 \
+       && [ "$MUON_BACKUP_1D" = "0" ] && [ "$MUON_NORMUON" != "0" ]; then
+      muon_flags+=(--variant sft-balanced)
+    elif [ "$MUON_ADJUST" = "match_rms_adamw" ] \
+         && [ "$MUON_BACKUP_OPTIMIZER" = "gefen" ] \
+         && is_frac 0.5 \
+         && [ "$MUON_BACKUP_1D" = "1" ] && [ "$MUON_NORMUON" != "0" ]; then
+      muon_flags+=(--variant low-memory)
     else
       muon_flags+=(--variant custom)
     fi
@@ -333,6 +366,7 @@ run_cell() { # gpu tag model opt lr steps out logfile
   "$PY" "$CELL" --opt "$opt" --model "$model" --lr "$lr" --seed "$SEED" \
     --steps "$steps" --seq "$SEQ" --gpu "$gpu" --arch "$ARCH" --tag "$tag" \
     --dataset "$DATASET" --eval-every "$EVAL_EVERY" --muon-adjust "$MUON_ADJUST" \
+    "${uuid_flags[@]}" \
     "${muon_flags[@]}" --out "$out" > "$log" 2>&1
   local rc=$?
   echo "[done  $(date +%T)] $tag $opt rc=$rc"

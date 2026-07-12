@@ -10,15 +10,16 @@ import csv
 import math
 import os
 
-import matplotlib
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt  # noqa: E402
-from matplotlib.patches import Patch  # noqa: E402
+from optimizer_sweep_plot_helpers import (
+    cohort_flags_winners,
+    muon_recipe_text,
+    optimizer_label,
+)
 
 ORDER = ["adamw_bf16", "adamw8bit", "adamw4bit", "gefen_fused", "gefen_nonfused", "gefen_muon"]
 LABEL = {"adamw_bf16": "AdamW\n(bf16)", "adamw8bit": "AdamW\n8-bit",
          "adamw4bit": "AdamW\n4-bit", "gefen_fused": "Gefen\n(fused)",
-         "gefen_nonfused": "Gefen\n(non-fused)", "gefen_muon": "Gefen\nMuon"}
+         "gefen_nonfused": "Gefen\n(non-fused)"}
 COLOR = {"adamw_bf16": "#9aa7b5", "adamw8bit": "#6b8cae", "adamw4bit": "#4a6fa5",
          "gefen_fused": "#e07b39", "gefen_nonfused": "#d68a4e", "gefen_muon": "#c25b1f"}
 
@@ -30,8 +31,7 @@ PANELS = [
 ]
 
 CONFIG = ("Full fine-tune . bf16 master weights . grad-checkpointing . seq 2048 . "
-          "micro-batch 1 . Alpaca (packed) . constant LR\n"
-          "Each optimizer at its own fair LR . green outline / star = best in panel")
+          "micro-batch 1 . Alpaca (packed) . constant LR")
 
 
 def best_idx(vals, direction):
@@ -39,14 +39,18 @@ def best_idx(vals, direction):
 
 
 def main():
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from matplotlib.patches import Patch
+
     ap = argparse.ArgumentParser()
     ap.add_argument("--csv", required=True)
     ap.add_argument("--out-dir", required=True)
     ap.add_argument("--subtitle", default="",
                     help="optional extra footer line (e.g. hardware / date / LRs)")
     args = ap.parse_args()
-    config_text = CONFIG + ("\n" + args.subtitle if args.subtitle else "")
-
     rows = list(csv.DictReader(open(args.csv)))
     for r in rows:
         for k in ("final_eval_loss", "final_train_ema", "tok_per_s",
@@ -63,6 +67,23 @@ def main():
         mrows = {r["optimizer"]: r for r in rows if r["tag"] == tag}
         opts = [o for o in ORDER if o in mrows]
         lr = {o: mrows[o]["LR"] for o in opts}
+        # best-in-panel is flagged only in fully provenance-complete cohorts;
+        # mixed cohorts (any legacy_context_only row) get no winner markers.
+        flag_winners = cohort_flags_winners(mrows[o] for o in opts)
+        config_lines = [CONFIG]
+        recipe_bits = []
+        if "gefen_muon" in mrows:
+            recipe_bits.append(muon_recipe_text(mrows["gefen_muon"]))
+        if flag_winners:
+            recipe_bits.append("green outline / star = best in panel")
+        else:
+            recipe_bits.append(
+                "mixed-provenance cohort (legacy context rows): no best-in-panel marked"
+            )
+        config_lines.append(" . ".join(recipe_bits))
+        if args.subtitle:
+            config_lines.append(args.subtitle)
+        config_text = "\n".join(config_lines)
 
         fig, axes = plt.subplots(2, 2, figsize=(12.5, 9.5))
         fig.suptitle(f"{disp} - optimizer comparison  (loss . speed . memory)",
@@ -71,13 +92,22 @@ def main():
         for ax, (key, title, unit, direction) in zip(axes.flat, PANELS):
             vals = [mrows[o][key] for o in opts]
             colors = [COLOR.get(o, "#888888") for o in opts]
-            bi = best_idx(vals, direction)
+            bi = best_idx(vals, direction) if flag_winners else None
             bars = ax.bar(range(len(opts)), vals, color=colors,
                           edgecolor="black", linewidth=0.6, width=0.66)
-            bars[bi].set_edgecolor("#1a7a1a")
-            bars[bi].set_linewidth(2.4)
+            if bi is not None:
+                bars[bi].set_edgecolor("#1a7a1a")
+                bars[bi].set_linewidth(2.4)
             ax.set_xticks(range(len(opts)))
-            ax.set_xticklabels([LABEL.get(o, o) for o in opts], fontsize=9.5)
+            ax.set_xticklabels(
+                [
+                    optimizer_label(
+                        o, mrows[o], base_labels=LABEL, multiline=True
+                    )
+                    for o in opts
+                ],
+                fontsize=9.5,
+            )
             ax.set_ylabel(unit, fontsize=10)
             arrow = "lower is better" if direction == "lower" else "higher is better"
             ax.set_title(f"{title}   ({arrow})", fontsize=12, fontweight="bold")
@@ -95,7 +125,7 @@ def main():
             ax.set_axisbelow(True)
 
         handles = [Patch(facecolor=COLOR.get(o, "#888888"), edgecolor="black",
-                         label=f"{LABEL.get(o, o).replace(chr(10), ' ')}  (lr {lr[o]})")
+                         label=f"{optimizer_label(o, mrows[o], base_labels=LABEL)}  (lr {lr[o]})")
                    for o in opts]
         fig.legend(handles=handles, loc="lower center", ncol=len(opts), fontsize=9.5,
                    frameon=False, bbox_to_anchor=(0.5, 0.04))

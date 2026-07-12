@@ -86,7 +86,8 @@ def run():
     # --- C. state_dict round-trip ---
     _step(opt, params)  # build some optimizer state
     sd = copy.deepcopy(opt.state_dict())
-    assert set(sd.keys()) == {"muon", "backup"}
+    assert set(sd.keys()) == {"muon", "backup", "backup_optimizer"}
+    assert sd["backup_optimizer"] == "gefen"
     opt2, params2 = _build()
     _step(opt2, params2)  # populate live state so load has matching structure
     crashed = None

@@ -79,11 +79,13 @@ void gefen_quantized_momentum_update_cuda(
     at::Tensor m_sign,
     at::Tensor m_magnitude,
     at::Tensor codebook,
+    at::Tensor lut,
     at::Tensor momentum_out,
     double beta1,
     bool stochastic_round,
     int64_t rng_seed,
-    c10::optional<at::Tensor> seed_dev
+    c10::optional<at::Tensor> seed_dev,
+    bool nesterov
 );
 
 void gefen_factored_update_cuda(
@@ -237,15 +239,18 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         "gefen_quantized_momentum_update_cuda",
         &gefen_quantized_momentum_update_cuda,
         "Muon quantized-momentum update: update the quantized momentum state and "
-        "emit the dense quantized momentum for Newton-Schulz in one pass (CUDA)",
+        "emit the dense quantized momentum (optionally exact Nesterov) for "
+        "Newton-Schulz in one pass (CUDA)",
         py::arg("grad_view"),
         py::arg("m_sign"),
         py::arg("m_magnitude"),
         py::arg("codebook"),
+        py::arg("lut"),
         py::arg("momentum_out"),
         py::arg("beta1"),
         py::arg("stochastic_round") = false,
         py::arg("rng_seed") = 0,
-        py::arg("seed_dev") = py::none()
+        py::arg("seed_dev") = py::none(),
+        py::arg("nesterov") = false
     );
 }

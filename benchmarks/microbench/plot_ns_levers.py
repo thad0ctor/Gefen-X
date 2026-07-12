@@ -3,7 +3,7 @@
   * muon_ns_loss.png       -- real-training eval loss vs step, AdamW + every
                               Muon NS variant (does any lever hurt loss?)
   * muon_ns_throughput.png -- full-step training throughput (tok/s) for every
-                              Muon NS variant, with speedup vs default annotated
+                              Muon NS variant, with speedup vs classic NS5
 
 Variants are discovered from the committed stability logs
 (docs/benchmarks/logs/ns_stability_*.log); each log's RESULT line carries the
@@ -33,7 +33,7 @@ _DOCS = os.path.join(_REPO, "docs", "benchmarks")
 
 # (ns_schedule, fp8) -> short key / display label / color, in display order.
 VARIANTS = [
-    (("standard", False), "standard",   "Muon (default)", "#3f5e8c"),
+    (("standard", False), "standard",   "classic NS5", "#3f5e8c"),
     (("tuned3",   False), "tuned3",     "tuned3",         "#8c3f7a"),
     (("tuned4",   False), "tuned4",     "tuned4",         "#2e8b57"),
     (("standard", True),  "fp8",        "fp8",            "#c25b1f"),
@@ -102,8 +102,11 @@ def main():
         if s:
             adamw = {"steps": s, "ev": ev}
 
-    dev = "RTX 5090"
-    sub = f"Qwen3-0.6B · {dev} · {args.steps} steps · lr 5e-5"
+    loss_sub = (
+        f"Qwen3-0.6B · Muon variants RTX 5090 · AdamW reference RTX 3090 "
+        f"· {args.steps} steps · lr 5e-5"
+    )
+    throughput_sub = f"Qwen3-0.6B · RTX 5090 · {args.steps} steps · lr 5e-5"
 
     # ---------------- chart 1: loss ----------------
     fig, ax = plt.subplots(figsize=(10.5, 6.4))
@@ -119,8 +122,8 @@ def main():
                 label=f"{LABEL[k]} -> {v['ev'][-1]:.3f}")
     ax.set_xlabel("training step")
     ax.set_ylabel("held-out eval loss  ->  lower is better")
-    ax.set_title("Gefen-Muon faster Newton-Schulz — real-training loss\n" + sub +
-                 "  ·  do the opt-in NS levers hurt loss?",
+    ax.set_title("Gefen-Muon faster Newton-Schulz — real-training loss\n" + loss_sub +
+                 "  ·  how do the schedules affect loss?",
                  fontsize=12, fontweight="bold")
     ax.grid(alpha=0.25)
     ax.set_axisbelow(True)
@@ -144,7 +147,7 @@ def main():
         t = variants[k]["tps"]
         lab = f"{t:.0f} tok/s"
         if base:
-            lab += f"\n{t/base:.2f}× vs default"
+            lab += f"\n{t/base:.2f}× vs classic NS5"
         ax.text(i, t + vmax * 0.012, lab, ha="center", va="bottom",
                 fontsize=9.5, fontweight="bold")
     if base:
@@ -153,7 +156,7 @@ def main():
     ax.set_xticklabels([LABEL[k] for k in bars], fontsize=10)
     ax.set_ylabel("full-step training throughput (tokens/sec)  ->  higher is better")
     ax.set_ylim(0, vmax * 1.16)
-    ax.set_title("Gefen-Muon faster Newton-Schulz — end-to-end throughput\n" + sub +
+    ax.set_title("Gefen-Muon faster Newton-Schulz — end-to-end throughput\n" + throughput_sub +
                  "  ·  full-step tok/s (NS + model fwd/bwd)",
                  fontsize=12, fontweight="bold")
     ax.grid(axis="y", alpha=0.25)

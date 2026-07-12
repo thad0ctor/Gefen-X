@@ -13,6 +13,8 @@ close in aggregate, not bit-for-bit.
 Run: python tests/test_gefen_factored_v.py
 """
 
+from unittest import mock
+
 import torch  # noqa: E402
 import torch.nn as nn  # noqa: E402
 
@@ -22,6 +24,7 @@ except ImportError:  # pragma: no cover
     pytest = None
 
 from gefen import Gefen  # noqa: E402
+import gefen.gefen as gefen_mod  # noqa: E402
 
 
 def _run(fused, steps=6, shape=(768, 512), seed=3, **opt_kwargs):
@@ -109,6 +112,89 @@ def check_state_and_flag_hygiene():
     return True
 
 
+def check_noncontiguous_fused_copyback(capturable=False):
+    """A strided 2D Parameter must stay on the factored CUDA path.
+
+    Compare it with a contiguous tensor carrying identical values/gradients;
+    spy on the fused call to prove that every step receives a distinct
+    contiguous work tensor rather than the strided Parameter itself.  This
+    covers both the contiguous-work-buffer update and copy-back end to end.
+    """
+    torch.manual_seed(17)
+    rows, cols = 256, 192
+    init = (torch.randn(rows, cols, device="cuda") * 0.02).bfloat16()
+    parent = torch.empty(rows, cols * 2, device="cuda", dtype=init.dtype)
+    noncontig = parent[:, ::2]
+    noncontig.copy_(init)
+    assert not noncontig.is_contiguous()
+
+    p_ref = nn.Parameter(init.clone())
+    p_nc = nn.Parameter(noncontig.detach())
+    before = p_nc.detach().clone()
+    opt_ref = Gefen(
+        [("w", p_ref)], lr=1e-3, fused=True, factored_v_2d=True,
+        capturable=capturable,
+    )
+    opt_nc = Gefen(
+        [("w", p_nc)], lr=1e-3, fused=True, factored_v_2d=True,
+        capturable=capturable,
+    )
+    torch.manual_seed(18)
+    grads = [
+        torch.randn(rows, cols, device="cuda").bfloat16() * 1e-3
+        for _ in range(3)
+    ]
+    for grad in grads:
+        p_ref.grad = grad.clone()
+        opt_ref.step()
+
+    fused_update = gefen_mod._gefen_factored_update_cuda
+    with mock.patch.object(
+        gefen_mod, "_gefen_factored_update_cuda", wraps=fused_update
+    ) as fused_spy:
+        for step, grad in enumerate(grads, start=1):
+            calls_before = fused_spy.call_count
+            p_nc.grad = grad.clone()
+            opt_nc.step()
+            assert fused_spy.call_count == calls_before + 1, (
+                f"step {step} did not issue exactly one fused factored update"
+            )
+
+    assert fused_spy.call_count == len(grads)
+    for step, call in enumerate(fused_spy.call_args_list, start=1):
+        p_kernel = call.args[0]
+        assert p_kernel.is_contiguous(), f"step {step} kernel input is strided"
+        assert p_kernel is not p_nc, f"step {step} passed the Parameter directly"
+        assert p_kernel.data_ptr() != p_nc.data_ptr(), (
+            f"step {step} kernel input aliases the strided Parameter storage"
+        )
+        assert (call.kwargs.get("step_scalars") is not None) is capturable, (
+            f"step {step} did not use the expected capturable scalar path"
+        )
+
+    assert not p_nc.is_contiguous()
+    assert not torch.equal(before, p_nc)
+    if capturable:
+        # Capturable factored updates derive mean(v_row) through block-reduced
+        # atomicAdd operations. Independent launches can therefore land a few
+        # bf16 values on an adjacent rounding boundary; use the same calibrated
+        # envelope as test_parity_gefen_factored_fused.
+        diff = (p_ref.detach().float() - p_nc.detach().float()).abs()
+        max_diff = diff.max().item()
+        frac_diff = (diff > 0).float().mean().item()
+        assert max_diff <= 1.5e-3, max_diff
+        assert frac_diff <= 1e-3, frac_diff
+    else:
+        assert torch.equal(p_ref, p_nc)
+    sr = opt_ref.state[p_ref]
+    sn = opt_nc.state[p_nc]
+    assert torch.equal(sr["m_codebook"], sn["m_codebook"])
+    assert torch.equal(sr["m_magnitude"], sn["m_magnitude"])
+    assert torch.allclose(sr["v_row"], sn["v_row"], rtol=2e-6, atol=1e-12)
+    assert torch.allclose(sr["v_col"], sn["v_col"], rtol=2e-6, atol=1e-12)
+    return True
+
+
 def check_tall_matrix_grid_stride():
     """rows > 65535 * TILE_ROWS exceeds CUDA's grid.y with one tile per
     block-row; the stats kernel must cover the tail via its y-grid-stride.
@@ -168,6 +254,11 @@ def run():
         ("single_step_adjacency", check_single_step_adjacency),
         ("transient_memory_bounded", check_transient_memory_bounded),
         ("state_and_flag_hygiene", check_state_and_flag_hygiene),
+        ("noncontiguous_fused_copyback", check_noncontiguous_fused_copyback),
+        (
+            "noncontiguous_fused_copyback_capturable",
+            lambda: check_noncontiguous_fused_copyback(capturable=True),
+        ),
         ("pre_factored_checkpoint_resume", check_pre_factored_checkpoint_resume),
         ("tall_matrix_grid_stride", check_tall_matrix_grid_stride),
     ]
@@ -201,6 +292,11 @@ if pytest is not None:
     @_skip
     def test_state_and_flag_hygiene():
         assert check_state_and_flag_hygiene()
+
+    @_skip
+    @pytest.mark.parametrize("capturable", [False, True])
+    def test_noncontiguous_fused_copyback(capturable):
+        assert check_noncontiguous_fused_copyback(capturable=capturable)
 
     @_skip
     def test_pre_factored_checkpoint_resume():

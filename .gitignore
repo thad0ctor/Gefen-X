@@ -15,6 +15,10 @@ dist/
 # Local prepared benchmark dataset (load_from_disk; ~68MB, machine-local)
 benchmarks/data/
 
+# Generated optimizer-matrix results, logs, and checkpoints
+benchmarks/training_matrix/out/
+benchmarks/training_matrix/RESULTS_*.md
+
 # Toy fine-tuning example outputs (generated data + saved checkpoints)
 examples/toy-finetune/data/
 examples/toy-finetune/runs/

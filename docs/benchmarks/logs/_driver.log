@@ -1,17 +1,18 @@
-[start 12:28:26] qwen1p7b adamw8bit gpu=2 lr=5e-5
-[start 12:28:26] qwen1p7b adamw_bf16 gpu=4 lr=5e-5
-[start 12:28:26] qwen1p7b adamw4bit gpu=5 lr=5e-5
-[start 12:28:26] qwen0p6b adamw8bit gpu=1 lr=5e-5
-[start 12:28:26] qwen0p6b adamw_bf16 gpu=7 lr=5e-5
-[done  12:43:00] qwen0p6b adamw_bf16 rc=0
-[start 12:43:00] qwen0p6b gefen_fused gpu=7 lr=2e-5
-[done  12:43:44] qwen0p6b adamw8bit rc=0
-[start 12:43:44] qwen0p6b adamw4bit gpu=1 lr=5e-5
-[done  12:55:05] qwen1p7b adamw_bf16 rc=0
-[done  12:57:01] qwen1p7b adamw8bit rc=0
-[start 12:57:01] qwen1p7b gefen_fused gpu=2 lr=2e-5
-[done  12:57:59] qwen0p6b gefen_fused rc=0
-[done  13:00:33] qwen1p7b adamw4bit rc=0
-[done  13:01:44] qwen0p6b adamw4bit rc=0
-[done  13:23:36] qwen1p7b gefen_fused rc=0
-ALL DONE 13:23:36
+[retained refresh 2026-07-10]
+gpu=NVIDIA GeForce RTX 3090 uuid=GPU-22becb18-bef9-4f98-4eee-5fc4bb8c7a53 pci_index=2
+source_commit=5287abbbee8572b4e627871374400b0f8c0e639b dirty=false
+torch=2.12.0+cu133 cuda=13.3 steps=2000 sequence=2048 seed=0
+
+# Complete Qwen3-0.6B set rerun sequentially on the main physical card.
+[done 15:46:13] qwen0p6b adamw_bf16 lr=5e-5 rc=0
+[done 15:59:13] qwen0p6b adamw8bit lr=5e-5 rc=0
+[done 16:12:52] qwen0p6b adamw4bit lr=5e-5 rc=0
+[done 16:25:31] qwen0p6b gefen_fused lr=3e-5 rc=0
+[done 16:43:24] qwen0p6b gefen_muon lr=3e-5 variant=sft-balanced backup=adamw rc=0
+
+# Only the impacted Qwen3-1.7B Muon row was rerun; unchanged RTX 3090
+# baseline logs remain from their prior retained runs.
+[start 16:43:44] qwen1p7b gefen_muon lr=3e-5 variant=sft-balanced backup=adamw
+[done  17:34:22] qwen1p7b gefen_muon rc=0
+
+ALL IMPACTED RETAINED RUNS DONE 17:34:22

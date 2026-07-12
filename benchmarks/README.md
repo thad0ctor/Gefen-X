@@ -1,36 +1,76 @@
 # Gefen benchmarks
 
-Reproducible benchmarks behind the numbers in the top-level [README](../README.md#benchmarks). Three suites, each self-contained (point it at a model + some GPUs and it regenerates its data → tables/plots):
+These suites measure optimizer quality, throughput, memory, and Muon-specific execution modes. Each suite README defines its inputs, outputs, and full command-line interface.
 
-| Suite | What it measures | GPUs | How to run |
-|---|---|---|---|
-| [`optimizer-sweep/`](optimizer-sweep/README.md) | AdamW vs Gefen vs Gefen-Muon on a full fine-tune — eval loss, throughput, peak VRAM, optimizer-state bytes/param (the main table + quad / loss-curve / throughput-vs-VRAM plots) | single GPU per cell | `bash optimizer-sweep/run.sh` |
-| [`sharding-sweep/`](sharding-sweep/README.md) | GefenMuon `sharded_mode` (exact / distributed / approx) convergence + throughput under FSDP2 as shard count grows | 2–4 GPUs | `bash sharding-sweep/run.sh` |
-| `microbench/` | Newton-Schulz kernel-level studies — tuned coefficient schedules, fp8, the speed/quality of the NS speed levers | single GPU (fp8 needs sm_89+) | see scripts below |
+## Suites
 
-## Quick start (optimizer sweep)
+| Suite | Purpose | Entry point |
+|---|---|---|
+| [`optimizer-sweep/`](optimizer-sweep/README.md) | Compare AdamW, Gefen, and Gefen-Muon on full-model SFT: validation loss, throughput, peak VRAM, and optimizer-state bytes per parameter | `bash benchmarks/optimizer-sweep/run.sh` |
+| [`training_matrix/`](training_matrix/README.md) | Compare controlled AdamW/Muon recipes across full-model HF SFT, small-model pretraining, and checkpoint handoff | `PYTHONPATH=.:src python -m benchmarks.training_matrix.run_matrix` |
+| [`sharding-sweep/`](sharding-sweep/README.md) | Compare Gefen-Muon `sharded_mode` choices under FSDP2 across world sizes | `bash benchmarks/sharding-sweep/run.sh` |
+| [`microbench/`](microbench/) | Measure Newton–Schulz schedules, fp8 and batched kernels, capturable steps, and distributed Muon internals | `PYTHONPATH=.:src python benchmarks/microbench/bench_ns_schedule.py --help` |
+
+## Canonical published results
+
+The top-level [benchmark summary](../README.md#benchmarks) is the user-facing result overview. Canonical machine-readable optimizer-comparison rows are [`optimizer_comparison_2000steps.csv`](../docs/benchmarks/optimizer_comparison_2000steps.csv) and [`optimizer_comparison_2000steps.jsonl`](../docs/benchmarks/optimizer_comparison_2000steps.jsonl); supporting logs and plots live in [`docs/benchmarks/`](../docs/benchmarks/). Generated suite outputs remain local unless they appear in those checked-in artifacts.
+
+## Run a suite
+
+Run each block from the repository root.
+
+Optimizer comparison:
 
 ```bash
-cd benchmarks/optimizer-sweep
-cp config.example.yaml config.yaml      # edit models / GPUs / dataset
-bash run.sh                             # LR-sweep (optional) → 2000-step finals → table → plots
+(
+  cd benchmarks/optimizer-sweep
+  cp config.example.yaml config.yaml
+  $EDITOR config.yaml
+  bash run.sh
+)
 ```
-Outputs land in the configured out-dir: per-cell logs, `results.jsonl`, `comparison_table.{md,csv}`, and the PNGs. Each suite README documents the regime, config precedence, GPU pinning, and the exact reproduce-it commands.
 
-## Reproducing the published Gefen-Muon numbers
+Training matrix help and CPU smoke:
 
-`run.sh` applies the **recommended Gefen-Muon config by default** — `adjust_lr_fn=match_rms_adamw`, `backup_lr = 0.5 × the cell LR`, `backup_1d_period_one`, and (via the `GefenMuonHybrid` default) `normuon`, the throughput-free per-neuron 2nd moment on the Newton-Schulz output (see the `GefenMuonHybrid` docstring). Override via config keys (`muon_adjust`, `muon_backup_lr_fraction`, `muon_backup_1d`, `muon_normuon`) or flags (`--muon-adjust`, `--muon-backup-lr-frac`, `--no-muon-backup-1d`, `--no-muon-normuon`). See [the optimizer-sweep README](optimizer-sweep/README.md) for the full flag list.
+```bash
+PYTHONPATH=.:src python -m benchmarks.training_matrix.run_matrix --help
+PYTHONPATH=.:src python -m benchmarks.training_matrix.run_matrix --cells adamw --execute \
+  --output-dir /tmp/gefen-matrix-cpu -- \
+  --phase pretrain --source synthetic --steps 1 --batch-size 1 \
+  --gradient-accumulation-steps 1 --seq-len 16 --validation-blocks 1 \
+  --eval-every 1 --tail-evals 1 --throughput-warmup 0 \
+  --lr 1e-3 --weight-decay 0.01 --schedule constant \
+  --hidden-size 16 --intermediate-size 32 --layers 1 --heads 2 --kv-heads 1 \
+  --device cpu --dtype float32 --no-fused
+```
 
-> The published `gefen_muon` numbers use the shipped defaults, including `normuon`. Pass `--no-muon-normuon` to disable it (results are then labeled `recommended-no-normuon`); the isolated normuon ablation (0.6B: −0.007/−0.010 final eval over two seeds; 1.7B: ≈⅓ of the residual gap to AdamW on the tail-mean of the last 10 evals) is documented in the main README's normuon section.
+FSDP2 sharding comparison:
 
-> **Note on the published `gefen_muon` throughput:** it reflects the current `GefenMuonHybrid` default `ns_schedule="tuned3"` (loss-neutral, ≈1.4× the classic quintic — measured +38%/+39% on the 3090-class GPUs used). `run.sh` reproduces it (tuned3 is the default); pass `--ns-schedule standard` to `sweep_cell` for the bit-identical classic quintic (≈0.7× the throughput, same loss). The other optimizers' rows are schedule-independent.
+```bash
+(
+  cd benchmarks/sharding-sweep
+  cp config.example.yaml config.yaml
+  $EDITOR config.yaml
+  bash run.sh
+)
+```
 
-## microbench scripts
+Representative microbenchmarks:
 
-Run from `benchmarks/microbench/` with `gefen` importable (fp8 paths require an sm_89+ GPU):
+```bash
+PYTHONPATH=.:src python benchmarks/microbench/bench_ns_schedule.py --help
+PYTHONPATH=.:src python benchmarks/microbench/bench_ns_fp8.py --help
+PYTHONPATH=.:src python benchmarks/microbench/bench_batched_ns.py --help
+PYTHONPATH=.:src python benchmarks/microbench/bench_capturable_step.py --help
+PYTHONPATH=.:src python benchmarks/microbench/profile_capturable_cohorts.py --help
+```
 
-- `bench_ns_schedule.py` / `plot_ns_schedule.py` — tuned NS coefficient schedules (tuned3 / tuned4) vs the standard 5-step quintic: per-shape step time + orthogonality.
-- `bench_ns_fp8.py` / `plot_ns_fp8.py` — fp8 (e4m3) NS vs bf16: per-shape step time + orthogonality drift.
-- `bench_capturable_step.py` — 386M-param optimizer-step timing for eager, capturable eager, manual CUDA graph replay, and `torch.compile(mode="reduce-overhead")`, reporting tail-window CUDA and wall time plus peak allocated memory.
-- `plot_ns_levers.py` — the consolidated "faster Newton-Schulz" charts (real-training loss + end-to-end throughput across NS variants).
-- `bench_muon_fsdp2.py`, `profile_muon_step.py`, `derive_ns_schedule.py` — distributed-Muon timing, per-op Muon-step profiler, and the schedule-coefficient derivation.
+## Reproducibility requirements
+
+- Record the exact commit and any local source diff; preserve suite-emitted provenance with the results.
+- Keep model and dataset inputs immutable, and record the seed, initialization, optimizer recipe, update count, effective batch, schedule, and evaluation policy.
+- Compare throughput only on the same physical GPU model and UUID with the same software stack, timing scope, warmup policy, and no competing workload.
+- For `training_matrix`, compare result rows only when their recorded comparison context and data fingerprints match.
+- Use repeated seeds for quality conclusions and forward/reverse or rotated cell order for sensitive throughput comparisons.
+
+Use each suite's README for configuration precedence, GPU selection, output schemas, and complete reproduction commands.

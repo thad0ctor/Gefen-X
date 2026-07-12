@@ -1,0 +1,50 @@
+{
+  "pretrain_cells": [
+    "adamw",
+    "gefen_hybrid_recommended"
+  ],
+  "sft_cells": [
+    "adamw",
+    "gefen_hybrid_recommended"
+  ],
+  "shared": {
+    "seed": 0,
+    "seq_len": 1024,
+    "batch_size": 1,
+    "validation_blocks": 256,
+    "tail_evals": 10,
+    "lr": 0.001,
+    "weight_decay": 0.01,
+    "preset": "pretrain_134m",
+    "schedule": "warmup_cosine",
+    "cache_only": true,
+    "device": "cuda",
+    "dtype": "bfloat16",
+    "fused": true,
+    "batched_ns": false,
+    "batched_ns_workspace_bytes": 268435456,
+    "expected_device_name": "RTX 3090",
+    "expected_cuda_uuid": "GPU-22becb18-bef9-4f98-4eee-5fc4bb8c7a53"
+  },
+  "pretrain": {
+    "source": "hf",
+    "hf_dataset": "EleutherAI/wikitext_document_level",
+    "hf_config": "wikitext-103-raw-v1",
+    "hf_revision": "647234772b9554e208af6c826f23b99e3cac88c8",
+    "hf_split": "train",
+    "hf_validation_split": "validation",
+    "text_column": "page",
+    "max_train_bytes": 167772160,
+    "gradient_accumulation_steps": 128,
+    "steps": 1024,
+    "eval_every": 100
+  },
+  "sft": {
+    "source": "hf",
+    "hf_dataset": "tatsu-lab/alpaca",
+    "hf_revision": "dce01c9b08f87459cf36a430d809084718273017",
+    "gradient_accumulation_steps": 1,
+    "steps": 1000,
+    "eval_every": 50
+  }
+}
