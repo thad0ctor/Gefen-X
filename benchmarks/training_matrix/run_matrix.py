@@ -82,19 +82,32 @@ def commands(args: argparse.Namespace) -> list[list[str]]:
     return planned
 
 
+def _generated_dirs(args) -> tuple[Path, ...]:
+    """Dirs the cells write into: --output-dir plus a forwarded --results dir."""
+    generated = [Path(args.output_dir)]
+    forwarded = list(args.train_args)
+    if forwarded[:1] == ["--"]:
+        forwarded = forwarded[1:]
+    if "--results" in forwarded:
+        index = forwarded.index("--results")
+        if index + 1 < len(forwarded):
+            generated.append(Path(forwarded[index + 1]).parent)
+    return tuple(generated)
+
+
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
     planned = commands(args)
-    output = Path(args.output_dir)
+    generated = _generated_dirs(args)
     root = Path(__file__).resolve().parents[2]
     env = os.environ.copy()
     env["PYTHONPATH"] = str(root / "src") + os.pathsep + env.get("PYTHONPATH", "")
-    captured_source = source_fingerprint(root, exclude_dirs=(output,))
+    captured_source = source_fingerprint(root, exclude_dirs=generated)
     env[SOURCE_FINGERPRINT_ENV] = canonical_json(captured_source)
     print(f"# {len(planned)} sequential cells; working tree: {root}")
     for index, command in enumerate(planned):
         if args.execute and index:
-            require_unchanged_source(root, captured_source, exclude_dirs=(output,))
+            require_unchanged_source(root, captured_source, exclude_dirs=generated)
         print(shlex.join(command), flush=True)
         if args.execute:
             subprocess.run(command, cwd=root, env=env, check=True)

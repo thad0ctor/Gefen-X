@@ -29,6 +29,10 @@ from .comparison import (
 
 PROTECTED = {"cell", "phase", "checkpoint_out", "init_checkpoint", "run_name", "results"}
 
+# train.py defines these as plain store_true flags, so "--no-<flag>" does not
+# exist; a config spelling out the False default must simply omit the flag.
+STORE_TRUE_ONLY = {"allow_random_sft", "allow_nonpretrain_init", "overwrite_checkpoint"}
+
 
 def _cli_args(values: dict[str, Any]) -> list[str]:
     args: list[str] = []
@@ -39,7 +43,10 @@ def _cli_args(values: dict[str, Any]) -> list[str]:
         if value is None:
             continue
         if isinstance(value, bool):
-            args.append(flag if value else "--no-" + key.replace("_", "-"))
+            if value:
+                args.append(flag)
+            elif key not in STORE_TRUE_ONLY:
+                args.append("--no-" + key.replace("_", "-"))
         elif isinstance(value, list):
             for item in value:
                 args.extend((flag, str(item)))

@@ -45,6 +45,7 @@ from benchmarks.training_matrix.data import build_dataset
 from benchmarks.training_matrix.hf_sft import (
     _local_model_manifest_sha256,
     accumulate_hf_microbatches,
+    main as hf_sft_main,
     parse_args as parse_hf_sft_args,
 )
 from benchmarks.training_matrix.run_matrix import commands as matrix_commands
@@ -1211,6 +1212,12 @@ def test_custom_output_dir_is_excluded_from_source_fingerprint():
     try:
         unfiltered_before = source_fingerprint(ROOT)
         filtered_before = source_fingerprint(ROOT, exclude_dirs=(output_dir,))
+        # A relative dir escaping the repo needs no exclusion and must not
+        # produce an invalid git pathspec (git would exit 128 on ../**).
+        assert (
+            source_fingerprint(ROOT, exclude_dirs=("../fingerprint-escape",))
+            == unfiltered_before
+        )
         artifact.write_text('{"generated": true}\n', encoding="utf-8")
         # Without the exclusion the untracked output counts as a source change;
         # with it (absolute or root-relative form) the fingerprint is stable.
@@ -1276,6 +1283,83 @@ def test_matrix_launcher_preserves_capture_and_guards_before_second_cell(
     # custom --output-dir inside the repo cannot trip the source guard.
     assert checks == [(captured, (Path(str(tmp_path)),))]
     assert launches[0][2][SOURCE_FINGERPRINT_ENV] == canonical_json(captured)
+
+
+def test_matrix_launcher_excludes_forwarded_results_dir_from_guard(
+    tmp_path, monkeypatch
+):
+    captured = {"commit": "abc", "diff_sha256": "diff", "dirty": True}
+    checks = []
+    monkeypatch.setattr(
+        matrix_driver,
+        "source_fingerprint",
+        lambda _root, exclude_dirs=(): captured.copy(),
+    )
+
+    def reject_next(_root, expected, exclude_dirs=()):
+        checks.append(tuple(exclude_dirs))
+        raise RuntimeError("source changed")
+
+    monkeypatch.setattr(matrix_driver, "require_unchanged_source", reject_next)
+    monkeypatch.setattr(
+        matrix_driver.subprocess,
+        "run",
+        lambda command, *, cwd, env, check: SimpleNamespace(returncode=0),
+    )
+    results = tmp_path / "custom" / "results.jsonl"
+    with pytest.raises(RuntimeError, match="source changed"):
+        matrix_driver.main(
+            [
+                "--cells",
+                "adamw,torch_muon_adamw",
+                "--output-dir",
+                str(tmp_path),
+                "--execute",
+                "--",
+                "--results",
+                str(results),
+            ]
+        )
+    # A forwarded --results file is generated output too: its directory must
+    # reach the guard's exclusions alongside --output-dir.
+    assert checks == [(Path(str(tmp_path)), results.parent)]
+
+
+def test_consistency_cli_args_omit_false_store_true_flags():
+    from benchmarks.training_matrix.consistency_2x2 import _cli_args
+
+    args = _cli_args(
+        {
+            "allow_random_sft": False,
+            "allow_nonpretrain_init": False,
+            "overwrite_checkpoint": False,
+            "save_optimizer": False,
+            "allow_random_sft2": None,
+        }
+    )
+    # train.py defines the first three as plain store_true flags: spelling out
+    # their False default must emit nothing (no unrecognized --no-... flag),
+    # while BooleanOptionalAction options still get their --no- form.
+    assert args == ["--no-save-optimizer"]
+    assert _cli_args({"allow_random_sft": True}) == ["--allow-random-sft"]
+
+
+def test_hf_sft_rejects_negative_grad_clip():
+    with pytest.raises(SystemExit, match=r"--grad-clip must be >= 0"):
+        hf_sft_main(
+            [
+                "--cell",
+                "adamw",
+                "--model",
+                "unused",
+                "--lr",
+                "0.001",
+                "--results",
+                "unused.jsonl",
+                "--grad-clip",
+                "-1",
+            ]
+        )
 
 
 def test_consistency_launcher_preserves_capture_and_guards_before_second_job(

@@ -648,6 +648,8 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
+    if args.grad_clip < 0:
+        raise SystemExit("--grad-clip must be >= 0")
     run(args)
     return 0
 

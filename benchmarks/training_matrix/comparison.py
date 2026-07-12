@@ -33,12 +33,15 @@ def _generated_output_dirs(
     excludes = {"benchmarks/training_matrix/out"}
     for exclude in exclude_dirs:
         path = Path(exclude)
-        if path.is_absolute():
-            try:
-                path = path.resolve().relative_to(root.resolve())
-            except ValueError:
-                continue
-        excludes.add(path.as_posix().rstrip("/"))
+        if not path.is_absolute():
+            path = root / path
+        try:
+            relative = path.resolve().relative_to(root.resolve())
+        except ValueError:
+            # Outside the repo (absolute, or relative escaping via ..):
+            # nothing to exclude, and an escaping git pathspec would error.
+            continue
+        excludes.add(relative.as_posix().rstrip("/"))
     return sorted(excludes)
 
 
