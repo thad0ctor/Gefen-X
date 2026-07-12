@@ -2,6 +2,7 @@
   <a href="https://pypi.org/project/gefen-x/"><img src="https://img.shields.io/pypi/v/gefen-x?style=flat-square&amp;color=blue" alt="PyPI"></a>
   <a href="https://pypi.org/project/gefen-x/"><img src="https://img.shields.io/pypi/pyversions/gefen-x?style=flat-square" alt="Python versions"></a>
   <a href="https://github.com/thad0ctor/Gefen-X/blob/main/LICENSE"><img src="https://img.shields.io/pypi/l/gefen-x?style=flat-square" alt="License"></a>
+  <a href="https://pypi.org/project/gefen-x/"><img src="https://img.shields.io/pypi/dm/gefen-x?style=flat-square&amp;logo=pypi&amp;label=downloads" alt="PyPI monthly downloads"></a>
 </p>
 
 <p align="center">
