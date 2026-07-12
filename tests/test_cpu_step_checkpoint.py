@@ -727,3 +727,38 @@ def test_hybrid_rejected_backup_layout_load_is_a_true_no_op(backup_optimizer):
 
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-v"]))
+
+
+def test_state_dict_prehook_changes_survive_orphan_withholding():
+    """A state_dict pre-hook that mutates live state during the save must keep
+    its changes afterwards (torch semantics), even on the orphan-withholding
+    path used under a ZeRO-style param swap."""
+    model = _small_model()
+    opt = Gefen(list(model.named_parameters()), lr=1e-3, fused=False)
+    _apply_grads(model, _synthetic_grads(model, 1)[0])
+    opt.step()
+    opt.zero_grad()
+
+    flat_params = _zero_style_flat_swap(opt)
+    for flat in flat_params:
+        flat.grad = torch.full_like(flat, 1e-3)
+    opt.step()
+    opt.zero_grad()
+
+    def stamp(optimizer):
+        # REBIND the entry (not an in-place mutation): the old clear+update
+        # restore silently reverted rebinds because its shallow snapshot
+        # shared the original entry dicts.
+        optimizer.state[flat_params[0]] = dict(
+            optimizer.state[flat_params[0]], hook_stamp=123
+        )
+
+    opt.register_state_dict_pre_hook(stamp)
+    live_keys_before = list(opt.state.keys())
+    sd = opt.state_dict()
+
+    # The hook's write is in the checkpoint AND survives in live state.
+    assert sd["state"][0]["hook_stamp"] == 123
+    assert opt.state[flat_params[0]]["hook_stamp"] == 123
+    # Key order is still restored when the hook leaves the key set unchanged.
+    assert list(opt.state.keys()) == live_keys_before

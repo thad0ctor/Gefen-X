@@ -105,9 +105,10 @@ class _HybridMergedState(dict):
       fp32 partition) raises a KeyError that explains the ZeRO incompatibility
       instead of a bare tensor-keyed KeyError.
 
-    The view itself is a fresh snapshot per ``.state`` access: other dict
-    mutators (``pop``/``del``/``clear``/``update``/``setdefault``) affect only
-    the snapshot, never the children.
+    All other mutators route too: ``setdefault``/``update``/``pop``/``del``
+    reach the owning child (unknown keys raise the same explanatory
+    ``KeyError``), and ``clear`` clears both children. ``popitem`` is
+    unsupported (ambiguous on a merged two-child view).
     """
 
     def __init__(self, subopts, param_owner):
@@ -124,7 +125,9 @@ class _HybridMergedState(dict):
             dict.update(self, o.state)
 
     def _owner_of(self, key):
-        entry = self._param_owner.get(id(key))
+        # getattr: a pickled/deepcopied husk loses instance attributes; degrade
+        # to "unknown key" instead of an AttributeError mislabeled as ZeRO.
+        entry = getattr(self, "_param_owner", {}).get(id(key))
         if entry is not None and entry[0] is key:
             return entry[1]
         return None
@@ -146,6 +149,51 @@ class _HybridMergedState(dict):
             raise KeyError(_UNKNOWN_STATE_KEY_MSG)
         owner.state[key] = value
         dict.__setitem__(self, key, value)
+
+    def setdefault(self, key, default=None):
+        owner = self._owner_of(key)
+        if owner is None:
+            raise KeyError(_UNKNOWN_STATE_KEY_MSG)
+        if key in owner.state:
+            value = owner.state[key]
+        else:
+            owner.state[key] = default
+            value = default
+        dict.__setitem__(self, key, value)
+        return value
+
+    def update(self, *args, **kwargs):
+        for key, value in dict(*args, **kwargs).items():
+            self[key] = value
+
+    def pop(self, key, *default):
+        owner = self._owner_of(key)
+        if owner is None or key not in owner.state:
+            if default:
+                dict.pop(self, key, None)
+                return default[0]
+            raise KeyError(_UNKNOWN_STATE_KEY_MSG if owner is None else key)
+        dict.pop(self, key, None)
+        return owner.state.pop(key)
+
+    def __delitem__(self, key):
+        owner = self._owner_of(key)
+        if owner is None:
+            raise KeyError(_UNKNOWN_STATE_KEY_MSG)
+        del owner.state[key]
+        dict.pop(self, key, None)
+
+    def clear(self):
+        for subopt in self._subopts:
+            subopt.state.clear()
+        dict.clear(self)
+
+    def popitem(self):
+        raise NotImplementedError(
+            "GefenMuonHybrid.state.popitem() is ambiguous on a merged "
+            "two-child view; use pop(param) or del state[param], which "
+            "route to the owning child."
+        )
 
 
 class GefenMuonHybrid(torch.optim.Optimizer):
@@ -297,11 +345,14 @@ class GefenMuonHybrid(torch.optim.Optimizer):
         # zero-numel input is the ZeRO-3 signature; fail loudly. A genuinely
         # 1D-only model (all params with real storage) still constructs a
         # backup-only hybrid exactly as before.
-        if not muon_named_params:
+        if not muon_named_params and backup_named_params:
             zero_numel = [
                 name for name, p in backup_named_params if p.numel() == 0
             ]
-            if zero_numel:
+            # Only the ALL-placeholder set is the ZeRO-3 signature; a mixed
+            # set (e.g. an intentionally empty slot among real 1-D weights)
+            # still constructs a backup-only hybrid as before.
+            if len(zero_numel) == len(backup_named_params):
                 raise ValueError(
                     "GefenMuonHybrid found no 2D Muon-eligible parameters, and "
                     "{} of the {} supplied parameters are zero-numel "

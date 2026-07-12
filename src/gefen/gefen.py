@@ -3224,16 +3224,24 @@ class Gefen(torch.optim.Optimizer):
         }
         orphaned = [param for param in self.state if param not in reachable]
         if orphaned:
-            live_state = dict(self.state)
-            for param in orphaned:
-                del self.state[param]
+            original_order = list(self.state)
+            withheld = [(param, self.state.pop(param)) for param in orphaned]
             try:
                 state_dict = super().state_dict()
             finally:
-                # Restore the exact original dict (entries AND order), so the
-                # live optimizer is indistinguishable from before the save.
-                self.state.clear()
-                self.state.update(live_state)
+                # Re-add only the withheld orphans, without clobbering
+                # anything a registered state_dict pre-hook wrote to live
+                # state during the super() call (torch semantics: hook
+                # changes persist). Restore the original key order only when
+                # the key set is unchanged; hook additions/removals keep the
+                # hook's own ordering.
+                for param, entry in withheld:
+                    self.state.setdefault(param, entry)
+                if set(self.state) == set(original_order):
+                    current = dict(self.state)
+                    self.state.clear()
+                    for key in original_order:
+                        self.state[key] = current[key]
         else:
             state_dict = super().state_dict()
         # stepsize/_h_buf are per-step scratch buffers (recomputed from vmean every

@@ -259,3 +259,65 @@ def test_plain_gefen_state_untouched_by_hybrid_guard():
     assert not opt.state[flatten_copy]  # defaultdict auto-create, no raise
     opt.state[flatten_copy]["momentum_buffer"] = torch.zeros(31)
     assert "momentum_buffer" in opt.state[flatten_copy]
+
+
+def test_hybrid_state_mutators_route_to_owning_child():
+    opt = _hybrid()
+    p = opt.backup.param_groups[0]["params"][0]
+    baseline = opt.state[p]
+
+    # setdefault on an existing entry returns the live child dict.
+    assert opt.state.setdefault(p, {"nope": 1}) is baseline
+    # update routes through the same ownership check as __setitem__.
+    replacement = dict(baseline, routed_marker=11)
+    opt.state.update({p: replacement})
+    assert opt.backup.state[p] is replacement
+    # pop removes from the owning child and returns the removed entry.
+    assert opt.state.pop(p) is replacement
+    assert p not in dict(opt.backup.state)
+    assert opt.state.pop(p, "absent") == "absent"
+    # setdefault on a missing entry inserts into the owning child.
+    fresh = {"seeded": True}
+    assert opt.state.setdefault(p, fresh) is fresh
+    assert opt.backup.state[p] is fresh
+    # del routes; deleting a now-missing entry raises the plain KeyError.
+    del opt.state[p]
+    assert p not in dict(opt.backup.state)
+    with pytest.raises(KeyError):
+        del opt.state[p]
+
+
+def test_hybrid_state_mutators_reject_unknown_keys():
+    opt = _hybrid()
+    foreign = torch.zeros(4)
+    with pytest.raises(KeyError, match="DeepSpeed ZeRO"):
+        opt.state.update({foreign: {}})
+    with pytest.raises(KeyError, match="DeepSpeed ZeRO"):
+        opt.state.setdefault(foreign, {})
+    with pytest.raises(KeyError, match="DeepSpeed ZeRO"):
+        opt.state.pop(foreign)
+    with pytest.raises(KeyError, match="DeepSpeed ZeRO"):
+        del opt.state[foreign]
+    with pytest.raises(NotImplementedError, match="popitem"):
+        opt.state.popitem()
+
+
+def test_hybrid_state_clear_clears_both_children():
+    opt = _hybrid()
+    assert dict(opt.muon.state) and dict(opt.backup.state)
+    opt.state.clear()
+    assert not dict(opt.muon.state)
+    assert not dict(opt.backup.state)
+    assert not opt.state
+
+
+def test_hybrid_mixed_zero_numel_backup_still_constructs():
+    # A mixed set (a real 1-D weight plus an intentionally empty slot) is NOT
+    # the ZeRO-3 all-placeholder signature and must keep constructing a
+    # backup-only hybrid, exactly as on main.
+    real = nn.Parameter(torch.zeros(8))
+    named = [("real.weight", real), ("empty.slot", nn.Parameter(torch.zeros(0)))]
+    opt = GefenMuonHybrid([], named, lr=1e-3, fused=False)
+    real.grad = torch.full_like(real, 1e-3)
+    opt.step()
+    assert torch.isfinite(real).all()
