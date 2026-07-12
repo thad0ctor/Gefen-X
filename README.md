@@ -118,12 +118,12 @@ Gefen drops into standard distributed training like any other PyTorch optimizer,
 
 | System | Works with |
 |---|---|
-| DDP | All optimizers, including fused BF16 resume |
-| FSDP2 / DTensor training | Plain Gefen and Muon `approx` / `exact` / `distributed` |
-| FSDP2 full-state checkpoints (DCP) | Plain Gefen and Muon `approx`; same 1-D topology and world size — scope note below |
-| Muon `distributed` native checkpoints | Resume under any world size, including a single-process optimizer — [details](#experimental-lever-sharded-newton-schulz-under-fsdp2-sharded_mode) |
-| DeepSpeed ZeRO 1-3 | Plain Gefen, direct or via axolotl `gefenx`; the Muon family needs FSDP2, DDP, or single-GPU — config note below |
-| Megatron DP/TP/PP/CP/EP/ETP | Plain Gefen, GefenMuon+AdamW, and GefenMuon+Gefen with legacy optimizer checkpoints — [scope](https://github.com/thad0ctor/Gefen-X/blob/main/COMPATIBILITY.md) |
+| DDP | All optimizers |
+| FSDP2 | All optimizers |
+| FSDP2 checkpoints | Plain Gefen and Muon `approx`; resume needs the same GPU count — scope note below |
+| Muon `distributed` checkpoints | Resume on any GPU count, even a single GPU — [details](#experimental-lever-sharded-newton-schulz-under-fsdp2-sharded_mode) |
+| DeepSpeed ZeRO 1-3 | Plain Gefen; use FSDP2 or DDP for the Muon family — config note below |
+| Megatron-LM | All optimizers, including checkpoint resume — [scope](https://github.com/thad0ctor/Gefen-X/blob/main/COMPATIBILITY.md) |
 
 > **FSDP2 optimizer checkpoint scope.** Plain Gefen and `GefenMuon(sharded_mode="approx")` collectively encode every rank's local DTensor optimizer state into PyTorch DCP `StateDictOptions(full_state_dict=True)` output, including the flattened optimizer-state form. `get_optimizer_state_dict()` and `set_optimizer_state_dict()` resume the next update exactly when world size, mesh, placements, rank coordinates, parameter ordering, shapes, names, and sharded mode are unchanged; the actual two-GPU `fully_shard` get/set test covers both optimizers. The adapter currently requires one 1-D DeviceMesh spanning the default world; multidimensional meshes, subgroups, and pipeline-local optimizers fail before its collectives. Save and restore are collective, so every rank must participate. Each process temporarily stages all serialized rank payloads on CPU, making the leading checkpoint-time CPU cost about `world_size ×` that rank's local optimizer state plus local serialization scratch. World-size or topology changes fail before mutation, and older unsafe untagged full checkpoints fail closed. This is not a reshardable optimizer-state format.
 
