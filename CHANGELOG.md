@@ -2,7 +2,9 @@
 
 All notable changes to this project are documented here. This project adheres to [Semantic Versioning](https://semver.org/).
 
-## [Unreleased]
+## [0.3.0] - 2026-07-11
+
+Lands the Muon optimization suite (#62) and validated DeepSpeed ZeRO support (#64): a selectable AdamW backup for the hybrid, an opt-in batched Newton-Schulz experiment, faster fused Muon momentum kernels, and plain `Gefen` as a validated DeepSpeed ZeRO 1-3 client optimizer with bit-exact checkpoint resume.
 
 API and compatibility:
 
