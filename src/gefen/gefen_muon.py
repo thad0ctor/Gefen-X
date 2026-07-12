@@ -1297,15 +1297,18 @@ class GefenMuon(Gefen):
 
     @torch._dynamo.disable
     def _assert_sharded_grad_presence_consistent(self) -> None:
-        """Fail before collectives when mesh ranks disagree on ``grad is None``.
+        """Fail before collectives when mesh ranks disagree on the step inputs.
 
         Exact and distributed Muon reconstruct full DTensor gradients with
-        collectives. If one mesh rank skips a parameter while another enters its
-        ``full_tensor()``/broadcast path, the latter waits forever. Pack every
-        relevant parameter's activity bit by DeviceMesh and sum it across each
-        mesh dimension in sequence; the final count is global to that mesh, so
-        every participating rank sees and raises on the same disagreement before
-        codebook learning or optimizer state/parameter mutation begins.
+        collectives entered in parameter-group insertion order, and
+        ``_step_distributed_pg`` assigns momentum owners by that same insertion
+        index. Two rank-local properties therefore must agree mesh-wide before
+        any of those collectives start: which parameters have gradients, and
+        the order the parameters were registered in. Pack both per DeviceMesh
+        — an activity bit summed across every mesh dimension, and an insertion
+        position reduced to its mesh-wide max and min — so every participating
+        rank sees the same global result and raises on the same disagreement
+        before codebook learning or optimizer state/parameter mutation begins.
 
         Plain tensors/DDP and local-shard ``approx`` mode take no Muon gradient
         collectives and therefore pay no preflight collective. Manual CUDA graph
@@ -1339,12 +1342,13 @@ class GefenMuon(Gefen):
                 mesh = p.device_mesh
                 if mesh.get_coordinate() is None or mesh.size() < 2:
                     continue
-                # Parameter-group order may legitimately differ between ranks
-                # while two equivalent DeviceMesh objects still refer to
-                # distinct c10d groups. Key each mesh by content instead of
-                # object identity, and sort meshes and items below, so every
-                # rank compares the same positional activity vector and enters
-                # the per-mesh collectives in the same order.
+                # Two equivalent DeviceMesh objects can still refer to distinct
+                # c10d groups, and a mis-built training script can register the
+                # same parameters in a different order per rank. Key each mesh
+                # by content instead of object identity, and sort meshes and
+                # items below, so this preflight's own collectives stay matched
+                # under both — and rank-divergent registration order is then
+                # detected positionally rather than corrupting the comparison.
                 process_groups = tuple(mesh.get_all_groups())
                 key = (
                     str(mesh.device_type),
@@ -1369,6 +1373,10 @@ class GefenMuon(Gefen):
         for mesh_key in sorted(by_mesh):
             entry = by_mesh[mesh_key]
             mesh = entry["mesh"]
+            local_position = {
+                id(item[1]): position
+                for position, item in enumerate(entry["items"])
+            }
             items = sorted(
                 entry["items"],
                 key=lambda item: (
@@ -1383,15 +1391,51 @@ class GefenMuon(Gefen):
                 dtype=torch.int32,
                 device=device,
             )
-            # Reducing the same vector once along every Cartesian mesh
-            # dimension propagates a global activity count to every mesh rank.
-            # This is one collective per mesh dimension, independent of the
-            # number of optimizer parameters.
+            # Each sorted slot is the same parameter identity on every rank, so
+            # reducing its local insertion position to the mesh-wide max and
+            # min (one MAX all_reduce over [position, -position]) exposes any
+            # rank whose parameter-group order differs.
+            order_probe = torch.tensor(
+                [
+                    signed
+                    for _, p, _ in items
+                    for signed in (
+                        local_position[id(p)],
+                        -local_position[id(p)],
+                    )
+                ],
+                dtype=torch.int32,
+                device=device,
+            )
+            # Reducing the same vectors once along every Cartesian mesh
+            # dimension propagates mesh-global results to every rank. This is
+            # two collectives per mesh dimension, independent of the number of
+            # optimizer parameters.
             for process_group in entry["process_groups"]:
                 if dist.get_world_size(process_group) > 1:
                     dist.all_reduce(
                         active_counts, op=dist.ReduceOp.SUM, group=process_group
                     )
+                    dist.all_reduce(
+                        order_probe, op=dist.ReduceOp.MAX, group=process_group
+                    )
+
+            order_flat = order_probe.cpu().tolist()
+            order_mismatches = [
+                items[index][0]
+                for index in range(len(items))
+                if order_flat[2 * index] != -order_flat[2 * index + 1]
+            ]
+            if order_mismatches:
+                raise RuntimeError(
+                    "GefenMuon requires identical parameter-group order on "
+                    "every rank of a DTensor/FSDP mesh before "
+                    "sharded_mode='exact' or 'distributed' stepping: gradient "
+                    "collectives and momentum-owner assignment follow that "
+                    "order. Parameters at rank-divergent positions: {}. "
+                    "Construct parameter groups in the same order on every "
+                    "rank.".format(", ".join(order_mismatches))
+                )
 
             mesh_size = mesh.size()
             inconsistent = torch.nonzero(

@@ -41,7 +41,8 @@
 
 set -euo pipefail
 
-usage() { sed -n '2,32p' "$0" | sed 's/^# \{0,1\}//'; }
+# Print the whole leading comment block, however long it grows.
+usage() { awk 'NR == 1 { next } /^#/ { sub(/^# ?/, ""); print; next } { exit }' "$0"; }
 
 TAG=""
 WHEEL=""
@@ -49,7 +50,13 @@ FRESH=0
 TAG_CHECK=1
 while [ $# -gt 0 ]; do
   case "$1" in
-    --wheel) WHEEL="$2"; shift 2 ;;
+    --wheel)
+      [ $# -ge 2 ] || { echo "error: --wheel requires a path" >&2; exit 2; }
+      # Resolve now: the script cd's to the repo root later, which would break
+      # a relative path given from another directory.
+      WHEEL="$(realpath -m -- "$2")"
+      shift 2
+      ;;
     --fresh) FRESH=1; shift ;;
     --no-tag-check) TAG_CHECK=0; shift ;;
     -h|--help) usage; exit 0 ;;

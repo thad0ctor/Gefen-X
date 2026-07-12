@@ -572,7 +572,12 @@ def _reversed_order_worker(rank, world, port, result_queue):
         mesh = init_device_mesh("cpu", (world,))
         results = []
 
-        for case in ("reversed_mismatch", "reversed_consistent", "aligned_mismatch"):
+        for case in (
+            "reversed_mismatch",
+            "reversed_consistent",
+            "aligned_mismatch",
+            "aligned_consistent",
+        ):
             generator = torch.Generator(device="cpu").manual_seed(
                 6100 + len(results)
             )
@@ -604,10 +609,11 @@ def _reversed_order_worker(rank, world, port, result_queue):
                     a.grad = None
 
             # Call the preflight directly instead of step(): before the
-            # order-insensitivity fix, the reversed_mismatch case falsely
-            # passed here and the corresponding step() would deadlock inside
-            # full_tensor(), so the isolated call is what keeps a regression
-            # loud instead of hung.
+            # order hardening, the reversed cases either falsely passed here
+            # (complementary grads) or sailed into step()'s misaligned owner
+            # assignment (consistent grads), and the corresponding step()
+            # would deadlock inside full_tensor(), so the isolated call is
+            # what keeps a regression loud instead of hung.
             message = None
             try:
                 optimizer._assert_sharded_grad_presence_consistent()
@@ -630,13 +636,16 @@ def _reversed_order_worker(rank, world, port, result_queue):
     not torch.distributed.is_available() or not torch.distributed.is_gloo_available(),
     reason="order-insensitive grad-presence regression needs Gloo",
 )
-def test_sharded_grad_presence_check_is_order_insensitive():
-    """Rank-divergent param-group order must not defeat the presence check.
+def test_sharded_grad_presence_check_rejects_rank_divergent_order():
+    """Rank-divergent param-group order must be rejected, not merely survived.
 
     The activity vector is compared positionally across ranks, so without
     content-keyed meshes and sorted items a reversed group order with
     complementary gradient presence sums to a full count on every position
-    and the check falsely passes right before full_tensor() deadlocks.
+    and the check falsely passes right before full_tensor() deadlocks. And
+    even with consistent gradient presence, exact/distributed stepping enters
+    collectives and assigns momentum owners by insertion order, so divergent
+    order itself must raise on every rank before any of that starts.
     """
     import torch.multiprocessing as mp
 
@@ -685,28 +694,32 @@ def test_sharded_grad_presence_check_is_order_insensitive():
             "reversed_mismatch",
             "reversed_consistent",
             "aligned_mismatch",
+            "aligned_consistent",
         }, (rank, cases)
-        for case in ("reversed_mismatch", "aligned_mismatch"):
+        # Rank-divergent order is rejected up front, with or without a
+        # gradient-presence mismatch layered on top.
+        for case in ("reversed_mismatch", "reversed_consistent"):
             message = cases[case]
             assert message is not None, (rank, case)
-            assert "identical gradient presence" in message, (rank, case, message)
-            assert "a (1/2 mesh ranks have gradients)" in message, (
+            assert "identical parameter-group order" in message, (
                 rank,
                 case,
                 message,
             )
-            assert "b (1/2 mesh ranks have gradients)" in message, (
-                rank,
-                case,
-                message,
-            )
-        assert cases["reversed_consistent"] is None, (
+            assert "a" in message and "b" in message, (rank, case, message)
+        message = cases["aligned_mismatch"]
+        assert message is not None, (rank, "aligned_mismatch")
+        assert "identical gradient presence" in message, (rank, message)
+        assert "a (1/2 mesh ranks have gradients)" in message, (rank, message)
+        assert "b (1/2 mesh ranks have gradients)" in message, (rank, message)
+        assert cases["aligned_consistent"] is None, (
             rank,
-            cases["reversed_consistent"],
+            cases["aligned_consistent"],
         )
 
-    # Sorted item names make the diagnostic identical on every rank.
-    for case in ("reversed_mismatch", "aligned_mismatch"):
+    # Reduced order/activity vectors make the diagnostic identical on every
+    # rank, which is what lets the job fail synchronously.
+    for case in ("reversed_mismatch", "reversed_consistent", "aligned_mismatch"):
         assert rank_results[0][case] == rank_results[1][case]
 
 
