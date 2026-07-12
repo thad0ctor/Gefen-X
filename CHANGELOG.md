@@ -2,6 +2,15 @@
 
 All notable changes to this project are documented here. This project adheres to [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+Correctness and compatibility:
+
+- Add `deterministic=True` to `Gefen`, `GefenMuon`, and `GefenMuonHybrid` for replica-exact fused routing on homogeneous GPUs. Automatic periods use fixed-order reductions, block-vmean parameters use the deterministic fused v1 path, factored-v parameters use the decomposed deterministic update, and tagged checkpoints enforce the saved policy.
+- Capturable optimizers maintain device-resident global-step counters on every parameter device. CUDA-graph replays now serialize the true global step, including steps with no gradients, so stochastic-rounding checkpoints resume with the correct seed.
+- Checkpoint loading preserves compact optimizer-state dtypes for bf16 parameters, validates frozen codebooks and hybrid backend metadata, and keeps legacy untagged checkpoints loadable.
+- Reject host-driven gradient-histogram output under `capturable=True`, matching the existing periodic-codebook-refresh guard.
+
 ## [0.3.0] - 2026-07-11
 
 Lands the Muon optimization suite (#62) and validated DeepSpeed ZeRO support (#64): a selectable AdamW backup for the hybrid, an opt-in batched Newton-Schulz experiment, faster fused Muon momentum kernels, and plain `Gefen` as a validated DeepSpeed ZeRO 1-3 client optimizer with bit-exact checkpoint resume.

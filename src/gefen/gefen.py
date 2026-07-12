@@ -569,7 +569,9 @@ class Gefen(torch.optim.Optimizer):
             float ``lr`` is baked at capture time. Codebook learning and the
             period search are host-driven and run on the FIRST step, so do the
             standard warmup steps before capturing. Incompatible with
-            ``codebook_refresh_every > 0``.
+            ``codebook_refresh_every > 0``. Every captured parameter must live
+            on the current CUDA capture device; distributed jobs should use
+            one optimizer per rank/device.
         verbose (bool, default False): extra diagnostics during codebook
             learning and period prediction.
     """
@@ -704,6 +706,11 @@ class Gefen(torch.optim.Optimizer):
         # nothing it would mark has changed. See _static_mark_signature.
         self._static_mark_sig = None
         self._gefen_global_step = 0
+        # Manual CUDA-graph replay does not execute Python, so the host counter
+        # above cannot be the checkpoint authority under capturable=True. Keep
+        # one device counter per parameter device and advance it in the captured
+        # step tail; state_dict synchronizes the host mirror before serializing.
+        self._gefen_global_step_by_device = {}
 
         defaults = dict(
             lr=lr,
@@ -926,6 +933,7 @@ class Gefen(torch.optim.Optimizer):
         for param, param_name in zip(params, param_names):
             self._param_names[param] = param_name
             self.state[param]["name"] = param_name
+        self._ensure_gefen_global_step_devices()
 
     def _lr_scalar(self, group) -> float:
         """Resolve ``group["lr"]`` to a python float, caching a tensor lr's ``.item()``.
@@ -1016,16 +1024,29 @@ class Gefen(torch.optim.Optimizer):
         # graph without capturable=True would silently freeze the host-side
         # step counters / bias corrections at their capture-time values, so
         # fail loudly instead.
-        if (
-            not self.capturable
-            and torch.cuda.is_available()
-            and torch.cuda.is_current_stream_capturing()
-        ):
+        capturing = (
+            torch.cuda.is_available() and torch.cuda.is_current_stream_capturing()
+        )
+        if capturing and not self.capturable:
             raise RuntimeError(
                 "Attempting CUDA graph capture of {}.step() but capturable=False. "
                 "Construct the optimizer with capturable=True to make step() "
                 "graph-safe.".format(type(self).__name__)
             )
+        if capturing:
+            devices = {
+                param.device
+                for group in self.param_groups
+                for param in group["params"]
+            }
+            capture_device = torch.device("cuda", torch.cuda.current_device())
+            if devices != {capture_device}:
+                raise RuntimeError(
+                    "CUDA graph capture requires every Gefen parameter on the "
+                    "current capture device {}; found {}".format(
+                        capture_device, sorted(map(str, devices))
+                    )
+                )
 
     def _static_mark_signature(self):
         # Cheap identity fingerprint of every object the static-marking pass
@@ -1169,12 +1190,93 @@ class Gefen(torch.optim.Optimizer):
             return None
         seed = self._sr_seed_by_device.get(device)
         if seed is None:
+            self._ensure_gefen_global_step_devices()
+            seed = self._sr_seed_by_device.get(device)
+        if seed is None:
+            global_counter = self._gefen_global_step_by_device.get(device)
+            initial_step = (
+                self._gefen_global_step
+                if global_counter is None
+                else int(global_counter.item())
+            )
             seed = torch.full(
-                (), int(self._gefen_global_step),
+                (), initial_step,
                 dtype=torch.int64, device=device,
             )
             self._sr_seed_by_device[device] = seed
         return seed
+
+    def _gefen_cuda_param_devices(self):
+        return sorted(
+            {
+                param.device
+                for group in self.param_groups
+                for param in group["params"]
+                if param.device.type == "cuda"
+            },
+            key=lambda device: -1 if device.index is None else device.index,
+        )
+
+    def _device_gefen_global_step(self):
+        if not self._gefen_global_step_by_device:
+            return None
+        steps = [
+            int(counter.item())
+            for counter in self._gefen_global_step_by_device.values()
+        ]
+        if any(step != steps[0] for step in steps[1:]):
+            raise RuntimeError(
+                "Gefen capturable global-step counters disagree across devices: "
+                "{}".format(steps)
+            )
+        return steps[0]
+
+    def _ensure_gefen_global_step_devices(self) -> None:
+        """Create capturable counters before capture, including no-grad devices."""
+        if not self.capturable:
+            return
+        devices = self._gefen_cuda_param_devices()
+        missing = [
+            device
+            for device in devices
+            if device not in self._gefen_global_step_by_device
+        ]
+        if missing:
+            device_step = self._device_gefen_global_step()
+            initial_step = self._gefen_global_step if device_step is None else device_step
+            self._gefen_global_step = initial_step
+            for device in missing:
+                self._gefen_global_step_by_device[device] = torch.full(
+                    (), initial_step, dtype=torch.int64, device=device
+                )
+        if self._stochastic_round:
+            for device in devices:
+                if device not in self._sr_seed_by_device:
+                    self._sr_seed_by_device[device] = (
+                        self._gefen_global_step_by_device[device].detach().clone()
+                    )
+
+    def _reset_gefen_global_step_devices(self) -> None:
+        self._gefen_global_step_by_device.clear()
+        self._ensure_gefen_global_step_devices()
+
+    def _synchronize_gefen_global_step_for_checkpoint(self) -> None:
+        """Refresh the serialized host mirror after manual graph replays."""
+        self._ensure_gefen_global_step_devices()
+        device_step = self._device_gefen_global_step()
+        if device_step is not None:
+            self._gefen_global_step = device_step
+        if self.capturable and self._stochastic_round:
+            seed_steps = [
+                int(seed.item()) for seed in self._sr_seed_by_device.values()
+            ]
+            if any(seed_step != self._gefen_global_step for seed_step in seed_steps):
+                raise RuntimeError(
+                    "Gefen capturable stochastic-round seeds disagree with the "
+                    "optimizer global step: {} != {}".format(
+                        seed_steps, self._gefen_global_step
+                    )
+                )
 
     @torch._dynamo.disable
     def _advance_sr_seeds(self) -> None:
@@ -2350,6 +2452,11 @@ class Gefen(torch.optim.Optimizer):
         requested_steps = quantization_module.LIST_STEPS_SAVE_HIST_GRAD
         if requested_steps is None:
             return
+        if self.capturable and requested_steps:
+            raise ValueError(
+                "capturable=True is incompatible with LIST_STEPS_SAVE_HIST_GRAD: "
+                "histogram collection and file output are host-driven"
+            )
         if self._gefen_global_step not in requested_steps:
             return
         if not hasattr(quantization_module, "SAVE_CODEBOOK_PREFIX"):
@@ -3258,6 +3365,8 @@ class Gefen(torch.optim.Optimizer):
         live ``self.state`` untouched (``_param_name`` still reads them);
         they are only withheld from the serialized copy.
         """
+        self._synchronize_gefen_global_step_for_checkpoint()
+
         # Withhold state entries orphaned from param_groups around the base
         # call (see docstring). Tensor hashing is identity-based, so set
         # membership matches the id()-keyed param_mappings the base class
@@ -3590,11 +3699,9 @@ class Gefen(torch.optim.Optimizer):
         self._gefen_global_step = gefen_global_step
         # Capturable SR seeds are optimizer-level scratch (a device mirror of
         # gefen_global_step): drop them so the first post-load SR kernel call
-        # rebuilds them from the restored counter. (Under manual graph-replay
-        # training the host counter -- like every host-side value -- reflects
-        # host step() calls, not replays; checkpoint semantics are unchanged
-        # from the pre-SR capturable behavior.)
+        # uses a scalar rebuilt from the restored, replay-synchronized counter.
         self._sr_seed_by_device.clear()
+        self._reset_gefen_global_step_devices()
 
         # Restoring the frozen codebook keeps _maybe_refresh_gefen_codebook a
         # no-op on the first resume step, so the restored automatic_period values
@@ -3795,4 +3902,7 @@ class Gefen(torch.optim.Optimizer):
         # step. @torch._dynamo.disable makes the increment a single opaque
         # call at the very tail of step() instead (one cheap graph break
         # after all device work). Eager behavior is unchanged.
+        self._ensure_gefen_global_step_devices()
+        for counter in self._gefen_global_step_by_device.values():
+            counter.add_(1)
         self._gefen_global_step += 1

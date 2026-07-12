@@ -87,7 +87,7 @@ Setup: from scratch — MNIST (paper recipe, 3 seeds), CIFAR-10 ResNet-18; fine-
 
 ## CUDA Graphs & torch.compile (`capturable`)
 
-`Gefen`, `GefenMuon`, and `GefenMuonHybrid` accept `capturable=True` (same meaning as `torch.optim`'s argument): step counters, bias corrections, and a tensor `lr` live on the GPU, so `opt.step()` stays correct inside a replayed CUDA graph or a compiled region. The default `capturable=False` is bit-identical to previous behavior, and capturing with it raises instead of silently freezing the step counters.
+`Gefen`, `GefenMuon`, and `GefenMuonHybrid` accept `capturable=True` (same meaning as `torch.optim`'s argument): step counters, bias corrections, the optimizer-global checkpoint counter, and a tensor `lr` live on the GPU, so `opt.step()` stays correct inside a replayed CUDA graph or a compiled region. The default `capturable=False` is bit-identical to previous behavior, and capturing with it raises instead of silently freezing the step counters.
 
 Measured step times (386M-parameter census, RTX 3090 Ti, tail-100 mean over 500 CUDA-event-timed steps):
 
@@ -119,8 +119,9 @@ compiled_step()
 Caveats:
 
 - `dynamic=False` is required — dynamic shapes trip a dynamo symbolic-shapes bug (torch 2.12) on the per-param optimizer state.
-- `capturable=True` rejects the host-driven option `codebook_refresh_every > 0` at construction.
+- `capturable=True` rejects host-driven periodic codebook refresh and gradient-histogram output.
+- Every parameter in a captured optimizer must live on the current CUDA capture device; multi-process distributed training should construct one optimizer per rank/device.
 - A float `lr` bakes into the graph (as in `torch.optim`); pass a tensor `lr` and update it in place to drive an LR schedule.
-- Checkpoints are portable across the `capturable` toggle in both directions.
+- Checkpoints are portable across the `capturable` toggle in both directions; saving after graph replay synchronizes the true replayed global step so stochastic-rounding resumes continue from the correct seed.
 - FSDP2 / DTensor row-shard capture is validated by `tests/test_capturable_fsdp2.py` on 2 ranks for plain Gefen plus GefenMuon `sharded_mode="approx"`, `"exact"`, and `"distributed"` (including empty-shard coverage); ranks must capture and replay in lockstep.
 - Capturing the sharded `"exact"`/`"distributed"` modes records NCCL collectives (the in-`step()` all-gather) into the graph, which requires an NCCL/PyTorch build that supports collective graph capture — validated on PyTorch 2.12 / CUDA 13.3; on older stacks capture may raise (use `"approx"` or plain Gefen, which take no collectives, or `capturable=False`).

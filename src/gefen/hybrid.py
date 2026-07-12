@@ -321,11 +321,13 @@ class GefenMuonHybrid(torch.optim.Optimizer):
             capturable: forwarded to both halves. ``stochastic_round`` and
                 ``deterministic`` are forwarded to Gefen children; with an
                 AdamW backup they apply only to the Muon half. ``verbose`` is
-                likewise forwarded to Gefen children.
+                likewise forwarded to Gefen children. Every captured parameter
+                must live on the current CUDA capture device.
         """
         if not isinstance(deterministic, bool):
             raise TypeError("deterministic must be a bool")
         self._deterministic = deterministic
+        self.capturable = capturable
         if backup_named_params is None:
             # Single-argument convenience form: the first arg is a model or a
             # named-param iterable to split internally.
@@ -611,7 +613,35 @@ class GefenMuonHybrid(torch.optim.Optimizer):
         for o in self._subopts:
             o.zero_grad(set_to_none=set_to_none)
 
+    def _assert_capturable_devices_if_capturing(self) -> None:
+        capturing = (
+            torch.cuda.is_available() and torch.cuda.is_current_stream_capturing()
+        )
+        if not capturing:
+            return
+        if not self.capturable:
+            raise RuntimeError(
+                "Attempting CUDA graph capture of GefenMuonHybrid.step() but "
+                "capturable=False. Construct the optimizer with capturable=True "
+                "to make step() graph-safe."
+            )
+        devices = {
+            param.device
+            for optimizer in self._subopts
+            for group in optimizer.param_groups
+            for param in group["params"]
+        }
+        capture_device = torch.device("cuda", torch.cuda.current_device())
+        if devices != {capture_device}:
+            raise RuntimeError(
+                "CUDA graph capture requires every GefenMuonHybrid parameter on "
+                "the current capture device {}; found {}".format(
+                    capture_device, sorted(map(str, devices))
+                )
+            )
+
     def step(self, closure=None):
+        self._assert_capturable_devices_if_capturing()
         # Dispatch the INSTANCE step hooks around the composite step, mirroring
         # torch.optim.Optimizer.profile_hook_step exactly: hooks receive
         # (optimizer, args, kwargs) where args are the raw step() call args

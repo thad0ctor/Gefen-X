@@ -13,6 +13,7 @@ import torch
 import torch.nn as nn
 
 import gefen
+import gefen.quantization as gefen_quantization
 from gefen import Gefen, GefenMuon, GefenMuonHybrid, split_params_for_muon, validate_split
 from gefen.gefen_muon import (
     NS_SCHEDULES,
@@ -67,6 +68,17 @@ def test_gefen_rejects_bad_hyperparams(kwargs):
 def test_gefen_rejects_capturable_with_codebook_refresh():
     with pytest.raises(ValueError):
         Gefen(_params_1d(), fused=False, capturable=True, codebook_refresh_every=10)
+
+
+def test_gefen_rejects_capturable_gradient_histogram(monkeypatch):
+    monkeypatch.setattr(
+        gefen_quantization, "LIST_STEPS_SAVE_HIST_GRAD", [0], raising=False
+    )
+    opt = Gefen(_params_1d(), fused=False, capturable=True)
+    opt.param_groups[0]["params"][0].grad = torch.ones(8)
+
+    with pytest.raises(ValueError, match="LIST_STEPS_SAVE_HIST_GRAD"):
+        opt.step()
 
 
 def test_gefen_rejects_non_tensor_param():
