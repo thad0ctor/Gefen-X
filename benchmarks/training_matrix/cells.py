@@ -356,10 +356,14 @@ def resolve_cell(name: str, config: CellBuildConfig) -> dict[str, Any]:
         backup_lr = config.lr * recipe.backup_lr_multiplier
     if backup_lr is not None:
         _check_positive("backup_lr", backup_lr)
-    if recipe.primary == "gefen.GefenMuonHybrid" and config.muon_eps != 1e-7:
+    if (
+        recipe.primary in {"gefen.GefenMuon", "gefen.GefenMuonHybrid"}
+        and config.muon_eps != 1e-7
+    ):
         raise ValueError(
             "GefenMuonHybrid does not expose the Muon-half epsilon; "
-            "--muon-eps must remain its actual 1e-7 default for hybrid cells"
+            "--muon-eps must remain its actual 1e-7 default for the "
+            "GefenMuonHybrid-built cells (only torch_muon_adamw forwards it)"
         )
 
     muon_wd = config.weight_decay if config.muon_weight_decay is None else config.muon_weight_decay
@@ -375,6 +379,12 @@ def resolve_cell(name: str, config: CellBuildConfig) -> dict[str, Any]:
         "gefen.GefenMuon",
         "gefen.GefenMuonHybrid",
     }
+    if batched_ns_supported and config.batched_ns and not config.fused:
+        raise ValueError(
+            "--batched-ns requires --fused for GefenMuon cells: batched "
+            "Newton-Schulz buckets only form on the fused path, so a no-fused "
+            "run would be labeled batched_ns without ever batching"
+        )
     resolved = asdict(recipe)
     if recipe.ns_steps is not None and config.adjust_lr_fn is not None:
         if config.adjust_lr_fn not in {"original", "match_rms_adamw"}:

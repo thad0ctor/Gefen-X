@@ -10,6 +10,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+import torch
+
 from .cells import ALL_CELLS, CELL_RECIPES, CORE_CELLS
 from .comparison import (
     SOURCE_FINGERPRINT_ENV,
@@ -46,25 +48,61 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
+def _forwarded_train_args(train_args: list[str]) -> list[str]:
+    forwarded = list(train_args)
+    if forwarded[:1] == ["--"]:
+        forwarded = forwarded[1:]
+    return forwarded
+
+
+def _has_flag(forwarded: list[str], flag: str) -> bool:
+    """Detect both the separated (--flag value) and equals (--flag=value) forms."""
+    return any(token == flag or token.startswith(flag + "=") for token in forwarded)
+
+
+def _flag_value(forwarded: list[str], flag: str) -> str | None:
+    """Last occurrence wins, matching how the cell parsers resolve repeats."""
+    value = None
+    for index, token in enumerate(forwarded):
+        if token == flag and index + 1 < len(forwarded):
+            value = forwarded[index + 1]
+        elif token.startswith(flag + "="):
+            value = token[len(flag) + 1 :]
+    return value
+
+
 def commands(args: argparse.Namespace) -> list[list[str]]:
+    bundle_selection = args.cells.strip() == "all" or args.cells == ",".join(CORE_CELLS)
     names = list(ALL_CELLS) if args.cells.strip() == "all" else [
         name.strip() for name in args.cells.split(",") if name.strip()
     ]
     unknown = sorted(set(names) - set(CELL_RECIPES))
     if unknown:
         raise ValueError(f"unknown cells {unknown}; choose from {list(CELL_RECIPES)}")
+    if (
+        bundle_selection
+        and "torch_muon_adamw" in names
+        and not hasattr(torch.optim, "Muon")
+    ):
+        # The stock-Muon control needs torch.optim.Muon (PyTorch 2.9+); the
+        # package floor is torch>=2.5, so keep the default bundle runnable and
+        # require an explicit --cells request to fail loudly instead.
+        names.remove("torch_muon_adamw")
+        print(
+            "# skipping torch_muon_adamw: torch.optim.Muon is unavailable on "
+            f"torch {torch.__version__} (needs 2.9+); pass --cells to request it explicitly",
+            flush=True,
+        )
     if args.order == "reverse":
         names.reverse()
     elif args.order == "rotate" and names:
         offset = args.rotation % len(names)
         names = names[offset:] + names[:offset]
-    forwarded = list(args.train_args)
-    if forwarded[:1] == ["--"]:
-        forwarded = forwarded[1:]
+    forwarded = _forwarded_train_args(args.train_args)
     output = Path(args.output_dir)
     result_path = output / "results.jsonl"
-    has_results = "--results" in forwarded
-    has_run_name = "--run-name" in forwarded
+    has_results = _has_flag(forwarded, "--results")
+    has_run_name = _has_flag(forwarded, "--run-name")
     planned = []
     module = (
         "benchmarks.training_matrix.train"
@@ -85,13 +123,9 @@ def commands(args: argparse.Namespace) -> list[list[str]]:
 def _generated_dirs(args) -> tuple[Path, ...]:
     """Dirs the cells write into: --output-dir plus a forwarded --results dir."""
     generated = [Path(args.output_dir)]
-    forwarded = list(args.train_args)
-    if forwarded[:1] == ["--"]:
-        forwarded = forwarded[1:]
-    if "--results" in forwarded:
-        index = forwarded.index("--results")
-        if index + 1 < len(forwarded):
-            generated.append(Path(forwarded[index + 1]).parent)
+    results = _flag_value(_forwarded_train_args(args.train_args), "--results")
+    if results is not None:
+        generated.append(Path(results).parent)
     return tuple(generated)
 
 
