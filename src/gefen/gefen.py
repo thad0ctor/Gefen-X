@@ -596,8 +596,6 @@ def _amp_dtensor_protocol_preflight(optimizer) -> bool:
     """
     if not torch.distributed.is_available() or not torch.distributed.is_initialized():
         return False
-    if torch.cuda.is_available() and torch.cuda.is_current_stream_capturing():
-        return False
 
     import torch.distributed as dist
 
@@ -623,6 +621,7 @@ def _amp_dtensor_protocol_preflight(optimizer) -> bool:
             mesh = param.device_mesh
             if mesh.get_coordinate() is None or mesh.size() < 2:
                 continue
+            process_groups = tuple(mesh.get_all_groups())
             key = (
                 str(mesh.device_type),
                 tuple(int(item) for item in mesh.shape),
@@ -630,10 +629,15 @@ def _amp_dtensor_protocol_preflight(optimizer) -> bool:
                     int(item)
                     for item in mesh.mesh.detach().cpu().reshape(-1).tolist()
                 ),
+                tuple(str(group.group_name) for group in process_groups),
             )
             entry = by_mesh.get(key)
             if entry is None:
-                entry = {"mesh": mesh, "items": []}
+                entry = {
+                    "mesh": mesh,
+                    "process_groups": process_groups,
+                    "items": [],
+                }
                 by_mesh[key] = entry
             name = (
                 names[index]
@@ -646,9 +650,23 @@ def _amp_dtensor_protocol_preflight(optimizer) -> bool:
 
     if not by_mesh:
         return False
+    # Do not initialize or query CUDA for a CPU-only DTensor optimizer. Spawned
+    # Gloo workers may run alongside a CUDA-heavy parent release gate, and an
+    # unrelated current-stream query can otherwise block before the CPU
+    # collective preflight. CUDA-backed optimizers retain the capture guard.
+    if any(param.device.type == "cuda" for param in params) and (
+        torch.cuda.is_current_stream_capturing()
+    ):
+        return False
 
     mismatches = []
-    for entry in by_mesh.values():
+    # Parameter-group order may legitimately differ between ranks while two
+    # equivalent DeviceMesh objects still refer to distinct c10d groups. Sort
+    # by each mesh's process-group names so every rank enters those collectives
+    # in creation order instead of whichever parameter happened to appear
+    # first locally.
+    for mesh_key in sorted(by_mesh):
+        entry = by_mesh[mesh_key]
         mesh = entry["mesh"]
         items = sorted(
             entry["items"],
@@ -666,7 +684,7 @@ def _amp_dtensor_protocol_preflight(optimizer) -> bool:
             dtype=torch.int32,
             device=local.device,
         )
-        for process_group in mesh.get_all_groups():
+        for process_group in entry["process_groups"]:
             if dist.get_world_size(process_group) > 1:
                 dist.all_reduce(
                     active_counts, op=dist.ReduceOp.SUM, group=process_group
