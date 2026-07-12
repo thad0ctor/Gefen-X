@@ -139,6 +139,8 @@ Set `deterministic=True` when every GPU replica must produce bit-identical resul
 optimizer = Gefen(model.named_parameters(), lr=3e-4, fused=True, deterministic=True)
 ```
 
+It is an ordinary constructor argument, so it works the same everywhere you build the optimizer: pass it in the [Hugging Face Trainer](#hugging-face-trainer) construction, or in [axolotl](#using-gefen-with-axolotl) add `optim_args: { deterministic: true }`.
+
 ## CUDA Graphs & torch.compile (`capturable`)
 
 All three optimizers accept `capturable=True` (same meaning as `torch.optim`'s argument): `opt.step()` can then be captured in a `torch.cuda.CUDAGraph` or wrapped in `torch.compile(mode="reduce-overhead")` — the compiled hybrid step is about 10% faster than eager. Checkpoints stay correct across graph replays. Usage, caveats, and measured numbers: [COMPATIBILITY.md](https://github.com/thad0ctor/Gefen-X/blob/main/COMPATIBILITY.md#cuda-graphs--torchcompile-capturable).
@@ -275,7 +277,7 @@ optim_args:
 
 For quality-first pretraining, keep the AdamW backup at full LR and set `ns_schedule: standard` plus `normuon: false`. In every recipe, `adjust_lr_fn="match_rms_adamw"` keeps Muon updates on the AdamW LR scale.
 
-**How config maps:** `learning_rate`, `weight_decay`, `adam_beta1`/`adam_beta2`, and `adam_epsilon` forward to the selected constructor. Under `optim_args`, `fused` applies to both optimizer names; `factored_v_2d` is `gefenx`-only; and `backup_optimizer`, `backup_lr`, `ns_schedule`, `normuon`, and `sharded_mode` are `gefenx_muon`-only. String values are coerced to type. For plain Gefen, measure the LR instead of relying only on the `~0.6×` heuristic: `python -m gefen.tools.find_lr --model <path> --optimizer gefen --method sweep` — see [`tools/README.md`](https://github.com/thad0ctor/Gefen-X/blob/main/src/gefen/tools/README.md).
+**How config maps:** `learning_rate`, `weight_decay`, `adam_beta1`/`adam_beta2`, and `adam_epsilon` forward to the selected constructor. Under `optim_args`, `fused` and `deterministic` apply to both optimizer names; `factored_v_2d` is `gefenx`-only; and `backup_optimizer`, `backup_lr`, `ns_schedule`, `normuon`, and `sharded_mode` are `gefenx_muon`-only. String values are coerced to type. For plain Gefen, measure the LR instead of relying only on the `~0.6×` heuristic: `python -m gefen.tools.find_lr --model <path> --optimizer gefen --method sweep` — see [`tools/README.md`](https://github.com/thad0ctor/Gefen-X/blob/main/src/gefen/tools/README.md).
 
 | Lever | axolotl config | Notes |
 |---|---|---|
@@ -285,6 +287,7 @@ For quality-first pretraining, keep the AdamW backup at full LR and set `ns_sche
 | Factored 2D 2nd moment | `optim_args: { factored_v_2d: true }` | matches AdamW loss; default on |
 | Muon backup LR | `optim_args: { backup_lr: <lr> }` | LR for the selected Gefen/AdamW backup; the Axolotl factory defaults to `0.5 × learning_rate`, while balanced SFT/pretraining use full LR |
 | Sharded Newton-Schulz | `optim_args: { sharded_mode: exact }` | `exact` (default) or `distributed` (splits NS across GPUs under FSDP2) |
+| Replica-exact updates | `optim_args: { deterministic: true }` | bit-identical GPU replicas on matching GPUs; both optimizer names — [details](#replica-exact-fused-updates-deterministic) |
 | Learning rate | `learning_rate: <lr>` | the ~0.6× heuristic applies to plain Gefen; tune Muon by task. Background: [Learning rate](#learning-rate-when-porting-an-adamw-config) |
 | `period==1` memory fallback | *on by default in this fork* | restores ~1 B/param on modern decoders; module flag `MEMORY_SAFE_FALLBACK`, not a YAML key |
 
