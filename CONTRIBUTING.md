@@ -12,7 +12,7 @@ pip install torch --index-url https://download.pytorch.org/whl/cpu
 pip install -e ".[test]"
 ```
 
-Add the `perf` extra (`pip install -e ".[perf,test]"`) for ninja-backed CUDA kernel builds (faster JIT; optional — torch builds without it).
+`ninja` and setuptools are core dependencies because PyTorch's runtime extension loader requires them for the fused CUDA kernel build; the editable install above includes both automatically.
 
 ## Running the tests
 
@@ -22,7 +22,7 @@ CI runs the CPU suite from the repo root after installing the package. Mirror th
 python -m pytest tests -q -ra
 ```
 
-CUDA-dependent tests skip themselves automatically on CPU. GPU kernel-parity tests require an NVIDIA device plus `nvcc` and are gated behind the manual `workflow_dispatch` GPU job in CI; run them locally with the same command on a CUDA host.
+CUDA-dependent tests skip themselves automatically on CPU. GPU kernel-parity tests require an NVIDIA device plus `nvcc`; branch CI exposes them through the manual `workflow_dispatch` job, while release tags must pass the two-GPU JIT and distributed gate in `release.yml`. Run the full suite locally with the same command on a CUDA host.
 
 ## Code style
 

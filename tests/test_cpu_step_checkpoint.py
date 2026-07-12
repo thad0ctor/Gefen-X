@@ -841,3 +841,70 @@ def test_state_dict_prehook_changes_survive_orphan_withholding():
     assert opt.state[flat_params[0]]["hook_stamp"] == 123
     # Key order is still restored when the hook leaves the key set unchanged.
     assert list(opt.state.keys()) == live_keys_before
+
+
+def test_gefen_state_dict_post_hooks_see_and_can_replace_final_schema():
+    model = _small_model()
+    opt = Gefen(list(model.named_parameters()), lr=1e-3, fused=False)
+    _apply_grads(model, _synthetic_grads(model, 1)[0])
+    opt.step()
+
+    observed = []
+
+    def inspect_final(_optimizer, state_dict):
+        observed.append(copy.deepcopy(state_dict))
+
+    opt.register_state_dict_post_hook(inspect_final)
+    opt.register_state_dict_post_hook(
+        lambda _optimizer, _state_dict: {"custom": "replacement"}
+    )
+    assert opt.state_dict() == {"custom": "replacement"}
+    assert len(observed) == 1
+    assert {
+        "state",
+        "param_groups",
+        "gefen_global_step",
+        "gefen_codebook",
+        "gefen_deterministic",
+    }.issubset(observed[0])
+    assert all(
+        "stepsize" not in pstate and "_h_buf" not in pstate
+        for pstate in observed[0]["state"].values()
+    )
+
+
+def test_gefen_load_hooks_wrap_complete_restore():
+    source_model = _small_model()
+    source = Gefen(list(source_model.named_parameters()), lr=1e-3, fused=False)
+    for step_grads in _synthetic_grads(source_model, 2):
+        _apply_grads(source_model, step_grads)
+        source.step()
+        source.zero_grad()
+    saved = copy.deepcopy(source.state_dict())
+
+    target_model = _small_model()
+    target = Gefen(list(target_model.named_parameters()), lr=9e-3, fused=False)
+    seen_pre = []
+    seen_post = []
+
+    def pre_hook(_optimizer, state_dict):
+        seen_pre.append(set(state_dict))
+
+    def post_hook(optimizer):
+        seen_post.append(
+            (
+                optimizer._gefen_global_step,
+                optimizer._gefen_codebook.detach().clone(),
+                [state.get("step") for state in optimizer.state.values()],
+            )
+        )
+
+    target.register_load_state_dict_pre_hook(pre_hook)
+    target.register_load_state_dict_post_hook(post_hook)
+    target.load_state_dict(saved)
+
+    assert seen_pre == [set(saved)]
+    assert len(seen_post) == 1
+    assert seen_post[0][0] == 2
+    assert torch.equal(seen_post[0][1], saved["gefen_codebook"])
+    assert all(not torch.is_tensor(step) for step in seen_post[0][2] if step is not None)

@@ -2,14 +2,26 @@
 
 All notable changes to this project are documented here. This project adheres to [Semantic Versioning](https://semver.org/).
 
-## [Unreleased]
+## [0.4.0] - 2026-07-12
 
 Correctness and compatibility:
 
 - Add `deterministic=True` to `Gefen`, `GefenMuon`, and `GefenMuonHybrid` for replica-exact fused routing on homogeneous GPUs. Automatic periods use fixed-order reductions, block-vmean parameters use the deterministic fused v1 path, factored-v parameters use the decomposed deterministic update, and tagged checkpoints enforce the saved policy.
 - Capturable optimizers maintain device-resident global-step counters on every parameter device. CUDA-graph replays now serialize the true global step, including steps with no gradients, so stochastic-rounding checkpoints resume with the correct seed.
-- Checkpoint loading preserves compact optimizer-state dtypes for bf16 parameters, validates frozen codebooks and hybrid backend metadata, and keeps legacy untagged checkpoints loadable.
+- Checkpoint loading preserves compact optimizer-state dtypes for bf16 parameters, validates frozen codebooks and hybrid backend metadata, and keeps safe legacy untagged native checkpoints loadable.
+- Plain Gefen and `GefenMuon(sharded_mode="approx")` collectively encode rank-local DTensor optimizer state for ordinary and flattened PyTorch full-state DCP. Two-GPU FSDP2 `fully_shard` get/set tests resume both optimizers' next update exactly on the same one-dimensional default-world mesh; all ranks must participate, per-process CPU checkpoint memory approaches `world_size ×` local serialized state plus local scratch, topology changes fail closed, and old unsafe untagged full checkpoints are rejected.
+- Add a Transformers Trainer checkpoint-continuation gate for plain Gefen, GefenMuon+AdamW, and GefenMuon+Gefen, covering Trainer's internal Accelerate wrapper, tied weights, gradient accumulation, changing LRs, fused BF16 DDP replica hashes, and exact deterministic resume state.
+- Integrate PyTorch GradScaler without changing the ordinary FP32-master/BF16 Accelerate path: true-FP16 gradients use the optimizer-side protocol, overflow skips every GefenMuonHybrid child atomically, DTensor overflow decisions remain synchronized across ranks, and FSDP1 FP16 directs callers to `ShardedGradScaler`.
+- Reject rank-divergent `grad is None` patterns before exact/distributed DTensor Muon collectives, avoiding an unmatched-collective deadlock without adding collectives to plain/DDP/`approx` steps.
+- Parallel-Muon `distributed` checkpoints now carry a versioned saved-world ownership manifest, validate full owner-state geometry before mutation, preserve released consolidated-v1 and cross-world-size resume, and reject markerless, partial, or internally inconsistent populated state instead of warning and risking divergent momentum.
+- Preflight every active gradient before AMP, codebook work, or child dispatch so a later sparse, compressed, MKLDNN, complex, or malformed gradient cannot leave an earlier parameter partially updated; periodic codebook refresh likewise stages every replacement index before committing shared state.
 - Reject host-driven gradient-histogram output under `capturable=True`, matching the existing periodic-codebook-refresh guard.
+
+Packaging:
+
+- Require `numba>=0.65` for the compiled exact-DP codebook solver.
+- Make `ninja` and `setuptools>=77` core dependencies because PyTorch's runtime CUDA extension loader requires both to build the fused kernels; the former `perf` extra is no longer needed.
+- Pin release build tooling, verify byte-reproducible wheel and normalized-sdist rebuilds, and gate the installed artifact on PyTorch 2.5.0 plus latest CPU, Transformers Trainer resume, and fresh-build two-GPU CUDA/distributed tests before either package index can publish it.
 
 ## [0.3.0] - 2026-07-11
 
@@ -75,7 +87,7 @@ Packaging:
 
 - Distribution renamed to `gefen-x`; project URLs point at the fork repository.
 - Version single-sourced at runtime via `gefen.__version__`.
-- Hard runtime dependencies are `torch>=2.5`, `numpy`, and `numba` (the compiled codebook solver; the pure-Python fallback is too slow for real training). `ninja` is optional under the `perf` extra (`pip install gefen-x[perf]`) for faster CUDA JIT builds. `requires-python = ">=3.10"`.
+- Hard runtime dependencies are `torch>=2.5`, `numpy`, and `numba` (the compiled codebook solver; the pure-Python fallback is too slow for real training). At this release, `ninja` was exposed under the `perf` extra; 0.4.0 corrects it to a core dependency because PyTorch's runtime extension loader requires it. `requires-python = ">=3.10"`.
 - SPDX `license = "MIT"` metadata and a shipped `py.typed` (PEP 561) marker.
 - CI adds lint, an sdist/wheel build check, and Python 3.12 and 3.13 to the test matrix; the CPU job now runs the real pytest suite (66 new CPU-only tests) instead of an import smoke.
 - Package moved into a `src/gefen/` layout, retiring the flat-layout import shadowing (`import gefen` from a clone; the repo's `kernels/` no longer shadows Hugging Face's `kernels`).

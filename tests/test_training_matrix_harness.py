@@ -399,6 +399,8 @@ def test_cell_parsers_reject_flag_abbreviations(parse, extra):
 
 @pytest.mark.parametrize("cell", ("adamw", "torch_muon_adamw"))
 def test_stock_cells_record_batched_ns_request_as_unsupported(cell):
+    if cell == "torch_muon_adamw" and not hasattr(torch.optim, "Muon"):
+        pytest.skip("torch.optim.Muon requires PyTorch 2.9+")
     optimizer, resolved = build_optimizer(
         _model(),
         cell,
@@ -813,8 +815,8 @@ TINY_SHAKESPEARE_REVISION_CACHE = next(
 
 
 @pytest.mark.skipif(
-    TINY_SHAKESPEARE_REVISION_CACHE is None,
-    reason="the pinned Tiny Shakespeare revision is an optional local integration asset",
+    TINY_SHAKESPEARE_REVISION_CACHE is None or importlib.util.find_spec("datasets") is None,
+    reason="the pinned Tiny Shakespeare revision and datasets package are optional local integration assets",
 )
 def test_cached_tiny_shakespeare_hash_groups_are_disjoint():
     bundle = build_dataset(
@@ -872,8 +874,8 @@ WIKITEXT_DOCUMENT_CACHE = (
 
 
 @pytest.mark.skipif(
-    not WIKITEXT_DOCUMENT_CACHE.exists(),
-    reason="pinned document-level WikiText is an optional local integration asset",
+    not WIKITEXT_DOCUMENT_CACHE.exists() or importlib.util.find_spec("datasets") is None,
+    reason="pinned document-level WikiText and the datasets package are optional local integration assets",
 )
 def test_pinned_wikitext_official_split_provenance():
     bundle = build_dataset(

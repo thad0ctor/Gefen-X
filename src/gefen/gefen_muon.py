@@ -6,7 +6,11 @@ from typing import Iterable, Optional, Tuple, Union
 import torch
 import torch.nn as nn
 
-from gefen.gefen import Gefen
+from gefen.gefen import (
+    Gefen,
+    _amp_prepare_optimizer_step,
+    _assert_optimizer_gradients_structurally_valid,
+)
 
 EPS = 1e-7
 DEFAULT_A = 3.4445
@@ -85,6 +89,7 @@ BATCHED_NS_MIN_BATCH = 8
 BATCHED_NS_MAX_MIN_DIM = 512
 BATCHED_NS_MAX_NUMEL = 1 << 20
 BATCHED_NS_DEFAULT_WORKSPACE_BYTES = 256 << 20
+_DISTRIBUTED_CHECKPOINT_METADATA_KEY = "muon_distributed_state"
 
 
 def _batched_ns_shape_eligible(rows: int, cols: int) -> bool:
@@ -523,6 +528,10 @@ class GefenMuon(Gefen):
             step counters and scalars; see Gefen).
         verbose: print codebook/quantization diagnostics.
     """
+
+    @staticmethod
+    def _step_non_2d_parameter_error(param: torch.Tensor) -> str:
+        return _swapped_param_groups_error(param)
 
     def __init__(
         self,
@@ -1286,6 +1295,96 @@ class GefenMuon(Gefen):
             return False
         return torch.distributed.is_initialized()
 
+    @torch._dynamo.disable
+    def _assert_sharded_grad_presence_consistent(self) -> None:
+        """Fail before collectives when mesh ranks disagree on ``grad is None``.
+
+        Exact and distributed Muon reconstruct full DTensor gradients with
+        collectives. If one mesh rank skips a parameter while another enters its
+        ``full_tensor()``/broadcast path, the latter waits forever. Pack every
+        relevant parameter's activity bit by DeviceMesh and sum it across each
+        mesh dimension in sequence; the final count is global to that mesh, so
+        every participating rank sees and raises on the same disagreement before
+        codebook learning or optimizer state/parameter mutation begins.
+
+        Plain tensors/DDP and local-shard ``approx`` mode take no Muon gradient
+        collectives and therefore pay no preflight collective. Manual CUDA graph
+        capture also skips this host-branching check: capturable Gefen requires
+        eager warmup before capture, and those warmup steps establish that the
+        graph's fixed gradient-presence pattern is rank-consistent.
+        """
+        if not self._dist_available():
+            return
+        if torch.cuda.is_available() and torch.cuda.is_current_stream_capturing():
+            return
+
+        import torch.distributed as dist
+
+        by_mesh = OrderedDict()
+        for group in self.param_groups:
+            if group["sharded_mode"] == "approx":
+                continue
+            for name, p in self._iter_group_params_with_names(group):
+                if not self._is_sharded(p):
+                    continue
+                mesh = p.device_mesh
+                if mesh.get_coordinate() is None or mesh.size() < 2:
+                    continue
+                # All parameters created from one FSDP2/DTensor mesh normally
+                # share the same DeviceMesh object. Key by identity so exotic
+                # optimizers carrying distinct meshes run one matched vector
+                # collective per mesh without conflating their parameter order.
+                key = id(mesh)
+                entry = by_mesh.get(key)
+                if entry is None:
+                    entry = {"mesh": mesh, "items": []}
+                    by_mesh[key] = entry
+                entry["items"].append((str(name), p, p.grad is not None))
+
+        mismatches = []
+        for entry in by_mesh.values():
+            mesh = entry["mesh"]
+            items = entry["items"]
+            device = self._state_tensor_device(items[0][1])
+            active_counts = torch.tensor(
+                [int(active) for _, _, active in items],
+                dtype=torch.int32,
+                device=device,
+            )
+            # Reducing the same vector once along every Cartesian mesh
+            # dimension propagates a global activity count to every mesh rank.
+            # This is one collective per mesh dimension, independent of the
+            # number of optimizer parameters.
+            for process_group in mesh.get_all_groups():
+                if dist.get_world_size(process_group) > 1:
+                    dist.all_reduce(
+                        active_counts, op=dist.ReduceOp.SUM, group=process_group
+                    )
+
+            mesh_size = mesh.size()
+            inconsistent = torch.nonzero(
+                (active_counts != 0) & (active_counts != mesh_size),
+                as_tuple=False,
+            ).flatten()
+            if inconsistent.numel() == 0:
+                continue
+            counts_cpu = active_counts.cpu()
+            for index in inconsistent.cpu().tolist():
+                mismatches.append(
+                    "{} ({}/{} mesh ranks have gradients)".format(
+                        items[index][0], int(counts_cpu[index]), mesh_size
+                    )
+                )
+
+        if mismatches:
+            raise RuntimeError(
+                "GefenMuon requires identical gradient presence on every rank "
+                "of a DTensor/FSDP mesh before sharded_mode='exact' or "
+                "'distributed' stepping. Mismatched parameters: {}. Ensure "
+                "conditional or unused parameters produce the same `.grad is "
+                "None` pattern on every mesh rank.".format(", ".join(mismatches))
+            )
+
     def _distributed_process_group(self, p: torch.Tensor):
         if not self._dist_available() or not self._is_sharded(p):
             return None
@@ -1645,6 +1744,7 @@ class GefenMuon(Gefen):
         if not by_pg:
             return state_dict
 
+        marker_groups = []
         for pg, pg_items in by_pg.items():
             world = dist.get_world_size(pg)
             my_coord = dist.get_group_rank(pg, dist.get_rank())
@@ -1708,10 +1808,40 @@ class GefenMuon(Gefen):
 
                 state_dict["state"][saved_id] = owner_state
 
+            marker_groups.append(
+                {
+                    "world_size": world,
+                    "params": [
+                        {
+                            "saved_id": saved_id,
+                            "name": str(name),
+                            "shape": tuple(p.shape),
+                            "owner": owner_by_saved_id[saved_id],
+                            "state_keys": tuple(
+                                sorted(
+                                    str(key)
+                                    for key in state_dict["state"]
+                                    .get(saved_id, {})
+                                    .keys()
+                                )
+                            ),
+                            "initialized": any(
+                                str(key) != "name"
+                                for key in state_dict["state"]
+                                .get(saved_id, {})
+                                .keys()
+                            ),
+                        }
+                        for name, p, saved_id in pg_items
+                    ],
+                }
+            )
+
         state_dict["gefen_muon_distributed"] = {
-            "version": 1,
+            "version": 2,
             "ownership": "stable_full_param_index_v1",
             "consolidated": True,
+            "groups": marker_groups,
         }
         return state_dict
 
@@ -1741,53 +1871,644 @@ class GefenMuon(Gefen):
                 pstate.clear()
                 pstate["name"] = str(name).lower()
 
-    def state_dict(self):
-        state_dict = super().state_dict()
-        return self._consolidate_distributed_state_dict(state_dict)
+    def _state_dict_impl(self):
+        # Parallel-Muon owner state must be made complete before Gefen's
+        # rank-local DTensor adapter serializes the per-rank payload. This
+        # ordering matters for mixed optimizers carrying both ``approx`` and
+        # ``distributed`` groups: wrapping first replaces every real state entry
+        # with opaque transport tensors, which are not owner momentum.
+        state_dict = super()._state_dict_impl(consolidate_rank_local=False)
+        state_dict = self._consolidate_distributed_state_dict(state_dict)
 
-    def _warn_if_unconsolidated_distributed_load(self, state_dict, marker) -> None:
+        checkpoint_metadata = None
+        groups = state_dict.get("param_groups", ())
+        if groups:
+            checkpoint_metadata = groups[0].get("_gefen_checkpoint_metadata")
+        if self._uses_rank_local_sharded_state():
+            if not isinstance(checkpoint_metadata, dict):
+                raise RuntimeError(
+                    "GefenMuon rank-local checkpoint metadata was not initialized"
+                )
+            self._consolidate_rank_local_sharded_state(
+                state_dict, checkpoint_metadata
+            )
+
+        marker = state_dict.get("gefen_muon_distributed")
+        if marker is not None:
+            # Generic DCP keeps only conventional state/param_groups top-level
+            # keys. Mirror the owner proof into every group's private transport
+            # metadata so ordinary and flattened DCP round-trips retain it.
+            for group in groups:
+                metadata = dict(group.get("_gefen_checkpoint_metadata", {}))
+                metadata[_DISTRIBUTED_CHECKPOINT_METADATA_KEY] = marker
+                group["_gefen_checkpoint_metadata"] = metadata
+        return state_dict
+
+    @staticmethod
+    def _distributed_checkpoint_error(detail: str) -> ValueError:
+        return ValueError(
+            "GefenMuon.load_state_dict refused populated "
+            "sharded_mode='distributed' optimizer state before mutation: {}. "
+            "Parallel-Muon momentum must be consolidated by calling "
+            "GefenMuon.state_dict() on every save rank and must carry either a "
+            "canonical released version-1 consolidation proof or a valid "
+            "version-2 'gefen_muon_distributed' saved-world/owner manifest. "
+            "Re-save from the original distributed job; do not load a rank-local "
+            "or manually stripped optimizer state.".format(detail)
+        )
+
+    def _distributed_checkpoint_marker(self, state_dict):
+        """Recover one consistent owner proof from top-level/group transport."""
+
+        marker = state_dict.pop("gefen_muon_distributed", None)
+        groups = state_dict.get("param_groups", ())
+        metadata_markers = []
+        metadata_presence = []
+        for group in groups if isinstance(groups, (list, tuple)) else ():
+            metadata = (
+                group.get("_gefen_checkpoint_metadata")
+                if isinstance(group, dict)
+                else None
+            )
+            present = (
+                isinstance(metadata, dict)
+                and _DISTRIBUTED_CHECKPOINT_METADATA_KEY in metadata
+            )
+            metadata_presence.append(present)
+            if present:
+                metadata_markers.append(
+                    metadata[_DISTRIBUTED_CHECKPOINT_METADATA_KEY]
+                )
+
+        if any(metadata_presence) and not all(metadata_presence):
+            raise self._distributed_checkpoint_error(
+                "the parameter-group copies of the owner manifest are incomplete"
+            )
+        if metadata_markers:
+            metadata_marker = metadata_markers[0]
+            try:
+                copies_agree = all(
+                    item == metadata_marker for item in metadata_markers[1:]
+                )
+            except Exception:
+                copies_agree = False
+            if not copies_agree:
+                raise self._distributed_checkpoint_error(
+                    "the parameter-group copies of the owner manifest disagree"
+                )
+            if marker is None:
+                marker = metadata_marker
+            else:
+                try:
+                    top_level_agrees = marker == metadata_marker
+                except Exception:
+                    top_level_agrees = False
+                if not top_level_agrees:
+                    raise self._distributed_checkpoint_error(
+                        "the top-level and parameter-group owner manifests disagree"
+                    )
+        return marker
+
+    def _distributed_load_state_items(self, state_dict):
+        """Bind saved distributed groups to live params without zip truncation."""
+        saved_groups = state_dict.get("param_groups")
+        if not isinstance(saved_groups, (list, tuple)):
+            raise self._distributed_checkpoint_error(
+                "the checkpoint param_groups payload is not a sequence"
+            )
+        if not any(
+            isinstance(group, dict) and group.get("sharded_mode") == "distributed"
+            for group in saved_groups
+        ):
+            return [], OrderedDict()
+        if len(saved_groups) != len(self.param_groups):
+            raise self._distributed_checkpoint_error(
+                "the checkpoint has {} parameter groups but the live optimizer "
+                "has {}".format(len(saved_groups), len(self.param_groups))
+            )
+
+        saved_state = state_dict.get("state", {})
+        expected_items = []
+        seen_saved_ids = set()
+        by_pg = OrderedDict()
+        for group_index, (saved_group, live_group) in enumerate(
+            zip(saved_groups, self.param_groups)
+        ):
+            if not isinstance(saved_group, dict):
+                raise self._distributed_checkpoint_error(
+                    "checkpoint parameter group {} is not a mapping".format(
+                        group_index
+                    )
+                )
+            saved_ids = saved_group.get("params")
+            if not isinstance(saved_ids, (list, tuple)):
+                raise self._distributed_checkpoint_error(
+                    "checkpoint parameter group {} has no parameter-id list".format(
+                        group_index
+                    )
+                )
+            live_items = list(self._iter_group_params_with_names(live_group))
+            if len(saved_ids) != len(live_items):
+                raise self._distributed_checkpoint_error(
+                    "checkpoint parameter group {} has {} parameters but the live "
+                    "group has {}".format(
+                        group_index, len(saved_ids), len(live_items)
+                    )
+                )
+            if saved_group.get("sharded_mode") != "distributed":
+                continue
+
+            saved_names = saved_group.get("param_names")
+            if saved_names is not None and (
+                not isinstance(saved_names, (list, tuple))
+                or len(saved_names) != len(saved_ids)
+            ):
+                raise self._distributed_checkpoint_error(
+                    "checkpoint distributed group {} has an invalid param_names "
+                    "manifest".format(group_index)
+                )
+            for param_index, ((live_name, live_param), saved_id) in enumerate(
+                zip(live_items, saved_ids)
+            ):
+                if saved_id in seen_saved_ids:
+                    raise self._distributed_checkpoint_error(
+                        "checkpoint distributed parameter id {!r} appears more "
+                        "than once".format(saved_id)
+                    )
+                seen_saved_ids.add(saved_id)
+                state_name = None
+                if isinstance(saved_state, dict):
+                    pstate = saved_state.get(saved_id)
+                    if isinstance(pstate, dict):
+                        state_name = pstate.get("name")
+                saved_name = (
+                    saved_names[param_index]
+                    if saved_names is not None
+                    else state_name
+                )
+                if saved_name is not None and str(saved_name).lower() != str(
+                    live_name
+                ).lower():
+                    raise self._distributed_checkpoint_error(
+                        "checkpoint distributed group {} parameter {} name {!r} "
+                        "does not match live name {!r}".format(
+                            group_index, param_index, saved_name, str(live_name)
+                        )
+                    )
+                item = (str(live_name).lower(), live_param, saved_id)
+                expected_items.append(item)
+                pg = self._distributed_process_group(live_param)
+                if pg is not None:
+                    by_pg.setdefault(pg, []).append(item)
+        return expected_items, by_pg
+
+    @staticmethod
+    def _distributed_checkpoint_is_pristine(state_dict, expected_items) -> bool:
+        steps = []
+        if "gefen_global_step" in state_dict:
+            steps.append(state_dict.get("gefen_global_step"))
+        codebooks = [state_dict.get("gefen_codebook")]
+        for group in state_dict.get("param_groups", ()):
+            if not isinstance(group, dict):
+                return False
+            metadata = group.get("_gefen_checkpoint_metadata")
+            if isinstance(metadata, dict):
+                if "global_step" in metadata:
+                    steps.append(metadata.get("global_step"))
+                codebooks.append(metadata.get("codebook"))
+        if not steps or any(type(step) is not int or step != 0 for step in steps):
+            return False
+        if any(codebook is not None for codebook in codebooks):
+            return False
+
+        saved_state = state_dict.get("state", {})
+        if not isinstance(saved_state, dict):
+            return False
+        for expected_name, _, saved_id in expected_items:
+            pstate = saved_state.get(saved_id)
+            if (
+                not isinstance(pstate, dict)
+                or set(pstate) != {"name"}
+                or str(pstate.get("name")).lower() != expected_name
+            ):
+                return False
+        return True
+
+    def _distributed_checkpoint_codebook(self, state_dict):
+        candidates = []
+        if "gefen_codebook" in state_dict:
+            candidates.append(state_dict.get("gefen_codebook"))
+        for group in state_dict.get("param_groups", ()):
+            if not isinstance(group, dict):
+                continue
+            metadata = group.get("_gefen_checkpoint_metadata")
+            if isinstance(metadata, dict) and "codebook" in metadata:
+                candidates.append(metadata.get("codebook"))
+        non_null = [value for value in candidates if value is not None]
+        if not non_null:
+            return None
+        codebook = non_null[0]
+        for other in non_null[1:]:
+            if not (
+                torch.is_tensor(codebook)
+                and torch.is_tensor(other)
+                and torch.equal(codebook, other)
+            ):
+                raise self._distributed_checkpoint_error(
+                    "checkpoint copies of the frozen codebook disagree"
+                )
+        return codebook
+
+    def _validate_distributed_codebook(self, state_dict, *, required: bool) -> None:
+        try:
+            self._validate_rank_local_codebook(
+                self._distributed_checkpoint_codebook(state_dict),
+                required=required,
+            )
+        except ValueError as exc:
+            raise self._distributed_checkpoint_error(str(exc)) from exc
+
+    @staticmethod
+    def _distributed_counter_is_valid(value, *, minimum: int = 1) -> bool:
+        if torch.is_tensor(value):
+            if (
+                value.dim() != 0
+                or value.dtype == torch.bool
+                or not bool(torch.isfinite(value).all())
+            ):
+                return False
+            scalar = float(value.detach().cpu().item())
+            return scalar >= minimum and scalar.is_integer()
+        return type(value) is int and value >= minimum
+
+    def _validate_distributed_param_state(
+        self, pstate, expected_name: str, param: torch.Tensor
+    ) -> bool:
+        """Validate owner momentum independently of the consolidation marker."""
+        if not isinstance(pstate, dict):
+            raise self._distributed_checkpoint_error(
+                "state for parameter {!r} is missing or is not a mapping".format(
+                    expected_name
+                )
+            )
+        if not all(isinstance(key, str) for key in pstate):
+            raise self._distributed_checkpoint_error(
+                "state for parameter {!r} has non-string keys".format(expected_name)
+            )
+        if str(pstate.get("name")).lower() != expected_name:
+            raise self._distributed_checkpoint_error(
+                "state name {!r} does not match parameter {!r}".format(
+                    pstate.get("name"), expected_name
+                )
+            )
+        if set(pstate) == {"name"}:
+            return False
+
+        core = {"name", "automatic_period", "step", "m_codebook", "m_magnitude"}
+        missing = core - set(pstate)
+        if missing:
+            raise self._distributed_checkpoint_error(
+                "state for parameter {!r} is initialized but missing core keys "
+                "{}".format(expected_name, sorted(missing))
+            )
+        period = pstate["automatic_period"]
+        if type(period) is not int or period <= 0 or param.numel() % period != 0:
+            raise self._distributed_checkpoint_error(
+                "parameter {!r} has invalid automatic_period {!r} for {} "
+                "elements".format(expected_name, period, param.numel())
+            )
+        blocks = param.numel() // period
+        indices = pstate["m_codebook"]
+        magnitude = pstate["m_magnitude"]
+        if (
+            not torch.is_tensor(indices)
+            or indices.dtype != torch.uint8
+            or tuple(indices.shape) != (blocks, period)
+        ):
+            raise self._distributed_checkpoint_error(
+                "parameter {!r} has invalid m_codebook dtype/geometry".format(
+                    expected_name
+                )
+            )
+        if (
+            not torch.is_tensor(magnitude)
+            or magnitude.dtype != torch.float32
+            or tuple(magnitude.shape) != (blocks, 1)
+            or not bool(torch.isfinite(magnitude).all())
+            or not bool((magnitude >= 0).all())
+        ):
+            raise self._distributed_checkpoint_error(
+                "parameter {!r} has invalid m_magnitude dtype/geometry/values".format(
+                    expected_name
+                )
+            )
+        if not self._distributed_counter_is_valid(pstate["step"]):
+            raise self._distributed_checkpoint_error(
+                "parameter {!r} has invalid step counter".format(expected_name)
+            )
+        normuon_v = pstate.get("normuon_v")
+        normuon_step = pstate.get("normuon_step")
+        if (normuon_v is None) != (normuon_step is None):
+            raise self._distributed_checkpoint_error(
+                "parameter {!r} has incomplete NorMuon state".format(expected_name)
+            )
+        if normuon_v is not None and (
+            not torch.is_tensor(normuon_v)
+            or normuon_v.dtype != torch.float32
+            or tuple(normuon_v.shape) != (param.shape[0], 1)
+            or not bool(torch.isfinite(normuon_v).all())
+            or not bool((normuon_v >= 0).all())
+            or not self._distributed_counter_is_valid(normuon_step)
+        ):
+            raise self._distributed_checkpoint_error(
+                "parameter {!r} has invalid NorMuon dtype/geometry/counter".format(
+                    expected_name
+                )
+            )
+        return True
+
+    def _validate_distributed_checkpoint_load(self, state_dict, marker) -> None:
         # In distributed mode the persistent momentum lives only on each matrix's
         # stable owner rank; state_dict() runs a collective that broadcasts every
-        # owner's state to all ranks and stamps the consolidation marker. A
-        # checkpoint that skipped that consolidation (an old/foreign save, or a
-        # rank-0-only dump) leaves non-owner ranks without the owner's momentum, so
-        # a resumed run silently diverges. Warn (do NOT raise) so loading such a
-        # checkpoint degrades rather than crashes.
-        if not self._dist_available():
-            return
-        consolidated = isinstance(marker, dict) and marker.get("consolidated") is True
-        if consolidated:
-            return
+        # owner's state to all ranks and stamps a manifest describing the saved
+        # process-group world, stable owner, parameter identity/order, and state
+        # keys. A rank-local dump can otherwise look loadable on every rank while
+        # silently resetting the non-owner momentum. Validate before delegating to
+        # the base loader so every rejection is mutation-free.
         try:
-            by_pg = self._distributed_state_items(state_dict)
-        except (KeyError, TypeError):
+            expected_items, by_pg = self._distributed_load_state_items(state_dict)
+        except (KeyError, TypeError, ValueError) as exc:
+            if isinstance(exc, ValueError) and str(exc).startswith(
+                "GefenMuon.load_state_dict refused"
+            ):
+                raise
+            raise self._distributed_checkpoint_error(
+                "the checkpoint parameter-group layout cannot be matched to the "
+                "live distributed DTensor parameters ({})".format(exc)
+            ) from exc
+        if not expected_items:
             return
-        if not by_pg:
-            return
-        saved_state = state_dict.get("state", {})
-        carries_state = any(
-            saved_id in saved_state
-            for pg_items in by_pg.values()
-            for (_, _, saved_id) in pg_items
-        )
-        if not carries_state:
-            return
-        warnings.warn(
-            "GefenMuon.load_state_dict: loading a sharded_mode='distributed' "
-            "checkpoint that is not marked consolidated (missing/incomplete "
-            "'gefen_muon_distributed' marker written by GefenMuon.state_dict()). "
-            "Non-owner ranks may start with incomplete momentum and the resumed "
-            "run can diverge. Re-save with GefenMuon.state_dict() (called on every "
-            "rank) to produce a consolidated checkpoint.",
-            RuntimeWarning,
-            stacklevel=2,
-        )
 
-    def load_state_dict(self, state_dict):
+        saved_state = state_dict.get("state", {})
+        if not isinstance(saved_state, dict):
+            raise self._distributed_checkpoint_error(
+                "the checkpoint 'state' payload is not a mapping"
+            )
+        pristine = self._distributed_checkpoint_is_pristine(
+            state_dict, expected_items
+        )
+        if pristine and marker is None:
+            return
+
+        if not isinstance(marker, dict):
+            # A world-1 or unsupported-mesh "distributed" group takes Muon's
+            # replicated exact fallback and never had owner-local state to
+            # consolidate. Preserve such markerless legacy loads only when every
+            # expected entry is independently proven complete.
+            if not by_pg:
+                initialized = [
+                    self._validate_distributed_param_state(
+                        saved_state.get(saved_id), expected_name, param
+                    )
+                    for expected_name, param, saved_id in expected_items
+                ]
+                if initialized and all(initialized):
+                    self._validate_distributed_codebook(
+                        state_dict, required=True
+                    )
+                    return
+            raise self._distributed_checkpoint_error(
+                "the consolidation marker is missing or is not a mapping"
+            )
+        version = marker.get("version")
+        if version not in (1, 2):
+            raise self._distributed_checkpoint_error(
+                "the consolidation marker version is {!r}, expected 1 or 2".format(
+                    version
+                )
+            )
+        if marker.get("ownership") != "stable_full_param_index_v1":
+            raise self._distributed_checkpoint_error(
+                "the ownership scheme is {!r}, expected "
+                "'stable_full_param_index_v1'".format(marker.get("ownership"))
+            )
+        if marker.get("consolidated") is not True:
+            raise self._distributed_checkpoint_error(
+                "the consolidation marker does not assert consolidated=True"
+            )
+
+        if version == 1:
+            if pristine:
+                return
+            initialized = [
+                self._validate_distributed_param_state(
+                    saved_state.get(saved_id), expected_name, param
+                )
+                for expected_name, param, saved_id in expected_items
+            ]
+            if not initialized or not all(initialized):
+                raise self._distributed_checkpoint_error(
+                    "released version-1 state mixes initialized and empty owner "
+                    "entries, so completeness cannot be proven"
+                )
+            self._validate_distributed_codebook(state_dict, required=True)
+            return
+
+        marker_groups = marker.get("groups")
+        if not isinstance(marker_groups, (list, tuple)):
+            raise self._distributed_checkpoint_error(
+                "the saved-world/owner group manifest is missing or is not a list"
+            )
+
+        # A sharded_mode='distributed' optimizer group may contain a mixture of
+        # Parallel-Muon-eligible parameters and replicated fallbacks (plain
+        # tensors, multi-dimensional meshes, or world-one meshes). Save-side
+        # consolidation creates one owner manifest per eligible process group
+        # and deliberately leaves fallback state to the ordinary Gefen loader.
+        # Bind the proof to those same ordered process-group partitions instead
+        # of requiring it to cover every parameter in the optimizer group.
+        expected_pg_groups = list(by_pg.values())
+        if len(marker_groups) != len(expected_pg_groups):
+            raise self._distributed_checkpoint_error(
+                "the owner manifest has {} process-group entries but the live "
+                "optimizer has {} eligible distributed process groups".format(
+                    len(marker_groups), len(expected_pg_groups)
+                )
+            )
+
+        eligible_ids = {
+            saved_id
+            for pg_items in expected_pg_groups
+            for _, _, saved_id in pg_items
+        }
+        fallback_items = [
+            item for item in expected_items if item[2] not in eligible_ids
+        ]
+        initialized_any = False
+        for expected_name, param, saved_id in fallback_items:
+            initialized_any = (
+                self._validate_distributed_param_state(
+                    saved_state.get(saved_id), expected_name, param
+                )
+                or initialized_any
+            )
+
+        for group_index, (saved_group, expected_pg_items) in enumerate(
+            zip(marker_groups, expected_pg_groups)
+        ):
+            if not isinstance(saved_group, dict):
+                raise self._distributed_checkpoint_error(
+                    "owner manifest group {} is not a mapping".format(group_index)
+                )
+            saved_world = saved_group.get("world_size")
+            if (
+                not isinstance(saved_world, int)
+                or isinstance(saved_world, bool)
+                or saved_world <= 0
+            ):
+                raise self._distributed_checkpoint_error(
+                    "owner manifest group {} has invalid saved world_size {!r}".format(
+                        group_index, saved_world
+                    )
+                )
+            saved_params = saved_group.get("params")
+            if not isinstance(saved_params, (list, tuple)):
+                raise self._distributed_checkpoint_error(
+                    "owner manifest group {} has no ordered parameter list".format(
+                        group_index
+                    )
+                )
+            expected_ids = [saved_id for _, _, saved_id in expected_pg_items]
+            manifest_ids = []
+            for param_index, saved_param in enumerate(saved_params):
+                if not isinstance(saved_param, dict):
+                    raise self._distributed_checkpoint_error(
+                        "owner manifest group {} parameter {} is not a mapping".format(
+                            group_index, param_index
+                        )
+                    )
+                expected_owner = _stable_distributed_owner(param_index, saved_world)
+                saved_owner = saved_param.get("owner")
+                if (
+                    not isinstance(saved_owner, int)
+                    or isinstance(saved_owner, bool)
+                    or saved_owner != expected_owner
+                ):
+                    raise self._distributed_checkpoint_error(
+                        "owner manifest group {} parameter {} has owner {!r}, "
+                        "expected {} for saved world {}".format(
+                            group_index,
+                            param_index,
+                            saved_owner,
+                            expected_owner,
+                            saved_world,
+                        )
+                    )
+                manifest_ids.append(saved_param.get("saved_id"))
+
+            try:
+                manifest_id_set = set(manifest_ids)
+            except TypeError as exc:
+                raise self._distributed_checkpoint_error(
+                    "the owner manifest contains an unhashable saved_id"
+                ) from exc
+            if (
+                len(manifest_ids) != len(expected_ids)
+                or len(manifest_id_set) != len(manifest_ids)
+                or manifest_ids != expected_ids
+            ):
+                raise self._distributed_checkpoint_error(
+                    "owner manifest group {} parameter ids {!r} do not exactly "
+                    "match the ordered eligible checkpoint/live ids {!r}".format(
+                        group_index, manifest_ids, expected_ids
+                    )
+                )
+
+            for param_index, (saved_param, live_item) in enumerate(
+                zip(saved_params, expected_pg_items)
+            ):
+                live_name, live_param, saved_id = live_item
+                if saved_param.get("name") != str(live_name):
+                    raise self._distributed_checkpoint_error(
+                        "owner manifest group {} parameter {} name {!r} does not "
+                        "match live name {!r}".format(
+                            group_index,
+                            param_index,
+                            saved_param.get("name"),
+                            str(live_name),
+                        )
+                    )
+                saved_shape = saved_param.get("shape")
+                if not isinstance(saved_shape, (list, tuple)) or tuple(
+                    saved_shape
+                ) != tuple(live_param.shape):
+                    raise self._distributed_checkpoint_error(
+                        "owner manifest group {} parameter {} shape {!r} does not "
+                        "match live shape {!r}".format(
+                            group_index,
+                            param_index,
+                            saved_shape,
+                            tuple(live_param.shape),
+                        )
+                    )
+                saved_keys = saved_param.get("state_keys")
+                if (
+                    not isinstance(saved_keys, (list, tuple))
+                    or not all(isinstance(key, str) for key in saved_keys)
+                    or len(set(saved_keys)) != len(saved_keys)
+                ):
+                    raise self._distributed_checkpoint_error(
+                        "owner manifest group {} parameter {} has no state_keys "
+                        "manifest".format(group_index, param_index)
+                    )
+                actual_param_state = saved_state.get(saved_id)
+                initialized = self._validate_distributed_param_state(
+                    actual_param_state, str(live_name).lower(), live_param
+                )
+                initialized_any = initialized_any or initialized
+                actual_keys = tuple(sorted(str(key) for key in actual_param_state))
+                if tuple(sorted(saved_keys)) != actual_keys:
+                    raise self._distributed_checkpoint_error(
+                        "owner manifest group {} parameter {} state keys {!r} do "
+                        "not match checkpoint state keys {!r}".format(
+                            group_index,
+                            param_index,
+                            tuple(saved_keys),
+                            actual_keys,
+                        )
+                    )
+                marker_initialized = saved_param.get("initialized")
+                if (
+                    type(marker_initialized) is not bool
+                    or marker_initialized != initialized
+                ):
+                    raise self._distributed_checkpoint_error(
+                        "owner manifest group {} parameter {} initialized={!r} "
+                        "does not match checkpoint state initialized={}".format(
+                            group_index,
+                            param_index,
+                            marker_initialized,
+                            initialized,
+                        )
+                    )
+        self._validate_distributed_codebook(state_dict, required=initialized_any)
+
+    def _load_state_dict_impl(self, state_dict):
         state_dict = dict(state_dict)
-        marker = state_dict.pop("gefen_muon_distributed", None)
-        self._warn_if_unconsolidated_distributed_load(state_dict, marker)
-        super().load_state_dict(state_dict)
+        state_dict = self._pack_legacy_param_groups_for_load(state_dict)
+        marker = self._distributed_checkpoint_marker(state_dict)
+
+        # Unwrap only a copied transaction for Parallel-Muon validation. The
+        # base loader unwraps and loads the original exactly once after every
+        # owner/fallback invariant has passed, keeping all rejection paths
+        # mutation-free while composing with rank-local approx state.
+        validation_state = dict(state_dict)
+        validation_state["param_groups"] = [
+            dict(group) for group in state_dict.get("param_groups", ())
+        ]
+        self._unwrap_rank_local_sharded_checkpoint(validation_state)
+        self._validate_distributed_checkpoint_load(validation_state, marker)
+        super()._load_state_dict_impl(state_dict)
         # Old checkpoints predate shape-batched NS. Keep their historical,
         # bit-identical serial behavior even when this optimizer was constructed
         # with the new opt-in; current checkpoints carry and restore both keys.
@@ -1800,6 +2521,7 @@ class GefenMuon(Gefen):
                 BATCHED_NS_DEFAULT_WORKSPACE_BYTES,
             )
         self._drop_non_owned_distributed_state()
+        self._install_rank_local_checkpoint_schema()
 
     @torch.no_grad()
     def step(self, closure=None):
@@ -1808,6 +2530,19 @@ class GefenMuon(Gefen):
         if closure is not None:
             with torch.enable_grad():
                 loss = closure()
+
+        _assert_optimizer_gradients_structurally_valid(
+            self, require_2d_params=True
+        )
+
+        # Native GradScaler calls AMP-aware optimizers even when its non-finite
+        # scan found an overflow. Skip before the sharded preflight, first-step
+        # codebook learning, or any optimizer/parameter mutation; finite scaled
+        # gradients are unscaled once here for every existing Muon path.
+        if (
+            hasattr(self, "found_inf") or hasattr(self, "grad_scale")
+        ) and not _amp_prepare_optimizer_step(self):
+            return loss
 
         # Partition the work once so distributed-mode sharded params can take the
         # stable-owner Parallel-Muon path while every other param keeps the normal
@@ -1833,6 +2568,14 @@ class GefenMuon(Gefen):
                     distributed_items.append((group, name, p, grad))
                 elif grad is not None:
                     regular_items.append((group, name, p, grad))
+
+        # This must precede _maybe_refresh_gefen_codebook(): the first-step
+        # Muon codebook iterator itself calls full_tensor() in exact/distributed
+        # modes, before either update dispatcher gets a chance to validate the
+        # active set. The preflight is mutation-free and gives every mesh rank
+        # the same clear error instead of leaving active ranks in an unmatched
+        # collective.
+        self._assert_sharded_grad_presence_consistent()
 
         self._maybe_refresh_gefen_codebook()
         self._maybe_save_gefen_grad_histogram()

@@ -60,7 +60,12 @@ from collections import OrderedDict
 import torch
 import torch.nn as nn
 
-from gefen.gefen import Gefen
+from gefen.gefen import (
+    Gefen,
+    _amp_native_scaling_required,
+    _amp_prepare_optimizer_step,
+    _assert_optimizer_gradients_structurally_valid,
+)
 from gefen.gefen_muon import GefenMuon
 from gefen.params import (
     DEFAULT_BACKUP_SUBSTRINGS,
@@ -580,6 +585,17 @@ class GefenMuonHybrid(torch.optim.Optimizer):
             groups.extend(o.param_groups)
         return groups
 
+    @property
+    def _step_supports_amp_scaling(self) -> bool:
+        # Inspect the union of both halves so GradScaler chooses one protocol
+        # and one overflow decision for the whole composite. FP32-master AMP
+        # stays on the ordinary externally-skipped path; true FP16 uses the
+        # native path because generic unscale rejects FP16 tensors. A hybrid
+        # combining any true-FP16 storage with multi-rank DTensors selects that
+        # protocol statically after a union-wide collective presence preflight
+        # (FSDP1 FlatParameters require ShardedGradScaler).
+        return _amp_native_scaling_required(self)
+
     @param_groups.setter
     def param_groups(self, value):
         # A composite cannot accept a wholesale param_groups assignment: the
@@ -670,6 +686,20 @@ class GefenMuonHybrid(torch.optim.Optimizer):
         if closure is not None:
             with torch.enable_grad():
                 loss = closure()
+        for child in self._subopts:
+            _assert_optimizer_gradients_structurally_valid(
+                child, require_2d_params=child is self.muon
+            )
+        # A non-finite gradient in either half skips BOTH children before their
+        # codebooks, states, counters, or parameters can move. Explicit
+        # scaler.unscale_(hybrid) is detected by grad_scale=None and is not
+        # repeated; automatic unscale covers every child parameter exactly once.
+        if (
+            hasattr(self, "found_inf") or hasattr(self, "grad_scale")
+        ) and not _amp_prepare_optimizer_step(self):
+            for post_hook in self._optimizer_step_post_hooks.values():
+                post_hook(self, args, kwargs)
+            return loss
         with torch.no_grad():
             for o in self._subopts:
                 o.step()

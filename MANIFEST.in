@@ -1,6 +1,2 @@
-# Include CUDA/C++ sources in source distributions so PyTorch JIT can build kernels after install.
-recursive-include src/gefen/kernels *.py *.cu *.cpp
-recursive-include src/gefen/tools *.md
-# PEP 561 typing marker.
-include src/gefen/py.typed
-prune src/gefen/kernels/.build
+prune benchmarks
+prune tests
