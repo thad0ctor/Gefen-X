@@ -728,7 +728,9 @@ def _cpu_mesh_no_cuda_query_worker(rank, world, port, result_queue):
             timeout=timedelta(seconds=12),
         )
         mesh = init_device_mesh("cpu", (world,))
-        generator = torch.Generator(device="cpu").manual_seed(7300 + rank * 0)
+        # Identical seed on every rank: distribute_tensor needs the same full
+        # tensor across ranks to stay collective-safe.
+        generator = torch.Generator(device="cpu").manual_seed(7300)
 
         full_weight = torch.randn(8, 8, generator=generator)
         weight = nn.Parameter(distribute_tensor(full_weight.clone(), mesh, [Shard(0)]))

@@ -585,6 +585,11 @@ def _mixed_cpu_checkpoint_worker(rank, world, port, result_queue):
             dist.destroy_process_group()
 
 
+@pytest.mark.skipif(
+    not torch.distributed.is_available()
+    or not torch.distributed.is_gloo_available(),
+    reason="mixed parallel/fallback CPU composition needs Gloo",
+)
 def test_mixed_parallel_fallback_and_rank_local_composition_cpu():
     import torch.multiprocessing as mp
 
