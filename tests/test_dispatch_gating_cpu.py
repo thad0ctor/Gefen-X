@@ -125,6 +125,36 @@ def test_construction_never_probes(monkeypatch):
     assert opt._fused_build_ok is None  # unprobed
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+def test_nonfused_cuda_step_never_loads_jit_extensions(monkeypatch):
+    """The public ``fused=False`` contract is JIT-free even on CUDA.
+
+    Period selection and exact-codebook histogramming have their own optional
+    extensions. Historically those still built on the first non-fused step,
+    so selecting the documented pure-PyTorch path could fail on a machine with
+    an otherwise usable CUDA PyTorch install but no matching nvcc toolchain.
+    """
+    import gefen.kernels.exact_histogram_fused as histogram_mod
+    import gefen.kernels.period_variance as period_mod
+
+    def unexpected_load():
+        raise AssertionError("fused=False must not load a CUDA extension")
+
+    monkeypatch.setattr(gefen_mod, "_ensure_gefen_fused_extension_loaded", unexpected_load)
+    monkeypatch.setattr(histogram_mod, "_load_extension", unexpected_load)
+    monkeypatch.setattr(period_mod, "_load_extension", unexpected_load)
+
+    w = nn.Parameter(torch.randn(16, 16, device="cuda"))
+    opt = Gefen([("w", w)], lr=1e-2, fused=False)
+    before = w.detach().clone()
+    (w.square().sum()).backward()
+    opt.step()
+
+    assert opt._fused_build_ok is None
+    assert torch.isfinite(w).all()
+    assert not torch.equal(w.detach(), before)
+
+
 # ---------------------------------------------------------------------------
 # m14 -- empty-string env override means UNSET
 # ---------------------------------------------------------------------------

@@ -32,6 +32,8 @@ The suite needs a CUDA device and is skipped cleanly without one.
 
 Run on the current GPU:  python tests/test_capturable.py
 """
+import copy
+
 import torch
 
 try:
@@ -145,10 +147,10 @@ def test_parity_gefen_factored_fused():
     # per-step scalars flow through the device buffer). The two sides run the
     # identical kernel arithmetic: the fp32 scalars the kernel consumes are
     # asserted BIT-IDENTICAL (device float64 tensor ops vs host python doubles
-    # cast to the same fp32 values), so the only residual divergence is the
-    # factored kernel's own documented run-to-run atomicAdd nondeterminism in
-    # the row/col grad^2 sums (a re-run of the SAME config differs by a couple
-    # of 1-ulp bf16 flips) -- hold the params to that envelope.
+    # cast to the same fp32 values). Pin momentum period selection so a near tie
+    # in the separate variance-search reduction cannot change state geometry;
+    # this test then isolates capturable scalar plumbing, with only the factored
+    # row/col reduction's small run-to-run atomicAdd noise remaining.
     lr, wd, beta1, beta2 = 1e-3, 0.1, 0.9, 0.999
 
     def run(capturable, steps=6, shape=(768, 512), seed=3):
@@ -156,7 +158,13 @@ def test_parity_gefen_factored_fused():
         p = torch.nn.Parameter(
             (torch.randn(*shape, device=DEVICE) * 0.02).bfloat16()
         )
-        opt = Gefen([("w", p)], lr=lr, weight_decay=wd, capturable=capturable)
+        opt = Gefen(
+            [("w", p)],
+            lr=lr,
+            weight_decay=wd,
+            capturable=capturable,
+            force_2d_period_one=True,
+        )
         torch.manual_seed(seed + 1)
         for _ in range(steps):
             p.grad = torch.randn(*shape, device=DEVICE).bfloat16() * 1e-3
@@ -544,11 +552,13 @@ def test_compile_reduce_overhead_gefen():
             else:
                 opt.step()
         torch.cuda.synchronize()
-        return [p.detach().clone() for _, p in params]
+        return [p.detach().clone() for _, p in params], opt
 
-    ref = run(compiled=False)
-    got = run(compiled=True)
+    ref, ref_opt = run(compiled=False)
+    got, got_opt = run(compiled=True)
     _assert_params_close(got, ref, rtol=1e-4, atol=1e-6, what="gefen-compile")
+    assert ref_opt.state_dict()["gefen_global_step"] == steps
+    assert got_opt.state_dict()["gefen_global_step"] == steps
     torch._dynamo.reset()
 
 
@@ -700,6 +710,282 @@ def test_state_dict_roundtrip_across_toggle_hybrid():
 
     seen = _roundtrip_case(build, specs, what="hybrid")
     assert "step" in seen, seen
+
+
+@pytest.mark.parametrize(
+    ("make_opt", "specs"),
+    [
+        (
+            lambda params, lr: Gefen(
+                params, lr=lr, capturable=True, fused=False
+            ),
+            GEFEN_SPECS,
+        ),
+        (
+            lambda params, lr: GefenMuon(
+                params, lr=lr, capturable=True, fused=False, normuon=True
+            ),
+            MUON_SPECS,
+        ),
+    ],
+    ids=("gefen", "muon"),
+)
+def test_graph_replay_checkpoint_serializes_true_global_step(make_opt, specs):
+    warmup, replays = 2, 4
+    steps = warmup + replays
+    grads = _grad_sequence(11, specs, steps)
+    params, opt = _run_captured(
+        make_opt,
+        specs,
+        grads,
+        [1e-3] * steps,
+        warmup,
+        seed=10,
+    )
+
+    state_dict = copy.deepcopy(opt.state_dict())
+
+    assert opt._gefen_global_step == steps
+    assert state_dict["gefen_global_step"] == steps
+    assert {
+        group["_gefen_checkpoint_metadata"]["global_step"]
+        for group in state_dict["param_groups"]
+    } == {steps}
+    assert {
+        int(counter.item())
+        for counter in opt._gefen_global_step_by_device.values()
+    } == {steps}
+
+    restored_params = [
+        (name, torch.nn.Parameter(param.detach().clone())) for name, param in params
+    ]
+    restored = make_opt(
+        restored_params,
+        torch.tensor(1e-3, device=DEVICE),
+    )
+    restored.load_state_dict(state_dict)
+    assert restored._gefen_global_step == steps
+    assert {
+        int(counter.item())
+        for counter in restored._gefen_global_step_by_device.values()
+    } == {steps}
+
+
+def test_graph_replay_global_step_advances_without_gradients():
+    parameter = torch.nn.Parameter(torch.ones(32, device=DEVICE))
+    opt = Gefen(
+        [("unused", parameter)], lr=1e-3, capturable=True, fused=False
+    )
+    warmup, replays = 2, 3
+
+    for _ in range(warmup):
+        opt.step()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        opt.step()
+    for _ in range(replays):
+        graph.replay()
+    torch.cuda.synchronize()
+
+    assert opt.state_dict()["gefen_global_step"] == warmup + replays
+
+
+def test_no_grad_replays_seed_first_active_stochastic_step_correctly():
+    warmup, replays = 2, 3
+    steps = warmup + replays
+    params = _named_params(30, GEFEN_SPECS)
+    opt = _sr_gefen(params, True, lr=torch.tensor(1e-3, device=DEVICE))
+
+    for _ in range(warmup):
+        opt.step()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        opt.step()
+    for _ in range(replays):
+        graph.replay()
+    torch.cuda.synchronize()
+
+    reference_params = _named_params(30, GEFEN_SPECS)
+    reference = _sr_gefen(
+        reference_params, True, lr=torch.tensor(1e-3, device=DEVICE)
+    )
+    for _ in range(steps):
+        reference.step()
+
+    active_grads = _grad_sequence(31, GEFEN_SPECS, 1)[0]
+    for (_, captured), (_, eager), grad in zip(
+        params, reference_params, active_grads
+    ):
+        captured.grad = grad.clone()
+        eager.grad = grad.clone()
+    opt.step()
+    reference.step()
+    torch.cuda.synchronize()
+
+    for (_, captured), (_, eager) in zip(params, reference_params):
+        assert torch.equal(captured, eager)
+    for captured, eager in zip(_m_codebooks(opt), _m_codebooks(reference)):
+        assert torch.equal(captured, eager)
+    for candidate in (opt, reference):
+        assert candidate.state_dict()["gefen_global_step"] == steps + 1
+        assert {
+            int(seed.item()) for seed in candidate._sr_seed_by_device.values()
+        } == {steps + 1}
+
+
+@pytest.mark.skipif(torch.cuda.device_count() < 2, reason="needs two CUDA devices")
+def test_capturable_global_step_stays_aligned_across_devices():
+    first = torch.nn.Parameter(torch.ones(32, device="cuda:0"))
+    second = torch.nn.Parameter(torch.ones(32, device="cuda:1"))
+    opt = Gefen(
+        [
+            {"params": [("first", first)]},
+            {"params": [("second", second)]},
+        ],
+        lr=1e-3,
+        capturable=True,
+        fused=False,
+    )
+
+    for step in range(4):
+        first.grad = torch.full_like(first, 0.1) if step != 2 else None
+        second.grad = torch.full_like(second, -0.1) if step != 1 else None
+        opt.step()
+
+    assert opt.state_dict()["gefen_global_step"] == 4
+    assert {
+        int(counter.item())
+        for counter in opt._gefen_global_step_by_device.values()
+    } == {4}
+
+
+@pytest.mark.skipif(torch.cuda.device_count() < 2, reason="needs two CUDA devices")
+def test_add_param_group_uses_replay_authoritative_global_step():
+    first = torch.nn.Parameter(torch.ones(32, device="cuda:0"))
+    opt = Gefen(
+        [("first", first)], lr=1e-3, capturable=True, fused=False
+    )
+    for _ in range(2):
+        opt.step()
+
+    # Model the state after five graph replays: only the captured device
+    # counter advances until Python runs again.
+    opt._gefen_global_step_by_device[first.device].add_(5)
+    second = torch.nn.Parameter(torch.ones(32, device="cuda:1"))
+    opt.add_param_group({"params": [("second", second)]})
+
+    assert opt._gefen_global_step == 7
+    assert {
+        int(counter.item())
+        for counter in opt._gefen_global_step_by_device.values()
+    } == {7}
+
+
+@pytest.mark.skipif(torch.cuda.device_count() < 2, reason="needs two CUDA devices")
+def test_cuda_graph_rejects_multi_device_optimizer():
+    first = torch.nn.Parameter(torch.ones(32, device="cuda:0"))
+    second = torch.nn.Parameter(torch.ones(32, device="cuda:1"))
+    opt = Gefen(
+        [
+            {"params": [("first", first)]},
+            {"params": [("second", second)]},
+        ],
+        lr=1e-3,
+        capturable=True,
+        fused=False,
+    )
+
+    graph = torch.cuda.CUDAGraph()
+    with pytest.raises(RuntimeError, match="current capture device"):
+        with torch.cuda.graph(graph):
+            opt.step()
+
+
+@pytest.mark.skipif(torch.cuda.device_count() < 2, reason="needs two CUDA devices")
+def test_cuda_graph_rejects_parameter_on_noncurrent_device():
+    parameter = torch.nn.Parameter(torch.ones(32, device="cuda:1"))
+    opt = Gefen(
+        [("other", parameter)], lr=1e-3, capturable=True, fused=False
+    )
+
+    with torch.cuda.device(0):
+        graph = torch.cuda.CUDAGraph()
+        with pytest.raises(RuntimeError, match="current capture device cuda:0"):
+            with torch.cuda.graph(graph):
+                opt.step()
+
+
+def test_cuda_graph_rejects_cpu_parameter():
+    parameter = torch.nn.Parameter(torch.ones(32, device="cpu"))
+    opt = Gefen(
+        [("cpu", parameter)], lr=1e-3, capturable=True, fused=False
+    )
+
+    graph = torch.cuda.CUDAGraph()
+    with pytest.raises(RuntimeError, match="current capture device"):
+        with torch.cuda.graph(graph):
+            opt.step()
+
+
+@pytest.mark.skipif(torch.cuda.device_count() < 2, reason="needs two CUDA devices")
+def test_hybrid_cuda_graph_rejects_children_split_across_devices():
+    muon = [("hidden", torch.nn.Parameter(torch.ones(32, 32, device="cuda:0")))]
+    backup = [("bias", torch.nn.Parameter(torch.ones(32, device="cuda:1")))]
+    opt = GefenMuonHybrid(
+        muon,
+        backup,
+        lr=1e-3,
+        backup_optimizer="adamw",
+        fused=False,
+        capturable=True,
+    )
+
+    with torch.cuda.device(0):
+        graph = torch.cuda.CUDAGraph()
+        with pytest.raises(RuntimeError, match="every GefenMuonHybrid parameter"):
+            with torch.cuda.graph(graph):
+                opt.step()
+
+
+def test_graph_replay_stochastic_round_checkpoint_continues_exactly():
+    warmup, replays = 2, 4
+    steps = warmup + replays
+    grads = _grad_sequence(21, GEFEN_SPECS, steps)
+    params, opt = _run_captured(
+        lambda named, lr: _sr_gefen(named, True, lr=lr),
+        GEFEN_SPECS,
+        grads,
+        [1e-3] * steps,
+        warmup,
+        seed=20,
+    )
+    state_dict = copy.deepcopy(opt.state_dict())
+    restored_params = [
+        (name, torch.nn.Parameter(param.detach().clone())) for name, param in params
+    ]
+    restored = _sr_gefen(
+        restored_params,
+        True,
+        lr=torch.tensor(1e-3, device=DEVICE),
+    )
+    restored.load_state_dict(state_dict)
+
+    next_grads = _grad_sequence(22, GEFEN_SPECS, 1)[0]
+    for (_, original), (_, resumed), grad in zip(
+        params, restored_params, next_grads
+    ):
+        original.grad = grad.clone()
+        resumed.grad = grad.clone()
+    opt.step()
+    restored.step()
+    torch.cuda.synchronize()
+
+    for (_, original), (_, resumed) in zip(params, restored_params):
+        assert torch.equal(original, resumed)
+    for original, resumed in zip(_m_codebooks(opt), _m_codebooks(restored)):
+        assert torch.equal(original, resumed)
+    assert opt.state_dict()["gefen_global_step"] == steps + 1
+    assert restored.state_dict()["gefen_global_step"] == steps + 1
 
 
 # ---------------------------------------------------------------------------
@@ -920,6 +1206,7 @@ def test_compile_reduce_overhead_sr():
     for o in (ref_opt, got_opt):
         (seed,) = o._sr_seed_by_device.values()
         assert seed.item() == steps
+        assert o.state_dict()["gefen_global_step"] == steps
     torch._dynamo.reset()
 
 

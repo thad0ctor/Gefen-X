@@ -1,13 +1,13 @@
 # Python packaging metadata used by pip/build to install Gefen as an importable package.
 # Distribution name is `gefen-x` (this fork); the import name stays `gefen`.
 [build-system]
-requires = ["setuptools>=77", "wheel"]
+requires = ["setuptools==80.10.2", "wheel==0.47.0"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "gefen-x"
 # Single-sourced at runtime via importlib.metadata (see __init__.py __version__).
-version = "0.3.0"
+version = "0.4.0"
 description = "Gefen optimizer for memory-efficient PyTorch training"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -33,17 +33,18 @@ classifiers = [
 # Hard runtime deps. The code needs FSDP2 / public DTensor namespace
 # (torch.distributed.tensor), so torch>=2.5. numba is required: it compiles the
 # exact-DP codebook solver, and the pure-Python fallback in quantization.py is
-# too slow (O(bins^2 * codebooks)) for real training. ninja is optional (CUDA
-# JIT builds are faster with it, but torch can build without) -> the `perf` extra.
+# too slow (O(bins^2 * codebooks)) for real training. ninja and setuptools are
+# required by torch.utils.cpp_extension.load, which builds the fused CUDA kernels
+# at runtime.
 dependencies = [
   "numpy>=1.24",
   "torch>=2.5",
-  "numba"
+  "numba>=0.65",
+  "ninja",
+  "setuptools>=77"
 ]
 
 [project.optional-dependencies]
-# ninja speeds up the CUDA kernel JIT build (optional; torch builds without it).
-perf = ["ninja"]
 test = ["pytest"]
 
 [project.urls]

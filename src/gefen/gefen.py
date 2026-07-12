@@ -10,10 +10,12 @@ contains the ``Gefen`` optimizer and the block-partitioning / quantization
 helpers it steps through; ``gefen_muon``/``hybrid`` build on it.
 """
 
+import io
 import logging
 import math
 import os
 import warnings
+from collections import OrderedDict
 from itertools import chain
 from typing import Iterable, Optional, Tuple, Union
 
@@ -48,6 +50,15 @@ from gefen.kernels.automatic_gefen_fused import (
 )
 
 logger = logging.getLogger(__name__)
+
+_RANK_LOCAL_PAYLOAD_KEY_PREFIX = "_gefen_rank_local_payload_"
+_RANK_LOCAL_MEMBER_KEY = "_gefen_rank_local_member"
+_RANK_LOCAL_FORMAT = "rank_local_dtensor_v2"
+_RANK_LOCAL_METADATA_VERSION = 3
+
+
+def _rank_local_payload_key(global_rank: int) -> str:
+    return "{}{}".format(_RANK_LOCAL_PAYLOAD_KEY_PREFIX, int(global_rank))
 
 # Optional explicit override for the period-search backend ("cuda_kernel" / "cpu"
 # / "gpu"). None (default) means resolve per call from each tensor's own device
@@ -486,6 +497,326 @@ def _resolve_find_period_backend(grad: torch.Tensor) -> str:
     return "cuda_kernel" if grad_work.device.type == "cuda" else "cpu"
 
 
+@torch.no_grad()
+def _amp_prepare_optimizer_step(optimizer) -> bool:
+    """Honor PyTorch's native ``GradScaler`` optimizer-step protocol.
+
+    ``GradScaler.step`` gives AMP-aware optimizers two temporary attributes:
+    ``found_inf`` contains the result of the non-finite scan and ``grad_scale``
+    contains the scale that still needs to be removed. When users explicitly
+    call ``scaler.unscale_(optimizer)`` first, ``grad_scale`` is ``None`` and
+    the gradients must not be divided a second time.
+
+    Return ``False`` on overflow before callers learn a codebook or mutate any
+    optimizer/parameter state. On a finite automatic-unscale step, multiply the
+    gradients in place by the same fp32 reciprocal used by ``GradScaler``. This
+    keeps every existing fused/unfused update path operating on ordinary
+    unscaled gradients and also works for local DTensor shards.
+    """
+    found_inf = getattr(optimizer, "found_inf", None)
+    if found_inf is not None:
+        if torch.is_tensor(found_inf):
+            if found_inf.numel() != 1:
+                raise RuntimeError(
+                    "GradScaler supplied a non-scalar found_inf tensor with "
+                    "shape {}".format(tuple(found_inf.shape))
+                )
+            overflow = bool(found_inf.detach().item())
+        else:
+            overflow = bool(found_inf)
+        if overflow:
+            return False
+
+    grad_scale = getattr(optimizer, "grad_scale", None)
+    if grad_scale is None:
+        # Explicit scaler.unscale_(optimizer), or an ordinary non-AMP step.
+        return True
+
+    if torch.is_tensor(grad_scale):
+        if grad_scale.numel() != 1:
+            raise RuntimeError(
+                "GradScaler supplied a non-scalar grad_scale tensor with shape "
+                "{}".format(tuple(grad_scale.shape))
+            )
+        scale = grad_scale.detach()
+        # Match torch.amp.GradScaler.unscale_: computing the reciprocal in
+        # fp64 avoids compile-option-dependent fp32 division differences.
+        inv_scale = scale.double().reciprocal().float()
+    else:
+        inv_scale = torch.tensor(float(grad_scale), dtype=torch.float64)
+        inv_scale = inv_scale.reciprocal().float()
+
+    grads_by_device = OrderedDict()
+    for group in optimizer.param_groups:
+        for param in group["params"]:
+            grad = param.grad
+            if grad is None:
+                continue
+            # A DTensor's local shard is a writable view of its local storage;
+            # scaling that view avoids introducing a DTensor collective.
+            if hasattr(grad, "placements") and hasattr(grad, "to_local"):
+                grad = grad.to_local()
+            if grad.is_sparse:
+                grad = grad._values()
+            grads_by_device.setdefault(grad.device, []).append(grad)
+
+    inv_scale_by_device = {}
+    for device, grads in grads_by_device.items():
+        device_inv_scale = inv_scale_by_device.get(device)
+        if device_inv_scale is None:
+            device_inv_scale = inv_scale.to(device=device, non_blocking=True)
+            inv_scale_by_device[device] = device_inv_scale
+        # One foreach launch per parameter device. Mixed floating dtypes are
+        # supported; each tensor rounds the fp32 reciprocal in its own dtype's
+        # elementwise multiply, just as GradScaler's regular unscale path does.
+        torch._foreach_mul_(grads, device_inv_scale)
+    return True
+
+
+@torch._dynamo.disable
+def _amp_dtensor_protocol_preflight(optimizer) -> bool:
+    """Synchronize FP16-DTensor AMP protocol selection before GradScaler scans.
+
+    ``GradScaler.step`` reads ``_step_supports_amp_scaling`` before it checks
+    gradients for non-finite values. DTensor dispatch may make that check
+    collective, so choosing the protocol from rank-local active gradients can
+    leave one rank in the ordinary path while another enters a DTensor
+    collective. When an optimizer contains any multi-rank DTensor, non-FSDP1
+    FP16 parameter storage makes the native protocol a topology property
+    instead. Before returning it, compare a fixed gradient-presence vector for
+    every DTensor parameter on the same mesh so every rank either proceeds with
+    the same protocol or raises before GradScaler touches any gradient.
+
+    Return ``True`` when a distributed optimizer containing DTensors also has
+    any non-FSDP1 FP16 parameter storage, even if that parameter is local or
+    inactive on this step. Every DTensor in the optimizer is included because
+    GradScaler scans the complete active set after selecting the native
+    protocol. Single-rank and DTensor-free optimizers retain the active-gradient
+    protocol and do not pay a collective here.
+    """
+    if not torch.distributed.is_available() or not torch.distributed.is_initialized():
+        return False
+
+    import torch.distributed as dist
+
+    params = [param for group in optimizer.param_groups for param in group["params"]]
+    has_fp16_storage = any(
+        param.dtype == torch.float16
+        and not getattr(param, "_is_flat_param", False)
+        for param in params
+    )
+    if not has_fp16_storage:
+        return False
+
+    by_mesh = OrderedDict()
+    for group in optimizer.param_groups:
+        names = group.get("param_names")
+        for index, param in enumerate(group["params"]):
+            if not (
+                hasattr(param, "to_local")
+                and hasattr(param, "placements")
+                and hasattr(param, "device_mesh")
+            ):
+                continue
+            mesh = param.device_mesh
+            if mesh.get_coordinate() is None or mesh.size() < 2:
+                continue
+            process_groups = tuple(mesh.get_all_groups())
+            key = (
+                str(mesh.device_type),
+                tuple(int(item) for item in mesh.shape),
+                tuple(
+                    int(item)
+                    for item in mesh.mesh.detach().cpu().reshape(-1).tolist()
+                ),
+                tuple(str(group.group_name) for group in process_groups),
+            )
+            entry = by_mesh.get(key)
+            if entry is None:
+                entry = {
+                    "mesh": mesh,
+                    "process_groups": process_groups,
+                    "items": [],
+                }
+                by_mesh[key] = entry
+            name = (
+                names[index]
+                if isinstance(names, (list, tuple)) and index < len(names)
+                else getattr(optimizer, "_param_name", lambda _: "parameter")(
+                    param
+                )
+            )
+            entry["items"].append((str(name), param, param.grad is not None))
+
+    if not by_mesh:
+        return False
+    # Do not initialize or query CUDA for a CPU-only DTensor optimizer. Spawned
+    # Gloo workers may run alongside a CUDA-heavy parent release gate, and an
+    # unrelated current-stream query can otherwise block before the CPU
+    # collective preflight. CUDA-backed optimizers retain the capture guard.
+    if any(param.device.type == "cuda" for param in params) and (
+        torch.cuda.is_current_stream_capturing()
+    ):
+        return False
+
+    mismatches = []
+    # Parameter-group order may legitimately differ between ranks while two
+    # equivalent DeviceMesh objects still refer to distinct c10d groups. Sort
+    # by each mesh's process-group names so every rank enters those collectives
+    # in creation order instead of whichever parameter happened to appear
+    # first locally.
+    for mesh_key in sorted(by_mesh):
+        entry = by_mesh[mesh_key]
+        mesh = entry["mesh"]
+        items = sorted(
+            entry["items"],
+            key=lambda item: (
+                item[0],
+                tuple(item[1].shape),
+                str(item[1].dtype),
+            ),
+        )
+        local = items[0][1].to_local()
+        if hasattr(local, "wait"):
+            local = local.wait()
+        active_counts = torch.tensor(
+            [int(active) for _, _, active in items],
+            dtype=torch.int32,
+            device=local.device,
+        )
+        for process_group in entry["process_groups"]:
+            if dist.get_world_size(process_group) > 1:
+                dist.all_reduce(
+                    active_counts, op=dist.ReduceOp.SUM, group=process_group
+                )
+
+        mesh_size = mesh.size()
+        inconsistent = torch.nonzero(
+            (active_counts != 0) & (active_counts != mesh_size),
+            as_tuple=False,
+        ).flatten()
+        if inconsistent.numel() == 0:
+            continue
+        counts_cpu = active_counts.cpu()
+        for index in inconsistent.cpu().tolist():
+            mismatches.append(
+                "{} ({}/{} mesh ranks have gradients)".format(
+                    items[index][0], int(counts_cpu[index]), mesh_size
+                )
+            )
+
+    if mismatches:
+        raise RuntimeError(
+            "Gefen GradScaler integration requires identical DTensor gradient "
+            "presence on every mesh rank before its distributed non-finite "
+            "scan. Mismatched parameters: {}. Ensure conditional or unused "
+            "parameters produce the same `.grad is None` pattern on every "
+            "mesh rank.".format(", ".join(mismatches))
+        )
+    return True
+
+
+def _amp_native_scaling_required(optimizer) -> bool:
+    """Use native scaling only when generic GradScaler cannot unscale safely.
+
+    PyTorch's ordinary GradScaler path has the best integration semantics: it
+    does not call ``optimizer.step()`` on overflow, so Accelerate/Trainer can
+    observe the skip and keep schedulers aligned. Its one unsupported case is a
+    true FP16 gradient tensor. Opt into the optimizer-side protocol only for
+    that case.
+
+    FSDP1 FlatParameter FP16 needs ``ShardedGradScaler``'s scaler-owned,
+    cross-rank non-finite reduction, so native handling is disabled for that
+    representation. DTensor/FSDP2 is different: torch's DTensor handler for the
+    AMP non-finite op MAX-reduces the scaler-owned flag over every mesh
+    dimension even in the native check path, so all ranks skip and update their
+    scales identically.
+    """
+    has_fp16_grad = _amp_dtensor_protocol_preflight(optimizer)
+    has_fsdp1_flat_param = False
+    for group in optimizer.param_groups:
+        for param in group["params"]:
+            if getattr(param, "_is_flat_param", False):
+                has_fsdp1_flat_param = True
+            grad = param.grad
+            if grad is not None and grad.dtype == torch.float16:
+                has_fp16_grad = True
+
+    if has_fp16_grad and has_fsdp1_flat_param:
+        if not getattr(optimizer, "_gefen_warned_sharded_fp16_amp", False):
+            warnings.warn(
+                "Gefen detected FP16 gradients on an FSDP1 FlatParameter and "
+                "disabled optimizer-side AMP unscaling. Use "
+                "torch.distributed.fsdp.ShardedGradScaler (or explicitly call "
+                "its unscale_ before step) so non-finite detection is reduced "
+                "across ranks. Base GradScaler will fail fast while unscaling "
+                "FP16 gradients instead of risking rank-divergent optimizer "
+                "steps.",
+                RuntimeWarning,
+                stacklevel=3,
+            )
+            optimizer._gefen_warned_sharded_fp16_amp = True
+        return False
+    return has_fp16_grad
+
+
+def _assert_optimizer_gradients_structurally_valid(
+    optimizer, *, require_2d_params: bool = False
+) -> None:
+    """Validate every active gradient before any optimizer mutation.
+
+    Optimizer implementations normally discover an invalid later gradient only
+    after earlier parameters have already stepped. Gefen also learns/refreshes a
+    shared codebook before its per-parameter loop, and native AMP may unscale
+    gradients in place. Scan the complete parameter set first so sparse,
+    compressed-sparse, MKLDNN, complex, or malformed gradients fail atomically.
+    """
+    for group in optimizer.param_groups:
+        names = group.get("param_names")
+        for index, param in enumerate(group["params"]):
+            name = (
+                names[index]
+                if isinstance(names, (list, tuple)) and index < len(names)
+                else getattr(optimizer, "_param_name", lambda _: "parameter")(param)
+            )
+            if require_2d_params and param.ndim != 2:
+                error_factory = getattr(
+                    optimizer, "_step_non_2d_parameter_error", None
+                )
+                if callable(error_factory):
+                    raise ValueError(error_factory(param))
+                raise ValueError(
+                    "GefenMuon requires every parameter to remain a 2D matrix "
+                    "before step, but {!r} has {} dimensions.".format(
+                        str(name), param.ndim
+                    )
+                )
+            grad = param.grad
+            if grad is None:
+                continue
+            layout = getattr(grad, "layout", None)
+            if getattr(grad, "is_sparse", False) or layout != torch.strided:
+                raise RuntimeError(
+                    "Gefen does not support sparse gradients or other "
+                    "non-strided layouts; parameter {!r} has gradient layout "
+                    "{}.".format(
+                        str(name), layout
+                    )
+                )
+            if torch.is_complex(grad):
+                raise RuntimeError(
+                    "Gefen optimizers do not support complex gradients, but "
+                    "parameter {!r} has dtype {}.".format(str(name), grad.dtype)
+                )
+            if tuple(grad.shape) != tuple(param.shape):
+                raise RuntimeError(
+                    "Gefen gradient shape {} for parameter {!r} does not match "
+                    "parameter shape {}.".format(
+                        tuple(grad.shape), str(name), tuple(param.shape)
+                    )
+                )
+
+
 class Gefen(torch.optim.Optimizer):
     """Adam-family optimizer with 8-bit quantized momentum and block-shared or
     factored second moments, at roughly 1 byte of optimizer state per parameter.
@@ -550,6 +881,16 @@ class Gefen(torch.optim.Optimizer):
             nearest-rounding accumulates in the EMA momentum over a long
             horizon. Only the fused CUDA automatic-step kernels honor it; a
             warning fires when the fused path is off.
+        deterministic (bool, default False): require replica-exact update
+            arithmetic on identical devices and inputs. Automatic block periods
+            use fixed-order GPU reductions instead of the atomic CUDA search.
+            Fused block-vmean parameters stay fused but use the fixed-order v1
+            reduction instead of the atomic v2-full path. Fused factored-v
+            parameters use the deterministic decomposed factored update because
+            the fast fused stats kernel accumulates column sums with unordered
+            floating-point atomics. This is an explicit throughput-for-
+            reproducibility mode; the default keeps the existing performance
+            routing unchanged.
         capturable (bool, default False): CUDA-graph capturability (mirrors
             torch.optim's argument). Everything that varies across steps --
             step counters, bias corrections, kernel scalars -- lives in device
@@ -559,7 +900,9 @@ class Gefen(torch.optim.Optimizer):
             float ``lr`` is baked at capture time. Codebook learning and the
             period search are host-driven and run on the FIRST step, so do the
             standard warmup steps before capturing. Incompatible with
-            ``codebook_refresh_every > 0``.
+            ``codebook_refresh_every > 0``. Every captured parameter must live
+            on the current CUDA capture device; distributed jobs should use
+            one optimizer per rank/device.
         verbose (bool, default False): extra diagnostics during codebook
             learning and period prediction.
     """
@@ -579,9 +922,19 @@ class Gefen(torch.optim.Optimizer):
         factored_v_2d: bool = True,
         codebook_refresh_every: int = 0,
         stochastic_round: bool = False,
+        deterministic: bool = False,
         capturable: bool = False,
         verbose: bool = False,
     ):
+        if not isinstance(deterministic, bool):
+            raise TypeError("deterministic must be a bool")
+        if deterministic and factored_v_2d and stochastic_round:
+            raise ValueError(
+                "deterministic=True with factored_v_2d=True cannot honor "
+                "stochastic_round=True: the replica-exact factored path uses "
+                "deterministic nearest-codeword quantization. Disable stochastic "
+                "rounding or factored_v_2d."
+            )
         if fused and not torch.cuda.is_available():
             warnings.warn(
                 "Gefen optimizer got fused=True, but CUDA is not available. "
@@ -609,6 +962,7 @@ class Gefen(torch.optim.Optimizer):
             s.lower() for s in period_one_substrings
         )
         self._factored_v_2d = factored_v_2d
+        self._deterministic = deterministic
         if codebook_refresh_every < 0:
             raise ValueError(
                 "codebook_refresh_every must be >= 0 but is: {}".format(
@@ -683,6 +1037,11 @@ class Gefen(torch.optim.Optimizer):
         # nothing it would mark has changed. See _static_mark_signature.
         self._static_mark_sig = None
         self._gefen_global_step = 0
+        # Manual CUDA-graph replay does not execute Python, so the host counter
+        # above cannot be the checkpoint authority under capturable=True. Keep
+        # one device counter per parameter device and advance it in the captured
+        # step tail; state_dict synchronizes the host mirror before serializing.
+        self._gefen_global_step_by_device = {}
 
         defaults = dict(
             lr=lr,
@@ -692,7 +1051,22 @@ class Gefen(torch.optim.Optimizer):
             weight_decay=weight_decay,
         )
         self._param_names = {}
+        # ``set_optimizer_state_dict(flatten_optimizer_state_dict=True)`` uses
+        # the *live* optimizer state/group keys as its unflattening schema before
+        # it calls our loader. Publish the private rank-local transport keys only
+        # after the base constructor has finished registering every group.
+        self._gefen_checkpoint_schema_ready = False
         super().__init__(self._normalize_param_groups(params), defaults)
+        self._gefen_checkpoint_schema_ready = True
+        self._install_rank_local_checkpoint_schema()
+
+    @property
+    def _step_supports_amp_scaling(self) -> bool:
+        # Keep standard GradScaler/Accelerate skip semantics for ordinary
+        # FP32-master AMP. Native handling is needed for active local FP16
+        # gradients, or statically for distributed optimizers that combine any
+        # true-FP16 storage with DTensors after a collective presence preflight.
+        return _amp_native_scaling_required(self)
 
     @staticmethod
     def _normalize_param_groups(params):
@@ -724,8 +1098,10 @@ class Gefen(torch.optim.Optimizer):
             )
         elif not 0.0 <= weight_decay:
             raise ValueError("Invalid weight_decay value: {}".format(weight_decay))
-        elif not 0.0 <= eps:
-            raise ValueError("Invalid epsilon value: {}".format(eps))
+        elif not math.isfinite(eps) or eps <= 0.0:
+            raise ValueError(
+                "Invalid epsilon value: {}; eps must be finite and > 0".format(eps)
+            )
 
     @staticmethod
     def _iter_params_with_names(group_params):
@@ -903,6 +1279,9 @@ class Gefen(torch.optim.Optimizer):
         for param, param_name in zip(params, param_names):
             self._param_names[param] = param_name
             self.state[param]["name"] = param_name
+        self._ensure_gefen_global_step_devices()
+        if getattr(self, "_gefen_checkpoint_schema_ready", False):
+            self._install_rank_local_checkpoint_schema()
 
     def _lr_scalar(self, group) -> float:
         """Resolve ``group["lr"]`` to a python float, caching a tensor lr's ``.item()``.
@@ -993,16 +1372,29 @@ class Gefen(torch.optim.Optimizer):
         # graph without capturable=True would silently freeze the host-side
         # step counters / bias corrections at their capture-time values, so
         # fail loudly instead.
-        if (
-            not self.capturable
-            and torch.cuda.is_available()
-            and torch.cuda.is_current_stream_capturing()
-        ):
+        capturing = (
+            torch.cuda.is_available() and torch.cuda.is_current_stream_capturing()
+        )
+        if capturing and not self.capturable:
             raise RuntimeError(
                 "Attempting CUDA graph capture of {}.step() but capturable=False. "
                 "Construct the optimizer with capturable=True to make step() "
                 "graph-safe.".format(type(self).__name__)
             )
+        if capturing:
+            devices = {
+                param.device
+                for group in self.param_groups
+                for param in group["params"]
+            }
+            capture_device = torch.device("cuda", torch.cuda.current_device())
+            if devices != {capture_device}:
+                raise RuntimeError(
+                    "CUDA graph capture requires every Gefen parameter on the "
+                    "current capture device {}; found {}".format(
+                        capture_device, sorted(map(str, devices))
+                    )
+                )
 
     def _static_mark_signature(self):
         # Cheap identity fingerprint of every object the static-marking pass
@@ -1146,12 +1538,93 @@ class Gefen(torch.optim.Optimizer):
             return None
         seed = self._sr_seed_by_device.get(device)
         if seed is None:
+            self._ensure_gefen_global_step_devices()
+            seed = self._sr_seed_by_device.get(device)
+        if seed is None:
+            global_counter = self._gefen_global_step_by_device.get(device)
+            initial_step = (
+                self._gefen_global_step
+                if global_counter is None
+                else int(global_counter.item())
+            )
             seed = torch.full(
-                (), int(self._gefen_global_step),
+                (), initial_step,
                 dtype=torch.int64, device=device,
             )
             self._sr_seed_by_device[device] = seed
         return seed
+
+    def _gefen_cuda_param_devices(self):
+        return sorted(
+            {
+                param.device
+                for group in self.param_groups
+                for param in group["params"]
+                if param.device.type == "cuda"
+            },
+            key=lambda device: -1 if device.index is None else device.index,
+        )
+
+    def _device_gefen_global_step(self):
+        if not self._gefen_global_step_by_device:
+            return None
+        steps = [
+            int(counter.item())
+            for counter in self._gefen_global_step_by_device.values()
+        ]
+        if any(step != steps[0] for step in steps[1:]):
+            raise RuntimeError(
+                "Gefen capturable global-step counters disagree across devices: "
+                "{}".format(steps)
+            )
+        return steps[0]
+
+    def _ensure_gefen_global_step_devices(self) -> None:
+        """Create capturable counters before capture, including no-grad devices."""
+        if not self.capturable:
+            return
+        devices = self._gefen_cuda_param_devices()
+        missing = [
+            device
+            for device in devices
+            if device not in self._gefen_global_step_by_device
+        ]
+        if missing:
+            device_step = self._device_gefen_global_step()
+            initial_step = self._gefen_global_step if device_step is None else device_step
+            self._gefen_global_step = initial_step
+            for device in missing:
+                self._gefen_global_step_by_device[device] = torch.full(
+                    (), initial_step, dtype=torch.int64, device=device
+                )
+        if self._stochastic_round:
+            for device in devices:
+                if device not in self._sr_seed_by_device:
+                    self._sr_seed_by_device[device] = (
+                        self._gefen_global_step_by_device[device].detach().clone()
+                    )
+
+    def _reset_gefen_global_step_devices(self) -> None:
+        self._gefen_global_step_by_device.clear()
+        self._ensure_gefen_global_step_devices()
+
+    def _synchronize_gefen_global_step_for_checkpoint(self) -> None:
+        """Refresh the serialized host mirror after manual graph replays."""
+        self._ensure_gefen_global_step_devices()
+        device_step = self._device_gefen_global_step()
+        if device_step is not None:
+            self._gefen_global_step = device_step
+        if self.capturable and self._stochastic_round:
+            seed_steps = [
+                int(seed.item()) for seed in self._sr_seed_by_device.values()
+            ]
+            if any(seed_step != self._gefen_global_step for seed_step in seed_steps):
+                raise RuntimeError(
+                    "Gefen capturable stochastic-round seeds disagree with the "
+                    "optimizer global step: {} != {}".format(
+                        seed_steps, self._gefen_global_step
+                    )
+                )
 
     @torch._dynamo.disable
     def _advance_sr_seeds(self) -> None:
@@ -1831,24 +2304,31 @@ class Gefen(torch.optim.Optimizer):
         self, param_name: str, param: torch.Tensor, grad: torch.Tensor
     ) -> int:
         backend = _resolve_find_period_backend(grad)
-        # If the fused CUDA toolchain GENUINELY failed to build (the step-1 probe
-        # ran and returned False -> _fused_build_ok is False), fall back to the
-        # pure-torch "gpu" period backend rather than crashing in the separate
-        # period-variance extension load. Gate on the explicit build-failure
-        # verdict, NOT on _gefen_fused_toolchain_ok(): the latter also returns
-        # False for a user-chosen fused=False optimizer, which must keep using
-        # the cuda_kernel period backend (bit-identical to before this scrub).
-        # Only override the AUTO resolution -- an explicit FIND_PERIOD_BACKEND is
-        # the user's deliberate choice.
+        # The dedicated CUDA period-search kernel finishes each candidate's
+        # cross-block variance reduction with a floating-point atomicAdd. Its
+        # scheduling-dependent last bits normally do not affect the selected
+        # period, but a near tie can route otherwise-identical replicas to
+        # different state geometries before their first update. Deterministic
+        # mode therefore uses PyTorch's fixed-order CUDA reductions, including
+        # when a process-wide FIND_PERIOD_BACKEND override requested the faster
+        # atomic kernel.
+        if self._deterministic and backend == "cuda_kernel":
+            backend = "gpu"
+        # ``fused=False`` is an explicit request for a pure-PyTorch optimizer
+        # step, so it must not cross a different lazy-JIT boundary merely to
+        # choose the block period. A failed fused-kernel probe has the same
+        # requirement. Outside deterministic mode, keep honoring an explicit
+        # FIND_PERIOD_BACKEND override; callers that deliberately select
+        # ``cuda_kernel`` accept its JIT.
+        grad_work = grad.to_local() if hasattr(grad, "to_local") else grad
         if (
             backend == "cuda_kernel"
             and FIND_PERIOD_BACKEND is None
-            and grad.device.type == "cuda"
-            and self._fused_build_ok is False
+            and grad_work.device.type == "cuda"
+            and (not self.fused or self._fused_build_ok is False)
         ):
             backend = "gpu"
         if backend == "cuda_kernel":
-            grad_work = grad.to_local() if hasattr(grad, "to_local") else grad
             grad_flat = grad_work.detach().reshape(-1)
             try:
                 return find_period_by_block_variance(
@@ -1880,11 +2360,13 @@ class Gefen(torch.optim.Optimizer):
                 )
 
         if backend == "cpu":
-            period_input = grad.detach().float().square().reshape(-1).cpu().numpy()
+            period_input = (
+                grad_work.detach().float().square().reshape(-1).cpu().numpy()
+            )
         elif backend == "gpu":
-            if grad.device.type != "cuda":
+            if grad_work.device.type != "cuda":
                 raise ValueError("FIND_PERIOD_BACKEND='gpu' requires a CUDA tensor")
-            period_input = grad.detach().float().square().reshape(-1)
+            period_input = grad_work.detach().float().square().reshape(-1)
         else:
             raise ValueError("Unexpected FIND_PERIOD_BACKEND: {}".format(backend))
         return find_period_by_block_variance(
@@ -1998,14 +2480,14 @@ class Gefen(torch.optim.Optimizer):
             force_endpoints=True,
             verbose=self.verbose,
             compute_mse_logging=compute_mse_logging,
-            # Use the fused histogram UNLESS the toolchain probe explicitly
-            # failed (_fused_build_ok is False). Gating on the build-failure
-            # verdict rather than self.fused preserves the pre-scrub behavior of
-            # the histogram (it ran on CUDA tensors regardless of the optimizer's
-            # fused flag), so a fused=False run stays bit-identical; only a
-            # genuinely broken toolchain drops to the pure-torch bincount path.
+            # ``fused=False`` promises a JIT-free pure-PyTorch path. Do not load
+            # the separate histogram extension in that mode (or after the fused
+            # toolchain probe failed). An explicit global period-backend choice
+            # remains independent of this histogram implementation decision.
             use_fused_histogram=(
-                FUSE_HISTOGRAM_FOR_EXACT and self._fused_build_ok is not False
+                FUSE_HISTOGRAM_FOR_EXACT
+                and self.fused
+                and self._fused_build_ok is not False
             ),
         )
         if codebook is None:
@@ -2104,6 +2586,7 @@ class Gefen(torch.optim.Optimizer):
             self._use_fused_gefen_automatic_step()
             and p.is_cuda
             and p.dtype != torch.float64
+            and not self._deterministic
         ):
             # Fused path. Phase 1 of the kernel computes the per-block absmax
             # AND the raw row/col grad^2 sums in ONE pass over grad + m_sign;
@@ -2199,9 +2682,13 @@ class Gefen(torch.optim.Optimizer):
         bias_correction_1 = 1 - beta1 ** state["step"]
         bias_correction_2 = 1 - beta2 ** state["factored_step"]
 
-        # Decomposed fallback (CPU / fused disabled). Row/col mean-square EMAs
-        # over bounded fp32 row-chunks (one chunk serves both reductions, so
-        # the transient stays ~a few chunk sizes), then whole-tensor torch ops.
+        # Decomposed fallback (CPU / fused disabled / deterministic factored-v).
+        # The fast factored CUDA stats kernel uses unordered floating-point
+        # atomicAdd operations for row/column partials, so deterministic mode
+        # deliberately reaches this fixed-order reduction path while block-vmean
+        # parameters continue using the fused v1 kernel. Row/col mean-square
+        # EMAs run over bounded fp32 row-chunks (one chunk serves both reductions,
+        # so the transient stays ~a few chunk sizes), then whole-tensor torch ops.
         grad2d = grad.detach()
         row_ms = torch.empty(rows, dtype=torch.float32, device=p.device)
         col_sq = torch.zeros(cols, dtype=torch.float32, device=p.device)
@@ -2224,7 +2711,7 @@ class Gefen(torch.optim.Optimizer):
         state["v_row"].mul_(beta2).add_(row_ms, alpha=1 - beta2)
         state["v_col"].mul_(beta2).add_(col_sq, alpha=1 - beta2)
 
-        # Decomposed fallback (CPU / fused disabled): whole-tensor torch ops.
+        # Decomposed fallback: whole-tensor torch ops.
         # The kernel above is the canonical numerics; this matches it within
         # float tolerance (different op association), not bit-for-bit.
         v_hat = torch.outer(state["v_row"], state["v_col"]).div_(
@@ -2258,19 +2745,29 @@ class Gefen(torch.optim.Optimizer):
         )
         if new_codebook is None:
             return
+        staged_indices = []
         for pgroup in self.param_groups:
             for p in pgroup["params"]:
                 pstate = self.state.get(p)
                 if not pstate or "m_codebook" not in pstate:
                     continue
                 stored_device = pstate["m_codebook"].device
-                old_codebook_local = self._gefen_codebook_on(stored_device)
+                # Do not populate/mutate the per-device cache until the whole
+                # refresh transaction succeeds. A failure while staging a later
+                # parameter must leave both indices and cache identity untouched.
+                old_codebook_local = old_codebook.to(stored_device)
                 new_codebook_local = new_codebook.to(stored_device)
                 coeffs = gefen_dequantize_unpacked_indices(
                     old_codebook_local, pstate["m_codebook"], old_codebook_local
                 )
                 indices = gefen_nearest_codebook_indices(new_codebook_local, coeffs)
-                gefen_set_unpacked_indices(pstate["m_codebook"], indices)
+                staged_indices.append((pstate["m_codebook"], indices))
+
+        # Commit only after every allocation/dequantization/search succeeded.
+        # The staged tensors already have the destination shape/device, so this
+        # tail is a deterministic sequence of infallible in-place copies.
+        for stored_indices, indices in staged_indices:
+            gefen_set_unpacked_indices(stored_indices, indices)
         self._gefen_codebook = new_codebook
         self._gefen_codebook_by_device.clear()
         self._gefen_codebook_lut_by_device.clear()
@@ -2313,6 +2810,11 @@ class Gefen(torch.optim.Optimizer):
         requested_steps = quantization_module.LIST_STEPS_SAVE_HIST_GRAD
         if requested_steps is None:
             return
+        if self.capturable and requested_steps:
+            raise ValueError(
+                "capturable=True is incompatible with LIST_STEPS_SAVE_HIST_GRAD: "
+                "histogram collection and file output are host-driven"
+            )
         if self._gefen_global_step not in requested_steps:
             return
         if not hasattr(quantization_module, "SAVE_CODEBOOK_PREFIX"):
@@ -2815,7 +3317,13 @@ class Gefen(torch.optim.Optimizer):
             and grad_view.is_cuda
             and grad_view.dtype != torch.float64
         )
-        route_v2 = _should_use_v2_full(
+        # v2-full forms each block's grad^2 sum through floating-point atomics.
+        # The result is convergence-equivalent but not replica-exact because
+        # independent launches may observe a different accumulation order.
+        # Deterministic mode keeps the fused update and selects v1-full, whose
+        # fixed thread tree produces bit-identical vmean/parameter writes for
+        # identical inputs on a homogeneous architecture.
+        route_v2 = False if self._deterministic else _should_use_v2_full(
             grad_view.shape[0], automatic_period, grad_view.device
         )
         if (
@@ -3194,15 +3702,559 @@ class Gefen(torch.optim.Optimizer):
         )
 
     def state_dict(self):
+        """Run optimizer state-dict hooks around Gefen's complete schema."""
+
+        for pre_hook in self._optimizer_state_dict_pre_hooks.values():
+            pre_hook(self)
+        state_dict = self._state_dict_impl()
+        for post_hook in self._optimizer_state_dict_post_hooks.values():
+            hook_result = post_hook(self, state_dict)
+            if hook_result is not None:
+                state_dict = hook_result
+        return state_dict
+
+    def _base_state_dict_without_hooks(self):
+        """Call ``Optimizer.state_dict`` without double-firing public hooks."""
+
+        pre_hooks = self._optimizer_state_dict_pre_hooks
+        post_hooks = self._optimizer_state_dict_post_hooks
+        self._optimizer_state_dict_pre_hooks = OrderedDict()
+        self._optimizer_state_dict_post_hooks = OrderedDict()
+        try:
+            return super().state_dict()
+        finally:
+            self._optimizer_state_dict_pre_hooks = pre_hooks
+            self._optimizer_state_dict_post_hooks = post_hooks
+
+    def _uses_rank_local_sharded_state(self) -> bool:
+        """Whether this topology stores optimizer state in rank-local geometry."""
+
+        for group in self.param_groups:
+            mode = group.get("sharded_mode")
+            if mode not in (None, "approx"):
+                continue
+            for p in group["params"]:
+                if (
+                    hasattr(p, "to_local")
+                    and hasattr(p, "placements")
+                    and hasattr(p, "device_mesh")
+                ):
+                    return True
+        return False
+
+    @staticmethod
+    def _is_dtensor_parameter(param) -> bool:
+        return (
+            hasattr(param, "to_local")
+            and hasattr(param, "placements")
+            and hasattr(param, "device_mesh")
+        )
+
+    @staticmethod
+    def _placement_checkpoint_signature(placement):
+        """Encode a DTensor placement structurally rather than through repr()."""
+
+        encoded = {
+            "type": type(placement).__name__,
+            "module": type(placement).__module__,
+        }
+        for attribute in ("dim", "split_factor"):
+            value = getattr(placement, attribute, None)
+            if value is not None:
+                encoded[attribute] = int(value)
+        reduce_op = getattr(placement, "reduce_op", None)
+        if reduce_op is not None:
+            encoded["reduce_op"] = str(reduce_op)
+        return encoded
+
+    @staticmethod
+    def _device_mesh_checkpoint_signature(mesh):
+        mesh_ranks = mesh.mesh.detach().cpu().reshape(-1).tolist()
+        return {
+            "device_type": str(mesh.device_type),
+            "shape": list(mesh.shape),
+            "dim_names": list(mesh.mesh_dim_names or ()),
+            "ranks": [int(item) for item in mesh_ranks],
+        }
+
+    def _rank_local_checkpoint_context(self, *, fail: bool = True):
+        """Return the deliberately narrow process-group contract for the adapter.
+
+        Rank-local full-state encoding currently supports exactly one 1-D
+        DeviceMesh spanning the default process group. Subgroups, pipeline-local
+        optimizers, and multidimensional meshes need a native sharded DCP format;
+        silently routing them through the global collectives below can deadlock.
+        """
+
+        if not self._uses_rank_local_sharded_state():
+            return None
+
+        def reject(message):
+            if fail:
+                raise RuntimeError(message)
+            return None
+
+        if not torch.distributed.is_available() or not torch.distributed.is_initialized():
+            return reject(
+                "Gefen rank-local DTensor checkpointing requires an initialized "
+                "default distributed process group"
+            )
+
+        import torch.distributed as dist
+
+        dtensor_params = [
+            p
+            for group in self.param_groups
+            for p in group["params"]
+            if self._is_dtensor_parameter(p)
+        ]
+        if not dtensor_params:
+            return None
+
+        first_mesh = dtensor_params[0].device_mesh
+        first_mesh_signature = self._device_mesh_checkpoint_signature(first_mesh)
+        if len(first_mesh_signature["shape"]) != 1:
+            return reject(
+                "Gefen rank-local optimizer checkpoints support only one 1-D "
+                "DeviceMesh spanning the default process group"
+            )
+        for param in dtensor_params[1:]:
+            mesh_signature = self._device_mesh_checkpoint_signature(param.device_mesh)
+            if mesh_signature != first_mesh_signature:
+                return reject(
+                    "Gefen rank-local optimizer checkpoints require every DTensor "
+                    "parameter to use the same 1-D DeviceMesh"
+                )
+
+        world = dist.get_world_size()
+        world_ranks = list(range(world))
+        if (
+            first_mesh_signature["shape"] != [world]
+            or sorted(first_mesh_signature["ranks"]) != world_ranks
+        ):
+            return reject(
+                "Gefen rank-local optimizer checkpoints do not support DeviceMesh "
+                "subgroups; the one-dimensional mesh must span the default world"
+            )
+
+        try:
+            mesh_group = first_mesh.get_group()
+            mesh_group_ranks = [
+                dist.get_global_rank(mesh_group, group_rank)
+                for group_rank in range(dist.get_world_size(mesh_group))
+            ]
+        except Exception as exc:
+            if fail:
+                raise RuntimeError(
+                    "Gefen could not resolve the rank-local DeviceMesh process group"
+                ) from exc
+            return None
+        if sorted(mesh_group_ranks) != world_ranks:
+            return reject(
+                "Gefen rank-local optimizer checkpoints require the DeviceMesh "
+                "process group to contain exactly the default-world ranks"
+            )
+
+        coordinate = first_mesh.get_coordinate()
+        if coordinate is None:
+            return reject(
+                "The current rank is not a member of Gefen's checkpoint DeviceMesh"
+            )
+        return {
+            "world_size": world,
+            "global_rank": dist.get_rank(),
+            "group_rank": dist.get_group_rank(mesh_group, dist.get_rank()),
+            "world_ranks": world_ranks,
+            "mesh": first_mesh_signature,
+            "coordinate": [int(item) for item in coordinate],
+        }
+
+    def _install_rank_local_checkpoint_schema(self) -> None:
+        """Expose private live keys required by PyTorch's flat OSD unflattener."""
+
+        for group in self.param_groups:
+            group.pop("_gefen_checkpoint_metadata", None)
+            for param in group["params"]:
+                pstate = self.state.get(param)
+                if pstate is not None:
+                    for key in tuple(pstate):
+                        if key.startswith(_RANK_LOCAL_PAYLOAD_KEY_PREFIX):
+                            pstate.pop(key)
+                    pstate.pop(_RANK_LOCAL_MEMBER_KEY, None)
+
+        context = self._rank_local_checkpoint_context(fail=False)
+        if context is None:
+            return
+        params = [param for group in self.param_groups for param in group["params"]]
+        if not params:
+            return
+        for global_rank in context["world_ranks"]:
+            self.state[params[0]][_rank_local_payload_key(global_rank)] = torch.zeros(
+                1, dtype=torch.uint8
+            )
+        for param in params[1:]:
+            self.state[param][_RANK_LOCAL_MEMBER_KEY] = True
+        placeholder = {
+            "format_version": _RANK_LOCAL_METADATA_VERSION,
+            "global_step": self._gefen_global_step,
+            "codebook": None,
+            "deterministic": self._deterministic,
+            "device_anchor": self._checkpoint_device_anchor(),
+            "rank_local_sharded_state": {"format": _RANK_LOCAL_FORMAT},
+        }
+        for group in self.param_groups:
+            group["_gefen_checkpoint_metadata"] = placeholder
+
+    def _rank_local_sharded_signature(self, context=None):
+        if context is None:
+            context = self._rank_local_checkpoint_context()
+        signature = []
+        for group_index, group in enumerate(self.param_groups):
+            for param_index, (name, p) in enumerate(
+                self._iter_group_params_with_names(group)
+            ):
+                identifier = "group_{}_param_{}_{}".format(
+                    group_index, param_index, str(name).lower()
+                )
+                if not self._is_dtensor_parameter(p):
+                    signature.append(
+                        {
+                            "identifier": identifier,
+                            "group": group_index,
+                            "param": param_index,
+                            "name": str(name).lower(),
+                            "sharded": False,
+                            "shape": list(p.shape),
+                            "local_shape": list(p.shape),
+                            "dtype": str(p.dtype),
+                            "requires_grad": bool(p.requires_grad),
+                            "sharded_mode": group.get("sharded_mode"),
+                        }
+                    )
+                    continue
+                local = p.to_local()
+                if hasattr(local, "wait"):
+                    local = local.wait()
+                mesh = p.device_mesh
+                coordinate = mesh.get_coordinate()
+                signature.append(
+                    {
+                        "identifier": identifier,
+                        "group": group_index,
+                        "param": param_index,
+                        "name": str(name).lower(),
+                        "sharded": True,
+                        "shape": list(p.shape),
+                        "local_shape": list(local.shape),
+                        "dtype": str(p.dtype),
+                        "local_dtype": str(local.dtype),
+                        "requires_grad": bool(p.requires_grad),
+                        "placements": [
+                            self._placement_checkpoint_signature(item)
+                            for item in p.placements
+                        ],
+                        "mesh": self._device_mesh_checkpoint_signature(mesh),
+                        "coordinate": None
+                        if coordinate is None
+                        else list(coordinate),
+                        "sharded_mode": group.get("sharded_mode"),
+                    }
+                )
+        return signature
+
+    @staticmethod
+    def _rank_local_parameter_manifest(signature):
+        keys = (
+            "identifier",
+            "group",
+            "param",
+            "name",
+            "sharded",
+            "shape",
+            "dtype",
+            "requires_grad",
+            "sharded_mode",
+        )
+        return [{key: item.get(key) for key in keys} for item in signature]
+
+    def _checkpoint_device_anchor(self) -> torch.Tensor:
+        """One byte that lets DCP locate a fresh lazy optimizer's device."""
+
+        if self._uses_rank_local_sharded_state():
+            # The collective rank-indexed adapter deliberately stages every
+            # payload on CPU to avoid multiplying live VRAM by world size at
+            # checkpoint time. DCP requires every tensor in the fresh local
+            # schema to name one device, so its anchor must be CPU as well.
+            return torch.zeros(1, dtype=torch.uint8)
+        for group in self.param_groups:
+            for p in group["params"]:
+                local = p.to_local() if hasattr(p, "to_local") else p
+                if hasattr(local, "wait"):
+                    local = local.wait()
+                return torch.zeros(1, dtype=torch.uint8, device=local.device)
+        return torch.zeros(1, dtype=torch.uint8)
+
+    @classmethod
+    def _pack_checkpoint_payload(cls, value, tensors):
+        if torch.is_tensor(value):
+            tensor = value.to_local() if hasattr(value, "to_local") else value
+            if hasattr(tensor, "wait"):
+                tensor = tensor.wait()
+            tensor = tensor.detach().contiguous()
+            index = len(tensors)
+            tensors.append(tensor)
+            return ("tensor", index)
+        if isinstance(value, dict):
+            return (
+                "dict",
+                [
+                    (key, cls._pack_checkpoint_payload(item, tensors))
+                    for key, item in value.items()
+                ],
+            )
+        if isinstance(value, list):
+            return (
+                "list",
+                [cls._pack_checkpoint_payload(item, tensors) for item in value],
+            )
+        if isinstance(value, tuple):
+            return (
+                "tuple",
+                [cls._pack_checkpoint_payload(item, tensors) for item in value],
+            )
+        return ("object", value)
+
+    @classmethod
+    def _unpack_checkpoint_payload(cls, packed, tensors):
+        kind, value = packed
+        if kind == "tensor":
+            return tensors[value]
+        if kind == "dict":
+            return {
+                key: cls._unpack_checkpoint_payload(item, tensors)
+                for key, item in value
+            }
+        if kind == "list":
+            return [cls._unpack_checkpoint_payload(item, tensors) for item in value]
+        if kind == "tuple":
+            return tuple(
+                cls._unpack_checkpoint_payload(item, tensors) for item in value
+            )
+        if kind == "object":
+            return value
+        raise ValueError("Unknown Gefen checkpoint payload kind: {}".format(kind))
+
+    @staticmethod
+    def _serialize_rank_local_payload(payload) -> torch.Tensor:
+        buffer = io.BytesIO()
+        torch.save(payload, buffer)
+        return torch.frombuffer(
+            bytearray(buffer.getvalue()), dtype=torch.uint8
+        ).clone()
+
+    @staticmethod
+    def _deserialize_rank_local_payload(payload: torch.Tensor):
+        if not torch.is_tensor(payload) or payload.dtype != torch.uint8 or payload.dim() != 1:
+            raise ValueError(
+                "Gefen rank-local checkpoint payload must be a 1-D uint8 tensor"
+            )
+        buffer = io.BytesIO(payload.detach().cpu().contiguous().numpy().tobytes())
+        try:
+            return torch.load(buffer, map_location="cpu", weights_only=True)
+        except Exception as exc:
+            raise ValueError("Gefen rank-local checkpoint payload is invalid") from exc
+
+    def _broadcast_checkpoint_payload(self, payload, src, group=None):
+        import torch.distributed as dist
+
+        rank = dist.get_rank(group)
+        tensors = []
+        if rank == src:
+            packed = self._pack_checkpoint_payload(payload, tensors)
+            specs = [(tuple(tensor.shape), tensor.dtype) for tensor in tensors]
+            header = [(packed, specs)]
+        else:
+            header = [None]
+        dist.broadcast_object_list(header, src=src, group=group)
+        packed, specs = header[0]
+
+        backend = str(dist.get_backend(group)).lower()
+        comm_device = (
+            torch.device("cuda", torch.cuda.current_device())
+            if "nccl" in backend
+            else torch.device("cpu")
+        )
+        received = []
+        for index, (shape, dtype) in enumerate(specs):
+            if rank == src:
+                tensor = tensors[index].to(device=comm_device).contiguous()
+            else:
+                tensor = torch.empty(shape, dtype=dtype, device=comm_device)
+            dist.broadcast(tensor, src=src, group=group)
+            received.append(tensor.detach().cpu().clone())
+        return self._unpack_checkpoint_payload(packed, received)
+
+    def _consolidate_rank_local_sharded_state(
+        self, state_dict, checkpoint_metadata
+    ) -> None:
+        """Collect rank-local DTensor state for exact same-topology resume.
+
+        Plain Gefen and ``GefenMuon(sharded_mode='approx')`` learn rank-local
+        codebooks and block geometry. PyTorch DCP treats their ordinary local
+        tensors as replicated and otherwise keeps rank 0 silently. Make every
+        rank return the same rank-indexed payload so generic DCP preserves all
+        shards; loading selects the payload for the current rank and rejects a
+        topology/world-size change.
+        """
+
+        if not self._uses_rank_local_sharded_state():
+            return
+
+        import torch.distributed as dist
+
+        context = self._rank_local_checkpoint_context()
+        world = context["world_size"]
+        rank = context["global_rank"]
+        saved_ids = list(state_dict["state"])
+        local_signature = self._rank_local_sharded_signature(context)
+        local_manifest = self._rank_local_parameter_manifest(local_signature)
+        local_control = {
+            "saved_ids": saved_ids,
+            "manifest": local_manifest,
+            "signature": local_signature,
+            "global_step": self._gefen_global_step,
+            "deterministic": self._deterministic,
+        }
+        controls = [None] * world
+        dist.all_gather_object(controls, local_control)
+        if any(control["saved_ids"] != saved_ids for control in controls):
+            raise RuntimeError(
+                "Gefen DTensor checkpoint requires identical optimizer parameter "
+                "ordering on every rank; got state keys {}".format(
+                    [control["saved_ids"] for control in controls]
+                )
+            )
+        if any(control["manifest"] != local_manifest for control in controls):
+            raise RuntimeError(
+                "Gefen DTensor checkpoint parameter identifiers, names, dtypes, "
+                "or global shapes differ across ranks"
+            )
+        global_steps = [control["global_step"] for control in controls]
+        if any(type(step) is not int for step in global_steps) or len(
+            set(global_steps)
+        ) != 1:
+            raise RuntimeError(
+                "Gefen rank-local checkpoint global_step differs across ranks: "
+                "{}".format(global_steps)
+            )
+        deterministic_values = [control["deterministic"] for control in controls]
+        if any(type(value) is not bool for value in deterministic_values) or len(
+            set(deterministic_values)
+        ) != 1:
+            raise RuntimeError(
+                "Gefen rank-local checkpoint deterministic policy differs across "
+                "ranks: {}".format(deterministic_values)
+            )
+
+        signatures = {
+            str(global_rank): controls[global_rank]["signature"]
+            for global_rank in context["world_ranks"]
+        }
+        local_payload = {
+            "format": _RANK_LOCAL_FORMAT,
+            "global_rank": rank,
+            "group_rank": context["group_rank"],
+            "world_size": world,
+            "world_ranks": context["world_ranks"],
+            "mesh": context["mesh"],
+            "signature": local_signature,
+            "parameter_manifest": local_manifest,
+            "global_step": global_steps[0],
+            "deterministic": deterministic_values[0],
+            "states": [state_dict["state"][saved_id] for saved_id in saved_ids],
+            "codebook": self._gefen_codebook,
+        }
+        # Serialize locally before transfer. The prior tensor-by-tensor gather
+        # retained every rank's decoded state and then a second serialized copy
+        # on every process. Exchanging one opaque byte tensor per rank keeps CPU
+        # peak near one global serialized optimizer state plus this rank's live
+        # local state. Share serialization status first so a deterministic local
+        # schema/serialization failure makes every rank raise before broadcasts.
+        try:
+            local_serialized = self._serialize_rank_local_payload(local_payload)
+            serialization_status = {"ok": True, "error": None}
+        except Exception as exc:
+            local_serialized = None
+            serialization_status = {
+                "ok": False,
+                "error": "{}: {}".format(type(exc).__name__, exc),
+            }
+        serialization_statuses = [None] * world
+        dist.all_gather_object(serialization_statuses, serialization_status)
+        if any(not item.get("ok", False) for item in serialization_statuses):
+            raise RuntimeError(
+                "Gefen rank-local checkpoint payload serialization failed across "
+                "ranks: {}".format(serialization_statuses)
+            )
+        serialized_payloads = {
+            str(src): self._broadcast_checkpoint_payload(
+                local_serialized if rank == src else None, src
+            )
+            for src in context["world_ranks"]
+        }
+        state_dict["state"] = {}
+        carrier_state = {
+            # PyTorch 2.5's flat optimizer-state loader requires every key
+            # present in the fresh live state to have a direct tensor/int/float
+            # leaf in the flattened checkpoint. The real stable name remains
+            # inside the validated payload; this integer is only an outer
+            # transport-schema sentinel.
+            "name": 0,
+        }
+        carrier_state.update(
+            {
+                _rank_local_payload_key(global_rank): serialized_payloads[
+                    str(global_rank)
+                ]
+                for global_rank in context["world_ranks"]
+            }
+        )
+        for index, saved_id in enumerate(saved_ids):
+            state_dict["state"][saved_id] = (
+                dict(carrier_state)
+                if index == 0
+                else {"name": 0, _RANK_LOCAL_MEMBER_KEY: True}
+            )
+        marker = {
+            "format": _RANK_LOCAL_FORMAT,
+            "world_size": world,
+            "world_ranks": context["world_ranks"],
+            "mesh": context["mesh"],
+            "signatures": signatures,
+            "parameter_manifest": local_manifest,
+            "global_step": global_steps[0],
+            "deterministic": deterministic_values[0],
+        }
+        checkpoint_metadata["format_version"] = _RANK_LOCAL_METADATA_VERSION
+        checkpoint_metadata["global_step"] = global_steps[0]
+        checkpoint_metadata["deterministic"] = deterministic_values[0]
+        checkpoint_metadata["codebook"] = None
+        checkpoint_metadata["rank_local_sharded_state"] = marker
+        # DCP drops custom top-level keys, and a raw state_dict must not carry
+        # rank 0's codebook as if it applied to every payload.
+        state_dict["gefen_codebook"] = None
+
+    def _state_dict_impl(self, *, consolidate_rank_local: bool = True):
         """Serialize optimizer state, plus Gefen's run-level extras.
 
         Beyond the base ``torch.optim.Optimizer.state_dict`` contents (per-param
         state keyed by index and caller-preserved ``param_groups``), the dict
         carries each parameter's stable ``name`` in its state, plus
-        ``gefen_global_step`` and the frozen exact-DP ``gefen_codebook`` (without
-        it a resume would re-learn the codebook and desync the restored block
-        periods). Per-step scratch buffers are stripped, and non-owning state
-        views are compacted to tight clones so checkpoints stay small.
+        ``gefen_global_step``, the frozen exact-DP ``gefen_codebook`` (without it
+        a resume would re-learn the codebook and desync the restored block
+        periods), and the replica-determinism policy. Per-step scratch buffers
+        are stripped, and non-owning state views are compacted to tight clones
+        so checkpoints stay small.
 
         Only state entries whose parameter is still reachable from
         ``param_groups`` are serialized. Wrappers like DeepSpeed ZeRO-1/2
@@ -3214,6 +4266,8 @@ class Gefen(torch.optim.Optimizer):
         live ``self.state`` untouched (``_param_name`` still reads them);
         they are only withheld from the serialized copy.
         """
+        self._synchronize_gefen_global_step_for_checkpoint()
+
         # Withhold state entries orphaned from param_groups around the base
         # call (see docstring). Tensor hashing is identity-based, so set
         # membership matches the id()-keyed param_mappings the base class
@@ -3227,7 +4281,7 @@ class Gefen(torch.optim.Optimizer):
             original_order = list(self.state)
             withheld = [(param, self.state.pop(param)) for param in orphaned]
             try:
-                state_dict = super().state_dict()
+                state_dict = self._base_state_dict_without_hooks()
             finally:
                 # Re-add only the withheld orphans, without clobbering
                 # anything a registered state_dict pre-hook wrote to live
@@ -3243,7 +4297,7 @@ class Gefen(torch.optim.Optimizer):
                     for key in original_order:
                         self.state[key] = current[key]
         else:
-            state_dict = super().state_dict()
+            state_dict = self._base_state_dict_without_hooks()
         # stepsize/_h_buf are per-step scratch buffers (recomputed from vmean every
         # step); they live in self.state only to be reused across steps, so strip
         # them from the serialized dict instead of bloating every checkpoint. Build
@@ -3262,7 +4316,17 @@ class Gefen(torch.optim.Optimizer):
             # falsely mark restored params as batch-covered.
             "_capt_stack",
             "_capt_row",
+            # Live-only schema hints consumed by PyTorch's flattened optimizer
+            # state unflattener. The collective adapter rebuilds their serialized
+            # values after ordinary state has been compacted.
+            _RANK_LOCAL_MEMBER_KEY,
         )
+
+        def _is_scratch_key(key):
+            return key in scratch_keys or (
+                isinstance(key, str)
+                and key.startswith(_RANK_LOCAL_PAYLOAD_KEY_PREFIX)
+            )
 
         def _compact(value):
             # K4 rebinds m_magnitude onto a [2, num_blocks, 1] scratch buffer via
@@ -3282,22 +4346,53 @@ class Gefen(torch.optim.Optimizer):
 
         state_dict["state"] = {
             pid: (
-                {k: _compact(v) for k, v in pstate.items() if k not in scratch_keys}
+                {
+                    k: _compact(v)
+                    for k, v in pstate.items()
+                    if not _is_scratch_key(k)
+                }
                 if isinstance(pstate, dict)
                 else pstate
             )
             for pid, pstate in state_dict["state"].items()
         }
         state_dict["gefen_global_step"] = self._gefen_global_step
+        state_dict["gefen_deterministic"] = self._deterministic
         # The exact-DP codebook is learned once on the first step and then frozen
         # for the rest of the run. It is not per-param state, so persist it
-        # explicitly; without it resume re-learns the codebook (see
-        # _maybe_refresh_gefen_codebook) which re-predicts and overwrites every
-        # restored automatic_period, desyncing them from the saved
-        # vmean/m_codebook. (Note: under FSDP optim-state consolidation strips
-        # these custom top-level keys; _maybe_refresh_gefen_codebook handles that
-        # fallback by reusing the restored periods.)
+        # explicitly; without it resume would reinterpret the restored uint8
+        # m_codebook indices against a freshly learned codebook. (Note: FSDP/DCP
+        # optim-state consolidation strips custom top-level keys; the per-group
+        # _gefen_checkpoint_metadata mirror below carries the codebook through
+        # that round-trip, and load_state_dict refuses quantized-momentum
+        # checkpoints that lost both copies rather than relearning.)
         state_dict["gefen_codebook"] = self._gefen_codebook
+        # PyTorch Distributed Checkpoint's ``get_optimizer_state_dict`` keeps
+        # only the conventional ``state`` and ``param_groups`` top-level keys.
+        # Mirror the optimizer-level values inside every serialized group so a
+        # DCP/FSDP normalization round-trip cannot silently discard the frozen
+        # codebook and reinterpret restored uint8 momentum indices with a newly
+        # learned one. The loader removes this private transport metadata before
+        # handing groups to torch, so it never leaks into live scheduler groups.
+        checkpoint_metadata = {
+            "format_version": 1,
+            "global_step": self._gefen_global_step,
+            "codebook": self._gefen_codebook,
+            "deterministic": self._deterministic,
+            # PyTorch DCP's full-state loader first inspects a freshly-created
+            # optimizer's local state to choose a broadcast/distribution device.
+            # Gefen initializes momentum lazily, so before step 1 it otherwise
+            # contains only parameter names and DCP raises "Expected device to
+            # be set". This one-byte transport value is removed with the rest
+            # of the private group metadata during load.
+            "device_anchor": self._checkpoint_device_anchor(),
+        }
+        if consolidate_rank_local:
+            self._consolidate_rank_local_sharded_state(
+                state_dict, checkpoint_metadata
+            )
+        for group in state_dict["param_groups"]:
+            group["_gefen_checkpoint_metadata"] = checkpoint_metadata
         return state_dict
 
     @staticmethod
@@ -3363,23 +4458,671 @@ class Gefen(torch.optim.Optimizer):
         return migrated
 
     def load_state_dict(self, state_dict):
+        """Run load hooks around Gefen's complete restore transaction."""
+
+        state_dict = state_dict.copy()
+        for pre_hook in self._optimizer_load_state_dict_pre_hooks.values():
+            hook_result = pre_hook(self, state_dict)
+            if hook_result is not None:
+                state_dict = hook_result
+        self._load_state_dict_impl(state_dict)
+        for post_hook in self._optimizer_load_state_dict_post_hooks.values():
+            post_hook(self)
+
+    def _base_load_state_dict_without_hooks(self, state_dict):
+        pre_hooks = self._optimizer_load_state_dict_pre_hooks
+        post_hooks = self._optimizer_load_state_dict_post_hooks
+        self._optimizer_load_state_dict_pre_hooks = OrderedDict()
+        self._optimizer_load_state_dict_post_hooks = OrderedDict()
+        try:
+            return super().load_state_dict(state_dict)
+        finally:
+            self._optimizer_load_state_dict_pre_hooks = pre_hooks
+            self._optimizer_load_state_dict_post_hooks = post_hooks
+
+    @staticmethod
+    def _validate_rank_local_codebook(codebook, *, required: bool) -> None:
+        if codebook is None:
+            if required:
+                raise ValueError(
+                    "Gefen rank-local checkpoint has quantized momentum but no codebook"
+                )
+            return
+        if (
+            not torch.is_tensor(codebook)
+            or codebook.dtype != torch.float32
+            or codebook.dim() != 1
+            or codebook.numel() != 256
+        ):
+            raise ValueError(
+                "Gefen rank-local checkpoint codebook must be a 256-element fp32 tensor"
+            )
+        codebook_cpu = codebook.detach().cpu()
+        if not bool(torch.isfinite(codebook_cpu).all()):
+            raise ValueError("Gefen rank-local checkpoint codebook must be finite")
+        if not bool(torch.all(codebook_cpu[1:] >= codebook_cpu[:-1])):
+            raise ValueError("Gefen rank-local checkpoint codebook must be sorted")
+        if codebook_cpu[0].item() != -1.0 or codebook_cpu[-1].item() != 1.0:
+            raise ValueError(
+                "Gefen rank-local checkpoint codebook must retain endpoints -1 and 1"
+            )
+
+    @staticmethod
+    def _validate_rank_local_counter(name, value) -> float:
+        if torch.is_tensor(value):
+            if (
+                value.numel() != 1
+                or value.dtype == torch.bool
+                or not bool(torch.isfinite(value.detach()).all())
+            ):
+                raise ValueError(
+                    "Gefen rank-local checkpoint counter {} must be a finite scalar".format(
+                        name
+                    )
+                )
+            scalar = float(value.detach().cpu().item())
+        elif type(value) is int:
+            scalar = float(value)
+        else:
+            raise ValueError(
+                "Gefen rank-local checkpoint counter {} has invalid type {}".format(
+                    name, type(value).__name__
+                )
+            )
+        if scalar < 0 or not scalar.is_integer():
+            raise ValueError(
+                "Gefen rank-local checkpoint counter {} must be a nonnegative integer".format(
+                    name
+                )
+            )
+        return scalar
+
+    def _validate_rank_local_states(self, states, signature, codebook) -> None:
+        if not isinstance(states, list) or len(states) != len(signature):
+            raise ValueError(
+                "Gefen rank-local checkpoint payload has the wrong parameter count"
+            )
+        has_quantized_momentum = False
+        counter_keys = ("step", "vmean_step", "factored_step", "normuon_step")
+        for pstate, param_signature in zip(states, signature):
+            if not isinstance(pstate, dict):
+                raise ValueError(
+                    "Gefen rank-local checkpoint parameter state must be a dict"
+                )
+            expected_name = param_signature["name"]
+            if pstate.get("name") != expected_name:
+                raise ValueError(
+                    "Gefen rank-local checkpoint state name/order differs: "
+                    "checkpoint={!r} expected={!r}".format(
+                        pstate.get("name"), expected_name
+                    )
+                )
+            counters = {}
+            for key in counter_keys:
+                if key in pstate:
+                    counters[key] = self._validate_rank_local_counter(
+                        key, pstate[key]
+                    )
+
+            local_shape = param_signature["local_shape"]
+            state_shape = (
+                param_signature["shape"]
+                if param_signature.get("sharded_mode") in ("exact", "distributed")
+                else local_shape
+            )
+            state_numel = math.prod(state_shape)
+            period = pstate.get("automatic_period")
+            if period is not None:
+                if type(period) is not int or period <= 0:
+                    raise ValueError(
+                        "Gefen rank-local checkpoint automatic_period must be a positive int"
+                    )
+                if state_numel == 0 or state_numel % period != 0:
+                    raise ValueError(
+                        "Gefen rank-local checkpoint automatic_period does not divide "
+                        "the parameter state geometry"
+                    )
+
+            momentum_keys = ("m_codebook", "m_magnitude")
+            carries_momentum = any(key in pstate for key in momentum_keys)
+            if carries_momentum:
+                has_quantized_momentum = True
+                if not all(key in pstate for key in momentum_keys) or period is None:
+                    raise ValueError(
+                        "Gefen rank-local checkpoint momentum state is incomplete"
+                    )
+                if "step" not in pstate:
+                    raise ValueError(
+                        "Gefen rank-local checkpoint momentum state is missing step"
+                    )
+                if counters["step"] < 1:
+                    raise ValueError(
+                        "Gefen rank-local checkpoint initialized momentum requires step >= 1"
+                    )
+                blocks = state_numel // period
+                indices = pstate["m_codebook"]
+                magnitude = pstate["m_magnitude"]
+                if (
+                    not torch.is_tensor(indices)
+                    or indices.dtype != torch.uint8
+                    or tuple(indices.shape) != (blocks, period)
+                ):
+                    raise ValueError(
+                        "Gefen rank-local checkpoint m_codebook geometry/dtype is invalid"
+                    )
+                if (
+                    not torch.is_tensor(magnitude)
+                    or magnitude.dtype != torch.float32
+                    or tuple(magnitude.shape) != (blocks, 1)
+                    or not bool(torch.isfinite(magnitude).all())
+                    or not bool((magnitude >= 0).all())
+                ):
+                    raise ValueError(
+                        "Gefen rank-local checkpoint m_magnitude geometry/dtype/values "
+                        "are invalid"
+                    )
+                vmean = pstate.get("vmean")
+                if vmean is not None and (
+                    not torch.is_tensor(vmean)
+                    or vmean.dtype != torch.float32
+                    or tuple(vmean.shape) != (blocks, 1)
+                    or not bool(torch.isfinite(vmean).all())
+                    or not bool((vmean >= 0).all())
+                ):
+                    raise ValueError(
+                        "Gefen rank-local checkpoint vmean geometry/dtype/values "
+                        "are invalid"
+                    )
+
+                # GefenMuon groups carry a sharded_mode and intentionally use
+                # quantized momentum without Adam's second moment. Plain Gefen
+                # must carry one complete second-moment representation.
+                if param_signature.get("sharded_mode") is None:
+                    carries_factored = "v_row" in pstate or "v_col" in pstate
+                    if carries_factored:
+                        if "factored_step" not in pstate:
+                            raise ValueError(
+                                "Gefen rank-local checkpoint factored state is missing "
+                                "factored_step"
+                            )
+                        if counters["factored_step"] < 1:
+                            raise ValueError(
+                                "Gefen rank-local checkpoint initialized factored "
+                                "state requires factored_step >= 1"
+                            )
+                    elif "vmean" not in pstate or "vmean_step" not in pstate:
+                        raise ValueError(
+                            "Gefen rank-local checkpoint plain momentum is missing "
+                            "vmean/vmean_step"
+                        )
+                    elif counters["vmean_step"] < 1:
+                        raise ValueError(
+                            "Gefen rank-local checkpoint initialized vmean requires "
+                            "vmean_step >= 1"
+                        )
+
+            factored = (pstate.get("v_row"), pstate.get("v_col"))
+            if (factored[0] is None) != (factored[1] is None):
+                raise ValueError(
+                    "Gefen rank-local checkpoint factored second moment is incomplete"
+                )
+            if factored[0] is not None:
+                global_shape = param_signature["shape"]
+                if len(global_shape) != 2:
+                    raise ValueError(
+                        "Gefen rank-local checkpoint factored state requires a 2-D parameter"
+                    )
+                for key, tensor, expected in (
+                    ("v_row", factored[0], global_shape[0]),
+                    ("v_col", factored[1], global_shape[1]),
+                ):
+                    if (
+                        not torch.is_tensor(tensor)
+                        or tensor.dtype != torch.float32
+                        or tuple(tensor.shape) != (expected,)
+                        or not bool(torch.isfinite(tensor).all())
+                        or not bool((tensor >= 0).all())
+                    ):
+                        raise ValueError(
+                            "Gefen rank-local checkpoint {} geometry/dtype/values "
+                            "are invalid".format(key)
+                        )
+
+            has_normuon_v = "normuon_v" in pstate
+            has_normuon_step = "normuon_step" in pstate
+            if has_normuon_v != has_normuon_step:
+                raise ValueError(
+                    "Gefen rank-local checkpoint NorMuon state is incomplete"
+                )
+            if has_normuon_v:
+                if param_signature.get("sharded_mode") is None:
+                    raise ValueError(
+                        "Gefen rank-local checkpoint NorMuon state is invalid for "
+                        "a plain Gefen parameter"
+                    )
+                if not carries_momentum:
+                    raise ValueError(
+                        "Gefen rank-local checkpoint NorMuon state is missing "
+                        "initialized momentum"
+                    )
+                if len(state_shape) != 2:
+                    raise ValueError(
+                        "Gefen rank-local checkpoint NorMuon state requires a 2-D "
+                        "parameter"
+                    )
+                normuon_v = pstate["normuon_v"]
+                if (
+                    not torch.is_tensor(normuon_v)
+                    or normuon_v.dtype != torch.float32
+                    or tuple(normuon_v.shape) != (state_shape[0], 1)
+                    or not bool(torch.isfinite(normuon_v).all())
+                    or not bool((normuon_v >= 0).all())
+                ):
+                    raise ValueError(
+                        "Gefen rank-local checkpoint normuon_v geometry/dtype/values "
+                        "are invalid"
+                    )
+                if counters["normuon_step"] < 1:
+                    raise ValueError(
+                        "Gefen rank-local checkpoint initialized NorMuon state "
+                        "requires normuon_step >= 1"
+                    )
+
+        self._validate_rank_local_codebook(
+            codebook, required=has_quantized_momentum
+        )
+
+    def _unwrap_rank_local_sharded_checkpoint(self, state_dict) -> None:
+        groups = state_dict.get("param_groups", ())
+        if not isinstance(groups, (list, tuple)):
+            raise ValueError("Gefen checkpoint param_groups must be a sequence")
+        metadata = []
+        for group in groups:
+            if not isinstance(group, dict):
+                raise ValueError("Gefen checkpoint parameter groups must be dicts")
+            metadata.append(group.get("_gefen_checkpoint_metadata"))
+        markers = [
+            item.get("rank_local_sharded_state")
+            for item in metadata
+            if isinstance(item, dict)
+            and item.get("rank_local_sharded_state") is not None
+        ]
+        wrapped_state = any(
+            isinstance(pstate, dict)
+            and (
+                any(
+                    isinstance(key, str)
+                    and key.startswith(_RANK_LOCAL_PAYLOAD_KEY_PREFIX)
+                    for key in pstate
+                )
+                or _RANK_LOCAL_MEMBER_KEY in pstate
+            )
+            for pstate in (state_dict.get("state", {}) or {}).values()
+        )
+        if not markers:
+            if wrapped_state:
+                raise ValueError(
+                    "Gefen checkpoint carries rank-local DTensor payloads but "
+                    "is missing their topology metadata"
+                )
+            has_quantized_momentum = any(
+                isinstance(pstate, dict) and "m_codebook" in pstate
+                for pstate in (state_dict.get("state", {}) or {}).values()
+            )
+            if self._uses_rank_local_sharded_state() and has_quantized_momentum:
+                raise ValueError(
+                    "Cannot safely load an untagged/full Gefen checkpoint into "
+                    "rank-local DTensor optimizer state. Older generic FSDP/DCP "
+                    "full optimizer checkpoints kept rank 0's codebook and block "
+                    "state for every rank. Re-save from the original run with a "
+                    "Gefen version that writes {} payloads.".format(
+                        _RANK_LOCAL_FORMAT
+                    )
+                )
+            return
+        if len(markers) != len(groups) or any(item is None for item in metadata):
+            raise ValueError(
+                "Gefen rank-local DTensor checkpoint metadata is present on only "
+                "some parameter groups"
+            )
+        marker = markers[0]
+        if not isinstance(marker, dict):
+            raise ValueError("Gefen rank-local checkpoint marker must be a dict")
+        if any(not isinstance(item, dict) or item != marker for item in markers[1:]):
+            raise ValueError(
+                "Gefen rank-local checkpoint parameter groups carry inconsistent markers"
+            )
+        if marker.get("format") != _RANK_LOCAL_FORMAT:
+            raise ValueError(
+                "Unsupported Gefen rank-local checkpoint format: {!r}".format(
+                    marker.get("format")
+                )
+            )
+        if not self._uses_rank_local_sharded_state():
+            raise ValueError(
+                "A rank-local DTensor Gefen checkpoint can only load into the "
+                "same sharded optimizer topology"
+            )
+        try:
+            context = self._rank_local_checkpoint_context()
+        except RuntimeError as exc:
+            raise ValueError(str(exc)) from exc
+        world = context["world_size"]
+        rank = context["global_rank"]
+        if marker.get("world_size") != world:
+            raise ValueError(
+                "Gefen rank-local DTensor checkpoints require the same world "
+                "size; checkpoint={} current={}".format(
+                    marker.get("world_size"), world
+                )
+            )
+        if marker.get("world_ranks") != context["world_ranks"]:
+            raise ValueError(
+                "Gefen rank-local checkpoint default-world rank membership differs"
+            )
+        if marker.get("mesh") != context["mesh"]:
+            raise ValueError("Gefen rank-local checkpoint DeviceMesh differs")
+        signatures = marker.get("signatures")
+        expected_rank_keys = {str(item) for item in context["world_ranks"]}
+        if not isinstance(signatures, dict) or set(signatures) != expected_rank_keys:
+            raise ValueError("Gefen rank-local checkpoint has invalid signatures")
+        current_signature = self._rank_local_sharded_signature(context)
+        if signatures[str(rank)] != current_signature:
+            raise ValueError(
+                "Gefen rank-local DTensor checkpoint topology differs on rank {}: "
+                "checkpoint={!r} current={!r}".format(
+                    rank, signatures[str(rank)], current_signature
+                )
+            )
+        current_manifest = self._rank_local_parameter_manifest(current_signature)
+        if marker.get("parameter_manifest") != current_manifest:
+            raise ValueError(
+                "Gefen rank-local checkpoint ordered parameter manifest differs"
+            )
+        marker_step = marker.get("global_step")
+        if type(marker_step) is not int or marker_step < 0:
+            raise ValueError("Gefen rank-local checkpoint has invalid global_step")
+        marker_deterministic = marker.get("deterministic")
+        if type(marker_deterministic) is not bool:
+            raise ValueError(
+                "Gefen rank-local checkpoint has invalid deterministic policy"
+            )
+        saved_ids = list(
+            chain.from_iterable(group.get("params", ()) for group in groups)
+        )
+        try:
+            unique_saved_ids = set(saved_ids)
+        except TypeError as exc:
+            raise ValueError(
+                "Gefen rank-local checkpoint parameter IDs must be hashable"
+            ) from exc
+        if len(unique_saved_ids) != len(saved_ids):
+            raise ValueError(
+                "Gefen rank-local checkpoint contains duplicate outer parameter IDs"
+            )
+        expected_carrier_keys = {
+            _rank_local_payload_key(item) for item in context["world_ranks"]
+        }
+        serialized_payloads = None
+        for param_id in saved_ids:
+            pstate = (state_dict.get("state", {}) or {}).get(param_id)
+            if not isinstance(pstate, dict):
+                raise ValueError(
+                    "Gefen rank-local checkpoint is missing parameter state {!r}".format(
+                        param_id
+                    )
+                )
+            carrier_keys = {
+                key
+                for key in pstate
+                if isinstance(key, str)
+                and key.startswith(_RANK_LOCAL_PAYLOAD_KEY_PREFIX)
+            }
+            extras = set(pstate) - carrier_keys - {
+                _RANK_LOCAL_MEMBER_KEY,
+                "name",
+            }
+            if extras:
+                raise ValueError(
+                    "Gefen rank-local checkpoint parameter state has an invalid "
+                    "schema: {!r}".format(pstate)
+                )
+            if pstate.get("name") != 0:
+                raise ValueError(
+                    "Gefen rank-local checkpoint outer name sentinel is invalid"
+                )
+            has_carrier = bool(carrier_keys)
+            has_member = _RANK_LOCAL_MEMBER_KEY in pstate
+            if has_carrier and has_member:
+                raise ValueError(
+                    "Gefen rank-local checkpoint state cannot be both carrier and member"
+                )
+            if has_carrier:
+                if carrier_keys != expected_carrier_keys:
+                    raise ValueError(
+                        "Gefen rank-local checkpoint carrier has missing or "
+                        "unexpected per-rank payload keys"
+                    )
+                if serialized_payloads is not None:
+                    raise ValueError(
+                        "Gefen rank-local checkpoint repeats its payload transport"
+                    )
+                serialized_payloads = {
+                    str(global_rank): pstate[
+                        _rank_local_payload_key(global_rank)
+                    ]
+                    for global_rank in context["world_ranks"]
+                }
+            elif pstate.get(_RANK_LOCAL_MEMBER_KEY) is not True:
+                raise ValueError(
+                    "Gefen rank-local checkpoint has an invalid member marker"
+                )
+        if (
+            not isinstance(serialized_payloads, dict)
+            or set(serialized_payloads) != expected_rank_keys
+            or any(not torch.is_tensor(item) for item in serialized_payloads.values())
+        ):
+            raise ValueError("Gefen rank-local checkpoint has invalid rank payloads")
+        selected_payload = self._deserialize_rank_local_payload(
+            serialized_payloads[str(rank)]
+        )
+        expected_payload_keys = {
+            "format",
+            "global_rank",
+            "group_rank",
+            "world_size",
+            "world_ranks",
+            "mesh",
+            "signature",
+            "parameter_manifest",
+            "global_step",
+            "deterministic",
+            "states",
+            "codebook",
+        }
+        if not isinstance(selected_payload, dict) or set(selected_payload) != expected_payload_keys:
+            raise ValueError("Gefen rank-local checkpoint payload has an invalid schema")
+        payload_identity = (
+            selected_payload["format"] == _RANK_LOCAL_FORMAT
+            and selected_payload["global_rank"] == rank
+            and selected_payload["group_rank"] == context["group_rank"]
+            and selected_payload["world_size"] == world
+            and selected_payload["world_ranks"] == context["world_ranks"]
+            and selected_payload["mesh"] == context["mesh"]
+            and selected_payload["signature"] == current_signature
+            and selected_payload["parameter_manifest"] == current_manifest
+            and selected_payload["global_step"] == marker_step
+            and selected_payload["deterministic"] == marker_deterministic
+        )
+        if not payload_identity:
+            raise ValueError(
+                "Gefen rank-local checkpoint payload rank/topology/parameter binding differs"
+            )
+        selected_states = selected_payload["states"]
+        selected_codebook = selected_payload["codebook"]
+        self._validate_rank_local_states(
+            selected_states, current_signature, selected_codebook
+        )
+        state_dict["state"] = dict(zip(saved_ids, selected_states))
+        state_dict["gefen_global_step"] = marker_step
+        state_dict["gefen_codebook"] = selected_codebook
+        state_dict["gefen_deterministic"] = marker_deterministic
+        for group in groups:
+            group_metadata = dict(group["_gefen_checkpoint_metadata"])
+            group_metadata["global_step"] = marker_step
+            group_metadata["codebook"] = selected_codebook
+            group_metadata["deterministic"] = marker_deterministic
+            group["_gefen_checkpoint_metadata"] = group_metadata
+
+    def _load_state_dict_impl(self, state_dict):
         """Restore optimizer state saved by :meth:`state_dict`.
 
         On top of the base load this restores ``gefen_global_step`` and the
-        frozen codebook, and undoes the base class's dtype coercion of aux
-        state: ``torch.optim`` casts every floating state tensor to the owning
-        param's dtype, which would corrupt Gefen's fp32 moments and uint8
-        momentum indices on bf16 models, so each aux tensor is written back in
-        its ORIGINAL saved dtype. Step counters are normalized to this
-        optimizer's ``capturable`` mode (host ints vs 0-dim device tensors), so
-        checkpoints are portable across the toggle in either direction.
+        frozen codebook, verifies that an explicitly tagged checkpoint uses the
+        same replica-determinism policy as this optimizer, and undoes the base
+        class's dtype coercion of aux state: ``torch.optim`` casts every floating
+        state tensor to the owning param's dtype, which would corrupt Gefen's
+        fp32 moments and uint8 momentum indices on bf16 models, so each aux
+        tensor is written back in its ORIGINAL saved dtype. Step counters are
+        normalized to this optimizer's ``capturable`` mode (host ints vs 0-dim
+        device tensors), so checkpoints are portable across that toggle in
+        either direction. Legacy checkpoints with no deterministic tag remain
+        loadable and retain the live optimizer's configured policy.
         """
         # Shallow-copy so the pop()s below don't mutate the caller's checkpoint
         # dict (torch.optim.Optimizer.load_state_dict leaves its input intact);
         # otherwise a second load of the same dict loses the gefen_* keys.
         state_dict = dict(state_dict)
-        gefen_global_step = state_dict.pop("gefen_global_step", 0)
+        # Copy the group dictionaries before removing private transport
+        # metadata so repeated loads leave the caller's checkpoint untouched.
+        state_dict["param_groups"] = [
+            dict(group) for group in state_dict.get("param_groups", ())
+        ]
+        self._unwrap_rank_local_sharded_checkpoint(state_dict)
+        group_metadata = []
+        for group in state_dict["param_groups"]:
+            metadata = group.pop("_gefen_checkpoint_metadata", None)
+            if metadata is not None:
+                group_metadata.append(metadata)
+
+        gefen_global_step = state_dict.pop("gefen_global_step", None)
         gefen_codebook = state_dict.pop("gefen_codebook", None)
+        has_top_level_deterministic = "gefen_deterministic" in state_dict
+        gefen_deterministic = state_dict.pop("gefen_deterministic", None)
+        if has_top_level_deterministic and type(gefen_deterministic) is not bool:
+            raise ValueError(
+                "Gefen checkpoint top-level deterministic policy must be a bool, "
+                "got {!r}".format(gefen_deterministic)
+            )
+        if group_metadata:
+            if len(group_metadata) != len(state_dict["param_groups"]):
+                raise ValueError(
+                    "Gefen checkpoint metadata is present on only some parameter groups"
+                )
+            first_metadata = group_metadata[0]
+            if first_metadata.get("format_version") not in (
+                1,
+                2,
+                _RANK_LOCAL_METADATA_VERSION,
+            ):
+                raise ValueError(
+                    "Unsupported Gefen checkpoint metadata format_version: {}".format(
+                        first_metadata.get("format_version")
+                    )
+                )
+            for metadata in group_metadata:
+                if (
+                    "deterministic" in metadata
+                    and type(metadata["deterministic"]) is not bool
+                ):
+                    raise ValueError(
+                        "Gefen checkpoint parameter-group deterministic policy "
+                        "must be a bool, got {!r}".format(metadata["deterministic"])
+                    )
+            for metadata in group_metadata[1:]:
+                same_step = metadata.get("global_step") == first_metadata.get(
+                    "global_step"
+                )
+                left_codebook = metadata.get("codebook")
+                right_codebook = first_metadata.get("codebook")
+                same_codebook = (
+                    left_codebook is right_codebook
+                    or (
+                        torch.is_tensor(left_codebook)
+                        and torch.is_tensor(right_codebook)
+                        and torch.equal(left_codebook, right_codebook)
+                    )
+                )
+                same_deterministic = metadata.get(
+                    "deterministic"
+                ) == first_metadata.get("deterministic")
+                if not same_step or not same_codebook or not same_deterministic:
+                    raise ValueError(
+                        "Gefen checkpoint parameter groups carry inconsistent "
+                        "optimizer metadata"
+                    )
+            metadata_step = first_metadata.get("global_step", 0)
+            metadata_codebook = first_metadata.get("codebook")
+            metadata_deterministic = first_metadata.get("deterministic")
+            if gefen_global_step is None:
+                gefen_global_step = metadata_step
+            elif gefen_global_step != metadata_step:
+                raise ValueError(
+                    "Gefen checkpoint top-level and parameter-group global steps disagree"
+                )
+            if gefen_codebook is None:
+                gefen_codebook = metadata_codebook
+            elif not (
+                gefen_codebook is metadata_codebook
+                or (
+                    torch.is_tensor(gefen_codebook)
+                    and torch.is_tensor(metadata_codebook)
+                    and torch.equal(gefen_codebook, metadata_codebook)
+                )
+            ):
+                raise ValueError(
+                    "Gefen checkpoint top-level and parameter-group codebooks disagree"
+                )
+            if gefen_deterministic is None:
+                gefen_deterministic = metadata_deterministic
+            elif (
+                metadata_deterministic is not None
+                and gefen_deterministic != metadata_deterministic
+            ):
+                raise ValueError(
+                    "Gefen checkpoint top-level and parameter-group deterministic "
+                    "policies disagree"
+                )
+        if gefen_deterministic is not None:
+            if type(gefen_deterministic) is not bool:
+                raise ValueError(
+                    "Gefen checkpoint deterministic policy must be a bool, got "
+                    "{!r}".format(gefen_deterministic)
+                )
+            if gefen_deterministic != self._deterministic:
+                raise ValueError(
+                    "Gefen checkpoint deterministic={!r}, but this optimizer was "
+                    "constructed with deterministic={!r}. Resuming under a "
+                    "different replica-determinism policy requires an intentional "
+                    "state migration or a fresh optimizer restart; refusing to "
+                    "change the policy silently.".format(
+                        gefen_deterministic, self._deterministic
+                    )
+                )
+        if gefen_global_step is None:
+            gefen_global_step = 0
+        has_quantized_momentum = any(
+            isinstance(param_state, dict) and "m_codebook" in param_state
+            for param_state in (state_dict.get("state", {}) or {}).values()
+        )
+        if has_quantized_momentum and gefen_codebook is None:
+            raise ValueError(
+                "Gefen checkpoint contains quantized momentum indices but no frozen "
+                "codebook. Loading it would reinterpret the restored indices with a "
+                "different codebook and silently corrupt optimizer state. Resume from "
+                "an unmodified Gefen checkpoint or a DCP checkpoint written by a "
+                "version that preserves _gefen_checkpoint_metadata."
+            )
         state_dict = self._pack_legacy_param_groups_for_load(state_dict)
 
         # torch.optim.Optimizer.load_state_dict casts *every* per-param state
@@ -3400,15 +5143,13 @@ class Gefen(torch.optim.Optimizer):
         # and re-aliases lazily).
         self._capt_invalidate()
 
-        super().load_state_dict(state_dict)
+        self._base_load_state_dict_without_hooks(state_dict)
         self._gefen_global_step = gefen_global_step
         # Capturable SR seeds are optimizer-level scratch (a device mirror of
         # gefen_global_step): drop them so the first post-load SR kernel call
-        # rebuilds them from the restored counter. (Under manual graph-replay
-        # training the host counter -- like every host-side value -- reflects
-        # host step() calls, not replays; checkpoint semantics are unchanged
-        # from the pre-SR capturable behavior.)
+        # uses a scalar rebuilt from the restored, replay-synchronized counter.
         self._sr_seed_by_device.clear()
+        self._reset_gefen_global_step_devices()
 
         # Restoring the frozen codebook keeps _maybe_refresh_gefen_codebook a
         # no-op on the first resume step, so the restored automatic_period values
@@ -3483,6 +5224,7 @@ class Gefen(torch.optim.Optimizer):
                     elif torch.is_tensor(value):
                         pstate[key] = int(value.item())
         self._sync_param_names_to_state()
+        self._install_rank_local_checkpoint_schema()
 
     @torch.no_grad()
     def step(self, closure=None):
@@ -3502,6 +5244,17 @@ class Gefen(torch.optim.Optimizer):
         if closure is not None:
             with torch.enable_grad():
                 loss = closure()
+
+        _assert_optimizer_gradients_structurally_valid(self)
+
+        # GradScaler invokes native-AMP optimizers even on overflow. Decide
+        # before codebook learning, periodic refresh, capturable counters, or
+        # parameter/state mutation. The attribute gate compiles away on the
+        # ordinary BF16/FP32 path where GradScaler attaches nothing.
+        if (
+            hasattr(self, "found_inf") or hasattr(self, "grad_scale")
+        ) and not _amp_prepare_optimizer_step(self):
+            return loss
 
         self._maybe_refresh_gefen_codebook()
         self._maybe_save_gefen_grad_histogram()
@@ -3609,4 +5362,7 @@ class Gefen(torch.optim.Optimizer):
         # step. @torch._dynamo.disable makes the increment a single opaque
         # call at the very tail of step() instead (one cheap graph break
         # after all device work). Eager behavior is unchanged.
+        self._ensure_gefen_global_step_devices()
+        for counter in self._gefen_global_step_by_device.values():
+            counter.add_(1)
         self._gefen_global_step += 1

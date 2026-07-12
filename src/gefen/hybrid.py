@@ -60,7 +60,12 @@ from collections import OrderedDict
 import torch
 import torch.nn as nn
 
-from gefen.gefen import Gefen
+from gefen.gefen import (
+    Gefen,
+    _amp_native_scaling_required,
+    _amp_prepare_optimizer_step,
+    _assert_optimizer_gradients_structurally_valid,
+)
 from gefen.gefen_muon import GefenMuon
 from gefen.params import (
     DEFAULT_BACKUP_SUBSTRINGS,
@@ -252,6 +257,7 @@ class GefenMuonHybrid(torch.optim.Optimizer):
         batched_ns=False,
         batched_ns_workspace_bytes=256 << 20,
         stochastic_round=False,
+        deterministic=False,
         normuon=True,
         normuon_beta2=0.95,
         normuon_eps=1e-8,
@@ -318,9 +324,15 @@ class GefenMuonHybrid(torch.optim.Optimizer):
                 Note ``normuon=True`` and ``ns_schedule="tuned3"`` are the
                 hybrid's defaults, unlike raw GefenMuon.
             capturable: forwarded to both halves. ``stochastic_round`` and
-                ``verbose`` are forwarded to Gefen children; with an AdamW
-                backup they apply only to the Muon half.
+                ``deterministic`` are forwarded to Gefen children; with an
+                AdamW backup they apply only to the Muon half. ``verbose`` is
+                likewise forwarded to Gefen children. Every captured parameter
+                must live on the current CUDA capture device.
         """
+        if not isinstance(deterministic, bool):
+            raise TypeError("deterministic must be a bool")
+        self._deterministic = deterministic
+        self.capturable = capturable
         if backup_named_params is None:
             # Single-argument convenience form: the first arg is a model or a
             # named-param iterable to split internally.
@@ -438,6 +450,7 @@ class GefenMuonHybrid(torch.optim.Optimizer):
                 batched_ns=batched_ns,
                 batched_ns_workspace_bytes=batched_ns_workspace_bytes,
                 stochastic_round=stochastic_round,
+                deterministic=deterministic,
                 normuon=normuon,
                 normuon_beta2=normuon_beta2,
                 normuon_eps=normuon_eps,
@@ -506,6 +519,7 @@ class GefenMuonHybrid(torch.optim.Optimizer):
                 # embedding/head, not the untested factored-v combination.
                 factored_v_2d=False,
                 stochastic_round=stochastic_round,
+                deterministic=deterministic,
                 capturable=capturable,
                 verbose=verbose,
             )
@@ -571,6 +585,17 @@ class GefenMuonHybrid(torch.optim.Optimizer):
             groups.extend(o.param_groups)
         return groups
 
+    @property
+    def _step_supports_amp_scaling(self) -> bool:
+        # Inspect the union of both halves so GradScaler chooses one protocol
+        # and one overflow decision for the whole composite. FP32-master AMP
+        # stays on the ordinary externally-skipped path; true FP16 uses the
+        # native path because generic unscale rejects FP16 tensors. A hybrid
+        # combining any true-FP16 storage with multi-rank DTensors selects that
+        # protocol statically after a union-wide collective presence preflight
+        # (FSDP1 FlatParameters require ShardedGradScaler).
+        return _amp_native_scaling_required(self)
+
     @param_groups.setter
     def param_groups(self, value):
         # A composite cannot accept a wholesale param_groups assignment: the
@@ -604,7 +629,35 @@ class GefenMuonHybrid(torch.optim.Optimizer):
         for o in self._subopts:
             o.zero_grad(set_to_none=set_to_none)
 
+    def _assert_capturable_devices_if_capturing(self) -> None:
+        capturing = (
+            torch.cuda.is_available() and torch.cuda.is_current_stream_capturing()
+        )
+        if not capturing:
+            return
+        if not self.capturable:
+            raise RuntimeError(
+                "Attempting CUDA graph capture of GefenMuonHybrid.step() but "
+                "capturable=False. Construct the optimizer with capturable=True "
+                "to make step() graph-safe."
+            )
+        devices = {
+            param.device
+            for optimizer in self._subopts
+            for group in optimizer.param_groups
+            for param in group["params"]
+        }
+        capture_device = torch.device("cuda", torch.cuda.current_device())
+        if devices != {capture_device}:
+            raise RuntimeError(
+                "CUDA graph capture requires every GefenMuonHybrid parameter on "
+                "the current capture device {}; found {}".format(
+                    capture_device, sorted(map(str, devices))
+                )
+            )
+
     def step(self, closure=None):
+        self._assert_capturable_devices_if_capturing()
         # Dispatch the INSTANCE step hooks around the composite step, mirroring
         # torch.optim.Optimizer.profile_hook_step exactly: hooks receive
         # (optimizer, args, kwargs) where args are the raw step() call args
@@ -633,6 +686,20 @@ class GefenMuonHybrid(torch.optim.Optimizer):
         if closure is not None:
             with torch.enable_grad():
                 loss = closure()
+        for child in self._subopts:
+            _assert_optimizer_gradients_structurally_valid(
+                child, require_2d_params=child is self.muon
+            )
+        # A non-finite gradient in either half skips BOTH children before their
+        # codebooks, states, counters, or parameters can move. Explicit
+        # scaler.unscale_(hybrid) is detected by grad_scale=None and is not
+        # repeated; automatic unscale covers every child parameter exactly once.
+        if (
+            hasattr(self, "found_inf") or hasattr(self, "grad_scale")
+        ) and not _amp_prepare_optimizer_step(self):
+            for post_hook in self._optimizer_step_post_hooks.values():
+                post_hook(self, args, kwargs)
+            return loss
         with torch.no_grad():
             for o in self._subopts:
                 o.step()

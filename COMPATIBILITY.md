@@ -82,12 +82,35 @@ Setup: from scratch — MNIST (paper recipe, 3 seeds), CIFAR-10 ResNet-18; fine-
 
 - **Real-dataset rows** (the Vision and Audio tables) report held-out accuracy, COCO mAP, or — where no accuracy metric exists (TTS) — validation loss, after a full training run: a convergence comparison against AdamW at matched model / data / LR / schedule / epochs.
 - **Smoke-test rows** (the LLM / VLM / diffusion matrix above) train a fixed batch for N optimizer steps and report the loss as `first → last (Δ%)`, where Δ% is the reduction from the first step's loss to the last (`(first − last) / first`); PASS if it exceeds 30% with no NaN/Inf. Peak VRAM from `torch.cuda.max_memory_allocated`.
-- The **Method** column: `full-param` trains every native parameter tensor; `full-param FSDP2` / `device_map` shard that same full-parameter training for models over one card; `LoRA` covers models too large to full-fine-tune even sharded — a weaker claim, since only the adapter matrices are trained.
+- The **Method** column: `full-param` trains every native parameter tensor; `full-param FSDP2` / `device_map` shard that same full-parameter training for models over one card; `LoRA` covers models too large to full-fine-tune even sharded — a weaker claim, since only the adapter matrices are trained. The FSDP2 rows validate training and loss reduction; the narrower same-topology full-state optimizer checkpoint contract is described below.
 - **Versions**: LLM / VLM / diffusion smokes on torch 2.12.0+cu133, transformers 5.10.2 (≥ 5.11 for PaddleOCR-VL), diffusers 0.39.0. Vision / audio / real-data runs on torch 2.13.0+cu133, torchvision 0.28, torchaudio 2.11, transformers 5.12, ultralytics 8.4, rfdetr 1.8. Harness and per-model recipes: [`benchmarks/arch-compat/`](benchmarks/arch-compat/).
+
+## Megatron-LM integration scope
+
+Megatron-LM integration tests ran tiny mock-data GPT training through the production pretraining entry point for plain Gefen, GefenMuon+AdamW, and GefenMuon+Gefen. Fused deterministic coverage on two homogeneous RTX 3090 Ti GPUs included DP2, TP2, PP2, CP2 with Transformer Engine, and EP2, with replica or tied-weight hashes appropriate to each topology; TP2 and PP2 also covered legacy optimizer checkpoint continuation for all three recipes. Unfused four-rank coverage included EP2×DP2, TP2×DP2, PP2×DP2, and TP2×PP2 for all three recipes, plus EP2×ETP2 and EP2 checkpoint continuation for GefenMuon+Gefen. This scope does not include Megatron's distributed optimizer, FSDP, optimizer CPU offload, fp16, or non-legacy optimizer checkpoint formats.
+
+## Optimizer checkpoint scope
+
+Native single-process optimizer `state_dict()`/`load_state_dict()` and the explicitly documented GefenMuon `distributed` state path remain separate from the rank-local DCP adapter. For plain Gefen and `GefenMuon(sharded_mode="approx")`, each rank can learn different local codebook and block geometry, so `state_dict()` collectively replaces ordinary rank-local tensors with one tagged, rank-indexed CPU payload that PyTorch full-state DCP preserves. Both optimizers' two-GPU FSDP2 `fully_shard` paths are exercised through `get_optimizer_state_dict(..., full_state_dict=True, cpu_offload=True)` and `set_optimizer_state_dict(..., full_state_dict=True, broadcast_from_rank0=True)`, with exact next-step continuation; the flattened optimizer-state form is also covered.
+
+This format is deliberately same-topology only and currently requires one 1-D DeviceMesh spanning the default process-group world. Every rank must participate in both save and restore; each process temporarily holds all serialized rank payloads on CPU, so the leading checkpoint-time CPU cost approaches `world_size ×` its local optimizer-state size plus local serialization scratch. Loading validates world size, parameter order and names, global and local shapes and dtypes, mesh membership and names, structural placements, rank coordinates, global step, deterministic policy, frozen codebook, and sharded mode before mutation. Multidimensional meshes, subgroups, pipeline-local optimizers, world-size/topology changes, and old unsafe untagged full checkpoints fail closed rather than silently applying rank 0's state to every shard. No optimizer-state reshard portability is claimed, model-only DCP is unaffected, and the full-state DCP support described here does not extend beyond plain Gefen and Muon `approx`.
+
+## Transformers Trainer DDP
+
+The `benchmarks.trainer_resume` gate exercises plain Gefen, GefenMuon+AdamW, and GefenMuon+Gefen through Trainer's internal Accelerate wrapper with tied weights, gradient accumulation, a changing scheduler, native Trainer checkpoint files, BF16 fused updates, and two-rank DDP replica hashes. All three recipes have passed its deterministic fused-BF16 two-rank configuration on homogeneous GPUs, which requires exact model, optimizer, scheduler, LR, and logged-loss agreement between uninterrupted and resumed runs. Run the gate with:
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1 PYTHONPATH=.:src torchrun --standalone --nproc-per-node=2 \
+  -m benchmarks.trainer_resume.run --output-dir benchmarks/trainer_resume/out/ddp \
+  --device cuda --dtype bfloat16 --fused --deterministic --steps 3 --split-step 1 \
+  --gradient-accumulation-steps 2
+```
+
+This covers Trainer's DDP frontend and internal Accelerate optimizer wrapper, not a standalone `Accelerator` loop, FSDP, or `model_init`.
 
 ## CUDA Graphs & torch.compile (`capturable`)
 
-`Gefen`, `GefenMuon`, and `GefenMuonHybrid` accept `capturable=True` (same meaning as `torch.optim`'s argument): step counters, bias corrections, and a tensor `lr` live on the GPU, so `opt.step()` stays correct inside a replayed CUDA graph or a compiled region. The default `capturable=False` is bit-identical to previous behavior, and capturing with it raises instead of silently freezing the step counters.
+`Gefen`, `GefenMuon`, and `GefenMuonHybrid` accept `capturable=True` (same meaning as `torch.optim`'s argument): step counters, bias corrections, the optimizer-global checkpoint counter, and a tensor `lr` live on the GPU, so `opt.step()` stays correct inside a replayed CUDA graph or compiled regions. The default `capturable=False` preserves the established eager behavior, and capturing with it raises instead of silently freezing the step counters. Parity is bitwise for fixed-order components and tolerance-bounded where fused atomic reductions can vary at the ULP scale.
 
 Measured step times (386M-parameter census, RTX 3090 Ti, tail-100 mean over 500 CUDA-event-timed steps):
 
@@ -98,6 +121,8 @@ Measured step times (386M-parameter census, RTX 3090 Ti, tail-100 mean over 500 
 | manual `torch.cuda.CUDAGraph` replay | 22.9 ms | 168.9 ms |
 | `torch.compile(mode="reduce-overhead")` | 23.0 ms | **147.6 ms** |
 
+These measurements are path- and shape-specific, not a zero-overhead guarantee: `capturable=True` and manual replay are nearly flat for plain Gefen but add modest overhead to the measured hybrid, while compilation improves the measured hybrid and is slightly slower for plain Gefen.
+
 **Manual capture** — run a few real warmup steps first (codebook learning happens on the first step), then capture one `opt.step()` and drive training by refilling the static grad buffers (and the `lr` tensor, for schedules) before each `graph.replay()`:
 
 ```python
@@ -106,7 +131,7 @@ from gefen import GefenMuonHybrid
 opt = GefenMuonHybrid(model, lr=torch.tensor(3e-5, device="cuda"), capturable=True)
 ```
 
-**torch.compile** — the fused kernels are registered as torch custom ops, so dynamo traces the whole step into one graph and CUDA-graphs it end to end:
+**torch.compile** — the fused kernels are registered as torch custom ops, so they remain inside compiled regions. The step also contains deliberate `@torch._dynamo.disable` host helpers for static-address registration, batched scalar refresh, and global-step bookkeeping, so Dynamo may partition one optimizer call into multiple compiled regions rather than one end-to-end graph:
 
 ```python
 compiled_step = torch.compile(opt.step, mode="reduce-overhead", dynamic=False)
@@ -119,8 +144,9 @@ compiled_step()
 Caveats:
 
 - `dynamic=False` is required — dynamic shapes trip a dynamo symbolic-shapes bug (torch 2.12) on the per-param optimizer state.
-- `capturable=True` rejects the host-driven option `codebook_refresh_every > 0` at construction.
+- `capturable=True` rejects host-driven periodic codebook refresh and gradient-histogram output.
+- Every parameter in a captured optimizer must live on the current CUDA capture device; multi-process distributed training should construct one optimizer per rank/device.
 - A float `lr` bakes into the graph (as in `torch.optim`); pass a tensor `lr` and update it in place to drive an LR schedule.
-- Checkpoints are portable across the `capturable` toggle in both directions.
+- Checkpoints are portable across the `capturable` toggle in both directions; saving after graph replay synchronizes the true replayed global step so stochastic-rounding resumes continue from the correct seed.
 - FSDP2 / DTensor row-shard capture is validated by `tests/test_capturable_fsdp2.py` on 2 ranks for plain Gefen plus GefenMuon `sharded_mode="approx"`, `"exact"`, and `"distributed"` (including empty-shard coverage); ranks must capture and replay in lockstep.
 - Capturing the sharded `"exact"`/`"distributed"` modes records NCCL collectives (the in-`step()` all-gather) into the graph, which requires an NCCL/PyTorch build that supports collective graph capture — validated on PyTorch 2.12 / CUDA 13.3; on older stacks capture may raise (use `"approx"` or plain Gefen, which take no collectives, or `capturable=False`).

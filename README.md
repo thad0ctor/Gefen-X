@@ -17,12 +17,12 @@
 
  - **Fine-tuning and pre-training** — upstream Gefen was validated for pre-training; this fork makes it a drop-in optimizer for fine-tuning: full fine-tune (FFT), LoRA, and QLoRA, with a [VRAM sizing guide](https://github.com/thad0ctor/Gefen-X/blob/main/docs/hardware.md).
  - **New: matches AdamW's loss out of the box** at about a quarter of its optimizer memory (default `factored_v_2d`). See [Benchmarks](#benchmarks) and [the factored-v lever](#quality-lever-factored-second-moment-on-2d-params-factored_v_2d).
- - **Works on modern decoders** (Qwen3, Llama-3, Mistral). Upstream loses its memory advantage on these architectures (~9 B/param — worse than AdamW); this fork keeps the intended ~1 B/param.
+ - **Works on modern decoders** (Qwen3, Llama-3, Mistral). Upstream loses its memory advantage on these architectures (≈9 B/param — worse than AdamW); this fork keeps the intended ≈1 B/param.
  - **Validated across 2026 architectures** — two dozen modern LLMs, VLMs, and image/video/audio media-gen models full-fine-tuned on 24 GB GPUs, plus 20-30B MoEs via LoRA. See the [compatibility matrix](https://github.com/thad0ctor/Gefen-X/blob/main/COMPATIBILITY.md).
- - **~2× faster `opt.step()`** via fused CUDA kernels, with identical results.
+ - **≈2× faster `opt.step()`** via fused CUDA kernels with validated numerical parity.
  - **Whole-model Muon option** (`GefenMuonHybrid`) with a selectable AdamW quality backup or ~1 B/param Gefen low-memory backup, plus task-specific [SFT and pretraining recipes](#which-muon-recipe-should-i-use).
- - **Reliable checkpoint save/resume and FSDP2 support** — broken or absent in the shipped release.
- - **Hardened against crashes** (device/dtype guards, bounds checks, race fixes) with a bit-exact test suite.
+ - **Reliable native checkpoint save/resume and FSDP2 training support** — broken or absent in the shipped release; see [Distributed Training](#distributed-training) for the checkpoint compatibility table.
+ - **Hardened against crashes** (device/dtype guards, bounds checks, race fixes).
 
 <details>
 <summary><span style="font-size: 1.25em;"><b>Detailed Fork Improvements</b> (vs upstream)</span></summary>
@@ -33,19 +33,19 @@
 >| **Loss vs AdamW** | trails AdamW by ~0.06 | **matches AdamW** via the default `factored_v_2d` — [details](#quality-lever-factored-second-moment-on-2d-params-factored_v_2d) |
 >| **Modern decoders** (Qwen3 / Llama-3 / Mistral — SwiGLU + grouped-query attention) | uses *more* optimizer memory than AdamW on these | keeps the full ~1 B/param optimizer state (about a quarter of bf16 AdamW's) |
 >| **Learning rate(s)** | no guidance — silently over-steps | documented ~0.6× AdamW, so quality matches AdamW |
->| **Optimizer-step speed** | baseline | ~2× faster `opt.step()` (fused kernels), identical results |
+>| **Optimizer-step speed** | baseline | ≈2× faster `opt.step()` with fused kernels |
 >| **Peak memory**| large transient spikes | much lower peak — room for bigger models / batches |
 >| **Sharded multi-GPU training (FSDP2)** | breaks with the fast path | works — for plain Gefen *and* Muon |
 >| **Whole-model Muon** | 2D weight matrices only | `GefenMuonHybrid` trains the entire model |
 >| **Muon step efficiency** | generic momentum hack + redundant dequant gather | single-pass bit-exact momentum kernel |
->| **Save / resume checkpoints** | can corrupt state or lose tuning on resume | saves &amp; resumes correctly |
+>| **Save / resume checkpoints** | can corrupt state or lose tuning on resume | native optimizer checkpoints save and resume correctly; distributed checkpoint formats have documented limits |
 >| **Crash safety** | missing device / edge-case guards | guarded against wrong-device, empty-tensor, and race bugs |
->| **Correctness** | no fused-kernel tests | bit-exact + distributed parity test suite |
+>| **Correctness** | no fused-kernel tests | kernel parity and distributed tests |
 >| **Documentation** | no Axolotl / fork-install guidance | Axolotl how-to + fair loss/speed/memory benchmarks |
 >| **Muon Usage** | no whole-model recipe or task split | measured SFT/pretraining recipes pair quantized Muon with an AdamW backup and document the observed quality/throughput tradeoff; a Gefen backup remains available for minimum state — [details](#which-muon-recipe-should-i-use) |
 >| **Muon (Newton-Schulz) speed** | fixed 5-step schedule | tunable `ns_schedule`; tuned3 is the balanced SFT choice, while quality-first pretraining retains classic NS5 — [details](#experimental-lever-faster-newton-schulz-ns_schedule-fp8_ns) |
 >| **Low-precision orthogonalization** | bf16 only | opt-in `fp8_ns` for large matrices on newer GPUs, safe fallback elsewhere — [details](#experimental-lever-faster-newton-schulz-ns_schedule-fp8_ns) |
->| **Sharded Muon under FSDP2** | every GPU redundantly repeats the same work | `sharded_mode="distributed"` splits the work across GPUs at identical results — [details](#experimental-lever-sharded-newton-schulz-under-fsdp2-sharded_mode) |
+>| **Sharded Muon under FSDP2** | every GPU redundantly repeats the same work | `sharded_mode="distributed"` splits the work across GPUs with identical results on matching GPUs — [details](#experimental-lever-sharded-newton-schulz-under-fsdp2-sharded_mode) |
 
 </details>
 
@@ -81,7 +81,7 @@ CUDA toolkit and host compiler compatible with your PyTorch build (the JIT compi
 | PyTorch | 2.5+ (verified on 2.12 / cu133) |
 | Platform | Linux with a CUDA GPU |
 
-The Hugging Face Trainer flow, the `find_lr` tool, and the `examples/` all use `transformers` and `datasets`, which are not core dependencies — install them alongside (`pip install transformers datasets`). Optional benchmark baselines: `bitsandbytes` (AdamW-8bit), `torchao` (AdamW-4bit).
+The Hugging Face Trainer flow uses `transformers` and Accelerate, while the data-backed examples also use `datasets`; these are not core dependencies — install them alongside (`pip install transformers 'accelerate>=1.1' datasets`). Optional benchmark baselines: `bitsandbytes` (AdamW-8bit), `torchao` (AdamW-4bit).
 
 ## Compatibility
 
@@ -114,13 +114,36 @@ One knock-on effect: weight decay in AdamW-style optimizers is applied as `lr ×
 
 ## Distributed Training
 
-Gefen drops into standard distributed training like any other PyTorch optimizer, with either `fused=True` or `fused=False`. Validated setups: single-GPU, PyTorch DDP, FSDP2 (`fully_shard` / DTensor), and DeepSpeed ZeRO 1-3 (plain `Gefen` as the client optimizer, direct or via axolotl `gefenx`; bit-exact ZeRO-2 checkpoint resume).
+Gefen drops into standard distributed training like any other PyTorch optimizer, with either `fused=True` or `fused=False`.
 
-> **DeepSpeed ZeRO config.** Set `"zero_allow_untested_optimizer": true` and leave the config's `optimizer` section unset. With optimizer CPU-offload, also set `"zero_force_ds_cpu_optimizer": false` — otherwise raw DeepSpeed refuses to initialize, and accelerate-based launchers (axolotl) silently swap in DeepSpeed's own CPU Adam. ZeRO steps flattened 1-D partitions, so `GefenMuon`/`GefenMuonHybrid` raise a clear error under ZeRO; use FSDP2, DDP, or single-GPU for the Muon family.
+| System | Works with |
+|---|---|
+| DDP | All optimizers |
+| FSDP2 | All optimizers |
+| FSDP2 checkpoints | Plain Gefen and Muon `approx`; resume needs the same GPU count — scope note below |
+| Muon `distributed` checkpoints | Resume on any GPU count, even a single GPU — [details](#experimental-lever-sharded-newton-schulz-under-fsdp2-sharded_mode) |
+| DeepSpeed ZeRO 1-3 | Plain Gefen; use FSDP2 or DDP for the Muon family — config note below |
+| Megatron-LM | All optimizers, including checkpoint resume — [scope](https://github.com/thad0ctor/Gefen-X/blob/main/COMPATIBILITY.md#megatron-lm-integration-scope) |
+
+> **FSDP2 checkpoint scope.** Plain Gefen and Muon `approx` save and resume exactly through PyTorch's standard full-state checkpoint calls, as long as the GPU count and sharding layout are unchanged and every GPU joins the save. Anything outside that scope refuses to load instead of corrupting state — [full details](https://github.com/thad0ctor/Gefen-X/blob/main/COMPATIBILITY.md#optimizer-checkpoint-scope).
+
+Mixed precision works out of the box: BF16 and standard AMP behave exactly as with any PyTorch optimizer, and true-FP16 `GradScaler` training is handled safely — an overflow step changes nothing. FSDP1 FP16 needs `torch.distributed.fsdp.ShardedGradScaler`.
+
+> **DeepSpeed ZeRO config.** Set `"zero_allow_untested_optimizer": true` and leave the config's `optimizer` section unset. With optimizer CPU-offload, also set `"zero_force_ds_cpu_optimizer": false` — otherwise raw DeepSpeed refuses to initialize, and accelerate-based launchers (axolotl) silently swap in DeepSpeed's own CPU Adam.
+
+## Determinism (`deterministic`)
+
+Set `deterministic=True` when every GPU replica must produce bit-identical results on matching GPUs. It is off by default (the fastest routing), checkpoints remember the setting, and older checkpoints without it still load. One combination is rejected: plain Gefen with `deterministic=True`, `factored_v_2d=True`, and `stochastic_round=True` together.
+
+```python
+optimizer = Gefen(model.named_parameters(), lr=3e-4, fused=True, deterministic=True)
+```
+
+It is an ordinary constructor argument, so it works the same everywhere you build the optimizer: pass it in the [Hugging Face Trainer](#hugging-face-trainer) construction, or in [axolotl](#using-gefen-with-axolotl) add `optim_args: { deterministic: true }`.
 
 ## CUDA Graphs & torch.compile (`capturable`)
 
-All three optimizers accept `capturable=True` (same meaning as `torch.optim`'s argument): `opt.step()` can then be captured in a `torch.cuda.CUDAGraph` or wrapped in `torch.compile(mode="reduce-overhead")` at no step-time cost — and the compiled hybrid step is about 10% faster than eager. Usage, caveats, and measured numbers: [COMPATIBILITY.md](https://github.com/thad0ctor/Gefen-X/blob/main/COMPATIBILITY.md#cuda-graphs--torchcompile-capturable).
+All three optimizers accept `capturable=True` (same meaning as `torch.optim`'s argument): `opt.step()` can then be captured in a `torch.cuda.CUDAGraph` or wrapped in `torch.compile(mode="reduce-overhead")` — the compiled hybrid step is about 10% faster than eager. Checkpoints stay correct across graph replays. Usage, caveats, and measured numbers: [COMPATIBILITY.md](https://github.com/thad0ctor/Gefen-X/blob/main/COMPATIBILITY.md#cuda-graphs--torchcompile-capturable).
 
 <br>
 
@@ -221,7 +244,7 @@ optimizer: gefenx
 learning_rate: 6.0e-6    # ≈0.6× your AdamW LR — Gefen takes larger effective steps
 bf16: true
 optim_args:
-  fused: true            # ≈2× faster opt.step, bit-exact (default)
+  fused: true            # ≈2× faster opt.step; validated numerical parity (default)
   factored_v_2d: true    # Adafactor-style 2D 2nd moment — matches AdamW loss (default)
 ```
 
@@ -254,7 +277,7 @@ optim_args:
 
 For quality-first pretraining, keep the AdamW backup at full LR and set `ns_schedule: standard` plus `normuon: false`. In every recipe, `adjust_lr_fn="match_rms_adamw"` keeps Muon updates on the AdamW LR scale.
 
-**How config maps:** `learning_rate`, `weight_decay`, `adam_beta1`/`adam_beta2`, and `adam_epsilon` forward to the selected constructor. Under `optim_args`, `fused` applies to both optimizer names; `factored_v_2d` is `gefenx`-only; and `backup_optimizer`, `backup_lr`, `ns_schedule`, `normuon`, and `sharded_mode` are `gefenx_muon`-only. String values are coerced to type. For plain Gefen, measure the LR instead of relying only on the `~0.6×` heuristic: `python -m gefen.tools.find_lr --model <path> --optimizer gefen --method sweep` — see [`tools/README.md`](https://github.com/thad0ctor/Gefen-X/blob/main/src/gefen/tools/README.md).
+**How config maps:** `learning_rate`, `weight_decay`, `adam_beta1`/`adam_beta2`, and `adam_epsilon` forward to the selected constructor. Under `optim_args`, `fused` and `deterministic` apply to both optimizer names; `factored_v_2d` is `gefenx`-only; and `backup_optimizer`, `backup_lr`, `ns_schedule`, `normuon`, and `sharded_mode` are `gefenx_muon`-only. String values are coerced to type. For plain Gefen, measure the LR instead of relying only on the `~0.6×` heuristic: `python -m gefen.tools.find_lr --model <path> --optimizer gefen --method sweep` — see [`tools/README.md`](https://github.com/thad0ctor/Gefen-X/blob/main/src/gefen/tools/README.md).
 
 | Lever | axolotl config | Notes |
 |---|---|---|
@@ -264,6 +287,7 @@ For quality-first pretraining, keep the AdamW backup at full LR and set `ns_sche
 | Factored 2D 2nd moment | `optim_args: { factored_v_2d: true }` | matches AdamW loss; default on |
 | Muon backup LR | `optim_args: { backup_lr: <lr> }` | LR for the selected Gefen/AdamW backup; the Axolotl factory defaults to `0.5 × learning_rate`, while balanced SFT/pretraining use full LR |
 | Sharded Newton-Schulz | `optim_args: { sharded_mode: exact }` | `exact` (default) or `distributed` (splits NS across GPUs under FSDP2) |
+| Determinism | `optim_args: { deterministic: true }` | bit-identical GPU replicas on matching GPUs; both optimizer names — [details](#determinism-deterministic) |
 | Learning rate | `learning_rate: <lr>` | the ~0.6× heuristic applies to plain Gefen; tune Muon by task. Background: [Learning rate](#learning-rate-when-porting-an-adamw-config) |
 | `period==1` memory fallback | *on by default in this fork* | restores ~1 B/param on modern decoders; module flag `MEMORY_SAFE_FALLBACK`, not a YAML key |
 
@@ -457,6 +481,7 @@ This keeps both halves on quantized Gefen state and is the low-memory recommenda
 | `normuon` | `True` | free per-neuron 2nd moment on the NS output; recovers tuned3 quality in SFT — [details](#quality-lever-per-neuron-2nd-moment-on-the-newton-schulz-output-normuon) | keep on for SFT; disable for classic pretraining |
 | `backup_2d_period_one` | `False` | per-element 2nd moment on a Gefen-backed embedding/LM head — extra memory — [details](#experimental-lever-per-element-gefen-backup-state-on-embed--lm-head-backup_2d_period_one) | Gefen backup only; AdamW already keeps per-element moments |
 | `stochastic_round` | `False` | unbiased rounding for the 8-bit momentum (free, loss-neutral) | optional |
+| `deterministic` | `False` | bit-identical updates on matching GPUs; remembered by checkpoints | enable when replicas must match exactly |
 | `capturable` | `False` | CUDA-graph-capturable `step()`, like `torch.optim`'s `capturable` — [details](https://github.com/thad0ctor/Gefen-X/blob/main/COMPATIBILITY.md#cuda-graphs--torchcompile-capturable) | turn on to capture `step()` in a `torch.cuda.CUDAGraph` |
 
 It supports `step()`, `zero_grad()`, `state_dict()`/`load_state_dict()`, and LR schedulers (e.g. `torch.optim.lr_scheduler.StepLR(optimizer, ...)`) like any optimizer. Because it splits params at construction rather than taking a single iterable, build it yourself and hand it to the Hugging Face `Trainer` via `optimizers=` (not `optimizer_cls_and_kwargs`):
@@ -473,6 +498,8 @@ optimizer = GefenMuonHybrid(
 trainer = Trainer(model=model, args=training_args, train_dataset=train_dataset,
                   optimizers=(optimizer, None))  # (optimizer, lr_scheduler)
 ```
+
+To prove save/resume in a real Trainer run, use [`benchmarks/trainer_resume/`](https://github.com/thad0ctor/Gefen-X/tree/main/benchmarks/trainer_resume): it compares an uninterrupted run against a save-and-resume run and requires them to match exactly. The run command and covered scope are in [COMPATIBILITY.md](https://github.com/thad0ctor/Gefen-X/blob/main/COMPATIBILITY.md#transformers-trainer-ddp).
 
 ## Quality Lever: factored second moment on 2D params (`factored_v_2d`)
 
@@ -500,7 +527,7 @@ opt = Gefen(model.named_parameters(), lr=0.6 * ADAMW_LR, fused=True)  # factored
 <summary><b>Details: validation, checkpoint migration, and limits</b></summary>
 
 - Validated at both scales in the fair-LR regime, with a second-seed replication at 0.6B and a learning-rate sweep at 1.7B (best LR `3e-5` ~ 0.6× AdamW's, matching Gefen's documented heuristic). The fused kernel computes the per-element step size in registers (no extra temporaries; step transients measured 0 MiB) and is covered by `tests/test_gefen_factored_v.py`.
-- Checkpoints migrate automatically in both directions (old checkpoints work with the new default and vice versa; the second-moment statistics re-warm briefly and harmlessly).
+- Native Gefen checkpoints migrate automatically in both directions (old checkpoints work with the new default and vice versa; the second-moment statistics re-warm briefly and harmlessly). Distributed checkpoints follow the [compatibility table](#distributed-training).
 - With `backup_optimizer="gefen"`, `GefenMuonHybrid` pins the backup half to Gefen's legacy block-vmean path (the factored-v combination has not been benchmarked). With `backup_optimizer="adamw"`, the backup uses conventional per-element AdamW state. Under FSDP2, sharded 2D Gefen params also fall back to the legacy path.
 - Two sibling experiments from the same investigation ship off by default because they measured **no effect**: `period_one_substrings` (per-element state on name-matched tensors) and `codebook_refresh_every` (periodic codebook refit).
 
@@ -571,7 +598,7 @@ A related opt-in, `stochastic_round=True`, switches the 8-bit momentum to unbias
 
 Under FSDP2, Muon's orthogonalization needs each full weight matrix, but every GPU only holds a slice. Three strategies:
 
-- **`"exact"`** (default) — every GPU rebuilds every matrix and does the same work. Identical to single-GPU results, but redundant.
+- **`"exact"`** (default) — every GPU rebuilds every matrix and does the same work. It matches the single-GPU oracle within the tested BF16 tolerance, but the cross-rank GEMM path is not promised bitwise identical; the work is redundant.
 - **`"distributed"`** (experimental) — each matrix is assigned by its stable position in the full distributed parameter set to one GPU, which does the work and shares the result. Bit-identical to `"exact"` on homogeneous GPUs and faster as you add them. Momentum ownership is stable when the active gradient set varies, and `state_dict()` collectively gathers owner-local momentum so rank 0 can write a complete checkpoint after all ranks call it.
 - **`"approx"`** — each GPU works on just its slice. Fastest, but results genuinely differ — an accuracy trade.
 
@@ -586,12 +613,12 @@ opt = GefenMuonHybrid(
 # only takes effect under FSDP2 (DTensor params); no-op single-GPU
 ```
 
-> **`"distributed"` checkpointing is collective.** `state_dict()` gathers each owner's momentum across ranks, so **every rank must call it** (as in a standard FSDP full-state-dict flow). Calling `state_dict()` on rank 0 only — e.g. a rank-0-only save loop — **deadlocks**. Save and load also transiently materialize the full unsharded momentum on every rank, so peak memory at checkpoint time approaches `"exact"` mode's.
+> **`"distributed"` checkpointing is collective.** `state_dict()` gathers each owner's momentum across ranks, so **every rank must call it** (as in a standard FSDP full-state-dict flow). Calling `state_dict()` on rank 0 only — e.g. a rank-0-only save loop — **deadlocks**. Save and load also transiently materialize the full unsharded momentum on every rank, so peak memory at checkpoint time approaches `"exact"` mode's. The saved checkpoint is complete on every rank and resumes under any world size, including a single-process optimizer; incomplete or inconsistent owner state fails closed before any state is touched.
 
 ![Gefen-Muon exact / distributed / approx sharded — eval loss](https://raw.githubusercontent.com/thad0ctor/Gefen-X/main/docs/benchmarks/muon_shard_loss.png)
 ![Gefen-Muon exact / distributed / approx sharded — throughput & VRAM](https://raw.githubusercontent.com/thad0ctor/Gefen-X/main/docs/benchmarks/muon_shard_perf.png)
 
-Measured (Qwen3-0.6B, 2 and 4 GPUs): `"distributed"` is a free speedup at identical results (1.06× / 1.12×); `"approx"` is faster still (1.25× / 1.39×) but visibly costs training quality, and the cost grows with GPU count. The `"distributed"` win grows with model size.
+Measured (Qwen3-0.6B, 2 and 4 GPUs): `"distributed"` matched `"exact"` in the retained convergence runs while improving throughput by 1.06× / 1.12×; `"approx"` is faster still (1.25× / 1.39×) but visibly costs training quality, and the cost grows with GPU count. The `"distributed"` win grows with model size.
 
 <br>
 
@@ -606,6 +633,8 @@ Measured (Qwen3-0.6B, 2 and 4 GPUs): `"distributed"` is a free speedup at identi
 ## Known limitations
 
 - **Hybrid checkpoint schema.** `GefenMuonHybrid`'s `state_dict()` uses its own nested `{"muon": ..., "backup": ..., "backup_optimizer": "gefen" | "adamw"}` layout. Resume from a checkpoint the hybrid itself saved—not one consolidated or converted to the flat torch `{state, param_groups}` layout. Cross-backend loads are rejected before either child is mutated; legacy untagged hybrid checkpoints are interpreted as Gefen-backed.
+- **FSDP2 optimizer checkpoints don't reshard.** Plain Gefen and Muon `approx` resume only on the same GPU count and layout; changing either refuses to load. Model weights are unaffected — [details](https://github.com/thad0ctor/Gefen-X/blob/main/COMPATIBILITY.md#optimizer-checkpoint-scope).
+- **True-FP16 overflow skips are invisible to Accelerate's `step_was_skipped` flag.** BF16 and standard AMP are unaffected and are the recommended modes in Trainer/Accelerate.
 
 ## Troubleshooting
 

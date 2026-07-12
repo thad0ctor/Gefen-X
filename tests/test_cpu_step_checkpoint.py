@@ -144,6 +144,49 @@ def test_state_dict_roundtrip_bit_exact(factored):
         assert torch.equal(pa, pb), "resumed run diverged from continuous run"
 
 
+@pytest.mark.parametrize("factored", [True, False])
+def test_distributed_checkpoint_optimizer_state_roundtrip_bit_exact(factored):
+    """PyTorch DCP normalization must retain Gefen's frozen codebook."""
+    from torch.distributed.checkpoint.state_dict import (
+        get_optimizer_state_dict,
+        set_optimizer_state_dict,
+    )
+
+    grads_all = _synthetic_grads(_small_model(), 4)
+    model_a = _small_model()
+    opt_a = Gefen(
+        list(model_a.named_parameters()), lr=1e-3, fused=False, factored_v_2d=factored
+    )
+    for step_grads in grads_all[:2]:
+        _apply_grads(model_a, step_grads)
+        opt_a.step()
+        opt_a.zero_grad()
+
+    saved_opt = copy.deepcopy(get_optimizer_state_dict(model_a, opt_a))
+    assert "gefen_codebook" not in saved_opt
+    assert all(
+        "_gefen_checkpoint_metadata" in group for group in saved_opt["param_groups"]
+    )
+
+    model_b = _small_model()
+    model_b.load_state_dict(copy.deepcopy(model_a.state_dict()))
+    opt_b = Gefen(
+        list(model_b.named_parameters()), lr=1e-3, fused=False, factored_v_2d=factored
+    )
+    set_optimizer_state_dict(model_b, opt_b, saved_opt)
+
+    for step_grads in grads_all[2:]:
+        _apply_grads(model_a, step_grads)
+        _apply_grads(model_b, step_grads)
+        opt_a.step()
+        opt_b.step()
+        opt_a.zero_grad()
+        opt_b.zero_grad()
+
+    for pa, pb in zip(model_a.parameters(), model_b.parameters()):
+        assert torch.equal(pa, pb), "DCP-resumed run diverged from continuous run"
+
+
 def _zero_style_flat_swap(opt):
     """Simulate DeepSpeed ZeRO-1/2 wrapping: replace every group's ``params``
     with one fresh flat fp32 partition tensor, leaving ``opt.state`` untouched
@@ -259,6 +302,42 @@ def test_load_state_dict_does_not_mutate_caller_dict():
     # contract in load_state_dict).
     assert "gefen_global_step" in sd and "gefen_codebook" in sd
     opt.load_state_dict(sd)
+
+
+def test_load_rejects_quantized_momentum_without_codebook():
+    model = _small_model()
+    opt = Gefen(list(model.named_parameters()), lr=1e-3, fused=False)
+    _apply_grads(model, _synthetic_grads(model, 1)[0])
+    opt.step()
+    sd = copy.deepcopy(opt.state_dict())
+    sd.pop("gefen_codebook")
+    for group in sd["param_groups"]:
+        group.pop("_gefen_checkpoint_metadata")
+
+    fresh_model = _small_model()
+    fresh_opt = Gefen(list(fresh_model.named_parameters()), lr=1e-3, fused=False)
+    with pytest.raises(ValueError, match="quantized momentum indices but no frozen codebook"):
+        fresh_opt.load_state_dict(sd)
+
+
+def test_load_rejects_partial_or_conflicting_group_metadata():
+    _, opt = _run_and_save(factored=False)
+    sd = copy.deepcopy(opt.state_dict())
+    # Create a second group so partial metadata can be represented.
+    group = sd["param_groups"][0]
+    first_param = group["params"][0]
+    second_group = dict(group)
+    second_group["params"] = [first_param]
+    group["params"] = group["params"][1:]
+    second_group.pop("_gefen_checkpoint_metadata")
+    sd["param_groups"].append(second_group)
+    with pytest.raises(ValueError, match="only some parameter groups"):
+        opt.load_state_dict(sd)
+
+    conflicting = copy.deepcopy(opt.state_dict())
+    conflicting["param_groups"][0]["_gefen_checkpoint_metadata"]["global_step"] += 1
+    with pytest.raises(ValueError, match="global steps disagree"):
+        opt.load_state_dict(conflicting)
 
 
 def test_load_legacy_flattened_param_group_checkpoint():
@@ -762,3 +841,70 @@ def test_state_dict_prehook_changes_survive_orphan_withholding():
     assert opt.state[flat_params[0]]["hook_stamp"] == 123
     # Key order is still restored when the hook leaves the key set unchanged.
     assert list(opt.state.keys()) == live_keys_before
+
+
+def test_gefen_state_dict_post_hooks_see_and_can_replace_final_schema():
+    model = _small_model()
+    opt = Gefen(list(model.named_parameters()), lr=1e-3, fused=False)
+    _apply_grads(model, _synthetic_grads(model, 1)[0])
+    opt.step()
+
+    observed = []
+
+    def inspect_final(_optimizer, state_dict):
+        observed.append(copy.deepcopy(state_dict))
+
+    opt.register_state_dict_post_hook(inspect_final)
+    opt.register_state_dict_post_hook(
+        lambda _optimizer, _state_dict: {"custom": "replacement"}
+    )
+    assert opt.state_dict() == {"custom": "replacement"}
+    assert len(observed) == 1
+    assert {
+        "state",
+        "param_groups",
+        "gefen_global_step",
+        "gefen_codebook",
+        "gefen_deterministic",
+    }.issubset(observed[0])
+    assert all(
+        "stepsize" not in pstate and "_h_buf" not in pstate
+        for pstate in observed[0]["state"].values()
+    )
+
+
+def test_gefen_load_hooks_wrap_complete_restore():
+    source_model = _small_model()
+    source = Gefen(list(source_model.named_parameters()), lr=1e-3, fused=False)
+    for step_grads in _synthetic_grads(source_model, 2):
+        _apply_grads(source_model, step_grads)
+        source.step()
+        source.zero_grad()
+    saved = copy.deepcopy(source.state_dict())
+
+    target_model = _small_model()
+    target = Gefen(list(target_model.named_parameters()), lr=9e-3, fused=False)
+    seen_pre = []
+    seen_post = []
+
+    def pre_hook(_optimizer, state_dict):
+        seen_pre.append(set(state_dict))
+
+    def post_hook(optimizer):
+        seen_post.append(
+            (
+                optimizer._gefen_global_step,
+                optimizer._gefen_codebook.detach().clone(),
+                [state.get("step") for state in optimizer.state.values()],
+            )
+        )
+
+    target.register_load_state_dict_pre_hook(pre_hook)
+    target.register_load_state_dict_post_hook(post_hook)
+    target.load_state_dict(saved)
+
+    assert seen_pre == [set(saved)]
+    assert len(seen_post) == 1
+    assert seen_post[0][0] == 2
+    assert torch.equal(seen_post[0][1], saved["gefen_codebook"])
+    assert all(not torch.is_tensor(step) for step in seen_post[0][2] if step is not None)

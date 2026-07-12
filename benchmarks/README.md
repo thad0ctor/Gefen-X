@@ -8,6 +8,7 @@ These suites measure optimizer quality, throughput, memory, and Muon-specific ex
 |---|---|---|
 | [`optimizer-sweep/`](optimizer-sweep/README.md) | Compare AdamW, Gefen, and Gefen-Muon on full-model SFT: validation loss, throughput, peak VRAM, and optimizer-state bytes per parameter | `bash benchmarks/optimizer-sweep/run.sh` |
 | [`training_matrix/`](training_matrix/README.md) | Compare controlled AdamW/Muon recipes across full-model HF SFT, small-model pretraining, and checkpoint handoff | `PYTHONPATH=.:src python -m benchmarks.training_matrix.run_matrix` |
+| [`trainer_resume/`](trainer_resume/README.md) | Validate Trainer's internal Accelerate wrapping, accumulation, scheduling, tied weights, DDP replicas, and exact native Trainer checkpoint continuation | `PYTHONPATH=.:src python -m benchmarks.trainer_resume.run` |
 | [`sharding-sweep/`](sharding-sweep/README.md) | Compare Gefen-Muon `sharded_mode` choices under FSDP2 across world sizes | `bash benchmarks/sharding-sweep/run.sh` |
 | [`microbench/`](microbench/) | Measure Newton–Schulz schedules, fp8 and batched kernels, capturable steps, and distributed Muon internals | `PYTHONPATH=.:src python benchmarks/microbench/bench_ns_schedule.py --help` |
 
@@ -41,6 +42,14 @@ PYTHONPATH=.:src python -m benchmarks.training_matrix.run_matrix --cells adamw -
   --eval-every 1 --tail-evals 1 --throughput-warmup 0 \
   --lr 1e-3 --weight-decay 0.01 --schedule constant \
   --hidden-size 16 --intermediate-size 32 --layers 1 --heads 2 --kv-heads 1 \
+  --device cpu --dtype float32 --no-fused
+```
+
+Transformers Trainer checkpoint continuation:
+
+```bash
+PYTHONPATH=.:src python -m benchmarks.trainer_resume.run \
+  --output-dir benchmarks/trainer_resume/out/cpu \
   --device cpu --dtype float32 --no-fused
 ```
 
