@@ -116,14 +116,14 @@ One knock-on effect: weight decay in AdamW-style optimizers is applied as `lr ×
 
 Gefen drops into standard distributed training like any other PyTorch optimizer, with either `fused=True` or `fused=False`. Validated training setups include single-GPU, PyTorch DDP, FSDP2 (`fully_shard` / DTensor), and DeepSpeed ZeRO 1-3 (plain `Gefen` as the client optimizer, direct or via axolotl `gefenx`; bit-exact ZeRO-2 checkpoint resume). FSDP2 optimizer checkpoint support is mode- and topology-specific as described below.
 
-| System | Current status |
+| System | Works with |
 |---|---|
-| DDP | Supported and tested, including fused BF16 resume |
-| FSDP2 / DTensor training | Tested for plain Gefen and Muon `approx` / `exact` / `distributed` |
-| FSDP2 full-state checkpoints (DCP) | Plain Gefen and Muon `approx` only; same 1-D topology and world size — scope note below |
-| Muon `distributed` native checkpoints | Versioned owner manifest; collective save resumes across world sizes, including into a single-process optimizer — [details](#experimental-lever-sharded-newton-schulz-under-fsdp2-sharded_mode) |
-| DeepSpeed ZeRO 1-3 | Plain Gefen supported and tested, direct and via axolotl `gefenx`; Muon/Hybrid fail fast with a clear error — config note below |
-| Megatron DP/TP/PP/CP/EP/ETP | Tested through the Megatron GPT pretraining entry point with legacy optimizer checkpoints — [scope](https://github.com/thad0ctor/Gefen-X/blob/main/COMPATIBILITY.md) |
+| DDP | All optimizers, including fused BF16 resume |
+| FSDP2 / DTensor training | Plain Gefen and Muon `approx` / `exact` / `distributed` |
+| FSDP2 full-state checkpoints (DCP) | Plain Gefen and Muon `approx`; same 1-D topology and world size — scope note below |
+| Muon `distributed` native checkpoints | Resume under any world size, including a single-process optimizer — [details](#experimental-lever-sharded-newton-schulz-under-fsdp2-sharded_mode) |
+| DeepSpeed ZeRO 1-3 | Plain Gefen, direct or via axolotl `gefenx`; the Muon family needs FSDP2, DDP, or single-GPU — config note below |
+| Megatron DP/TP/PP/CP/EP/ETP | Plain Gefen, GefenMuon+AdamW, and GefenMuon+Gefen with legacy optimizer checkpoints — [scope](https://github.com/thad0ctor/Gefen-X/blob/main/COMPATIBILITY.md) |
 
 > **FSDP2 optimizer checkpoint scope.** Plain Gefen and `GefenMuon(sharded_mode="approx")` collectively encode every rank's local DTensor optimizer state into PyTorch DCP `StateDictOptions(full_state_dict=True)` output, including the flattened optimizer-state form. `get_optimizer_state_dict()` and `set_optimizer_state_dict()` resume the next update exactly when world size, mesh, placements, rank coordinates, parameter ordering, shapes, names, and sharded mode are unchanged; the actual two-GPU `fully_shard` get/set test covers both optimizers. The adapter currently requires one 1-D DeviceMesh spanning the default world; multidimensional meshes, subgroups, and pipeline-local optimizers fail before its collectives. Save and restore are collective, so every rank must participate. Each process temporarily stages all serialized rank payloads on CPU, making the leading checkpoint-time CPU cost about `world_size ×` that rank's local optimizer state plus local serialization scratch. World-size or topology changes fail before mutation, and older unsafe untagged full checkpoints fail closed. This is not a reshardable optimizer-state format.
 
@@ -621,7 +621,7 @@ opt = GefenMuonHybrid(
 # only takes effect under FSDP2 (DTensor params); no-op single-GPU
 ```
 
-> **`"distributed"` checkpointing is collective.** `state_dict()` gathers each owner's momentum across ranks, so **every rank must call it** (as in a standard FSDP full-state-dict flow). Calling `state_dict()` on rank 0 only — e.g. a rank-0-only save loop — **deadlocks**. Save and load also transiently materialize the full unsharded momentum on every rank, so peak memory at checkpoint time approaches `"exact"` mode's. The saved checkpoint carries a versioned owner manifest and is complete on every rank, so it resumes under a different world size or in a single-process optimizer; populated state whose manifest is missing, partial, or inconsistent is rejected before any mutation.
+> **`"distributed"` checkpointing is collective.** `state_dict()` gathers each owner's momentum across ranks, so **every rank must call it** (as in a standard FSDP full-state-dict flow). Calling `state_dict()` on rank 0 only — e.g. a rank-0-only save loop — **deadlocks**. Save and load also transiently materialize the full unsharded momentum on every rank, so peak memory at checkpoint time approaches `"exact"` mode's. The saved checkpoint is complete on every rank and resumes under any world size, including a single-process optimizer; incomplete or inconsistent owner state fails closed before any state is touched.
 
 ![Gefen-Muon exact / distributed / approx sharded — eval loss](https://raw.githubusercontent.com/thad0ctor/Gefen-X/main/docs/benchmarks/muon_shard_loss.png)
 ![Gefen-Muon exact / distributed / approx sharded — throughput & VRAM](https://raw.githubusercontent.com/thad0ctor/Gefen-X/main/docs/benchmarks/muon_shard_perf.png)
