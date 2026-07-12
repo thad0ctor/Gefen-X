@@ -25,8 +25,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--cells",
-        default=",".join(CORE_CELLS),
-        help="comma-separated names (default: seven core cells); use 'all' for isolation controls too",
+        default=None,
+        help="comma-separated names (default: the seven core cells); use 'all' for isolation controls too",
     )
     parser.add_argument("--python", default=sys.executable)
     parser.add_argument(
@@ -72,10 +72,16 @@ def _flag_value(forwarded: list[str], flag: str) -> str | None:
 
 
 def commands(args: argparse.Namespace) -> list[list[str]]:
-    bundle_selection = args.cells.strip() == "all" or args.cells == ",".join(CORE_CELLS)
-    names = list(ALL_CELLS) if args.cells.strip() == "all" else [
-        name.strip() for name in args.cells.split(",") if name.strip()
-    ]
+    # Only the untyped default and the "all" keyword are bundles the launcher
+    # may thin; any explicit list — even one spelling out the default — is
+    # honored verbatim and fails loudly at build time.
+    bundle_selection = args.cells is None or args.cells.strip() == "all"
+    if args.cells is None:
+        names = list(CORE_CELLS)
+    elif args.cells.strip() == "all":
+        names = list(ALL_CELLS)
+    else:
+        names = [name.strip() for name in args.cells.split(",") if name.strip()]
     unknown = sorted(set(names) - set(CELL_RECIPES))
     if unknown:
         raise ValueError(f"unknown cells {unknown}; choose from {list(CELL_RECIPES)}")
@@ -124,8 +130,13 @@ def _generated_dirs(args) -> tuple[Path, ...]:
     """Dirs the cells write into: --output-dir plus a forwarded --results dir."""
     generated = [Path(args.output_dir)]
     results = _flag_value(_forwarded_train_args(args.train_args), "--results")
-    if results is not None:
-        generated.append(Path(results).parent)
+    if results:
+        results_path = Path(results)
+        generated.append(results_path)
+        # The parent joins only when it is a real subdirectory: a bare
+        # filename's parent is the repo root, which must never be excluded.
+        if results_path.parent.parts:
+            generated.append(results_path.parent)
     return tuple(generated)
 
 
