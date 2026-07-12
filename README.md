@@ -113,9 +113,9 @@ One knock-on effect: weight decay in AdamW-style optimizers is applied as `lr ×
 
 ## Distributed Training
 
-Gefen drops into standard distributed training like any other PyTorch optimizer, with either `fused=True` or `fused=False`. Validated setups: single-GPU, PyTorch DDP, FSDP2 (`fully_shard` / DTensor), and DeepSpeed ZeRO stages 1-3 (2xRTX 3090, both direct `deepspeed.initialize` and axolotl's `optimizer: gefenx`) — loss parity with AdamW at matched settings, fused kernels active on ZeRO's fp32 partitions, and bit-exact `save_checkpoint`/`load_checkpoint` resume.
+Gefen drops into standard distributed training like any other PyTorch optimizer, with either `fused=True` or `fused=False`. Validated setups: single-GPU, PyTorch DDP, FSDP2 (`fully_shard` / DTensor), and DeepSpeed ZeRO 1-3 (plain `Gefen` as the client optimizer, direct or via axolotl `gefenx`; bit-exact checkpoint resume).
 
-DeepSpeed ZeRO specifics: pass `Gefen` as the client optimizer with `"zero_allow_untested_optimizer": true` in the DeepSpeed config, and leave the config's `optimizer` section unset. If you enable optimizer CPU-offload, also set `"zero_force_ds_cpu_optimizer": false` — otherwise DeepSpeed silently replaces the client optimizer with its own CPU Adam. ZeRO applies the optimizer to flattened 1-D partitions, so it composes with plain `Gefen` only: `GefenMuon` and `GefenMuonHybrid` raise a clear error under ZeRO (2-D Newton-Schulz cannot apply to flat partitions) — use FSDP2, DDP, or single-GPU for the Muon family.
+> **DeepSpeed ZeRO config.** Set `"zero_allow_untested_optimizer": true` and leave the config's `optimizer` section unset. With optimizer CPU-offload, also set `"zero_force_ds_cpu_optimizer": false` — otherwise DeepSpeed silently swaps in its own CPU Adam. ZeRO steps flattened 1-D partitions, so `GefenMuon`/`GefenMuonHybrid` raise a clear error under ZeRO; use FSDP2, DDP, or single-GPU for the Muon family.
 
 ## CUDA Graphs & torch.compile (`capturable`)
 
