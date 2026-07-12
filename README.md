@@ -125,7 +125,7 @@ Gefen drops into standard distributed training like any other PyTorch optimizer,
 | DeepSpeed ZeRO 1-3 | Plain Gefen; use FSDP2 or DDP for the Muon family — config note below |
 | Megatron-LM | All optimizers, including checkpoint resume — [scope](https://github.com/thad0ctor/Gefen-X/blob/main/COMPATIBILITY.md#megatron-lm-integration-scope) |
 
-> **FSDP2 checkpoint scope.** Plain Gefen and Muon `approx` save and resume exactly through PyTorch's standard full-state checkpoint calls, as long as the GPU count and sharding layout are unchanged and every GPU joins the save. Anything outside that scope fails with a clear error instead of corrupting state — [full details](https://github.com/thad0ctor/Gefen-X/blob/main/COMPATIBILITY.md#optimizer-checkpoint-scope).
+> **FSDP2 checkpoint scope.** Plain Gefen and Muon `approx` save and resume exactly through PyTorch's standard full-state checkpoint calls, as long as the GPU count and sharding layout are unchanged and every GPU joins the save. Anything outside that scope refuses to load instead of corrupting state — [full details](https://github.com/thad0ctor/Gefen-X/blob/main/COMPATIBILITY.md#optimizer-checkpoint-scope).
 
 Mixed precision works out of the box: BF16 and standard AMP behave exactly as with any PyTorch optimizer, and true-FP16 `GradScaler` training is handled safely — an overflow step changes nothing. FSDP1 FP16 needs `torch.distributed.fsdp.ShardedGradScaler`.
 
@@ -630,7 +630,7 @@ Measured (Qwen3-0.6B, 2 and 4 GPUs): `"distributed"` matched `"exact"` in the re
 ## Known limitations
 
 - **Hybrid checkpoint schema.** `GefenMuonHybrid`'s `state_dict()` uses its own nested `{"muon": ..., "backup": ..., "backup_optimizer": "gefen" | "adamw"}` layout. Resume from a checkpoint the hybrid itself saved—not one consolidated or converted to the flat torch `{state, param_groups}` layout. Cross-backend loads are rejected before either child is mutated; legacy untagged hybrid checkpoints are interpreted as Gefen-backed.
-- **FSDP2 optimizer checkpoints don't reshard.** Plain Gefen and Muon `approx` resume only on the same GPU count and layout; changing either fails with a clear error. Model weights are unaffected — [details](https://github.com/thad0ctor/Gefen-X/blob/main/COMPATIBILITY.md#optimizer-checkpoint-scope).
+- **FSDP2 optimizer checkpoints don't reshard.** Plain Gefen and Muon `approx` resume only on the same GPU count and layout; changing either refuses to load. Model weights are unaffected — [details](https://github.com/thad0ctor/Gefen-X/blob/main/COMPATIBILITY.md#optimizer-checkpoint-scope).
 - **True-FP16 overflow skips are invisible to Accelerate's `step_was_skipped` flag.** BF16 and standard AMP are unaffected and are the recommended modes in Trainer/Accelerate.
 
 ## Troubleshooting
