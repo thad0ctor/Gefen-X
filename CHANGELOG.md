@@ -23,7 +23,7 @@ Packaging:
 
 - Require `numba>=0.65` for the compiled exact-DP codebook solver.
 - Make `ninja` and `setuptools>=77` core dependencies because PyTorch's runtime CUDA extension loader requires both to build the fused kernels; the former `perf` extra is no longer needed.
-- Pin release build tooling, verify byte-reproducible wheel and normalized-sdist rebuilds, and gate the installed artifact on PyTorch 2.5.0 plus latest CPU, Transformers Trainer resume, and fresh-build two-GPU CUDA/distributed tests before either package index can publish it.
+- Pin release build tooling, verify byte-reproducible wheel and normalized-sdist rebuilds, and gate the installed artifact on PyTorch 2.5.0 plus latest CPU and Transformers Trainer resume tests before either package index can publish it. The fresh-build two-GPU CUDA/distributed gate runs locally via `scripts/release_gpu_gate.sh` against the release run's built wheel, with zero skips allowed, and is attested by the TestPyPI environment approval.
 
 ## [0.3.0] - 2026-07-11
 

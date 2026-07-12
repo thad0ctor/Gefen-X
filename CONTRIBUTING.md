@@ -22,7 +22,7 @@ CI runs the CPU suite from the repo root after installing the package. Mirror th
 python -m pytest tests -q -ra
 ```
 
-CUDA-dependent tests skip themselves automatically on CPU. GPU kernel-parity tests require an NVIDIA device plus `nvcc`; branch CI exposes them through the manual `workflow_dispatch` job, while release tags must pass the two-GPU JIT and distributed gate in `release.yml`. Run the full suite locally with the same command on a CUDA host.
+CUDA-dependent tests skip themselves automatically on CPU. GPU kernel-parity tests require an NVIDIA device plus `nvcc`; branch CI exposes them through the manual `workflow_dispatch` job, while release tags must pass the two-GPU JIT and distributed gate by running `scripts/release_gpu_gate.sh <tag>` against the release run's built wheel before the TestPyPI environment is approved. Run the full suite locally with the same command on a CUDA host.
 
 ## Code style
 

@@ -7,8 +7,14 @@ name: Release
 #
 # `ci.yml` intentionally runs on branch pushes and pull requests, not tag pushes.
 # This workflow therefore carries installed-wheel CPU and Transformers Trainer
-# gates plus a mandatory two-GPU CUDA/JIT/distributed gate. Every gate tests the
-# artifact built in `build`, and every publish job downloads that same artifact.
+# gates. Every gate tests the artifact built in `build`, and every publish job
+# downloads that same artifact.
+#
+# The two-GPU CUDA/JIT/distributed gate runs locally, not on a hosted runner:
+# `scripts/release_gpu_gate.sh <tag>` downloads this run's `dist` artifact and
+# runs the mandatory GPU test list against the installed wheel with zero skips
+# allowed. Approving the `testpypi` environment below is the release manager's
+# attestation that the local GPU gate passed for this exact artifact.
 #
 # Auth is OIDC trusted publishing (no API tokens stored). The manual approval
 # gates are GitHub Environment "required reviewers", configured in
@@ -194,144 +200,6 @@ jobs:
         env:
           CUDA_VISIBLE_DEVICES: ""
         run: python -m pytest tests -q -ra
-
-  gpu_release_tests:
-    name: Two-GPU JIT & distributed release gate
-    needs: build
-    runs-on: [self-hosted, gpu]
-    timeout-minutes: 120
-    steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
-        with:
-          persist-credentials: false
-
-      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
-        with:
-          name: dist
-          path: dist/
-
-      - name: Preflight homogeneous two-GPU CUDA runner
-        run: |
-          python - <<'PY'
-          import re
-          import shutil
-          import subprocess
-
-          import torch
-
-          assert torch.version.cuda is not None, "release gate requires a CUDA-enabled PyTorch build"
-          assert torch.cuda.is_available(), "release gate requires CUDA"
-          assert torch.cuda.device_count() >= 2, "release gate requires at least two visible GPUs"
-          assert torch.distributed.is_available(), "torch.distributed is unavailable"
-          assert torch.distributed.is_nccl_available(), "release gate requires NCCL"
-          names = [torch.cuda.get_device_name(index) for index in range(2)]
-          capabilities = [torch.cuda.get_device_capability(index) for index in range(2)]
-          assert names[0] == names[1], (
-              "replica-exact gate requires identical GPU models",
-              names,
-          )
-          assert capabilities[0] == capabilities[1], (
-              "replica-exact gate requires homogeneous GPUs",
-              capabilities,
-          )
-          nvcc = shutil.which("nvcc")
-          assert nvcc is not None, "release gate requires nvcc on PATH"
-          nvcc_result = subprocess.run(
-              [nvcc, "--version"], check=True, capture_output=True, text=True
-          )
-          match = re.search(r"release\s+([0-9]+)\.", nvcc_result.stdout)
-          assert match is not None, "could not parse nvcc CUDA version"
-          assert int(match.group(1)) == int(torch.version.cuda.split(".")[0]), (
-              "nvcc and PyTorch CUDA major versions differ",
-              nvcc_result.stdout,
-              torch.version.cuda,
-          )
-          print("torch:", torch.__version__, "CUDA:", torch.version.cuda)
-          print("GPUs:", names)
-          print("capabilities:", capabilities)
-          print(nvcc_result.stdout)
-          PY
-          if [ -n "${CUDA_VISIBLE_DEVICES:-}" ]; then
-            RELEASE_GPUS=$(printf '%s' "$CUDA_VISIBLE_DEVICES" | cut -d, -f1,2)
-          else
-            RELEASE_GPUS=0,1
-          fi
-          echo "CUDA_VISIBLE_DEVICES=$RELEASE_GPUS" >> "$GITHUB_ENV"
-          echo "Mandatory release tests will use CUDA_VISIBLE_DEVICES=$RELEASE_GPUS"
-
-      - name: Install the built wheel
-        env:
-          EXPECTED_VERSION: ${{ needs.build.outputs.version }}
-        run: |
-          python -m pip install --upgrade pip
-          python -m pip uninstall -y gefen-x || true
-          WHEEL=$(ls dist/*.whl)
-          python -m pip install "$WHEEL" pytest 'accelerate==1.14.0'
-          python - <<'PY'
-          import importlib.metadata as metadata
-          import os
-          from pathlib import Path
-
-          import gefen
-
-          version = metadata.version("gefen-x")
-          assert version == os.environ["EXPECTED_VERSION"], (version, os.environ["EXPECTED_VERSION"])
-          module_path = Path(gefen.__file__).resolve()
-          assert (Path.cwd() / "src").resolve() not in module_path.parents, module_path
-          print("installed wheel:", module_path, version)
-          PY
-          ninja --version
-
-      - name: Run mandatory JIT and distributed tests
-        env:
-          GEFEN_KERNEL_BUILD_ROOT: ${{ runner.temp }}/gefen-release-jit-${{ github.run_id }}-${{ github.run_attempt }}
-          GEFEN_VERBOSE_BUILD: "1"
-        run: |
-          rm -rf "$GEFEN_KERNEL_BUILD_ROOT"
-          python -m pytest -q -ra --junitxml=release-gpu.xml \
-            tests/test_amp_grad_scaler.py \
-            tests/test_capturable.py \
-            tests/test_capturable_fsdp2.py \
-            tests/test_deterministic_mode.py \
-            tests/test_factored_v_ema_parity.py \
-            tests/test_fused_fsdp2_noncontig.py \
-            tests/test_fused_full_update_parity.py \
-            tests/test_fused_update_v2_full_parity.py \
-            tests/test_gefen_fsdp2_checkpoint.py \
-            tests/test_muon_distributed_checkpoint_safety.py \
-            tests/test_muon_grad_presence.py \
-            tests/test_step_preflight_atomicity.py \
-            tests/test_muon_fsdp2_parity.py::test_muon_fsdp2_fused_cuda_parity \
-            tests/test_muon_fsdp2_parity.py::test_muon_fsdp2_fused_multirank_parity \
-            tests/test_muon_fsdp2_parity.py::test_muon_fsdp2_distributed_parity \
-            tests/test_muon_fsdp2_parity.py::test_muon_fsdp2_distributed_fluctuating_grad_set \
-            tests/test_muon_fsdp2_parity.py::test_muon_fsdp2_distributed_checkpoint_restore
-
-      - name: Reject skipped release-gate tests
-        run: |
-          python - <<'PY'
-          import xml.etree.ElementTree as ET
-
-          root = ET.parse("release-gpu.xml").getroot()
-          cases = root.findall(".//testcase")
-          assert cases, "release gate collected no tests"
-          skipped = [
-              "{}::{}".format(case.attrib.get("classname", ""), case.attrib.get("name", ""))
-              for case in cases
-              if case.find("skipped") is not None
-          ]
-          assert not skipped, "mandatory release tests skipped:\n{}".format("\n".join(skipped))
-          print("mandatory GPU release tests:", len(cases), "passed with zero skips")
-          PY
-
-      - name: Upload GPU release-gate report
-        if: always()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
-        with:
-          name: release-gpu-junit-${{ github.run_attempt }}
-          path: release-gpu.xml
-          if-no-files-found: ignore
-
   framework_wheel_tests:
     name: Installed-wheel Transformers Trainer resume
     needs: build
@@ -405,9 +273,11 @@ jobs:
 
   testpypi:
     name: Publish to TestPyPI (gate 1)
-    needs: [build, cpu_wheel_tests, framework_wheel_tests, gpu_release_tests]
+    needs: [build, cpu_wheel_tests, framework_wheel_tests]
     runs-on: ubuntu-latest
     # Approval gate #1: the `testpypi` environment's required reviewers.
+    # Approving attests that `scripts/release_gpu_gate.sh <tag>` passed locally
+    # against this run's built wheel (see the header comment).
     environment:
       name: testpypi
       url: https://test.pypi.org/project/gefen-x/${{ needs.build.outputs.version }}/
@@ -425,7 +295,7 @@ jobs:
 
   pypi:
     name: Publish to PyPI (gate 2)
-    needs: [build, cpu_wheel_tests, framework_wheel_tests, gpu_release_tests, testpypi]
+    needs: [build, cpu_wheel_tests, framework_wheel_tests, testpypi]
     # Prerelease tags stop at TestPyPI; only clean vX.Y.Z tags reach PyPI.
     if: needs.build.outputs.prerelease == 'false'
     runs-on: ubuntu-latest
