@@ -131,7 +131,7 @@ Mixed precision works out of the box: BF16 and standard AMP behave exactly as wi
 
 > **DeepSpeed ZeRO config.** Set `"zero_allow_untested_optimizer": true` and leave the config's `optimizer` section unset. With optimizer CPU-offload, also set `"zero_force_ds_cpu_optimizer": false` — otherwise raw DeepSpeed refuses to initialize, and accelerate-based launchers (axolotl) silently swap in DeepSpeed's own CPU Adam.
 
-## Replica-exact fused updates (`deterministic`)
+## Determinism (`deterministic`)
 
 Set `deterministic=True` when every GPU replica must produce bit-identical results on matching GPUs. It is off by default (the fastest routing), checkpoints remember the setting, and older checkpoints without it still load. One combination is rejected: plain Gefen with `deterministic=True`, `factored_v_2d=True`, and `stochastic_round=True` together.
 
@@ -287,7 +287,7 @@ For quality-first pretraining, keep the AdamW backup at full LR and set `ns_sche
 | Factored 2D 2nd moment | `optim_args: { factored_v_2d: true }` | matches AdamW loss; default on |
 | Muon backup LR | `optim_args: { backup_lr: <lr> }` | LR for the selected Gefen/AdamW backup; the Axolotl factory defaults to `0.5 × learning_rate`, while balanced SFT/pretraining use full LR |
 | Sharded Newton-Schulz | `optim_args: { sharded_mode: exact }` | `exact` (default) or `distributed` (splits NS across GPUs under FSDP2) |
-| Replica-exact updates | `optim_args: { deterministic: true }` | bit-identical GPU replicas on matching GPUs; both optimizer names — [details](#replica-exact-fused-updates-deterministic) |
+| Determinism | `optim_args: { deterministic: true }` | bit-identical GPU replicas on matching GPUs; both optimizer names — [details](#determinism-deterministic) |
 | Learning rate | `learning_rate: <lr>` | the ~0.6× heuristic applies to plain Gefen; tune Muon by task. Background: [Learning rate](#learning-rate-when-porting-an-adamw-config) |
 | `period==1` memory fallback | *on by default in this fork* | restores ~1 B/param on modern decoders; module flag `MEMORY_SAFE_FALLBACK`, not a YAML key |
 
