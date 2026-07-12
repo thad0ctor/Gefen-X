@@ -144,6 +144,110 @@ def test_state_dict_roundtrip_bit_exact(factored):
         assert torch.equal(pa, pb), "resumed run diverged from continuous run"
 
 
+def _zero_style_flat_swap(opt):
+    """Simulate DeepSpeed ZeRO-1/2 wrapping: replace every group's ``params``
+    with one fresh flat fp32 partition tensor, leaving ``opt.state`` untouched
+    (exactly what DeepSpeed does -- it never edits the inner optimizer's state,
+    so the ``name`` entries Gefen pre-registered for the original model params
+    become unreachable from ``param_groups``)."""
+    flat_params = []
+    for group in opt.param_groups:
+        numel = sum(p.numel() for p in group["params"])
+        flat = nn.Parameter(torch.zeros(numel, dtype=torch.float32))
+        group["params"] = [flat]
+        flat_params.append(flat)
+    return flat_params
+
+
+def test_state_dict_survives_zero_style_param_swap():
+    """ZeRO swaps group params for flat partitions without touching state;
+    state_dict() must skip the orphaned entries instead of KeyError-ing."""
+    model = _small_model()
+    opt = Gefen(list(model.named_parameters()), lr=1e-3, fused=False)
+    _apply_grads(model, _synthetic_grads(model, 1)[0])
+    opt.step()
+    opt.zero_grad()
+
+    flat_params = _zero_style_flat_swap(opt)
+    # DeepSpeed then drives steps on the flat fp32 partitions.
+    for flat in flat_params:
+        flat.grad = torch.full_like(flat, 1e-3)
+    opt.step()
+    opt.zero_grad()
+
+    live_keys_before = list(opt.state.keys())
+    sd = opt.state_dict()  # KeyError on unfixed code (torch param_mappings)
+
+    # Only the reachable flat partitions are serialized, indexed 0..n-1 in
+    # param_groups order; the orphaned original-param entries are withheld.
+    n_flat = len(flat_params)
+    assert set(sd["state"].keys()) == set(range(n_flat))
+    serialized_ids = [
+        pid for group in sd["param_groups"] for pid in group["params"]
+    ]
+    assert serialized_ids == list(range(n_flat))
+    for pstate in sd["state"].values():
+        assert "vmean" in pstate or "exp_avg" in pstate or len(pstate) > 1
+
+    # Live self.state is untouched: same keys, same order, orphaned entries
+    # still carry their pre-registered names.
+    assert list(opt.state.keys()) == live_keys_before
+    for (name, param) in model.named_parameters():
+        assert opt.state[param]["name"] == name.lower()
+
+    # Saving is idempotent (the withhold/restore leaves nothing behind).
+    sd2 = opt.state_dict()
+    _assert_state_dict_deep_equal(sd2, sd)
+
+
+def test_zero_style_swap_save_does_not_perturb_normal_save():
+    """After undoing the swap, a normal save must match the pristine pre-swap
+    save exactly (state + param_groups): the orphan filter fires only while
+    orphans exist and never leaks into the normal path."""
+    model = _small_model()
+    opt = Gefen(list(model.named_parameters()), lr=1e-3, fused=False)
+    _apply_grads(model, _synthetic_grads(model, 1)[0])
+    opt.step()
+    opt.zero_grad()
+
+    pristine = copy.deepcopy(opt.state_dict())
+    original_group_params = [list(g["params"]) for g in opt.param_groups]
+
+    _zero_style_flat_swap(opt)
+    opt.state_dict()  # swap-path save
+
+    for group, params in zip(opt.param_groups, original_group_params):
+        group["params"] = params
+    after = opt.state_dict()
+    _assert_state_dict_deep_equal(after["state"], pristine["state"], "state")
+    _assert_state_dict_deep_equal(
+        after["param_groups"], pristine["param_groups"], "param_groups"
+    )
+
+
+def test_gefen_muon_state_dict_survives_zero_style_param_swap():
+    """GefenMuon inherits Gefen.state_dict; the orphan filter must cover it
+    too (its constructor pre-registers names the same way)."""
+    torch.manual_seed(0)
+    params = [
+        ("blocks.0.w", nn.Parameter(torch.randn(32, 48))),
+        ("blocks.1.w", nn.Parameter(torch.randn(48, 16))),
+    ]
+    opt = GefenMuon(params, lr=1e-3, fused=False, adjust_lr_fn="match_rms_adamw")
+    gen = torch.Generator().manual_seed(7)
+    for _, p in params:
+        p.grad = torch.randn(p.shape, generator=gen) * 1e-2
+    opt.step()
+    opt.zero_grad()
+
+    _zero_style_flat_swap(opt)
+    sd = opt.state_dict()  # KeyError on unfixed code
+    assert all(isinstance(pid, int) for pid in sd["state"])
+    # Orphaned entries survive live for _param_name lookups.
+    for name, p in params:
+        assert opt.state[p]["name"] == name
+
+
 def test_load_state_dict_does_not_mutate_caller_dict():
     model = _small_model()
     opt = Gefen(list(model.named_parameters()), lr=1e-3, fused=False)
@@ -623,3 +727,38 @@ def test_hybrid_rejected_backup_layout_load_is_a_true_no_op(backup_optimizer):
 
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-v"]))
+
+
+def test_state_dict_prehook_changes_survive_orphan_withholding():
+    """A state_dict pre-hook that mutates live state during the save must keep
+    its changes afterwards (torch semantics), even on the orphan-withholding
+    path used under a ZeRO-style param swap."""
+    model = _small_model()
+    opt = Gefen(list(model.named_parameters()), lr=1e-3, fused=False)
+    _apply_grads(model, _synthetic_grads(model, 1)[0])
+    opt.step()
+    opt.zero_grad()
+
+    flat_params = _zero_style_flat_swap(opt)
+    for flat in flat_params:
+        flat.grad = torch.full_like(flat, 1e-3)
+    opt.step()
+    opt.zero_grad()
+
+    def stamp(optimizer):
+        # REBIND the entry (not an in-place mutation): the old clear+update
+        # restore silently reverted rebinds because its shallow snapshot
+        # shared the original entry dicts.
+        optimizer.state[flat_params[0]] = dict(
+            optimizer.state[flat_params[0]], hook_stamp=123
+        )
+
+    opt.register_state_dict_pre_hook(stamp)
+    live_keys_before = list(opt.state.keys())
+    sd = opt.state_dict()
+
+    # The hook's write is in the checkpoint AND survives in live state.
+    assert sd["state"][0]["hook_stamp"] == 123
+    assert opt.state[flat_params[0]]["hook_stamp"] == 123
+    # Key order is still restored when the hook leaves the key set unchanged.
+    assert list(opt.state.keys()) == live_keys_before

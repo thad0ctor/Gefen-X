@@ -413,6 +413,28 @@ def _adjust_lr(
     return lr * _adjust_lr_ratio(adjust_lr_fn, param_shape)
 
 
+def _swapped_param_groups_error(p: torch.Tensor) -> str:
+    """Message for a non-2D parameter discovered in a Muon group at step time.
+
+    GefenMuon validates 2D-ness at construction, so this only fires when an
+    optimizer wrapper replaced ``param_groups[*]["params"]`` after construction.
+    DeepSpeed ZeRO (stage 1/2/3) is the known case: it swaps in flattened 1-D
+    fp32 partitions and steps those, which Muon fundamentally cannot do.
+    """
+    return (
+        "GefenMuon found a {}-D parameter (shape {}) in its param groups at "
+        "step time, but every parameter was validated as a 2D matrix at "
+        "construction -- an optimizer wrapper has replaced "
+        "param_groups[*]['params'] after construction. DeepSpeed ZeRO "
+        "(stage 1/2/3) does exactly this: ZeRO steps flattened 1-D fp32 "
+        "partitions, and Muon's 2D Newton-Schulz orthogonalization cannot be "
+        "applied to a flat partition, so GefenMuon and GefenMuonHybrid cannot "
+        "be used as the DeepSpeed ZeRO client optimizer. Use plain Gefen as "
+        "the client optimizer under DeepSpeed ZeRO, or train the Muon family "
+        "under FSDP2 / DDP / single-GPU instead.".format(p.ndim, tuple(p.shape))
+    )
+
+
 class GefenMuon(Gefen):
     """Muon with Gefen's quantized (8-bit codebook) momentum state.
 
@@ -1417,7 +1439,12 @@ class GefenMuon(Gefen):
             raise RuntimeError("GefenMuon does not support sparse gradients")
         if grad.ndim != 2:
             raise ValueError(
-                "GefenMuon gradient must be a 2D matrix for {}".format(param_name)
+                "GefenMuon gradient must be a 2D matrix for {} but has {} "
+                "dimension(s). If a training wrapper flattened the parameters "
+                "or gradients (DeepSpeed ZeRO does this: it steps flattened "
+                "1-D fp32 partitions), note that Muon's 2D orthogonalization "
+                "cannot apply there -- use plain Gefen as the DeepSpeed ZeRO "
+                "client optimizer instead.".format(param_name, grad.ndim)
             )
 
         # In approx mode the pipeline operates on the local shard, so the period
@@ -1647,6 +1674,17 @@ class GefenMuon(Gefen):
         for group in self.param_groups:
             distributed = group["sharded_mode"] == "distributed"
             for name, p in self._iter_group_params_with_names(group):
+                # The constructor validated every parameter as a 2D matrix, so a
+                # non-2D parameter here means a wrapper replaced
+                # param_groups[*]["params"] AFTER construction (bypassing
+                # add_param_group). DeepSpeed ZeRO does exactly that -- it swaps
+                # in flattened 1-D fp32 partitions -- and without this guard the
+                # step fails later with a cryptic gradient-shape error carrying a
+                # stale param name. Fail loudly before any state is touched.
+                # (FSDP2/DTensor params keep their GLOBAL 2-D shape, so sharded
+                # flows never trip this.)
+                if p.ndim != 2:
+                    raise ValueError(_swapped_param_groups_error(p))
                 grad = p.grad
                 if distributed and self._is_sharded(p):
                     distributed_items.append((group, name, p, grad))

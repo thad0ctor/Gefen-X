@@ -6,6 +6,8 @@ All notable changes to this project are documented here. This project adheres to
 
 API and compatibility:
 
+- DeepSpeed ZeRO stages 1-3 are validated with plain `Gefen` as the client optimizer (direct `deepspeed.initialize` and axolotl `gefenx`); `Gefen.state_dict()` now skips state entries orphaned when a wrapper such as ZeRO replaces `param_groups` with flat partitions, fixing the previous `save_checkpoint` KeyError (round-trip resume is bit-exact).
+- `GefenMuon` and `GefenMuonHybrid` now fail fast with a self-explanatory error when a wrapper steps them on flattened 1-D partitions (DeepSpeed ZeRO), including the silent ZeRO-3 case where zero-numel placeholder params would previously build an all-backup hybrid; `GefenMuonHybrid.state` is now a routing live view, so external writes to `optimizer.state[param]` persist to the owning child instead of being silently discarded.
 - `GefenMuonHybrid` now accepts `backup_optimizer="gefen" | "adamw"`. Gefen remains the backward-compatible, minimum-state default; AdamW provides conventional per-element state for embeddings, heads, norms, and biases in the measured SFT/pretraining quality recipes. This choice is independent of `fused` execution.
 - Hybrid checkpoints record the selected backup backend. Untagged legacy checkpoints retain Gefen semantics, while cross-backend loads fail before either child is loaded.
 
