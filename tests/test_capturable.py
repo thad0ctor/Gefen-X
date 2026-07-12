@@ -145,10 +145,10 @@ def test_parity_gefen_factored_fused():
     # per-step scalars flow through the device buffer). The two sides run the
     # identical kernel arithmetic: the fp32 scalars the kernel consumes are
     # asserted BIT-IDENTICAL (device float64 tensor ops vs host python doubles
-    # cast to the same fp32 values), so the only residual divergence is the
-    # factored kernel's own documented run-to-run atomicAdd nondeterminism in
-    # the row/col grad^2 sums (a re-run of the SAME config differs by a couple
-    # of 1-ulp bf16 flips) -- hold the params to that envelope.
+    # cast to the same fp32 values). Pin momentum period selection so a near tie
+    # in the separate variance-search reduction cannot change state geometry;
+    # this test then isolates capturable scalar plumbing, with only the factored
+    # row/col reduction's small run-to-run atomicAdd noise remaining.
     lr, wd, beta1, beta2 = 1e-3, 0.1, 0.9, 0.999
 
     def run(capturable, steps=6, shape=(768, 512), seed=3):
@@ -156,7 +156,13 @@ def test_parity_gefen_factored_fused():
         p = torch.nn.Parameter(
             (torch.randn(*shape, device=DEVICE) * 0.02).bfloat16()
         )
-        opt = Gefen([("w", p)], lr=lr, weight_decay=wd, capturable=capturable)
+        opt = Gefen(
+            [("w", p)],
+            lr=lr,
+            weight_decay=wd,
+            capturable=capturable,
+            force_2d_period_one=True,
+        )
         torch.manual_seed(seed + 1)
         for _ in range(steps):
             p.grad = torch.randn(*shape, device=DEVICE).bfloat16() * 1e-3

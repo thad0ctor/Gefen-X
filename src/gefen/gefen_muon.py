@@ -554,9 +554,9 @@ class GefenMuon(Gefen):
             raise ValueError(
                 "momentum should be in [0, 1) but is: {}".format(momentum)
             )
-        if not eps > 0.0:
+        if not math.isfinite(eps) or eps <= 0.0:
             raise ValueError(
-                "eps should be > 0 but is: {}. The Newton-Schulz input "
+                "eps should be finite and > 0 but is: {}. The Newton-Schulz input "
                 "normalization divides by the momentum matrix norm clamped at "
                 "eps, so eps=0 turns an all-zero momentum matrix into 0/0 = "
                 "NaN".format(eps)
@@ -682,10 +682,35 @@ class GefenMuon(Gefen):
             raise ValueError(
                 "normuon_beta2 must be in [0, 1) but is: {}".format(normuon_beta2)
             )
+        if not math.isfinite(normuon_eps) or normuon_eps <= 0.0:
+            raise ValueError(
+                "normuon_eps must be finite and > 0 but is: {}".format(normuon_eps)
+            )
         # Cautious masking (opt-in): zero update coordinates whose sign
         # disagrees with the current gradient, rescaled to preserve magnitude.
         self._normuon = normuon
         self._cautious = cautious
+
+        # torch.optim.Optimizer calls ``self.add_param_group`` while the base
+        # constructor is still running. Publish the complete Muon group schema
+        # first so both constructor groups and groups added later take the same
+        # validation/default-injection path.
+        self._muon_group_defaults = {
+            "momentum": momentum,
+            "nesterov": nesterov,
+            "ns_coefficients": ns_coefficients,
+            "ns_steps": ns_steps,
+            "adjust_lr_fn": adjust_lr_fn,
+            "sharded_mode": sharded_mode,
+            "fp8_ns": fp8_ns,
+            "fp8_ns_compile": fp8_ns_compile,
+            "batched_ns": bool(batched_ns),
+            "batched_ns_workspace_bytes": batched_ns_workspace_bytes,
+            "normuon": normuon,
+            "normuon_beta2": normuon_beta2,
+            "normuon_eps": normuon_eps,
+            "cautious": cautious,
+        }
 
         super().__init__(
             params,
@@ -699,28 +724,132 @@ class GefenMuon(Gefen):
             verbose=verbose,
         )
 
-        for group in self.param_groups:
-            group["momentum"] = momentum
-            group["nesterov"] = nesterov
-            group["ns_coefficients"] = ns_coefficients
-            group["ns_steps"] = ns_steps
-            group["adjust_lr_fn"] = adjust_lr_fn
-            group["sharded_mode"] = sharded_mode
-            group["fp8_ns"] = fp8_ns
-            group["fp8_ns_compile"] = fp8_ns_compile
-            group["batched_ns"] = bool(batched_ns)
-            group["batched_ns_workspace_bytes"] = batched_ns_workspace_bytes
-            group["normuon"] = normuon
-            group["normuon_beta2"] = normuon_beta2
-            group["normuon_eps"] = normuon_eps
-            group["cautious"] = cautious
-            for p in group["params"]:
-                if p.ndim != 2:
+    def add_param_group(self, param_group):
+        """Add a validated 2D Muon parameter group atomically.
+
+        Muon-specific options may be supplied per group; omitted values inherit
+        the constructor defaults. The group is fully validated before the base
+        Gefen registration mutates ``param_groups`` or per-parameter state.
+        """
+        if not isinstance(param_group, dict) or "params" not in param_group:
+            # Preserve Gefen's public error types/messages for malformed group
+            # containers and missing ``params``.
+            return super().add_param_group(param_group)
+
+        group = dict(param_group)
+        raw_params = group["params"]
+        if isinstance(raw_params, torch.Tensor):
+            raw_params = [raw_params]
+        else:
+            raw_params = list(raw_params)
+        group["params"] = raw_params
+
+        # Validate tensor type/complex support and Muon's dimensionality before
+        # registration. Gefen.add_param_group repeats its own checks, but doing
+        # this first keeps a mixed valid/invalid addition all-or-nothing.
+        for _, param in self._iter_params_with_names(raw_params):
+            if param.ndim != 2:
+                raise ValueError(
+                    "GefenMuon only supports 2D parameters whereas we found a "
+                    "parameter with size: {}".format(param.size())
+                )
+
+        defaults = self._muon_group_defaults
+        momentum = group.get("momentum", defaults["momentum"])
+        if not 0.0 <= momentum < 1.0:
+            raise ValueError(
+                "momentum should be in [0, 1) but is: {}".format(momentum)
+            )
+
+        adjust_lr_fn = group.get("adjust_lr_fn", defaults["adjust_lr_fn"])
+        if adjust_lr_fn is not None and adjust_lr_fn not in (
+            "original",
+            "match_rms_adamw",
+        ):
+            raise ValueError(
+                "Adjust learning rate function {} is not supported".format(
+                    adjust_lr_fn
+                )
+            )
+
+        sharded_mode = group.get("sharded_mode", defaults["sharded_mode"])
+        if sharded_mode not in ("exact", "approx", "distributed"):
+            raise ValueError(
+                "sharded_mode must be 'exact', 'approx' or 'distributed' but is: "
+                "{}".format(sharded_mode)
+            )
+
+        ns_coefficients = group.get(
+            "ns_coefficients", defaults["ns_coefficients"]
+        )
+        ns_steps = group.get("ns_steps", defaults["ns_steps"])
+        ns_schedule = group.get("ns_schedule")
+        if ns_schedule is not None:
+            if isinstance(ns_schedule, str):
+                if ns_schedule not in NS_SCHEDULES:
                     raise ValueError(
-                        "GefenMuon only supports 2D parameters whereas we found a parameter with size: {}".format(
-                            p.size(),
+                        "Unknown ns_schedule {!r}; choose from {}".format(
+                            ns_schedule, sorted(NS_SCHEDULES)
                         )
                     )
+                resolved_schedule = NS_SCHEDULES[ns_schedule]
+            else:
+                resolved_schedule = ns_schedule
+            if resolved_schedule is not None:
+                ns_coefficients = _normalize_ns_schedule(
+                    resolved_schedule, ns_steps
+                )
+                ns_steps = len(ns_coefficients)
+        # Validate the fixed-coefficient path and direct explicit schedules too.
+        _normalize_ns_schedule(ns_coefficients, ns_steps)
+
+        workspace_bytes = group.get(
+            "batched_ns_workspace_bytes",
+            defaults["batched_ns_workspace_bytes"],
+        )
+        if not isinstance(workspace_bytes, int) or isinstance(workspace_bytes, bool):
+            raise TypeError("batched_ns_workspace_bytes must be an integer")
+        if workspace_bytes <= 0:
+            raise ValueError("batched_ns_workspace_bytes must be positive")
+
+        normuon_beta2 = group.get("normuon_beta2", defaults["normuon_beta2"])
+        if not 0.0 <= normuon_beta2 < 1.0:
+            raise ValueError(
+                "normuon_beta2 must be in [0, 1) but is: {}".format(normuon_beta2)
+            )
+        normuon_eps = group.get("normuon_eps", defaults["normuon_eps"])
+        if not math.isfinite(normuon_eps) or normuon_eps <= 0.0:
+            raise ValueError(
+                "normuon_eps must be finite and > 0 but is: {}".format(normuon_eps)
+            )
+
+        group.update(
+            {
+                "momentum": momentum,
+                "nesterov": group.get("nesterov", defaults["nesterov"]),
+                "ns_coefficients": ns_coefficients,
+                "ns_steps": ns_steps,
+                "adjust_lr_fn": adjust_lr_fn,
+                "sharded_mode": sharded_mode,
+                "fp8_ns": group.get("fp8_ns", defaults["fp8_ns"]),
+                "fp8_ns_compile": group.get(
+                    "fp8_ns_compile", defaults["fp8_ns_compile"]
+                ),
+                "batched_ns": bool(
+                    group.get("batched_ns", defaults["batched_ns"])
+                ),
+                "batched_ns_workspace_bytes": workspace_bytes,
+                "normuon": group.get("normuon", defaults["normuon"]),
+                "normuon_beta2": normuon_beta2,
+                "normuon_eps": normuon_eps,
+                "cautious": group.get("cautious", defaults["cautious"]),
+                # Gefen's inherited storage still carries beta1/beta2. Keep it
+                # consistent with the Muon momentum option instead of retaining
+                # irrelevant or contradictory caller-supplied Adam betas.
+                "betas": (momentum, 0.0),
+            }
+        )
+        return super().add_param_group(group)
 
     def _init_gefen_muon_state(self, state, grad_view: torch.Tensor) -> None:
         self._init_gefen_state(state, grad_view)
@@ -742,7 +871,9 @@ class GefenMuon(Gefen):
                 # approx mode learns the codebook/period from the LOCAL shard
                 # (no all-gather) so periods divide the local numel that the
                 # approximate step operates on; exact mode gathers the full matrix.
-                if self._sharded_mode == "approx" and hasattr(grad, "to_local"):
+                if group["sharded_mode"] == "approx" and hasattr(
+                    grad, "to_local"
+                ):
                     grad = grad.to_local()
                 elif hasattr(grad, "full_tensor"):
                     grad = grad.full_tensor()

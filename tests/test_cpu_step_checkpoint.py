@@ -144,6 +144,49 @@ def test_state_dict_roundtrip_bit_exact(factored):
         assert torch.equal(pa, pb), "resumed run diverged from continuous run"
 
 
+@pytest.mark.parametrize("factored", [True, False])
+def test_distributed_checkpoint_optimizer_state_roundtrip_bit_exact(factored):
+    """PyTorch DCP normalization must retain Gefen's frozen codebook."""
+    from torch.distributed.checkpoint.state_dict import (
+        get_optimizer_state_dict,
+        set_optimizer_state_dict,
+    )
+
+    grads_all = _synthetic_grads(_small_model(), 4)
+    model_a = _small_model()
+    opt_a = Gefen(
+        list(model_a.named_parameters()), lr=1e-3, fused=False, factored_v_2d=factored
+    )
+    for step_grads in grads_all[:2]:
+        _apply_grads(model_a, step_grads)
+        opt_a.step()
+        opt_a.zero_grad()
+
+    saved_opt = copy.deepcopy(get_optimizer_state_dict(model_a, opt_a))
+    assert "gefen_codebook" not in saved_opt
+    assert all(
+        "_gefen_checkpoint_metadata" in group for group in saved_opt["param_groups"]
+    )
+
+    model_b = _small_model()
+    model_b.load_state_dict(copy.deepcopy(model_a.state_dict()))
+    opt_b = Gefen(
+        list(model_b.named_parameters()), lr=1e-3, fused=False, factored_v_2d=factored
+    )
+    set_optimizer_state_dict(model_b, opt_b, saved_opt)
+
+    for step_grads in grads_all[2:]:
+        _apply_grads(model_a, step_grads)
+        _apply_grads(model_b, step_grads)
+        opt_a.step()
+        opt_b.step()
+        opt_a.zero_grad()
+        opt_b.zero_grad()
+
+    for pa, pb in zip(model_a.parameters(), model_b.parameters()):
+        assert torch.equal(pa, pb), "DCP-resumed run diverged from continuous run"
+
+
 def _zero_style_flat_swap(opt):
     """Simulate DeepSpeed ZeRO-1/2 wrapping: replace every group's ``params``
     with one fresh flat fp32 partition tensor, leaving ``opt.state`` untouched
@@ -259,6 +302,42 @@ def test_load_state_dict_does_not_mutate_caller_dict():
     # contract in load_state_dict).
     assert "gefen_global_step" in sd and "gefen_codebook" in sd
     opt.load_state_dict(sd)
+
+
+def test_load_rejects_quantized_momentum_without_codebook():
+    model = _small_model()
+    opt = Gefen(list(model.named_parameters()), lr=1e-3, fused=False)
+    _apply_grads(model, _synthetic_grads(model, 1)[0])
+    opt.step()
+    sd = copy.deepcopy(opt.state_dict())
+    sd.pop("gefen_codebook")
+    for group in sd["param_groups"]:
+        group.pop("_gefen_checkpoint_metadata")
+
+    fresh_model = _small_model()
+    fresh_opt = Gefen(list(fresh_model.named_parameters()), lr=1e-3, fused=False)
+    with pytest.raises(ValueError, match="quantized momentum indices but no frozen codebook"):
+        fresh_opt.load_state_dict(sd)
+
+
+def test_load_rejects_partial_or_conflicting_group_metadata():
+    _, opt = _run_and_save(factored=False)
+    sd = copy.deepcopy(opt.state_dict())
+    # Create a second group so partial metadata can be represented.
+    group = sd["param_groups"][0]
+    first_param = group["params"][0]
+    second_group = dict(group)
+    second_group["params"] = [first_param]
+    group["params"] = group["params"][1:]
+    second_group.pop("_gefen_checkpoint_metadata")
+    sd["param_groups"].append(second_group)
+    with pytest.raises(ValueError, match="only some parameter groups"):
+        opt.load_state_dict(sd)
+
+    conflicting = copy.deepcopy(opt.state_dict())
+    conflicting["param_groups"][0]["_gefen_checkpoint_metadata"]["global_step"] += 1
+    with pytest.raises(ValueError, match="global steps disagree"):
+        opt.load_state_dict(conflicting)
 
 
 def test_load_legacy_flattened_param_group_checkpoint():

@@ -724,8 +724,10 @@ class Gefen(torch.optim.Optimizer):
             )
         elif not 0.0 <= weight_decay:
             raise ValueError("Invalid weight_decay value: {}".format(weight_decay))
-        elif not 0.0 <= eps:
-            raise ValueError("Invalid epsilon value: {}".format(eps))
+        elif not math.isfinite(eps) or eps <= 0.0:
+            raise ValueError(
+                "Invalid epsilon value: {}; eps must be finite and > 0".format(eps)
+            )
 
     @staticmethod
     def _iter_params_with_names(group_params):
@@ -1831,20 +1833,16 @@ class Gefen(torch.optim.Optimizer):
         self, param_name: str, param: torch.Tensor, grad: torch.Tensor
     ) -> int:
         backend = _resolve_find_period_backend(grad)
-        # If the fused CUDA toolchain GENUINELY failed to build (the step-1 probe
-        # ran and returned False -> _fused_build_ok is False), fall back to the
-        # pure-torch "gpu" period backend rather than crashing in the separate
-        # period-variance extension load. Gate on the explicit build-failure
-        # verdict, NOT on _gefen_fused_toolchain_ok(): the latter also returns
-        # False for a user-chosen fused=False optimizer, which must keep using
-        # the cuda_kernel period backend (bit-identical to before this scrub).
-        # Only override the AUTO resolution -- an explicit FIND_PERIOD_BACKEND is
-        # the user's deliberate choice.
+        # ``fused=False`` is an explicit request for a pure-PyTorch optimizer
+        # step, so it must not cross a different lazy-JIT boundary merely to
+        # choose the block period. A failed fused-kernel probe has the same
+        # requirement. Keep honoring an explicit FIND_PERIOD_BACKEND override;
+        # callers that deliberately select ``cuda_kernel`` accept its JIT.
         if (
             backend == "cuda_kernel"
             and FIND_PERIOD_BACKEND is None
             and grad.device.type == "cuda"
-            and self._fused_build_ok is False
+            and (not self.fused or self._fused_build_ok is False)
         ):
             backend = "gpu"
         if backend == "cuda_kernel":
@@ -1998,14 +1996,14 @@ class Gefen(torch.optim.Optimizer):
             force_endpoints=True,
             verbose=self.verbose,
             compute_mse_logging=compute_mse_logging,
-            # Use the fused histogram UNLESS the toolchain probe explicitly
-            # failed (_fused_build_ok is False). Gating on the build-failure
-            # verdict rather than self.fused preserves the pre-scrub behavior of
-            # the histogram (it ran on CUDA tensors regardless of the optimizer's
-            # fused flag), so a fused=False run stays bit-identical; only a
-            # genuinely broken toolchain drops to the pure-torch bincount path.
+            # ``fused=False`` promises a JIT-free pure-PyTorch path. Do not load
+            # the separate histogram extension in that mode (or after the fused
+            # toolchain probe failed). An explicit global period-backend choice
+            # remains independent of this histogram implementation decision.
             use_fused_histogram=(
-                FUSE_HISTOGRAM_FOR_EXACT and self._fused_build_ok is not False
+                FUSE_HISTOGRAM_FOR_EXACT
+                and self.fused
+                and self._fused_build_ok is not False
             ),
         )
         if codebook is None:
@@ -3298,6 +3296,20 @@ class Gefen(torch.optim.Optimizer):
         # these custom top-level keys; _maybe_refresh_gefen_codebook handles that
         # fallback by reusing the restored periods.)
         state_dict["gefen_codebook"] = self._gefen_codebook
+        # PyTorch Distributed Checkpoint's ``get_optimizer_state_dict`` keeps
+        # only the conventional ``state`` and ``param_groups`` top-level keys.
+        # Mirror the optimizer-level values inside every serialized group so a
+        # DCP/FSDP normalization round-trip cannot silently discard the frozen
+        # codebook and reinterpret restored uint8 momentum indices with a newly
+        # learned one. The loader removes this private transport metadata before
+        # handing groups to torch, so it never leaks into live scheduler groups.
+        checkpoint_metadata = {
+            "format_version": 1,
+            "global_step": self._gefen_global_step,
+            "codebook": self._gefen_codebook,
+        }
+        for group in state_dict["param_groups"]:
+            group["_gefen_checkpoint_metadata"] = checkpoint_metadata
         return state_dict
 
     @staticmethod
@@ -3378,8 +3390,85 @@ class Gefen(torch.optim.Optimizer):
         # dict (torch.optim.Optimizer.load_state_dict leaves its input intact);
         # otherwise a second load of the same dict loses the gefen_* keys.
         state_dict = dict(state_dict)
-        gefen_global_step = state_dict.pop("gefen_global_step", 0)
+        # Copy the group dictionaries before removing private transport
+        # metadata so repeated loads leave the caller's checkpoint untouched.
+        state_dict["param_groups"] = [
+            dict(group) for group in state_dict.get("param_groups", ())
+        ]
+        group_metadata = []
+        for group in state_dict["param_groups"]:
+            metadata = group.pop("_gefen_checkpoint_metadata", None)
+            if metadata is not None:
+                group_metadata.append(metadata)
+
+        gefen_global_step = state_dict.pop("gefen_global_step", None)
         gefen_codebook = state_dict.pop("gefen_codebook", None)
+        if group_metadata:
+            if len(group_metadata) != len(state_dict["param_groups"]):
+                raise ValueError(
+                    "Gefen checkpoint metadata is present on only some parameter groups"
+                )
+            first_metadata = group_metadata[0]
+            if first_metadata.get("format_version") != 1:
+                raise ValueError(
+                    "Unsupported Gefen checkpoint metadata format_version: {}".format(
+                        first_metadata.get("format_version")
+                    )
+                )
+            for metadata in group_metadata[1:]:
+                same_step = metadata.get("global_step") == first_metadata.get(
+                    "global_step"
+                )
+                left_codebook = metadata.get("codebook")
+                right_codebook = first_metadata.get("codebook")
+                same_codebook = (
+                    left_codebook is right_codebook
+                    or (
+                        torch.is_tensor(left_codebook)
+                        and torch.is_tensor(right_codebook)
+                        and torch.equal(left_codebook, right_codebook)
+                    )
+                )
+                if not same_step or not same_codebook:
+                    raise ValueError(
+                        "Gefen checkpoint parameter groups carry inconsistent "
+                        "optimizer metadata"
+                    )
+            metadata_step = first_metadata.get("global_step", 0)
+            metadata_codebook = first_metadata.get("codebook")
+            if gefen_global_step is None:
+                gefen_global_step = metadata_step
+            elif gefen_global_step != metadata_step:
+                raise ValueError(
+                    "Gefen checkpoint top-level and parameter-group global steps disagree"
+                )
+            if gefen_codebook is None:
+                gefen_codebook = metadata_codebook
+            elif not (
+                gefen_codebook is metadata_codebook
+                or (
+                    torch.is_tensor(gefen_codebook)
+                    and torch.is_tensor(metadata_codebook)
+                    and torch.equal(gefen_codebook, metadata_codebook)
+                )
+            ):
+                raise ValueError(
+                    "Gefen checkpoint top-level and parameter-group codebooks disagree"
+                )
+        if gefen_global_step is None:
+            gefen_global_step = 0
+        has_quantized_momentum = any(
+            isinstance(param_state, dict) and "m_codebook" in param_state
+            for param_state in (state_dict.get("state", {}) or {}).values()
+        )
+        if has_quantized_momentum and gefen_codebook is None:
+            raise ValueError(
+                "Gefen checkpoint contains quantized momentum indices but no frozen "
+                "codebook. Loading it would reinterpret the restored indices with a "
+                "different codebook and silently corrupt optimizer state. Resume from "
+                "an unmodified Gefen checkpoint or a DCP checkpoint written by a "
+                "version that preserves _gefen_checkpoint_metadata."
+            )
         state_dict = self._pack_legacy_param_groups_for_load(state_dict)
 
         # torch.optim.Optimizer.load_state_dict casts *every* per-param state
