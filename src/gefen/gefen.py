@@ -3203,8 +3203,39 @@ class Gefen(torch.optim.Optimizer):
         it a resume would re-learn the codebook and desync the restored block
         periods). Per-step scratch buffers are stripped, and non-owning state
         views are compacted to tight clones so checkpoints stay small.
+
+        Only state entries whose parameter is still reachable from
+        ``param_groups`` are serialized. Wrappers like DeepSpeed ZeRO-1/2
+        replace each group's ``params`` with flat fp32 partition tensors
+        without touching ``self.state``, which orphans the ``name`` entries
+        Gefen pre-registers for the original model params at construction;
+        the base ``state_dict`` indexes state keys through ``param_groups``
+        and raises ``KeyError`` on any orphan. The orphaned entries stay in
+        live ``self.state`` untouched (``_param_name`` still reads them);
+        they are only withheld from the serialized copy.
         """
-        state_dict = super().state_dict()
+        # Withhold state entries orphaned from param_groups around the base
+        # call (see docstring). Tensor hashing is identity-based, so set
+        # membership matches the id()-keyed param_mappings the base class
+        # builds. The no-orphan path (every non-wrapped run) takes the plain
+        # super() call, bit-for-bit unchanged.
+        reachable = {
+            param for group in self.param_groups for param in group["params"]
+        }
+        orphaned = [param for param in self.state if param not in reachable]
+        if orphaned:
+            live_state = dict(self.state)
+            for param in orphaned:
+                del self.state[param]
+            try:
+                state_dict = super().state_dict()
+            finally:
+                # Restore the exact original dict (entries AND order), so the
+                # live optimizer is indistinguishable from before the save.
+                self.state.clear()
+                self.state.update(live_state)
+        else:
+            state_dict = super().state_dict()
         # stepsize/_h_buf are per-step scratch buffers (recomputed from vmean every
         # step); they live in self.state only to be reused across steps, so strip
         # them from the serialized dict instead of bloating every checkpoint. Build

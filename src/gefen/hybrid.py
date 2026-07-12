@@ -71,6 +71,82 @@ from gefen.params import (
 
 logger = logging.getLogger(__name__)
 
+_UNKNOWN_STATE_KEY_MSG = (
+    "GefenMuonHybrid.state was accessed with a key that is not a parameter of "
+    "either sub-optimizer (the Muon half or the backup half). A torch optimizer "
+    "would silently auto-create state here, but the hybrid cannot know which "
+    "half should own an unknown parameter. If this access comes from DeepSpeed "
+    "ZeRO (it reads optimizer.state[<flattened 1-D fp32 partition>] during the "
+    "first backward), note that GefenMuonHybrid cannot be used as the DeepSpeed "
+    "ZeRO client optimizer: ZeRO steps flattened 1-D fp32 partitions, and the "
+    "Muon half's 2D Newton-Schulz orthogonalization cannot be applied to a flat "
+    "partition. Use plain Gefen as the client optimizer under DeepSpeed ZeRO, "
+    "or train the hybrid under FSDP2 / DDP / single-GPU instead."
+)
+
+
+class _HybridMergedState(dict):
+    """Merged view of the children's per-param state that ROUTES writes.
+
+    The hybrid's ``.state`` property historically returned a plain merged dict
+    rebuilt per access, so a top-level write (``opt.state[p] = {...}``, or a
+    read of a not-yet-initialized param relying on torch's defaultdict
+    auto-create) landed in a throwaway copy and was silently discarded --
+    DeepSpeed ZeRO's ``optimizer.state[flat_partition]`` access then surfaced
+    as a bare ``KeyError`` deep inside its first ``backward()``. This subclass
+    keeps the merged READ view (values are the children's live per-param dicts,
+    so ``opt.state[p][k] = v`` always persisted and still does) and adds:
+
+    * ``opt.state[p]`` for a known param with no entry yet auto-creates the
+      entry in the OWNING child (torch defaultdict semantics) and persists.
+    * ``opt.state[p] = value`` for a known param routes to the owning child
+      and persists.
+    * Either access with an UNKNOWN key (e.g. DeepSpeed ZeRO's flattened 1-D
+      fp32 partition) raises a KeyError that explains the ZeRO incompatibility
+      instead of a bare tensor-keyed KeyError.
+
+    The view itself is a fresh snapshot per ``.state`` access: other dict
+    mutators (``pop``/``del``/``clear``/``update``/``setdefault``) affect only
+    the snapshot, never the children.
+    """
+
+    def __init__(self, subopts, param_owner):
+        super().__init__()
+        self._subopts = subopts
+        # Ownership is FROZEN at hybrid construction (the hybrid's param set is
+        # fixed by design: add_param_group raises). Scanning the LIVE group
+        # dicts here instead would defeat the guard: DeepSpeed ZeRO mutates the
+        # shared group dicts to point at its flat partitions, which would then
+        # masquerade as known params and push the failure to a later, more
+        # cryptic point.
+        self._param_owner = param_owner
+        for o in subopts:
+            dict.update(self, o.state)
+
+    def _owner_of(self, key):
+        entry = self._param_owner.get(id(key))
+        if entry is not None and entry[0] is key:
+            return entry[1]
+        return None
+
+    def __missing__(self, key):
+        owner = self._owner_of(key)
+        if owner is None:
+            raise KeyError(_UNKNOWN_STATE_KEY_MSG)
+        # torch's Optimizer.state is a defaultdict(dict): reading a known
+        # param auto-creates its entry. Route that to the owning child so the
+        # created entry is the child's live dict, then cache it in this view.
+        value = owner.state[key]
+        dict.__setitem__(self, key, value)
+        return value
+
+    def __setitem__(self, key, value):
+        owner = self._owner_of(key)
+        if owner is None:
+            raise KeyError(_UNKNOWN_STATE_KEY_MSG)
+        owner.state[key] = value
+        dict.__setitem__(self, key, value)
+
 
 class GefenMuonHybrid(torch.optim.Optimizer):
     """Composite optimizer: GefenMuon on 2D hidden weights, a backup on the rest.
@@ -212,6 +288,36 @@ class GefenMuonHybrid(torch.optim.Optimizer):
         backup_named_params = list(backup_named_params)
         if not muon_named_params and not backup_named_params:
             raise ValueError("GefenMuonHybrid received no parameters to optimize")
+        # DeepSpeed ZeRO stage 3 (zero.Init) partitions parameters BEFORE the
+        # optimizer is constructed: every param the hybrid then sees is a
+        # 0-size 1-D placeholder, so the 2D split finds no Muon candidates and
+        # would silently build a backup-only hybrid -- plain Gefen/AdamW at
+        # backup_lr, no Muon ever, no warning. Real models never hand the
+        # optimizer zero-numel weights, so zero Muon candidates plus any
+        # zero-numel input is the ZeRO-3 signature; fail loudly. A genuinely
+        # 1D-only model (all params with real storage) still constructs a
+        # backup-only hybrid exactly as before.
+        if not muon_named_params:
+            zero_numel = [
+                name for name, p in backup_named_params if p.numel() == 0
+            ]
+            if zero_numel:
+                raise ValueError(
+                    "GefenMuonHybrid found no 2D Muon-eligible parameters, and "
+                    "{} of the {} supplied parameters are zero-numel "
+                    "placeholders (e.g. {!r}). This is the signature of "
+                    "DeepSpeed ZeRO stage 3 (zero.Init partitions parameters "
+                    "to 0-size 1-D placeholders before the optimizer is "
+                    "constructed), and the hybrid would silently degrade to a "
+                    "backup-only optimizer at backup_lr with no Muon half. The "
+                    "Muon family cannot run under DeepSpeed ZeRO (ZeRO steps "
+                    "flattened 1-D partitions; Muon's 2D orthogonalization "
+                    "cannot apply) -- use plain Gefen as the DeepSpeed client "
+                    "optimizer, or construct the hybrid without ZeRO "
+                    "partitioning (FSDP2 / DDP / single-GPU).".format(
+                        len(zero_numel), len(backup_named_params), zero_numel[0]
+                    )
+                )
         if backup_optimizer not in ("gefen", "adamw"):
             raise ValueError(
                 "backup_optimizer must be 'gefen' or 'adamw' but is: {!r}".format(
@@ -385,6 +491,14 @@ class GefenMuonHybrid(torch.optim.Optimizer):
                 capturable=capturable,
             )
         self._subopts = [o for o in (self.muon, self.backup) if o is not None]
+        # Frozen param->child ownership for the .state routing view. Keyed by
+        # id() with a strong param ref (so ids can never be recycled); built
+        # once here because the hybrid's param set is fixed at construction.
+        self._state_param_owner = {}
+        for o in self._subopts:
+            for group in o.param_groups:
+                for p in group["params"]:
+                    self._state_param_owner[id(p)] = (p, o)
 
         # Deliberately do NOT call super().__init__(): we expose each
         # sub-optimizer's real param_groups/state via properties (shared dict
@@ -406,12 +520,34 @@ class GefenMuonHybrid(torch.optim.Optimizer):
             groups.extend(o.param_groups)
         return groups
 
+    @param_groups.setter
+    def param_groups(self, value):
+        # A composite cannot accept a wholesale param_groups assignment: the
+        # groups belong to the children and an arbitrary replacement cannot be
+        # split back. Without this setter the failure is a bare AttributeError
+        # ("property 'param_groups' ... has no setter") -- DeepSpeed ZeRO hits
+        # exactly that inside engine.step() (its _optimizer_step assigns
+        # optimizer.param_groups per group), so explain the real cause.
+        raise TypeError(
+            "GefenMuonHybrid.param_groups cannot be assigned: the groups "
+            "belong to the Muon/backup sub-optimizers. If this assignment "
+            "comes from DeepSpeed ZeRO (its optimizer step re-assigns "
+            "optimizer.param_groups), note that GefenMuonHybrid cannot be "
+            "used as the DeepSpeed ZeRO client optimizer: ZeRO steps "
+            "flattened 1-D fp32 partitions, and the Muon half's 2D "
+            "orthogonalization cannot be applied to a flat partition. Use "
+            "plain Gefen as the client optimizer under DeepSpeed ZeRO, or "
+            "train the hybrid under FSDP2 / DDP / single-GPU instead."
+        )
+
     @property
     def state(self):
-        merged = {}
-        for o in self._subopts:
-            merged.update(o.state)
-        return merged
+        # A routing merged view (see _HybridMergedState): reads/writes for
+        # params owned by a child reach that child's live state; access with an
+        # unknown key (DeepSpeed ZeRO's flattened 1-D fp32 partitions) fails
+        # fast with a self-explanatory KeyError instead of silently landing in
+        # a rebuilt-per-access throwaway dict.
+        return _HybridMergedState(self._subopts, self._state_param_owner)
 
     def zero_grad(self, set_to_none: bool = True):
         for o in self._subopts:
