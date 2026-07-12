@@ -1315,7 +1315,16 @@ class GefenMuon(Gefen):
         """
         if not self._dist_available():
             return
-        if torch.cuda.is_available() and torch.cuda.is_current_stream_capturing():
+        # Do not initialize or query CUDA for a CPU-only mesh optimizer.
+        # Spawned Gloo workers may run alongside a CUDA-heavy parent process,
+        # and an unrelated current-stream query can otherwise block before the
+        # CPU collective preflight. CUDA-backed optimizers retain the capture
+        # guard.
+        if any(
+            param.device.type == "cuda"
+            for group in self.param_groups
+            for param in group["params"]
+        ) and torch.cuda.is_current_stream_capturing():
             return
 
         import torch.distributed as dist
@@ -1330,21 +1339,44 @@ class GefenMuon(Gefen):
                 mesh = p.device_mesh
                 if mesh.get_coordinate() is None or mesh.size() < 2:
                     continue
-                # All parameters created from one FSDP2/DTensor mesh normally
-                # share the same DeviceMesh object. Key by identity so exotic
-                # optimizers carrying distinct meshes run one matched vector
-                # collective per mesh without conflating their parameter order.
-                key = id(mesh)
+                # Parameter-group order may legitimately differ between ranks
+                # while two equivalent DeviceMesh objects still refer to
+                # distinct c10d groups. Key each mesh by content instead of
+                # object identity, and sort meshes and items below, so every
+                # rank compares the same positional activity vector and enters
+                # the per-mesh collectives in the same order.
+                process_groups = tuple(mesh.get_all_groups())
+                key = (
+                    str(mesh.device_type),
+                    tuple(int(item) for item in mesh.shape),
+                    tuple(
+                        int(item)
+                        for item in mesh.mesh.detach().cpu().reshape(-1).tolist()
+                    ),
+                    tuple(str(pg.group_name) for pg in process_groups),
+                )
                 entry = by_mesh.get(key)
                 if entry is None:
-                    entry = {"mesh": mesh, "items": []}
+                    entry = {
+                        "mesh": mesh,
+                        "process_groups": process_groups,
+                        "items": [],
+                    }
                     by_mesh[key] = entry
                 entry["items"].append((str(name), p, p.grad is not None))
 
         mismatches = []
-        for entry in by_mesh.values():
+        for mesh_key in sorted(by_mesh):
+            entry = by_mesh[mesh_key]
             mesh = entry["mesh"]
-            items = entry["items"]
+            items = sorted(
+                entry["items"],
+                key=lambda item: (
+                    item[0],
+                    tuple(item[1].shape),
+                    str(item[1].dtype),
+                ),
+            )
             device = self._state_tensor_device(items[0][1])
             active_counts = torch.tensor(
                 [int(active) for _, _, active in items],
@@ -1355,7 +1387,7 @@ class GefenMuon(Gefen):
             # dimension propagates a global activity count to every mesh rank.
             # This is one collective per mesh dimension, independent of the
             # number of optimizer parameters.
-            for process_group in mesh.get_all_groups():
+            for process_group in entry["process_groups"]:
                 if dist.get_world_size(process_group) > 1:
                     dist.all_reduce(
                         active_counts, op=dist.ReduceOp.SUM, group=process_group
@@ -2328,6 +2360,45 @@ class GefenMuon(Gefen):
         # Bind the proof to those same ordered process-group partitions instead
         # of requiring it to cover every parameter in the optimizer group.
         expected_pg_groups = list(by_pg.values())
+        if not expected_pg_groups and marker_groups:
+            # A consolidated version-2 checkpoint carries the complete owner
+            # state on every rank, so it must stay loadable when the live
+            # optimizer has no Parallel-Muon-eligible process group at all
+            # (single-process resume/eval, uninitialized torch.distributed, or
+            # an all-fallback topology) — released-v1 and markerless loads of
+            # the same state already support exactly that. The manifest cannot
+            # bind to live process groups then; rebind each saved partition to
+            # the live parameters by saved id and run the identical
+            # per-parameter owner-state proof below on the rebound partitions.
+            items_by_saved_id = {item[2]: item for item in expected_items}
+            rebound_ids = set()
+            rebound_groups = []
+            for group_index, saved_group in enumerate(marker_groups):
+                group_items = []
+                saved_params = (
+                    saved_group.get("params")
+                    if isinstance(saved_group, dict)
+                    else None
+                )
+                if isinstance(saved_params, (list, tuple)):
+                    for saved_param in saved_params:
+                        if not isinstance(saved_param, dict):
+                            continue
+                        saved_id = saved_param.get("saved_id")
+                        try:
+                            item = items_by_saved_id.get(saved_id)
+                        except TypeError:
+                            item = None
+                        if item is None or saved_id in rebound_ids:
+                            raise self._distributed_checkpoint_error(
+                                "owner manifest group {} saved id {!r} does not "
+                                "map to exactly one live distributed "
+                                "parameter".format(group_index, saved_id)
+                            )
+                        rebound_ids.add(saved_id)
+                        group_items.append(item)
+                rebound_groups.append(group_items)
+            expected_pg_groups = rebound_groups
         if len(marker_groups) != len(expected_pg_groups):
             raise self._distributed_checkpoint_error(
                 "the owner manifest has {} process-group entries but the live "

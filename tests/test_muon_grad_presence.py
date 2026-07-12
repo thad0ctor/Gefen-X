@@ -552,3 +552,289 @@ def test_sharded_grad_presence_mismatch_fails_on_every_rank():
             rank_results[0][case_index]["message"]
             == rank_results[1][case_index]["message"]
         )
+
+
+def _reversed_order_worker(rank, world, port, result_queue):
+    import torch.distributed as dist
+    from torch.distributed.tensor import Shard, distribute_tensor, init_device_mesh
+
+    try:
+        os.environ["MASTER_ADDR"] = "127.0.0.1"
+        os.environ["MASTER_PORT"] = port
+        os.environ["RANK"] = str(rank)
+        os.environ["WORLD_SIZE"] = str(world)
+        dist.init_process_group(
+            "gloo",
+            rank=rank,
+            world_size=world,
+            timeout=timedelta(seconds=12),
+        )
+        mesh = init_device_mesh("cpu", (world,))
+        results = []
+
+        for case in ("reversed_mismatch", "reversed_consistent", "aligned_mismatch"):
+            generator = torch.Generator(device="cpu").manual_seed(
+                6100 + len(results)
+            )
+            full_a = torch.randn(8, 8, generator=generator)
+            full_a_grad = torch.randn(8, 8, generator=generator) * 0.01
+            full_b = torch.randn(6, 10, generator=generator)
+            full_b_grad = torch.randn(6, 10, generator=generator) * 0.01
+            a = nn.Parameter(distribute_tensor(full_a.clone(), mesh, [Shard(0)]))
+            b = nn.Parameter(distribute_tensor(full_b.clone(), mesh, [Shard(0)]))
+            named = [("a", a), ("b", b)]
+            if case.startswith("reversed") and rank == 1:
+                named = list(reversed(named))
+            optimizer = GefenMuon(
+                named,
+                lr=1e-3,
+                fused=False,
+                ns_steps=1,
+                sharded_mode="exact",
+            )
+            # distribute_tensor is itself collective, so materialize both
+            # gradients on every rank first, then drop one per rank to build
+            # the divergent presence pattern.
+            a.grad = distribute_tensor(full_a_grad.clone(), mesh, [Shard(0)])
+            b.grad = distribute_tensor(full_b_grad.clone(), mesh, [Shard(0)])
+            if case.endswith("mismatch"):
+                if rank == 0:
+                    b.grad = None
+                else:
+                    a.grad = None
+
+            # Call the preflight directly instead of step(): before the
+            # order-insensitivity fix, the reversed_mismatch case falsely
+            # passed here and the corresponding step() would deadlock inside
+            # full_tensor(), so the isolated call is what keeps a regression
+            # loud instead of hung.
+            message = None
+            try:
+                optimizer._assert_sharded_grad_presence_consistent()
+            except RuntimeError as exc:
+                message = str(exc)
+            results.append({"case": case, "message": message})
+            a.grad = None
+            b.grad = None
+            dist.barrier()
+
+        result_queue.put(("result", rank, results))
+    except Exception:
+        result_queue.put(("error", rank, traceback.format_exc()))
+    finally:
+        if dist.is_initialized():
+            dist.destroy_process_group()
+
+
+@pytest.mark.skipif(
+    not torch.distributed.is_available() or not torch.distributed.is_gloo_available(),
+    reason="order-insensitive grad-presence regression needs Gloo",
+)
+def test_sharded_grad_presence_check_is_order_insensitive():
+    """Rank-divergent param-group order must not defeat the presence check.
+
+    The activity vector is compared positionally across ranks, so without
+    content-keyed meshes and sorted items a reversed group order with
+    complementary gradient presence sums to a full count on every position
+    and the check falsely passes right before full_tensor() deadlocks.
+    """
+    import torch.multiprocessing as mp
+
+    world = 2
+    context = mp.get_context("spawn")
+    result_queue = context.Queue()
+    port = _free_port()
+    processes = [
+        context.Process(
+            target=_reversed_order_worker,
+            args=(rank, world, port, result_queue),
+        )
+        for rank in range(world)
+    ]
+    for process in processes:
+        process.start()
+
+    messages = []
+    try:
+        for _ in range(world):
+            messages.append(result_queue.get(timeout=45))
+    except queue.Empty:
+        pass
+    finally:
+        for process in processes:
+            process.join(timeout=5)
+        for process in processes:
+            if process.is_alive():
+                process.terminate()
+                process.join(timeout=5)
+
+    assert all(process.exitcode == 0 for process in processes), [
+        process.exitcode for process in processes
+    ]
+    errors = [payload for kind, _, payload in messages if kind == "error"]
+    assert not errors, "\n".join(errors)
+    rank_results = {
+        rank: {item["case"]: item["message"] for item in payload}
+        for kind, rank, payload in messages
+        if kind == "result"
+    }
+    assert set(rank_results) == {0, 1}, messages
+
+    for rank, cases in rank_results.items():
+        assert set(cases) == {
+            "reversed_mismatch",
+            "reversed_consistent",
+            "aligned_mismatch",
+        }, (rank, cases)
+        for case in ("reversed_mismatch", "aligned_mismatch"):
+            message = cases[case]
+            assert message is not None, (rank, case)
+            assert "identical gradient presence" in message, (rank, case, message)
+            assert "a (1/2 mesh ranks have gradients)" in message, (
+                rank,
+                case,
+                message,
+            )
+            assert "b (1/2 mesh ranks have gradients)" in message, (
+                rank,
+                case,
+                message,
+            )
+        assert cases["reversed_consistent"] is None, (
+            rank,
+            cases["reversed_consistent"],
+        )
+
+    # Sorted item names make the diagnostic identical on every rank.
+    for case in ("reversed_mismatch", "aligned_mismatch"):
+        assert rank_results[0][case] == rank_results[1][case]
+
+
+def _cpu_mesh_no_cuda_query_worker(rank, world, port, result_queue):
+    import torch.distributed as dist
+    from torch.distributed.tensor import Shard, distribute_tensor, init_device_mesh
+
+    from gefen.gefen import _amp_dtensor_protocol_preflight
+
+    try:
+        os.environ["MASTER_ADDR"] = "127.0.0.1"
+        os.environ["MASTER_PORT"] = port
+        os.environ["RANK"] = str(rank)
+        os.environ["WORLD_SIZE"] = str(world)
+        dist.init_process_group(
+            "gloo",
+            rank=rank,
+            world_size=world,
+            timeout=timedelta(seconds=12),
+        )
+        mesh = init_device_mesh("cpu", (world,))
+        generator = torch.Generator(device="cpu").manual_seed(7300 + rank * 0)
+
+        full_weight = torch.randn(8, 8, generator=generator)
+        weight = nn.Parameter(distribute_tensor(full_weight.clone(), mesh, [Shard(0)]))
+        muon = GefenMuon(
+            [("weight", weight)],
+            lr=1e-3,
+            fused=False,
+            ns_steps=1,
+            sharded_mode="exact",
+        )
+        weight.grad = distribute_tensor(
+            (torch.randn(8, 8, generator=generator) * 0.01), mesh, [Shard(0)]
+        )
+
+        full_fp16 = torch.randn(8, 8, generator=generator).to(torch.float16)
+        fp16_weight = nn.Parameter(
+            distribute_tensor(full_fp16.clone(), mesh, [Shard(0)])
+        )
+        gefen = Gefen(
+            [("weight", fp16_weight)],
+            lr=1e-3,
+            fused=False,
+            factored_v_2d=False,
+        )
+        fp16_weight.grad = distribute_tensor(
+            (torch.randn(8, 8, generator=generator) * 0.01).to(torch.float16),
+            mesh,
+            [Shard(0)],
+        )
+
+        # Spawned Gloo workers can share a machine with a CUDA-heavy parent, so
+        # a CPU-only mesh optimizer must never reach the CUDA capture query in
+        # either collective preflight (gefen.py gates it on a CUDA param; the
+        # Muon presence check mirrors that gate). Force is_available() to True
+        # so the regression also bites on CPU-only CI, where the old
+        # availability-based guard would short-circuit and hide it.
+        def forbidden():
+            raise AssertionError(
+                "torch.cuda.is_current_stream_capturing queried for a "
+                "CPU-only mesh optimizer"
+            )
+
+        original_capturing = torch.cuda.is_current_stream_capturing
+        original_available = torch.cuda.is_available
+        torch.cuda.is_current_stream_capturing = forbidden
+        torch.cuda.is_available = lambda: True
+        try:
+            muon._assert_sharded_grad_presence_consistent()
+            native_amp = _amp_dtensor_protocol_preflight(gefen)
+        finally:
+            torch.cuda.is_current_stream_capturing = original_capturing
+            torch.cuda.is_available = original_available
+
+        result_queue.put(("result", rank, {"native_amp": bool(native_amp)}))
+    except Exception:
+        result_queue.put(("error", rank, traceback.format_exc()))
+    finally:
+        if dist.is_initialized():
+            dist.destroy_process_group()
+
+
+@pytest.mark.skipif(
+    not torch.distributed.is_available() or not torch.distributed.is_gloo_available(),
+    reason="CPU-mesh CUDA-query regression needs Gloo",
+)
+def test_cpu_mesh_preflights_never_query_cuda_capture_state():
+    import torch.multiprocessing as mp
+
+    world = 2
+    context = mp.get_context("spawn")
+    result_queue = context.Queue()
+    port = _free_port()
+    processes = [
+        context.Process(
+            target=_cpu_mesh_no_cuda_query_worker,
+            args=(rank, world, port, result_queue),
+        )
+        for rank in range(world)
+    ]
+    for process in processes:
+        process.start()
+
+    messages = []
+    try:
+        for _ in range(world):
+            messages.append(result_queue.get(timeout=45))
+    except queue.Empty:
+        pass
+    finally:
+        for process in processes:
+            process.join(timeout=5)
+        for process in processes:
+            if process.is_alive():
+                process.terminate()
+                process.join(timeout=5)
+
+    assert all(process.exitcode == 0 for process in processes), [
+        process.exitcode for process in processes
+    ]
+    errors = [payload for kind, _, payload in messages if kind == "error"]
+    assert not errors, "\n".join(errors)
+    rank_results = {
+        rank: payload for kind, rank, payload in messages if kind == "result"
+    }
+    assert set(rank_results) == {0, 1}, messages
+    # The fp16 multi-rank DTensor optimizer must still select the native AMP
+    # protocol; skipping the CUDA query must not change the decision.
+    for rank, payload in rank_results.items():
+        assert payload["native_amp"] is True, (rank, payload)

@@ -2,6 +2,7 @@
 
 import copy
 from datetime import timedelta
+import io
 import os
 import queue
 import socket
@@ -837,3 +838,175 @@ def test_parallel_muon_rejection_is_atomic_and_valid_v2_continues():
         assert rejection, (rank, message)
         assert continuation, rank
         assert version == 2, rank
+
+
+def _single_process_resume_worker(rank, world, port, result_queue):
+    import torch.distributed as dist
+    from torch.distributed.tensor import Shard, distribute_tensor, init_device_mesh
+
+    try:
+        os.environ["MASTER_ADDR"] = "127.0.0.1"
+        os.environ["MASTER_PORT"] = port
+        os.environ["RANK"] = str(rank)
+        os.environ["WORLD_SIZE"] = str(world)
+        dist.init_process_group(
+            "gloo",
+            rank=rank,
+            world_size=world,
+            timeout=timedelta(seconds=60),
+        )
+        mesh = init_device_mesh("cpu", (world,))
+        specs = (("left", (8, 8)), ("right", (6, 10)))
+        generator = torch.Generator().manual_seed(9314)
+        params = [
+            (
+                name,
+                nn.Parameter(
+                    distribute_tensor(
+                        (torch.randn(*shape, generator=generator) * 0.02),
+                        mesh,
+                        [Shard(0)],
+                    )
+                ),
+            )
+            for name, shape in specs
+        ]
+        optimizer = GefenMuon(
+            params,
+            lr=2e-3,
+            fused=False,
+            ns_steps=1,
+            sharded_mode="distributed",
+        )
+        grad_generator = torch.Generator().manual_seed(9315)
+        for _, param in params:
+            param.grad = distribute_tensor(
+                torch.randn(param.shape, generator=grad_generator) * 0.002,
+                mesh,
+                [Shard(0)],
+            )
+        optimizer.step()
+        optimizer.zero_grad(set_to_none=True)
+        checkpoint = _clone(optimizer.state_dict())
+        full_values = [
+            param.detach().full_tensor().clone() for _, param in params
+        ]
+        if rank == 0:
+            # Serialize instead of queueing live tensors: tensor transport
+            # over mp.Queue shares memory via file descriptors that die with
+            # this worker process, racing the parent's read
+            # (ConnectionResetError on slow CI hosts). Bytes pickle normally.
+            buffer = io.BytesIO()
+            torch.save(
+                {"checkpoint": checkpoint, "full_values": full_values}, buffer
+            )
+            result_queue.put(("checkpoint", rank, buffer.getvalue()))
+        else:
+            result_queue.put(("done", rank, None))
+    except Exception:
+        result_queue.put(("error", rank, traceback.format_exc()))
+    finally:
+        if dist.is_initialized():
+            dist.destroy_process_group()
+
+
+@pytest.mark.skipif(
+    not torch.distributed.is_available()
+    or not torch.distributed.is_gloo_available(),
+    reason="consolidated single-process resume regression needs Gloo",
+)
+def test_consolidated_v2_checkpoint_loads_into_single_process_optimizer():
+    """A consolidated distributed save must resume without torch.distributed.
+
+    Consolidation exists so every rank's ``state_dict()`` carries the complete
+    owner state; the natural consumer is a single-process resume or eval run
+    that never initializes a process group. Released-v1 and markerless loads
+    already support that, so the version-2 manifest must not be stricter.
+    """
+    import torch.multiprocessing as mp
+
+    world = 2
+    context = mp.get_context("spawn")
+    result_queue = context.Queue()
+    port = _free_port()
+    processes = [
+        context.Process(
+            target=_single_process_resume_worker,
+            args=(rank, world, port, result_queue),
+        )
+        for rank in range(world)
+    ]
+    for process in processes:
+        process.start()
+
+    messages = []
+    try:
+        for _ in range(world):
+            messages.append(result_queue.get(timeout=90))
+    except queue.Empty:
+        pass
+    finally:
+        for process in processes:
+            process.join(timeout=10)
+        for process in processes:
+            if process.is_alive():
+                process.terminate()
+                process.join(timeout=5)
+
+    assert all(process.exitcode == 0 for process in processes), [
+        process.exitcode for process in processes
+    ]
+    errors = [payload for kind, _, payload in messages if kind == "error"]
+    assert not errors, "\n".join(errors)
+    payloads = [payload for kind, _, payload in messages if kind == "checkpoint"]
+    assert len(payloads) == 1, messages
+    saved = torch.load(io.BytesIO(payloads[0]), weights_only=False)
+    checkpoint, full_values = saved["checkpoint"], saved["full_values"]
+
+    marker = checkpoint.get("gefen_muon_distributed")
+    assert isinstance(marker, dict) and marker.get("version") == 2, marker
+    assert not torch.distributed.is_initialized()
+
+    specs = (("left", (8, 8)), ("right", (6, 10)))
+    params = [
+        (name, nn.Parameter(value.clone()))
+        for (name, _), value in zip(specs, full_values)
+    ]
+    optimizer = GefenMuon(
+        params,
+        lr=2e-3,
+        fused=False,
+        ns_steps=1,
+        sharded_mode="distributed",
+    )
+    optimizer.load_state_dict(_clone(checkpoint))
+
+    assert optimizer._gefen_global_step == 1
+    saved_ids = [
+        saved_id
+        for group in checkpoint["param_groups"]
+        for saved_id in group["params"]
+    ]
+    for (name, param), saved_id in zip(params, saved_ids):
+        live_state = optimizer.state[param]
+        saved_state = checkpoint["state"][saved_id]
+        for key in ("automatic_period", "step", "m_codebook", "m_magnitude"):
+            assert key in live_state, (name, key)
+            expected = saved_state[key]
+            actual = live_state[key]
+            if torch.is_tensor(expected):
+                assert torch.is_tensor(actual) and torch.equal(
+                    actual, expected
+                ), (name, key)
+            else:
+                assert actual == expected, (name, key)
+
+    grad_generator = torch.Generator().manual_seed(9316)
+    before = [param.detach().clone() for _, param in params]
+    for _, param in params:
+        param.grad = torch.randn(param.shape, generator=grad_generator) * 0.002
+    optimizer.step()
+    assert all(
+        not torch.equal(param.detach(), previous)
+        for (_, param), previous in zip(params, before)
+    )

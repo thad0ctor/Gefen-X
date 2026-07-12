@@ -4360,12 +4360,12 @@ class Gefen(torch.optim.Optimizer):
         state_dict["gefen_deterministic"] = self._deterministic
         # The exact-DP codebook is learned once on the first step and then frozen
         # for the rest of the run. It is not per-param state, so persist it
-        # explicitly; without it resume re-learns the codebook (see
-        # _maybe_refresh_gefen_codebook) which re-predicts and overwrites every
-        # restored automatic_period, desyncing them from the saved
-        # vmean/m_codebook. (Note: under FSDP optim-state consolidation strips
-        # these custom top-level keys; _maybe_refresh_gefen_codebook handles that
-        # fallback by reusing the restored periods.)
+        # explicitly; without it resume would reinterpret the restored uint8
+        # m_codebook indices against a freshly learned codebook. (Note: FSDP/DCP
+        # optim-state consolidation strips custom top-level keys; the per-group
+        # _gefen_checkpoint_metadata mirror below carries the codebook through
+        # that round-trip, and load_state_dict refuses quantized-momentum
+        # checkpoints that lost both copies rather than relearning.)
         state_dict["gefen_codebook"] = self._gefen_codebook
         # PyTorch Distributed Checkpoint's ``get_optimizer_state_dict`` keeps
         # only the conventional ``state`` and ``param_groups`` top-level keys.

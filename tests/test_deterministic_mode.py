@@ -120,6 +120,35 @@ def test_deterministic_checkpoint_mismatch_rejected_before_mutation():
     assert _deep_equal(target.state_dict(), before)
 
 
+def test_nondeterministic_checkpoint_into_deterministic_optimizer_rejected():
+    # The reverse policy mismatch of the test above: a deterministic=False
+    # tagged checkpoint must not silently adopt a deterministic=True live
+    # policy either, in either the native or the DCP-normalized shape.
+    _, source = _stepped_cpu_optimizer(deterministic=False)
+    checkpoint = copy.deepcopy(source.state_dict())
+    assert checkpoint["gefen_deterministic"] is False
+
+    target_param = nn.Parameter(torch.zeros(16, 12))
+    target = Gefen(
+        [("weight", target_param)],
+        lr=1e-3,
+        fused=False,
+        deterministic=True,
+    )
+    before = copy.deepcopy(target.state_dict())
+    with pytest.raises(ValueError, match="intentional state migration"):
+        target.load_state_dict(checkpoint)
+    assert _deep_equal(target.state_dict(), before)
+
+    dcp_style = {
+        "state": checkpoint["state"],
+        "param_groups": checkpoint["param_groups"],
+    }
+    with pytest.raises(ValueError, match="intentional state migration"):
+        target.load_state_dict(dcp_style)
+    assert _deep_equal(target.state_dict(), before)
+
+
 @pytest.mark.parametrize("invalid_tag", [None, 0, 1, "true"])
 def test_deterministic_checkpoint_top_level_tag_requires_actual_bool(invalid_tag):
     _, source = _stepped_cpu_optimizer(deterministic=True)
