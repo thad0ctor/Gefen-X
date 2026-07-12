@@ -56,7 +56,7 @@ def _nonnegative_int(value: str) -> int:
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description=__doc__)
+    parser = argparse.ArgumentParser(description=__doc__, allow_abbrev=False)
     parser.add_argument("--cell", required=True, choices=tuple(CELL_RECIPES))
     parser.add_argument("--phase", choices=("pretrain", "sft"), default="pretrain")
     parser.add_argument("--source", choices=("synthetic", "text", "jsonl", "hf"), default="synthetic")

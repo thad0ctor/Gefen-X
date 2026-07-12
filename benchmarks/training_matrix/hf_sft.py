@@ -62,7 +62,7 @@ def _nonnegative_int(value: str) -> int:
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description=__doc__)
+    parser = argparse.ArgumentParser(description=__doc__, allow_abbrev=False)
     parser.add_argument("--cell", required=True, choices=tuple(CELL_RECIPES))
     parser.add_argument("--model", required=True, help="local checkpoint path or Hugging Face model id")
     parser.add_argument("--model-revision", help="requested immutable model revision/commit")

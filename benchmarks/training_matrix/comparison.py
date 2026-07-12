@@ -22,13 +22,15 @@ def hash_context(context: dict[str, Any]) -> str:
 SOURCE_FINGERPRINT_ENV = "GEFEN_MATRIX_SOURCE_FINGERPRINT"
 
 
-def _generated_output_dirs(
+def _generated_output_paths(
     root: Path, exclude_dirs: Iterable[str | Path]
 ) -> list[str]:
-    """Repo-relative dirs whose contents are generated, not source.
+    """Repo-relative paths (files or directories) that hold generated output.
 
-    Relative entries are taken relative to ``root`` (cells run with that cwd);
-    absolute entries outside the repo need no exclusion and drop out.
+    Relative entries are taken relative to ``root`` (cells run with that cwd).
+    Entries outside the repo drop out (an escaping git pathspec would error),
+    and entries that normalize to the repo root itself drop out too — a bare
+    results filename must never blind the whole source guard.
     """
     excludes = {"benchmarks/training_matrix/out"}
     for exclude in exclude_dirs:
@@ -38,8 +40,8 @@ def _generated_output_dirs(
         try:
             relative = path.resolve().relative_to(root.resolve())
         except ValueError:
-            # Outside the repo (absolute, or relative escaping via ..):
-            # nothing to exclude, and an escaping git pathspec would error.
+            continue
+        if not relative.parts:
             continue
         excludes.add(relative.as_posix().rstrip("/"))
     return sorted(excludes)
@@ -55,7 +57,7 @@ def source_fingerprint(
     """
 
     root = Path(root)
-    generated = _generated_output_dirs(root, exclude_dirs)
+    generated = _generated_output_paths(root, exclude_dirs)
     commit = subprocess.check_output(
         ["git", "rev-parse", "HEAD"], cwd=root, text=True, stderr=subprocess.DEVNULL
     ).strip()
@@ -69,7 +71,7 @@ def source_fingerprint(
             "--",
             ".",
         ]
-        + [f":(exclude){directory}/**" for directory in generated],
+        + [f":(exclude){path}" for path in generated],
         cwd=root,
         stderr=subprocess.DEVNULL,
     )
@@ -83,8 +85,8 @@ def source_fingerprint(
         for path in untracked_raw.decode().split("\0")
         if path
         and not any(
-            path == directory or path.startswith(directory + "/")
-            for directory in generated
+            path == generated_path or path.startswith(generated_path + "/")
+            for generated_path in generated
         )
     )
     digest = hashlib.sha256()

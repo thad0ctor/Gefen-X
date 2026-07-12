@@ -257,7 +257,9 @@ def test_batched_ns_opt_in_reaches_actual_gefen_muon_child_group(cell):
         cell,
         CellBuildConfig(
             lr=1e-3,
-            fused=False,
+            # batched_ns is only reachable on the fused path; the no-fused
+            # combination is rejected at resolve time (tested below).
+            fused=True,
             batched_ns=True,
             batched_ns_workspace_bytes=workspace_bytes,
         ),
@@ -271,6 +273,128 @@ def test_batched_ns_opt_in_reaches_actual_gefen_muon_child_group(cell):
     assert resolved["batched_ns"] is True
     assert resolved["batched_ns_workspace_bytes_requested"] == workspace_bytes
     assert resolved["batched_ns_workspace_bytes"] == workspace_bytes
+
+
+@pytest.mark.parametrize(
+    "cell",
+    ("gefen_muon_classic_adamw", "gefen_hybrid_recommended"),
+)
+def test_batched_ns_without_fused_is_rejected_for_gefen_muon_cells(cell):
+    with pytest.raises(ValueError, match="--batched-ns requires --fused"):
+        resolve_cell(cell, CellBuildConfig(lr=1e-3, fused=False, batched_ns=True))
+    # Cells that cannot batch at all keep the established downgrade behavior.
+    resolved = resolve_cell(
+        "adamw", CellBuildConfig(lr=1e-3, fused=False, batched_ns=True)
+    )
+    assert resolved["batched_ns"] is False
+    assert resolved["unsupported_requests"] == ["batched_ns"]
+
+
+@pytest.mark.parametrize(
+    "cell",
+    ("gefen_muon_classic_adamw", "gefen_hybrid_recommended"),
+)
+def test_muon_eps_override_is_rejected_for_hybrid_built_cells(cell):
+    with pytest.raises(ValueError, match="Muon-half epsilon"):
+        resolve_cell(cell, CellBuildConfig(lr=1e-3, muon_eps=1e-5))
+    # torch_muon_adamw genuinely forwards the override, so it stays allowed.
+    resolved = resolve_cell("torch_muon_adamw", CellBuildConfig(lr=1e-3, muon_eps=1e-5))
+    assert resolved["muon_eps"] == 1e-5
+
+
+def test_default_matrix_gates_torch_muon_cell_when_muon_is_unavailable(monkeypatch):
+    monkeypatch.delattr(torch.optim, "Muon", raising=False)
+    default_commands = matrix_commands(parse_matrix_args([]))
+    default_names = [command[command.index("--cell") + 1] for command in default_commands]
+    assert "torch_muon_adamw" not in default_names
+    assert default_names == [name for name in CORE_CELLS if name != "torch_muon_adamw"]
+    # The "all" bundle is thinned the same way.
+    all_commands = matrix_commands(parse_matrix_args(["--cells", "all"]))
+    all_names = [command[command.index("--cell") + 1] for command in all_commands]
+    assert "torch_muon_adamw" not in all_names
+    # An explicit request is honored (and fails loudly later at build time) —
+    # including an explicit list that happens to spell out the default bundle.
+    explicit = matrix_commands(parse_matrix_args(["--cells", "torch_muon_adamw"]))
+    assert [command[command.index("--cell") + 1] for command in explicit] == [
+        "torch_muon_adamw"
+    ]
+    spelled_out = matrix_commands(parse_matrix_args(["--cells", ",".join(CORE_CELLS)]))
+    spelled_names = [command[command.index("--cell") + 1] for command in spelled_out]
+    assert tuple(spelled_names) == CORE_CELLS
+
+
+def test_forwarded_equals_form_flags_suppress_launcher_defaults(tmp_path):
+    args = parse_matrix_args(
+        [
+            "--cells",
+            "adamw",
+            "--output-dir",
+            str(tmp_path),
+            "--",
+            f"--results={tmp_path}/custom/results.jsonl",
+            "--run-name=my-run",
+        ]
+    )
+    (command,) = matrix_commands(args)
+    # The launcher must not append its defaults after caller-provided
+    # equals-form flags (the child parser would let the later value win).
+    assert command.count("--results") == 0
+    assert command.count("--run-name") == 0
+    assert f"--results={tmp_path}/custom/results.jsonl" in command
+    # The equals-form results file and its dir also reach the source-guard
+    # exclusions.
+    assert matrix_driver._generated_dirs(args) == (
+        Path(str(tmp_path)),
+        tmp_path / "custom" / "results.jsonl",
+        tmp_path / "custom",
+    )
+
+
+def test_bare_results_filename_never_excludes_the_repo_root(tmp_path):
+    args = parse_matrix_args(
+        [
+            "--cells",
+            "adamw",
+            "--output-dir",
+            str(tmp_path),
+            "--",
+            "--results=results.jsonl",
+        ]
+    )
+    # The bare filename's parent is the repo root: only the file itself may
+    # join the exclusions, never "." (which would blind the source guard).
+    assert matrix_driver._generated_dirs(args) == (
+        Path(str(tmp_path)),
+        Path("results.jsonl"),
+    )
+    # And at the fingerprint layer, excluding the bare file keeps the guard
+    # sharp: a different untracked file still changes the fingerprint, and a
+    # root-normalizing entry is dropped outright.
+    probe = ROOT / "fingerprint-root-guard-probe.tmp"
+    baseline = source_fingerprint(ROOT, exclude_dirs=("results.jsonl",))
+    assert baseline == source_fingerprint(ROOT, exclude_dirs=("results.jsonl", "."))
+    probe.write_text("generated\n", encoding="utf-8")
+    try:
+        assert source_fingerprint(ROOT, exclude_dirs=("results.jsonl",)) != baseline
+    finally:
+        probe.unlink()
+
+
+@pytest.mark.parametrize(
+    ("parse", "extra"),
+    [
+        (parse_args, ["--cell", "adamw"]),
+        (
+            parse_hf_sft_args,
+            ["--cell", "adamw", "--model", "unused", "--lr", "0.001"],
+        ),
+    ],
+)
+def test_cell_parsers_reject_flag_abbreviations(parse, extra):
+    # Abbreviations like --result would bypass the launcher's default
+    # suppression and then silently lose to the appended default.
+    with pytest.raises(SystemExit):
+        parse(extra + ["--result=/tmp/x.jsonl"])
 
 
 @pytest.mark.parametrize("cell", ("adamw", "torch_muon_adamw"))
@@ -1184,7 +1308,10 @@ def test_fallback_comparison_uses_requested_not_cell_effective_batched_ns():
     assert comparison_key(stock) != comparison_key(different_request)
 
 
-def test_matrix_default_remains_core_cells_and_all_is_explicit():
+def test_matrix_default_remains_core_cells_and_all_is_explicit(monkeypatch):
+    # Pin Muon availability so the bundle contents are torch-version-agnostic
+    # (the gating itself is covered by the dedicated unavailability test).
+    monkeypatch.setattr(torch.optim, "Muon", object(), raising=False)
     default_commands = matrix_commands(parse_matrix_args([]))
     default_names = [command[command.index("--cell") + 1] for command in default_commands]
     assert tuple(default_names) == CORE_CELLS
@@ -1320,9 +1447,9 @@ def test_matrix_launcher_excludes_forwarded_results_dir_from_guard(
                 str(results),
             ]
         )
-    # A forwarded --results file is generated output too: its directory must
-    # reach the guard's exclusions alongside --output-dir.
-    assert checks == [(Path(str(tmp_path)), results.parent)]
+    # A forwarded --results file is generated output too: the file and its
+    # directory must reach the guard's exclusions alongside --output-dir.
+    assert checks == [(Path(str(tmp_path)), results, results.parent)]
 
 
 def test_consistency_cli_args_omit_false_store_true_flags():
