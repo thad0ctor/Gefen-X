@@ -218,6 +218,49 @@ def test_runtime_state_is_private_and_only_one_parameter_is_staged():
 
 
 @_CUDA_REQUIRED
+def test_later_parameter_corruption_is_caught_before_earlier_parameter_mutates():
+    # Regression: the offloaded step processes parameters sequentially
+    # (stage -> update -> copyback -> commit per parameter). If a later
+    # parameter's offloaded state is corrupted in a way that preserves the
+    # state/param-group container identities and the layout version, a cached
+    # step-readiness verdict would let step() begin, mutate the first
+    # parameter, and only reject when the second parameter is staged --
+    # violating fail-before-mutation. The readiness scan therefore runs in
+    # full on every step, so the corruption is caught at step entry and the
+    # first parameter is left byte-for-byte untouched.
+    first = torch.nn.Parameter(torch.arange(8, device="cuda", dtype=torch.float32))
+    second = torch.nn.Parameter(torch.arange(8, 16, device="cuda", dtype=torch.float32))
+    optimizer = Gefen(
+        [("first", first), ("second", second)],
+        fused=False,
+        factored_v_2d=False,
+    )
+    optimizer._resolve_automatic_period = lambda *args, **kwargs: 4
+    optimizer.offload_state_()
+
+    first.grad = torch.linspace(-1.0, 1.0, 8, device="cuda")
+    second.grad = torch.linspace(1.0, -1.0, 8, device="cuda")
+    optimizer.step()
+
+    first_state_before = _persistent_snapshot(optimizer, first)
+    first_value_before = first.detach().clone()
+
+    # Corrupt the SECOND parameter's offloaded state with a non-tight CPU view.
+    # self.state, self.state[second], and the layout version are all unchanged.
+    corrupt = optimizer.state[second]["m_magnitude"].repeat_interleave(2)[::2]
+    assert not corrupt.is_contiguous()
+    optimizer.state[second]["m_magnitude"] = corrupt
+
+    first.grad = torch.linspace(-1.0, 1.0, 8, device="cuda")
+    second.grad = torch.linspace(1.0, -1.0, 8, device="cuda")
+    with pytest.raises(RuntimeError, match="cannot step"):
+        optimizer.step()
+
+    _assert_persistent_equal(_persistent_snapshot(optimizer, first), first_state_before)
+    assert torch.equal(first.detach(), first_value_before)
+
+
+@_CUDA_REQUIRED
 def test_active_load_preserves_target_policy_and_exact_continuation(monkeypatch):
     source_parameter = torch.nn.Parameter(torch.linspace(-0.5, 0.5, 8, device="cuda"))
     source = _make_gefen(source_parameter)

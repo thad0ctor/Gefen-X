@@ -272,7 +272,13 @@ def test_mutating_apis_bump_the_layout_version_and_force_revalidation(monkeypatc
     assert optimizer._gefen_layout_forensics_verdict is None
 
 
-def test_state_offload_step_scan_is_deduped_until_invalidated(monkeypatch):
+def test_state_offload_step_scan_runs_on_every_step(monkeypatch):
+    # The offload readiness scan is intentionally NOT cached: the per-parameter
+    # offloaded state tensors are legitimately replaced on every step, so a
+    # cached verdict cannot represent them, and a token-preserving in-place
+    # corruption of a later parameter would otherwise slip past step entry and
+    # only be caught mid-step, after earlier parameters were already mutated.
+    # The scan is O(local params) and must run before any parameter is staged.
     optimizer, parameters = _finalized_replicated_optimizer()
     _step_with_grads(optimizer, parameters)
 
@@ -292,18 +298,14 @@ def test_state_offload_step_scan_is_deduped_until_invalidated(monkeypatch):
     optimizer._assert_state_offload_step_ready()
     optimizer._assert_state_offload_step_ready()
     optimizer._assert_state_offload_step_ready()
-    assert calls["count"] == 1
-
-    optimizer._invalidate_layout_forensics_caches()
-    optimizer._assert_state_offload_step_ready()
-    assert calls["count"] == 2
+    assert calls["count"] == 3
 
     optimizer._gefen_state_offload_poisoned = True
     with pytest.raises(RuntimeError, match="poisoned"):
         optimizer._assert_state_offload_step_ready()
 
 
-def test_offload_verdict_is_not_cached_when_the_scan_rejects(monkeypatch):
+def test_offload_scan_re_rejects_on_every_step(monkeypatch):
     optimizer, parameters = _finalized_replicated_optimizer()
 
     calls = {"count": 0}

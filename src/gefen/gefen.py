@@ -1062,7 +1062,6 @@ class Gefen(torch.optim.Optimizer):
         "_gefen_layout_version",
         "_gefen_layout_forensics_verdict",
         "_gefen_manifest_forensics_cache",
-        "_gefen_state_offload_step_verdict",
     )
 
     def __init__(
@@ -1248,7 +1247,6 @@ class Gefen(torch.optim.Optimizer):
         # per finalized manifest object instead of rehashing every identity on
         # every scoped step header.
         self._gefen_manifest_forensics_cache = None
-        self._gefen_state_offload_step_verdict = None
         # ``set_optimizer_state_dict(flatten_optimizer_state_dict=True)`` uses
         # the *live* optimizer state/group keys as its unflattening schema before
         # it calls our loader. Publish the private rank-local transport keys only
@@ -1447,7 +1445,6 @@ class Gefen(torch.optim.Optimizer):
     def _invalidate_layout_forensics_caches(self) -> None:
         self._gefen_layout_version = getattr(self, "_gefen_layout_version", 0) + 1
         self._gefen_layout_forensics_verdict = None
-        self._gefen_state_offload_step_verdict = None
 
     @staticmethod
     def _forensics_tokens_match(cached, live) -> bool:
@@ -3285,18 +3282,6 @@ class Gefen(torch.optim.Optimizer):
             ) from exc
         self.state[parameter] = cpu_state
 
-    def _state_offload_step_tokens(self):
-        return (
-            getattr(self, "_gefen_layout_version", 0),
-            self.state,
-            self.param_groups,
-            len(self.param_groups),
-            self._gefen_state_offload_device,
-            self._gefen_codebook,
-            self._gefen_codebook_process_group,
-            self.capturable,
-        )
-
     def _assert_state_offload_step_ready(self) -> None:
         if self.state_offload_poisoned:
             raise RuntimeError(
@@ -3305,23 +3290,18 @@ class Gefen(torch.optim.Optimizer):
             )
         if not self.state_offload_active:
             return
-        # The complete offload scan (per-tensor storage checks, pairwise
-        # disjointness, native-schema validation) runs once after activation
-        # or any mutating API bumps the layout version; unchanged token
-        # identities reuse that verdict on the step hot path. Every boundary
-        # (activation, movement, staged checkpoint load) still runs the full
-        # scan directly through _state_offload_rejection_reason.
-        verdict = getattr(self, "_gefen_state_offload_step_verdict", None)
-        if verdict is not None:
-            if self._forensics_tokens_match(
-                verdict, self._state_offload_step_tokens()
-            ):
-                return
-            self._gefen_state_offload_step_verdict = None
+        # Run the complete offload scan (per-tensor storage checks, pairwise
+        # disjointness, native-schema validation) on every step before any
+        # parameter is staged. Unlike the finalized-layout manifest, the
+        # per-parameter offloaded state tensors are legitimately replaced each
+        # step, so a cached verdict cannot represent them; a token-preserving
+        # in-place corruption of a later parameter's state would otherwise slip
+        # past step entry and only be caught mid-step, after earlier parameters
+        # were already updated and committed. The scan is O(local params) and
+        # was never the layout-forensics cost this cache was introduced for.
         reason = self._state_offload_rejection_reason(require_cpu_state=True)
         if reason is not None:
             raise RuntimeError("Gefen state offload cannot step: {}".format(reason))
-        self._gefen_state_offload_step_verdict = self._state_offload_step_tokens()
 
     @torch.no_grad()
     def offload_state_(self, device="cpu") -> None:
