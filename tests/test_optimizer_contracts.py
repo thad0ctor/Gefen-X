@@ -2,7 +2,7 @@
 
 import copy
 from collections import defaultdict, OrderedDict
-from dataclasses import FrozenInstanceError, dataclass
+from dataclasses import FrozenInstanceError, dataclass, replace
 
 import pytest
 import torch
@@ -14,6 +14,7 @@ from gefen import (
     Gefen,
     GefenMuon,
     GefenMuonHybrid,
+    OptimizerChildContract,
     OptimizerContractProvider,
     OptimizerStateLayout,
     ParameterLayout,
@@ -758,3 +759,35 @@ def test_portable_global_transport_is_defined_but_not_claimed_before_integration
         support.transport is not CheckpointTransport.CANONICAL_GLOBAL
         for support in optimizer.optimizer_contract().capabilities.checkpoints
     )
+
+
+def test_capabilities_reject_untyped_entries_and_flags():
+    parameter = torch.nn.Parameter(torch.ones(4))
+    optimizer = Gefen([("parameter", parameter)], fused=False)
+    capabilities = optimizer.optimizer_contract().capabilities
+    with pytest.raises(TypeError, match="training must contain TrainingSupport"):
+        replace(capabilities, training=[{"junk": 1}])
+    with pytest.raises(TypeError, match="checkpoints must contain CheckpointSupport"):
+        replace(capabilities, checkpoints=["nonsense"])
+    with pytest.raises(TypeError, match="precisions must contain Precision"):
+        replace(capabilities, precisions={"float32"})
+    for name in (
+        "accepts_semantic_parameter_names",
+        "canonical_parameter_fqns",
+        "stable_shard_identity",
+        "explicit_process_group_codebook_scope",
+        "shard_rebinding",
+        "post_sharding",
+        "canonical_state_io",
+        "atomic_state_movement",
+        "state_offload",
+    ):
+        with pytest.raises(TypeError, match="{} must be a bool".format(name)):
+            replace(capabilities, **{name: "yes"})
+
+
+def test_child_contract_rejects_untyped_contract_payload():
+    with pytest.raises(
+        TypeError, match="contract must be an OptimizerContract or None"
+    ):
+        OptimizerChildContract("backup", "torch.optim.adamw.AdamW", {"junk": 1})

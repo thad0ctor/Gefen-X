@@ -1019,6 +1019,33 @@ class OptimizerCapabilities:
         object.__setattr__(self, "training", _tuple(self.training))
         object.__setattr__(self, "checkpoints", _tuple(self.checkpoints))
         object.__setattr__(self, "precisions", _frozenset(self.precisions))
+        if any(not isinstance(item, TrainingSupport) for item in self.training):
+            raise TypeError(
+                "OptimizerCapabilities.training must contain TrainingSupport values"
+            )
+        if any(not isinstance(item, CheckpointSupport) for item in self.checkpoints):
+            raise TypeError(
+                "OptimizerCapabilities.checkpoints must contain CheckpointSupport values"
+            )
+        if any(not isinstance(item, Precision) for item in self.precisions):
+            raise TypeError(
+                "OptimizerCapabilities.precisions must contain Precision values"
+            )
+        for name in (
+            "accepts_semantic_parameter_names",
+            "canonical_parameter_fqns",
+            "stable_shard_identity",
+            "explicit_process_group_codebook_scope",
+            "shard_rebinding",
+            "post_sharding",
+            "canonical_state_io",
+            "atomic_state_movement",
+            "state_offload",
+        ):
+            if type(getattr(self, name)) is not bool:
+                raise TypeError(
+                    "OptimizerCapabilities.{} must be a bool".format(name)
+                )
         if self.supported_parameter_ranks is not None:
             object.__setattr__(
                 self,
@@ -1045,6 +1072,12 @@ class OptimizerChildContract:
             raise ValueError("OptimizerChildContract.role must be non-empty")
         if not self.implementation:
             raise ValueError("OptimizerChildContract.implementation must be non-empty")
+        if self.contract is not None and not isinstance(
+            self.contract, OptimizerContract
+        ):
+            raise TypeError(
+                "OptimizerChildContract.contract must be an OptimizerContract or None"
+            )
 
 
 @dataclass(frozen=True)
