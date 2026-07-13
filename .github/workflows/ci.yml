@@ -136,10 +136,18 @@ jobs:
 
   gpu-tests:
     name: GPU kernel parity tests
-    # Only when explicitly requested via the Actions tab. Skipped on push/PR so the
-    # job never sits pending forever when no GPU runner is connected.
-    if: github.event_name == 'workflow_dispatch' && inputs.run_gpu_tests
+    # Runs on every PR targeting main so the CUDA-only fail-before-mutation /
+    # kernel-parity tests actually gate merges, plus on-demand via the Actions tab.
+    # (Pushes to other branches and non-main PRs still skip it.)
+    if: >-
+      (github.event_name == 'pull_request' && github.base_ref == 'main') ||
+      (github.event_name == 'workflow_dispatch' && inputs.run_gpu_tests)
     runs-on: [self-hosted, gpu]
+    # Tradeoff: the self-hosted GPU runner must be online for PRs to main. If it
+    # is offline the job is not picked up and, after this timeout, fails fast so
+    # the PR shows a failed GPU check (a visible, honest signal) instead of either
+    # sitting pending forever or silently skipping GPU coverage.
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         with:
