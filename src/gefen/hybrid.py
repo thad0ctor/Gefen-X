@@ -575,6 +575,15 @@ class GefenMuonHybrid(torch.optim.Optimizer):
         self._hybrid_codebook_process_group = None
         self._hybrid_finalized_slots = ()
 
+        # Composite finalized-layout forensics cache, mirroring the O(local
+        # params) scheme Gefen/GefenMuon use for their own step guards. The
+        # version counter is bumped by the only hybrid API that reassigns any
+        # of the finalized composite fields (post_sharding, which every rebind
+        # helper routes through); the cached verdict is one identity-token
+        # snapshot of everything the composite forensic rebuild reads.
+        self._hybrid_layout_version = 0
+        self._hybrid_layout_forensics_verdict = None
+
         # Deliberately do NOT call super().__init__(): we expose each
         # sub-optimizer's real param_groups/state via properties (shared dict
         # refs), so the LR scheduler's in-place ``group["lr"] = ...`` updates
@@ -894,6 +903,13 @@ class GefenMuonHybrid(torch.optim.Optimizer):
                 "_hybrid_fqn_roles": staged["fqn_roles"],
                 "_hybrid_codebook_process_group": staged["codebook_process_group"],
                 "_hybrid_finalized_slots": staged["finalized_slots"],
+                # Reassigning the composite fields invalidates any warm verdict
+                # (there is none from a pristine hybrid, but bumping keeps the
+                # counter honest and forces the next guard through a full
+                # rebuild before it caches a fresh verdict).
+                "_hybrid_layout_version": getattr(self, "_hybrid_layout_version", 0)
+                + 1,
+                "_hybrid_layout_forensics_verdict": None,
             },
         )
 
@@ -935,7 +951,88 @@ class GefenMuonHybrid(torch.optim.Optimizer):
             manifest=ShardingManifest((shard,)),
         )
 
-    def _finalized_binding_layout_matches(self) -> bool:
+    @staticmethod
+    def _hybrid_child_param_group_tokens(child, tokens):
+        # Append the child's live group containers, their ``params`` list
+        # objects, and every parameter in them so an in-place slot swap in a
+        # child's public param_groups is visible to the composite fast path.
+        tokens.append(child)
+        tokens.append(getattr(child, "_gefen_sharding_manifest", None))
+        tokens.append(getattr(child, "_gefen_codebook_process_group", None))
+        tokens.append(getattr(child, "_gefen_local_shard_bindings", None))
+        tokens.append(getattr(child, "defaults", None))
+        groups = child.param_groups
+        tokens.append(groups)
+        tokens.append(len(groups))
+        for group in groups:
+            params = group.get("params") if type(group) is dict else None
+            tokens.append(group)
+            tokens.append(params)
+            if isinstance(params, (list, tuple)):
+                tokens.append(len(params))
+                tokens.extend(params)
+
+    def _hybrid_layout_forensics_fast_tokens(self):
+        # O(local params) identity snapshot of everything the composite
+        # forensic rebuild reads by identity, plus each child's own O(local)
+        # cached fast-path verdict. Calling the children's fast path means any
+        # child-level change they can detect (an in-place ``group['params']``
+        # slot swap, a replaced private child registry, a mutated name cache)
+        # flips a bool in this token and forces the composite through a full
+        # rebuild; the composite-owned fields are captured directly so a
+        # replaced manifest/roles/local-bindings/slots/owner/binding container
+        # is caught even if no child noticed. Legitimate mutating APIs replace
+        # these containers (never mutate them in place) and bump the version
+        # counter, so an unchanged attribute is the same object.
+        live = [
+            getattr(self, "_hybrid_layout_version", 0),
+            self._hybrid_post_sharding_finalized,
+            self._hybrid_sharding_manifest,
+            self._hybrid_local_shard_bindings,
+            self._hybrid_fqn_roles,
+            self._hybrid_finalized_slots,
+            self._hybrid_codebook_process_group,
+            self._state_param_owner,
+            len(self._state_param_owner),
+            self.defaults,
+            self._subopts,
+            len(self._subopts),
+        ]
+        for child in self._subopts:
+            live.append(child._finalized_binding_layout_matches())
+            GefenMuonHybrid._hybrid_child_param_group_tokens(child, live)
+        return tuple(live)
+
+    def _finalized_binding_layout_matches(self, *, full: bool = False) -> bool:
+        # Steady-state guard: reuse one cached verdict validated by an
+        # O(local params) identity-token check. Any real finalized-layout
+        # change either bumps the hybrid version, replaces a composite
+        # container, or flips a child's own fast-path verdict -- all captured
+        # by the token -- so a stale hit is impossible; a full boundary check
+        # (``full=True`` from base contract-readiness call sites) always
+        # rebuilds. Detection stays before any mutation.
+        verdict = getattr(self, "_hybrid_layout_forensics_verdict", None)
+        if not full and verdict is not None:
+            try:
+                fast_tokens = self._hybrid_layout_forensics_fast_tokens()
+            except (AttributeError, KeyError, TypeError, ValueError, RuntimeError):
+                fast_tokens = None
+            if fast_tokens is not None and Gefen._forensics_tokens_match(
+                verdict, fast_tokens
+            ):
+                return True
+        self._hybrid_layout_forensics_verdict = None
+        matches = self._finalized_binding_layout_matches_full()
+        if matches:
+            try:
+                self._hybrid_layout_forensics_verdict = (
+                    self._hybrid_layout_forensics_fast_tokens()
+                )
+            except (AttributeError, KeyError, TypeError, ValueError, RuntimeError):
+                self._hybrid_layout_forensics_verdict = None
+        return matches
+
+    def _finalized_binding_layout_matches_full(self) -> bool:
         try:
             if (
                 not self._hybrid_post_sharding_finalized
@@ -1038,14 +1135,18 @@ class GefenMuonHybrid(torch.optim.Optimizer):
             return False
 
     def _canonical_identity_ready(self) -> bool:
-        return self._hybrid_post_sharding_finalized and self._finalized_binding_layout_matches()
+        # Contract readiness is an honest external claim, so it never trusts the
+        # per-step fast-path verdict and always runs the full forensic rebuild.
+        return self._hybrid_post_sharding_finalized and self._finalized_binding_layout_matches(
+            full=True
+        )
 
     def _codebook_scope_ready(self) -> bool:
         return self._hybrid_codebook_process_group is not None and self._canonical_identity_ready()
 
-    def _assert_finalized_binding_layout(self) -> None:
+    def _assert_finalized_binding_layout(self, *, full: bool = False) -> None:
         if self._hybrid_post_sharding_finalized:
-            if not self._finalized_binding_layout_matches():
+            if not self._finalized_binding_layout_matches(full=full):
                 raise RuntimeError("GefenMuonHybrid finalized parameter layout changed outside post_sharding")
         elif not self._hybrid_identity_metadata_empty():
             raise RuntimeError("GefenMuonHybrid found an incomplete post_sharding identity plan")
