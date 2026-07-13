@@ -90,11 +90,35 @@ target_optimizer.import_portable_state(
 )
 ```
 
+`save_portable_dcp(...)` and `load_portable_dcp(...)` provide synchronous PyTorch Distributed Checkpoint storage for the same document. The adapter persists only tensors: one bounded canonical-wire metadata tensor plus numbered dense payload tensors. Its load planner validates the exact namespace, key set, ordinary full-tensor metadata, dtype, rank, chunk coverage, tensor count, and aggregate bytes against `PortableStateLimits` before allocating CPU destinations; canonical-wire and portable-document digests are verified before collective import. The exact storage class and its bounded string or path-like `checkpoint_id` are included in the collective preflight, so every member must address the same checkpoint; a custom storage plugin without that identity fails closed. A plain DCP `Stateful` wrapper is intentionally not used because DCP asks the target for preallocated tensors before loading while portable state variants determine their own key set and shapes. Tensor-only optimizer data avoids DCP's opaque-object payload path, but the framework's own checkpoint metadata remains a trusted-storage boundary and is read before the custom planner runs. Every member temporarily holds the complete dense global document and its encoded CPU payload, so this synchronous path prioritizes portability and validation rather than rank-sharded checkpoint memory. The portable document and canonical-wire envelope are versioned by Gefen; the surrounding on-disk DCP format retains PyTorch's own cross-release compatibility policy.
+
+```python
+import torch.distributed.checkpoint as dcp
+
+from gefen import load_portable_dcp, save_portable_dcp
+
+save_portable_dcp(
+    optimizer,
+    checkpoint_process_group=checkpoint_binding,
+    storage_writer=dcp.FileSystemWriter("checkpoint/optimizer"),
+    transaction_id="optimizer-save-0001",
+    limits=limits,
+)
+
+load_portable_dcp(
+    target_optimizer,
+    checkpoint_process_group=target_checkpoint_binding,
+    storage_reader=dcp.FileSystemReader("checkpoint/optimizer"),
+    transaction_id="optimizer-load-0001",
+    limits=limits,
+)
+```
+
 The dynamic `CANONICAL_GLOBAL` checkpoint declaration appears only while the live finalized optimizer passes the exact runtime readiness checks: explicit process-group scope, stable logical slots and manifest, ordinary built-in containers, supported CPU/CUDA tensor storage, no active compilation or CUDA capture, `capturable=False`, `stochastic_round=False`, a complete declared native state variant, and period one for selected or initialized state. Plain Gefen supports replicated and contiguous flattened element shards. Block-second-moment state can reshard between replicated and flattened targets; a logical matrix using factored second moments remains replicated and same-topology because factored-to-block representation migration is not implemented. GefenMuon supports replicated matrices and whole-parameter ownership when every participating group uses `sharded_mode="distributed"`; the transport can change placement and redistribute owners across world sizes, including NorMuon row state. Pristine and period-selected states are supported under the same policy rules, and zero-element parameters remain pristine.
 
 The collective protocol exchanges fixed-size preparation headers before payload movement, visits member fragments in stable semantic order, bounds metadata and tensor chunks, propagates asymmetric local failures to every participant, and performs no semantic checks after the final freshness vote. Import preserves the target's parameter groups, defaults, parameters, compatibility names, and runtime process-group configuration while restoring portable common state, including the source deterministic setting. The atomic claim is fail-before-local-mutation for live, quiescent optimizer instances; it is not rollback after process death, backend failure, or concurrent mutation after the final vote. Ordinary state-dict hooks are bypassed. Adapters must quiesce training, avoid retaining state-container identities across a successful import, and persist the returned weights-only-safe CPU document with their checkpoint system.
 
-Portable v3 currently excludes non-period-one initialized state, second-moment representation conversion, DTensor layouts, stochastic rounding, capturable/device-authoritative state, GefenMuon modes other than `distributed` for whole-owner transport, `GefenMuonHybrid`, tied-alias expansion, and direct DCP orchestration. The optimizer-facing API is the adapter boundary for a DCP or platform integration; the core does not register a framework-specific state-dict adapter or perform storage I/O. `state_offload` remains false because a CPU portable document is a checkpoint artifact, not live optimizer state that can be stepped while offloaded.
+Portable v3 currently excludes non-period-one initialized state, second-moment representation conversion, DTensor layouts, stochastic rounding, capturable/device-authoritative state, GefenMuon modes other than `distributed` for whole-owner transport, `GefenMuonHybrid`, tied-alias expansion, asynchronous DCP, and mixed model/optimizer `Stateful` composition. The dedicated DCP helpers require every checkpoint member to enter synchronously and use the exact optimizer-owned process group. A singleton binding is rejected inside an initialized default world larger than one because the common PyTorch 2.5–2.12 `dcp.save/load` API interprets `process_group=None` as that world. A multi-member checkpoint group must have global rank zero at group coordinate zero; PyTorch 2.5's DCP coordinator path can otherwise address group coordinate zero as global rank zero and hang, so the adapter applies this compatibility restriction on every supported version. DCP storage publication is not transactionally atomic; the optimizer load remains fail-before-local-mutation after a complete successful read and verification. `state_offload` remains false because a CPU portable document is a checkpoint artifact, not live optimizer state that can be stepped while offloaded.
 
 ## Quiescent optimizer-state movement
 

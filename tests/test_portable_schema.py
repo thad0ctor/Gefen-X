@@ -284,4 +284,6 @@ def test_portable_schema_and_checkpoint_binding_exports_are_public():
     assert gefen.CheckpointProcessGroupBinding.__module__ == "gefen.checkpoint"
     assert gefen.PortableStateLimits.__module__ == "gefen.portable_state"
     assert gefen.PortableStateProvider.__module__ == "gefen.contracts"
+    assert gefen.load_portable_dcp.__module__ == "gefen.portable_dcp"
+    assert gefen.save_portable_dcp.__module__ == "gefen.portable_dcp"
     assert gefen.LogicalRegion.__module__ == "gefen.contracts"

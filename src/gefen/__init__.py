@@ -53,6 +53,8 @@ __all__ = [
     "build_portable_state_document",
     "normalize_portable_state_document",
     "portable_state_digest",
+    "load_portable_dcp",
+    "save_portable_dcp",
     "split_params_for_muon",
     "validate_split",
     "kernels",
@@ -109,6 +111,10 @@ def __getattr__(name):
         from .portable_state import PortableStateLimits
 
         return PortableStateLimits
+    if name in ("load_portable_dcp", "save_portable_dcp"):
+        from . import portable_dcp
+
+        return getattr(portable_dcp, name)
     if name in (
         "CONTRACT_SCHEMA_VERSION",
         "IDENTITY_SCHEMA_VERSION",
