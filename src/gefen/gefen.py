@@ -6828,6 +6828,8 @@ class Gefen(torch.optim.Optimizer):
         return (type(value).__name__, token)
 
     def _canonical_import_live_token(self):
+        from gefen.portable_runtime import _parameter_storage_token
+
         groups = tuple(
             (
                 id(group),
@@ -6885,7 +6887,16 @@ class Gefen(torch.optim.Optimizer):
                 for logical_slot in self._gefen_logical_slots
             ),
             tuple(
-                (id(parameter), shard.sort_key)
+                (
+                    id(parameter),
+                    shard.sort_key,
+                    # Mirror the portable live token: a prepared import must go
+                    # stale when a locally bound parameter's storage is
+                    # retargeted or mutated between prepare and commit.
+                    None
+                    if parameter is None
+                    else _parameter_storage_token(parameter),
+                )
                 for parameter, shard in self._gefen_local_shard_bindings
             ),
         )
