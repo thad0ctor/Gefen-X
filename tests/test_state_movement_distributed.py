@@ -5,7 +5,7 @@ from __future__ import annotations
 from datetime import timedelta
 import os
 import queue
-import socket
+import tempfile
 import traceback
 
 import pytest
@@ -26,12 +26,6 @@ _AUTHORITATIVE_TENSOR_KEYS = frozenset(
         "normuon_step",
     }
 )
-
-
-def _free_port() -> str:
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-        sock.bind(("127.0.0.1", 0))
-        return str(sock.getsockname()[1])
 
 
 def _oversized_copy(tensor: torch.Tensor) -> torch.Tensor:
@@ -508,17 +502,14 @@ def _whole_owner_case(rank, world) -> None:
     )
 
 
-def _distributed_worker(rank, world, port, result_queue) -> None:
+def _distributed_worker(rank, world, init_file, result_queue) -> None:
     import torch.distributed as dist
     from torch.distributed.tensor import init_device_mesh
 
     try:
-        os.environ["MASTER_ADDR"] = "127.0.0.1"
-        os.environ["MASTER_PORT"] = port
-        os.environ["RANK"] = str(rank)
-        os.environ["WORLD_SIZE"] = str(world)
         dist.init_process_group(
             "gloo",
+            init_method="file://{}".format(init_file),
             rank=rank,
             world_size=world,
             timeout=timedelta(seconds=90),
@@ -546,11 +537,16 @@ def test_atomic_state_movement_across_distributed_cpu_representations():
     world = 2
     context = mp.get_context("spawn")
     result_queue = context.Queue()
-    port = _free_port()
+    # A file:// rendezvous stays valid until every rank has initialized, unlike a
+    # pre-probed free TCP port that another process can steal before the workers
+    # bind it. Mirrors the DCP distributed test.
+    descriptor, init_file = tempfile.mkstemp(prefix="gefen-state-movement-")
+    os.close(descriptor)
+    os.unlink(init_file)
     processes = [
         context.Process(
             target=_distributed_worker,
-            args=(rank, world, port, result_queue),
+            args=(rank, world, init_file, result_queue),
         )
         for rank in range(world)
     ]
@@ -570,6 +566,8 @@ def test_atomic_state_movement_across_distributed_cpu_representations():
             if process.is_alive():
                 process.terminate()
                 process.join(timeout=5)
+        if os.path.exists(init_file):
+            os.unlink(init_file)
 
     assert all(process.exitcode == 0 for process in processes), [
         process.exitcode for process in processes
