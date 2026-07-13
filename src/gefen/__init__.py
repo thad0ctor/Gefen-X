@@ -11,6 +11,26 @@ __all__ = [
     "Gefen",
     "GefenMuon",
     "GefenMuonHybrid",
+    "CONTRACT_SCHEMA_VERSION",
+    "CheckpointSupport",
+    "CheckpointTransport",
+    "OptimizerCapabilities",
+    "OptimizerChildContract",
+    "OptimizerContract",
+    "OptimizerContractProvider",
+    "OptimizerStateLayout",
+    "ParameterLayout",
+    "ParameterStateRole",
+    "Precision",
+    "ProcessGroupScope",
+    "StateExtent",
+    "StateField",
+    "StateGeometry",
+    "StateKeyMatch",
+    "StateScope",
+    "StateVariant",
+    "TopologyChange",
+    "TrainingSupport",
     "split_params_for_muon",
     "validate_split",
     "kernels",
@@ -35,6 +55,31 @@ def __getattr__(name):
         from . import params
 
         return getattr(params, name)
+    if name in (
+        "CONTRACT_SCHEMA_VERSION",
+        "CheckpointSupport",
+        "CheckpointTransport",
+        "OptimizerCapabilities",
+        "OptimizerChildContract",
+        "OptimizerContract",
+        "OptimizerContractProvider",
+        "OptimizerStateLayout",
+        "ParameterLayout",
+        "ParameterStateRole",
+        "Precision",
+        "ProcessGroupScope",
+        "StateExtent",
+        "StateField",
+        "StateGeometry",
+        "StateKeyMatch",
+        "StateScope",
+        "StateVariant",
+        "TopologyChange",
+        "TrainingSupport",
+    ):
+        from . import contracts
+
+        return getattr(contracts, name)
     if name == "kernels":
         # NOT `from . import kernels`: its fromlist handling re-enters this
         # __getattr__ before the submodule import runs, recursing forever.

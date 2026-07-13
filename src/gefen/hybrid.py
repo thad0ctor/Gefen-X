@@ -60,6 +60,7 @@ from collections import OrderedDict
 import torch
 import torch.nn as nn
 
+from gefen.contracts import OptimizerContract, _hybrid_contract
 from gefen.gefen import (
     Gefen,
     _amp_native_scaling_required,
@@ -724,6 +725,30 @@ class GefenMuonHybrid(torch.optim.Optimizer):
             if hook_result is not None:
                 state_dict = hook_result
         return state_dict
+
+    def optimizer_contract(self) -> OptimizerContract:
+        """Return the composite contract without flattening either child schema."""
+
+        muon_contract = (
+            self.muon.optimizer_contract() if self.muon is not None else None
+        )
+        backup_contract = (
+            self.backup.optimizer_contract()
+            if self.backup is not None and hasattr(self.backup, "optimizer_contract")
+            else None
+        )
+        backup_implementation = ""
+        if self.backup is not None:
+            backup_implementation = (
+                backup_contract.implementation
+                if backup_contract is not None
+                else type(self.backup).__module__ + "." + type(self.backup).__qualname__
+            )
+        return _hybrid_contract(
+            muon=muon_contract,
+            backup=backup_contract,
+            backup_implementation=backup_implementation,
+        )
 
     def load_state_dict(self, state_dict):
         # Instance load pre-hooks first (a pre-hook may return a replacement

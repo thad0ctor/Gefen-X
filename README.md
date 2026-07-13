@@ -131,6 +131,8 @@ Mixed precision works out of the box: BF16 and standard AMP behave exactly as wi
 
 > **DeepSpeed ZeRO config.** Set `"zero_allow_untested_optimizer": true` and leave the config's `optimizer` section unset. With optimizer CPU-offload, also set `"zero_force_ds_cpu_optimizer": false` — otherwise raw DeepSpeed refuses to initialize, and accelerate-based launchers (axolotl) silently swap in DeepSpeed's own CPU Adam.
 
+Platform adapters can query the immutable [`optimizer_contract()` capability and state-layout descriptors](https://github.com/thad0ctor/Gefen-X/blob/main/docs/optimizer_contracts.md) instead of depending on Gefen's private optimizer attributes.
+
 ## Determinism (`deterministic`)
 
 Set `deterministic=True` when every GPU replica must produce bit-identical results on matching GPUs. It is off by default (the fastest routing), checkpoints remember the setting, and older checkpoints without it still load. One combination is rejected: plain Gefen with `deterministic=True`, `factored_v_2d=True`, and `stochastic_round=True` together.

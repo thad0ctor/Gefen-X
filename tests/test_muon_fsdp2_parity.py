@@ -82,6 +82,7 @@ def _worker(rank, world, case, port, q):
     import torch.distributed as dist
     from torch.distributed.tensor import Shard, distribute_tensor, init_device_mesh
 
+    from gefen import ParameterLayout, StateExtent
     from gefen.gefen_muon import GefenMuon
 
     os.environ["MASTER_ADDR"] = "127.0.0.1"
@@ -108,6 +109,24 @@ def _worker(rank, world, case, port, q):
             **_case_opt_kwargs(case),
         )
         opt.step()
+
+        contract = opt.optimizer_contract()
+        variant_name = (
+            "quantized_normuon_global"
+            if case.startswith("normuon-")
+            else "quantized_muon_global"
+        )
+        variant = next(
+            item
+            for item in contract.state_layout.parameter_variants
+            if item.name == variant_name
+        )
+        assert variant.layouts == frozenset(
+            {ParameterLayout.DTENSOR_1D_DEFAULT_WORLD}
+        )
+        assert variant.sharded_mode == "exact"
+        assert variant.extent is StateExtent.GLOBAL_PARAMETER
+        assert opt.state[p]["m_codebook"].numel() == full_init.numel()
 
         gathered = p.detach().full_tensor()  # collective; all ranks must call
 

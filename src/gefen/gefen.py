@@ -22,6 +22,7 @@ from typing import Iterable, Optional, Tuple, Union
 import torch
 import torch.nn as nn
 
+from gefen.contracts import OptimizerContract, _gefen_contract
 from gefen.partitioning import find_period_by_block_variance
 import gefen.quantization as quantization_module
 from gefen.kernels.automatic_vmean import (
@@ -1067,6 +1068,11 @@ class Gefen(torch.optim.Optimizer):
         # gradients, or statically for distributed optimizers that combine any
         # true-FP16 storage with DTensors after a collective presence preflight.
         return _amp_native_scaling_required(self)
+
+    def optimizer_contract(self) -> OptimizerContract:
+        """Return the immutable state-layout and integration capability contract."""
+
+        return _gefen_contract(factored_v_2d=self._factored_v_2d)
 
     @staticmethod
     def _normalize_param_groups(params):

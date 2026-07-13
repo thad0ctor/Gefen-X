@@ -6,6 +6,7 @@ from typing import Iterable, Optional, Tuple, Union
 import torch
 import torch.nn as nn
 
+from gefen.contracts import OptimizerContract, _gefen_muon_contract
 from gefen.gefen import (
     Gefen,
     _amp_prepare_optimizer_step,
@@ -743,6 +744,28 @@ class GefenMuon(Gefen):
             deterministic=deterministic,
             capturable=capturable,
             verbose=verbose,
+        )
+
+    def optimizer_contract(self) -> OptimizerContract:
+        """Return the immutable Muon state and capability contract."""
+
+        sharded_modes = frozenset(
+            group["sharded_mode"] for group in self.param_groups
+        )
+        normuon_modes = frozenset(
+            group["sharded_mode"]
+            for group in self.param_groups
+            if group.get("normuon", False)
+        )
+        non_normuon_modes = frozenset(
+            group["sharded_mode"]
+            for group in self.param_groups
+            if not group.get("normuon", False)
+        )
+        return _gefen_muon_contract(
+            sharded_modes=sharded_modes,
+            normuon_modes=normuon_modes,
+            non_normuon_modes=non_normuon_modes,
         )
 
     def add_param_group(self, param_group):
