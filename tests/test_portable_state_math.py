@@ -142,10 +142,12 @@ def test_period_one_recompression_is_exact_for_every_finite_fp32_scale():
         step=99,
     )
 
-    torch.testing.assert_close(reconstructed, momentum, rtol=0, atol=0)
+    assert torch.equal(reconstructed.view(torch.int32), momentum.view(torch.int32))
     assert torch.equal(magnitudes.reshape(-1), momentum.abs())
     assert torch.equal(indices[momentum < 0], torch.zeros_like(indices[momentum < 0]))
     assert torch.equal(indices[momentum > 0], torch.full_like(indices[momentum > 0], 4))
+    assert indices[3].item() == 0
+    assert indices[4].item() == codebook.numel() - 1
 
 
 def test_scalar_momentum_roundtrips_as_zero_dimensional_logical_state():

@@ -296,6 +296,11 @@ def _recompress_dense_momentum(
     if momentum.device != codebook.device:
         raise ValueError("dense momentum and codebook must share a device")
     period = _validate_period(period, numel=momentum.numel())
+    preserve_zero_sign = (
+        period == 1
+        and bool(codebook[0] == -1.0)
+        and bool(codebook[-1] == 1.0)
+    )
 
     blocks = momentum.numel() // period
     indices = _new_output(
@@ -322,6 +327,14 @@ def _recompress_dense_momentum(
         normalized.div_(magnitude_chunk)
         normalized.masked_fill_(~nonzero, 0.0)
         index_chunk = _nearest_codebook_indices(codebook, normalized)
+        if preserve_zero_sign:
+            zero_values = block_values == 0
+            zero_indices = torch.where(
+                torch.signbit(block_values),
+                torch.zeros_like(index_chunk),
+                torch.full_like(index_chunk, codebook.numel() - 1),
+            )
+            index_chunk = torch.where(zero_values, zero_indices, index_chunk)
         indices[row_start:row_stop].copy_(index_chunk)
         magnitudes[row_start:row_stop].copy_(magnitude_chunk)
     return (
