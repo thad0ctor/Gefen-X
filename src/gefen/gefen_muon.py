@@ -1383,6 +1383,9 @@ class GefenMuon(Gefen):
                 global_position[id(p)] = len(global_position)
 
         mismatches = []
+        order_mismatches = []
+        duplicate_labels = []
+        duplicates_anywhere = False
         for mesh_key in sorted(by_mesh):
             entry = by_mesh[mesh_key]
             mesh = entry["mesh"]
@@ -1397,8 +1400,11 @@ class GefenMuon(Gefen):
             # Two parameters carrying the same explicit name, shape, and dtype
             # are indistinguishable across ranks, so neither this order probe
             # nor the presence vector below can align them; construction
-            # accepts duplicate explicit names, so fail closed here before any
-            # collective rather than verify against ambiguous labels.
+            # accepts duplicate explicit names, so fail closed on them. The
+            # flag rides the reduced probe below rather than raising here:
+            # a rank whose own labels are clean must learn about duplicates on
+            # its peers and take the same error path, not enter a collective
+            # its peer already abandoned.
             duplicate_keys = sorted(
                 {
                     items[index][0]
@@ -1410,15 +1416,6 @@ class GefenMuon(Gefen):
                     == str(items[index - 1][1].dtype)
                 }
             )
-            if duplicate_keys:
-                raise RuntimeError(
-                    "GefenMuon cannot verify cross-rank parameter order or "
-                    "gradient presence when parameters in one "
-                    "sharded_mode='exact' or 'distributed' DTensor mesh share "
-                    "a name, shape, and dtype ({}): the shared label makes "
-                    "them indistinguishable across ranks. Give every "
-                    "parameter a unique name.".format(", ".join(duplicate_keys))
-                )
             # Bare parameters receive positional auto-names, so two of them
             # with the same shape and dtype have no rank-invariant identity at
             # all: the probes below would align labels that themselves follow
@@ -1461,7 +1458,9 @@ class GefenMuon(Gefen):
             # reducing its optimizer-wide insertion position to the mesh-wide
             # max and min (one MAX all_reduce over [position, -position])
             # exposes any rank whose registration order differs — including
-            # order swaps between parameters on different meshes.
+            # order swaps between parameters on different meshes. The final
+            # slot carries this rank's duplicate-label count so the reduction
+            # also propagates duplicates to every rank of the mesh.
             order_probe = torch.tensor(
                 [
                     signed
@@ -1470,7 +1469,8 @@ class GefenMuon(Gefen):
                         global_position[id(p)],
                         -global_position[id(p)],
                     )
-                ],
+                ]
+                + [len(duplicate_keys)],
                 dtype=torch.int32,
                 device=device,
             )
@@ -1487,22 +1487,20 @@ class GefenMuon(Gefen):
                         order_probe, op=dist.ReduceOp.MAX, group=process_group
                     )
 
+            # Do not raise inside this loop: with DTensors on overlapping but
+            # non-identical meshes, a rank exiting early would strand peers
+            # that only share a later mesh inside that mesh's all_reduce.
+            # Accumulate every violation and raise after all local meshes
+            # have completed their probe collectives, like the presence path.
             order_flat = order_probe.cpu().tolist()
-            order_mismatches = [
+            if order_flat[-1] > 0:
+                duplicates_anywhere = True
+                duplicate_labels.extend(duplicate_keys)
+            order_mismatches.extend(
                 items[index][0]
                 for index in range(len(items))
                 if order_flat[2 * index] != -order_flat[2 * index + 1]
-            ]
-            if order_mismatches:
-                raise RuntimeError(
-                    "GefenMuon requires identical parameter-group order on "
-                    "every rank of a DTensor/FSDP mesh before "
-                    "sharded_mode='exact' or 'distributed' stepping: gradient "
-                    "collectives and momentum-owner assignment follow that "
-                    "order. Parameters at rank-divergent positions: {}. "
-                    "Construct parameter groups in the same order on every "
-                    "rank.".format(", ".join(order_mismatches))
-                )
+            )
 
             mesh_size = mesh.size()
             inconsistent = torch.nonzero(
@@ -1519,6 +1517,29 @@ class GefenMuon(Gefen):
                     )
                 )
 
+        if duplicates_anywhere:
+            raise RuntimeError(
+                "GefenMuon cannot verify cross-rank parameter order or "
+                "gradient presence when parameters in one "
+                "sharded_mode='exact' or 'distributed' DTensor mesh share "
+                "a name, shape, and dtype{}: the shared label makes them "
+                "indistinguishable across ranks. Give every parameter a "
+                "unique name.".format(
+                    " ({})".format(", ".join(sorted(set(duplicate_labels))))
+                    if duplicate_labels
+                    else " on at least one mesh rank"
+                )
+            )
+        if order_mismatches:
+            raise RuntimeError(
+                "GefenMuon requires identical parameter-group order on "
+                "every rank of a DTensor/FSDP mesh before "
+                "sharded_mode='exact' or 'distributed' stepping: gradient "
+                "collectives and momentum-owner assignment follow that "
+                "order. Parameters at rank-divergent positions: {}. "
+                "Construct parameter groups in the same order on every "
+                "rank.".format(", ".join(order_mismatches))
+            )
         if mismatches:
             raise RuntimeError(
                 "GefenMuon requires identical gradient presence on every rank "

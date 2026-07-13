@@ -582,17 +582,19 @@ def _reversed_order_worker(rank, world, port, result_queue):
             "aligned_consistent",
             "bare_ambiguous",
             "duplicate_names",
+            "duplicate_one_rank",
             "cross_mesh_reversed",
         ):
             generator = torch.Generator(device="cpu").manual_seed(
                 6100 + len(results)
             )
-            # bare_ambiguous and duplicate_names need two same-shape
-            # parameters: identical shape and dtype is exactly what makes
-            # positional auto-names or shared explicit names ambiguous.
+            # The ambiguity cases need two same-shape parameters: identical
+            # shape and dtype is exactly what makes positional auto-names or
+            # shared explicit names ambiguous.
             b_shape = (
                 (8, 8)
-                if case in ("bare_ambiguous", "duplicate_names")
+                if case
+                in ("bare_ambiguous", "duplicate_names", "duplicate_one_rank")
                 else (6, 10)
             )
             b_mesh = second_mesh if case == "cross_mesh_reversed" else mesh
@@ -608,6 +610,14 @@ def _reversed_order_worker(rank, world, port, result_queue):
                 params = [a, b]
             elif case == "duplicate_names":
                 params = [("w", a), ("w", b)]
+            elif case == "duplicate_one_rank":
+                # Only rank 1 carries the duplicate labels; rank 0 must still
+                # learn about them through the reduced flag and take the same
+                # error path instead of blocking in a peer-abandoned
+                # collective.
+                params = (
+                    [("w", a), ("w", b)] if rank == 1 else [("a", a), ("b", b)]
+                )
             else:
                 params = [("a", a), ("b", b)]
                 if (
@@ -729,13 +739,17 @@ def test_sharded_grad_presence_check_rejects_rank_divergent_order():
             "aligned_consistent",
             "bare_ambiguous",
             "duplicate_names",
+            "duplicate_one_rank",
             "cross_mesh_reversed",
         }, (rank, cases)
         # Duplicate explicit labels defeat cross-rank identification, so they
-        # fail closed even with aligned order and full gradient presence.
-        message = cases["duplicate_names"]["message"]
-        assert message is not None, (rank, "duplicate_names")
-        assert "unique name" in message, (rank, message)
+        # fail closed even with aligned order and full gradient presence —
+        # and the rank whose own labels are clean must raise too, via the
+        # reduced flag, instead of blocking in an abandoned collective.
+        for case in ("duplicate_names", "duplicate_one_rank"):
+            message = cases[case]["message"]
+            assert message is not None, (rank, case)
+            assert "unique name" in message, (rank, case, message)
         # Order swaps between parameters on different meshes are step-fatal
         # too; the optimizer-wide position probe must catch them.
         message = cases["cross_mesh_reversed"]["message"]
@@ -775,6 +789,7 @@ def test_sharded_grad_presence_check_rejects_rank_divergent_order():
             "aligned_mismatch",
             "aligned_consistent",
             "duplicate_names",
+            "duplicate_one_rank",
             "cross_mesh_reversed",
         ):
             assert not cases[case]["warned"], (rank, case)
