@@ -1012,7 +1012,7 @@ def test_muon_flattened_rebinding_rejects_without_mutation():
     _assert_snapshot(optimizer, snapshot)
 
 
-def test_hybrid_contract_does_not_claim_composite_rebinding():
+def test_gefen_backed_hybrid_contract_claims_composite_rebinding():
     matrix = torch.nn.Parameter(torch.ones(4, 4))
     bias = torch.nn.Parameter(torch.ones(4))
     optimizer = GefenMuonHybrid(
@@ -1022,6 +1022,9 @@ def test_hybrid_contract_does_not_claim_composite_rebinding():
         fused=False,
     )
     contract = optimizer.optimizer_contract()
-    assert not contract.capabilities.shard_rebinding
-    assert not contract.capabilities.post_sharding
+    assert contract.capabilities.shard_rebinding
+    assert contract.capabilities.post_sharding
+    assert contract.capabilities.explicit_process_group_codebook_scope
     assert not contract.capabilities.canonical_parameter_fqns
+    assert not contract.capabilities.stable_shard_identity
+    assert optimizer.state_dict()["backup_optimizer"] == "gefen"

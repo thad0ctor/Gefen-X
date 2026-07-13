@@ -25,6 +25,7 @@ from gefen import (
     StateGeometry,
     StateKeyMatch,
     StateMovementProvider,
+    StateOffloadProvider,
     StateScope,
     StateVariant,
     TopologyChange,
@@ -36,8 +37,10 @@ _DTENSOR = ParameterLayout.DTENSOR_1D_DEFAULT_WORLD
 
 def _values_equal(left, right):
     if torch.is_tensor(left) or torch.is_tensor(right):
-        return torch.is_tensor(left) and torch.is_tensor(right) and torch.equal(
-            left, right
+        return (
+            torch.is_tensor(left)
+            and torch.is_tensor(right)
+            and torch.equal(left, right)
         )
     if type(left) is not type(right):
         return False
@@ -92,8 +95,7 @@ def _matching_variants(
         if set(variant.fields) == keys
         and layout in variant.layouts
         and (
-            variant.parameter_ranks is None
-            or parameter_rank in variant.parameter_ranks
+            variant.parameter_ranks is None or parameter_rank in variant.parameter_ranks
         )
         and parameter_rank not in variant.excluded_parameter_ranks
         and variant.sharded_mode == sharded_mode
@@ -105,8 +107,7 @@ def _training_support(contract, layout, mode=None):
     matches = [
         item
         for item in contract.capabilities.training
-        if item.layout is layout
-        and (mode is None or item.sharded_mode == mode)
+        if item.layout is layout and (mode is None or item.sharded_mode == mode)
     ]
     assert len(matches) == 1
     return matches[0]
@@ -136,16 +137,16 @@ def test_plain_contract_matches_live_persistent_state(factored_v_2d):
     assert contract.schema_version == CONTRACT_SCHEMA_VERSION
     assert contract.implementation == "gefen.Gefen"
     assert contract.capabilities.supported_parameter_ranks is None
-    assert {
-        item.layout for item in contract.capabilities.training
-    } == {
+    assert {item.layout for item in contract.capabilities.training} == {
         ParameterLayout.REPLICATED,
         ParameterLayout.FLATTENED_ELEMENT_SHARD,
         _DTENSOR,
     }
     dtensor_training = _training_support(contract, _DTENSOR)
     assert dtensor_training.mesh_dimensions == (1,)
-    assert dtensor_training.process_group_scope is ProcessGroupScope.INFERRED_DEVICE_MESH
+    assert (
+        dtensor_training.process_group_scope is ProcessGroupScope.INFERRED_DEVICE_MESH
+    )
     dcp = _checkpoint_support(
         contract, CheckpointTransport.PYTORCH_RANK_LOCAL, _DTENSOR
     )
@@ -172,9 +173,7 @@ def test_plain_contract_matches_live_persistent_state(factored_v_2d):
     assert contract.capabilities.atomic_state_movement
     assert not contract.capabilities.state_offload
     assert Precision.FLOAT64 in contract.capabilities.precisions
-    flattened = _training_support(
-        contract, ParameterLayout.FLATTENED_ELEMENT_SHARD
-    )
+    flattened = _training_support(contract, ParameterLayout.FLATTENED_ELEMENT_SHARD)
     assert flattened.process_group_scope is ProcessGroupScope.NONE
 
     assert optimizer.state[param] == {"name": "layer.weight"}
@@ -208,9 +207,7 @@ def test_plain_contract_matches_live_persistent_state(factored_v_2d):
     state_dict = optimizer.state_dict()
     common = {
         field.name
-        for field in contract.state_layout.fields_for_scope(
-            StateScope.OPTIMIZER_COMMON
-        )
+        for field in contract.state_layout.fields_for_scope(StateScope.OPTIMIZER_COMMON)
     }
     assert common == {
         "gefen_global_step",
@@ -220,9 +217,7 @@ def test_plain_contract_matches_live_persistent_state(factored_v_2d):
     }
     required_common = {
         field.name
-        for field in contract.state_layout.fields_for_scope(
-            StateScope.OPTIMIZER_COMMON
-        )
+        for field in contract.state_layout.fields_for_scope(StateScope.OPTIMIZER_COMMON)
         if not field.optional
     }
     assert required_common.issubset(state_dict)
@@ -408,9 +403,7 @@ def test_muon_contract_separates_mode_topology_and_state_extent(
 
     common_names = {
         field.name
-        for field in contract.state_layout.fields_for_scope(
-            StateScope.OPTIMIZER_COMMON
-        )
+        for field in contract.state_layout.fields_for_scope(StateScope.OPTIMIZER_COMMON)
     }
     assert "gefen_muon_distributed" not in common_names
     if sharded_mode == "distributed":
@@ -491,12 +484,20 @@ def test_hybrid_contract_preserves_child_namespaces(backup_optimizer):
         assert contract.children[1].implementation == "torch.optim.adamw.AdamW"
         assert contract.children[1].contract is None
     assert contract.state_layout.composite_namespaces == ("muon", "backup")
-    assert not contract.capabilities.explicit_process_group_codebook_scope
+    gefen_backed = backup_optimizer == "gefen"
+    assert contract.capabilities.explicit_process_group_codebook_scope is gefen_backed
+    assert contract.capabilities.shard_rebinding is gefen_backed
+    assert contract.capabilities.post_sharding is gefen_backed
+    assert not contract.capabilities.canonical_state_io
     assert not contract.capabilities.atomic_state_movement
     assert not contract.capabilities.state_offload
-    assert contract.children[0].contract.capabilities.explicit_process_group_codebook_scope
+    assert contract.children[
+        0
+    ].contract.capabilities.explicit_process_group_codebook_scope
     if backup_optimizer == "gefen":
-        assert contract.children[1].contract.capabilities.explicit_process_group_codebook_scope
+        assert contract.children[
+            1
+        ].contract.capabilities.explicit_process_group_codebook_scope
     assert {field.name for field in contract.state_layout.fields} == {
         "backup_optimizer"
     }
@@ -520,7 +521,8 @@ def test_muon_contract_keeps_mixed_normuon_variants_in_one_mode():
         sharded_mode="exact",
     )
     variants = {
-        item.name for item in optimizer.optimizer_contract().state_layout.parameter_variants
+        item.name
+        for item in optimizer.optimizer_contract().state_layout.parameter_variants
     }
     assert "quantized_muon_replicated_exact" in variants
     assert "quantized_normuon_replicated_exact" in variants
@@ -622,9 +624,7 @@ def test_muon_mixed_approx_distributed_checkpoint_is_same_topology_only():
         _DTENSOR,
     )
     assert len(support) == 1
-    assert support[0].required_sharded_modes == frozenset(
-        {"approx", "distributed"}
-    )
+    assert support[0].required_sharded_modes == frozenset({"approx", "distributed"})
     assert not support[0].topology_changing
 
 
@@ -747,6 +747,7 @@ def test_all_public_contract_exports_resolve():
 
     assert all(getattr(gefen, name) is not None for name in contracts.__all__)
     assert gefen.StateMovementProvider is StateMovementProvider
+    assert gefen.StateOffloadProvider is StateOffloadProvider
 
 
 def test_portable_global_transport_is_defined_but_not_claimed_before_integration():

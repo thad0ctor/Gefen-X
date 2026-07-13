@@ -652,6 +652,10 @@ def _validate_optimizer_shell(
         raise RuntimeError("portable state requires inactive capturable stacks")
     if optimizer._gefen_global_step_by_device or optimizer._sr_seed_by_device:
         raise RuntimeError("portable state does not support device-authoritative counters")
+    if optimizer.state_offload_poisoned:
+        raise RuntimeError("portable state does not support poisoned optimizer state")
+    if optimizer.state_offload_active:
+        raise RuntimeError("portable state does not support active optimizer-state offload")
     if torch.compiler.is_compiling():
         raise RuntimeError("portable state cannot run while compiling")
     if torch.cuda.is_available() and torch.cuda.is_current_stream_capturing():
@@ -849,6 +853,8 @@ def _portable_live_token(optimizer):
         optimizer.fused,
         optimizer.verbose,
         optimizer._fused_build_ok,
+        optimizer.state_offload_device,
+        optimizer.state_offload_poisoned,
         id(optimizer._gefen_codebook_process_group),
         _portable_value_token(optimizer._serialized_codebook_scope()),
         id(optimizer._gefen_sharding_manifest),

@@ -133,11 +133,20 @@ def _preflight_dcp_operation(
 ):
     from gefen import portable_runtime as runtime
     from gefen.portable_collective import _collective_unanimous_status
+    from gefen.hybrid import GefenMuonHybrid
 
-    transport = runtime._preflight_transport_binding(
-        optimizer,
-        checkpoint_process_group,
-    )
+    if type(optimizer) is GefenMuonHybrid:
+        from gefen.portable_hybrid import _hybrid_transport_binding
+
+        transport = _hybrid_transport_binding(
+            optimizer,
+            checkpoint_process_group,
+        )
+    else:
+        transport = runtime._preflight_transport_binding(
+            optimizer,
+            checkpoint_process_group,
+        )
     binding = None
     normalized_limits = None
     normalized_transaction = None
@@ -147,32 +156,56 @@ def _preflight_dcp_operation(
     wire_limits = runtime._STATUS_FALLBACK_LIMITS
     error = None
     try:
-        runtime._validate_supplied_binding(checkpoint_process_group, transport)
-        binding = transport
-        normalized_limits = runtime._require_limits(limits)
+        if type(optimizer) is GefenMuonHybrid:
+            from gefen.portable_hybrid import (
+                HYBRID_PORTABLE_STATE_IMPLEMENTATION,
+                _preflight_hybrid_portable_local,
+            )
+
+            (
+                binding,
+                normalized_transaction,
+                normalized_limits,
+                _children,
+                _routing,
+                base_context,
+                _base_digest,
+                _live_token,
+            ) = _preflight_hybrid_portable_local(
+                optimizer,
+                checkpoint_process_group=checkpoint_process_group,
+                transaction_id=transaction_id,
+                limits=limits,
+            )
+            implementation = HYBRID_PORTABLE_STATE_IMPLEMENTATION
+        else:
+            runtime._validate_supplied_binding(checkpoint_process_group, transport)
+            binding = transport
+            normalized_limits = runtime._require_limits(limits)
+            normalized_transaction = runtime._require_transaction_id(transaction_id)
+            implementation = runtime._optimizer_implementation(optimizer)
+            runtime._validate_context_identity_bounds(binding, normalized_limits)
+            prepared = runtime._prepare_local_structure(
+                optimizer,
+                implementation,
+                binding,
+                normalized_limits,
+                include_payload=False,
+            )
+            runtime._validate_prepared_local_state(
+                optimizer,
+                implementation,
+                prepared,
+            )
+            base_context = runtime._base_context(binding, implementation)
         wire_limits = normalized_limits._wire_limits()
-        normalized_transaction = runtime._require_transaction_id(transaction_id)
         normalized_namespace = _require_namespace(namespace, normalized_limits)
         if not isinstance(storage, storage_type):
             raise TypeError("storage must be a {}".format(storage_type.__name__))
         storage_identity = _storage_identity(storage, normalized_limits)
-        implementation = runtime._optimizer_implementation(optimizer)
-        runtime._validate_context_identity_bounds(binding, normalized_limits)
         _validate_dcp_runtime(binding)
-        prepared = runtime._prepare_local_structure(
-            optimizer,
-            implementation,
-            binding,
-            normalized_limits,
-            include_payload=False,
-        )
-        runtime._validate_prepared_local_state(
-            optimizer,
-            implementation,
-            prepared,
-        )
         context = {
-            **runtime._base_context(binding, implementation),
+            **base_context,
             "dcp_envelope_version": 1,
             "dcp_namespace": normalized_namespace,
             "dcp_storage": storage_identity,
@@ -416,7 +449,7 @@ def save_portable_dcp(
     limits,
     namespace="optimizer",
 ):
-    """Collectively save one tensor-only portable v3 document through DCP."""
+    """Collectively save one tensor-only portable optimizer document through DCP."""
 
     import torch.distributed.checkpoint as dcp
     from torch.distributed.checkpoint.storage import StorageWriter
@@ -474,7 +507,7 @@ def load_portable_dcp(
     limits,
     namespace="optimizer",
 ) -> None:
-    """Collectively load, verify, and atomically import portable v3 from DCP."""
+    """Collectively load, verify, and atomically import portable optimizer state."""
 
     import torch.distributed.checkpoint as dcp
     from torch.distributed.checkpoint.storage import StorageReader

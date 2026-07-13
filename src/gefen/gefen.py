@@ -17,6 +17,7 @@ import math
 import os
 import warnings
 from collections import defaultdict, deque, OrderedDict
+from copy import deepcopy
 from itertools import chain
 from typing import Iterable, Optional, Tuple, Union
 
@@ -169,6 +170,7 @@ _STATE_MOVEMENT_METADATA_SEQUENCE_TYPES = (
 
 def _rank_local_payload_key(global_rank: int) -> str:
     return "{}{}".format(_RANK_LOCAL_PAYLOAD_KEY_PREFIX, int(global_rank))
+
 
 # Optional explicit override for the period-search backend ("cuda_kernel" / "cpu"
 # / "gpu"). None (default) means resolve per call from each tensor's own device
@@ -528,9 +530,7 @@ def _gefen_exact_histogram_from_grad_periods(
                         torch.long
                     )
                     bin_indices = bin_indices.clamp(0, histogram_bins - 1)
-                    local_counts = torch.bincount(
-                        bin_indices, minlength=histogram_bins
-                    )
+                    local_counts = torch.bincount(bin_indices, minlength=histogram_bins)
                     bin_counts_cpu.add_(local_counts.cpu())
     finally:
         torch.set_deterministic_debug_mode(prev_mode)
@@ -669,8 +669,9 @@ def _amp_prepare_optimizer_step(optimizer) -> bool:
         if torch.is_tensor(found_inf):
             if found_inf.numel() != 1:
                 raise RuntimeError(
-                    "GradScaler supplied a non-scalar found_inf tensor with "
-                    "shape {}".format(tuple(found_inf.shape))
+                    "GradScaler supplied a non-scalar found_inf tensor with shape {}".format(
+                        tuple(found_inf.shape)
+                    )
                 )
             overflow = bool(found_inf.detach().item())
         else:
@@ -686,8 +687,9 @@ def _amp_prepare_optimizer_step(optimizer) -> bool:
     if torch.is_tensor(grad_scale):
         if grad_scale.numel() != 1:
             raise RuntimeError(
-                "GradScaler supplied a non-scalar grad_scale tensor with shape "
-                "{}".format(tuple(grad_scale.shape))
+                "GradScaler supplied a non-scalar grad_scale tensor with shape {}".format(
+                    tuple(grad_scale.shape)
+                )
             )
         scale = grad_scale.detach()
         # Match torch.amp.GradScaler.unscale_: computing the reciprocal in
@@ -752,8 +754,7 @@ def _amp_dtensor_protocol_preflight(optimizer) -> bool:
 
     params = [param for group in optimizer.param_groups for param in group["params"]]
     has_fp16_storage = any(
-        param.dtype == torch.float16
-        and not getattr(param, "_is_flat_param", False)
+        param.dtype == torch.float16 and not getattr(param, "_is_flat_param", False)
         for param in params
     )
     if not has_fp16_storage:
@@ -777,8 +778,7 @@ def _amp_dtensor_protocol_preflight(optimizer) -> bool:
                 str(mesh.device_type),
                 tuple(int(item) for item in mesh.shape),
                 tuple(
-                    int(item)
-                    for item in mesh.mesh.detach().cpu().reshape(-1).tolist()
+                    int(item) for item in mesh.mesh.detach().cpu().reshape(-1).tolist()
                 ),
                 tuple(str(group.group_name) for group in process_groups),
             )
@@ -793,9 +793,7 @@ def _amp_dtensor_protocol_preflight(optimizer) -> bool:
             name = (
                 names[index]
                 if isinstance(names, (list, tuple)) and index < len(names)
-                else getattr(optimizer, "_param_name", lambda _: "parameter")(
-                    param
-                )
+                else getattr(optimizer, "_param_name", lambda _: "parameter")(param)
             )
             entry["items"].append((str(name), param, param.grad is not None))
 
@@ -931,9 +929,7 @@ def _assert_optimizer_gradients_structurally_valid(
                 else getattr(optimizer, "_param_name", lambda _: "parameter")(param)
             )
             if require_2d_params and param.ndim != 2:
-                error_factory = getattr(
-                    optimizer, "_step_non_2d_parameter_error", None
-                )
+                error_factory = getattr(optimizer, "_step_non_2d_parameter_error", None)
                 if callable(error_factory):
                     raise ValueError(error_factory(param))
                 raise ValueError(
@@ -950,19 +946,17 @@ def _assert_optimizer_gradients_structurally_valid(
                 raise RuntimeError(
                     "Gefen does not support sparse gradients or other "
                     "non-strided layouts; parameter {!r} has gradient layout "
-                    "{}.".format(
-                        str(name), layout
-                    )
+                    "{}.".format(str(name), layout)
                 )
             if torch.is_complex(grad):
                 raise RuntimeError(
-                    "Gefen optimizers do not support complex gradients, but "
-                    "parameter {!r} has dtype {}.".format(str(name), grad.dtype)
+                    "Gefen optimizers do not support complex gradients, but parameter {!r} has dtype {}.".format(
+                        str(name), grad.dtype
+                    )
                 )
             if tuple(grad.shape) != tuple(param.shape):
                 raise RuntimeError(
-                    "Gefen gradient shape {} for parameter {!r} does not match "
-                    "parameter shape {}.".format(
+                    "Gefen gradient shape {} for parameter {!r} does not match parameter shape {}.".format(
                         tuple(grad.shape), str(name), tuple(param.shape)
                     )
                 )
@@ -1088,8 +1082,7 @@ class Gefen(torch.optim.Optimizer):
             )
         if fused and not torch.cuda.is_available():
             warnings.warn(
-                "Gefen optimizer got fused=True, but CUDA is not available. "
-                "Changing fused to False.",
+                "Gefen optimizer got fused=True, but CUDA is not available. Changing fused to False.",
                 UserWarning,
                 stacklevel=2,
             )
@@ -1109,9 +1102,7 @@ class Gefen(torch.optim.Optimizer):
         # partitioning.memory_safe_fallback_period.
         self._force_1d_period_one = force_1d_period_one
         self._force_2d_period_one = force_2d_period_one
-        self._period_one_substrings = tuple(
-            s.lower() for s in period_one_substrings
-        )
+        self._period_one_substrings = tuple(s.lower() for s in period_one_substrings)
         self._factored_v_2d = factored_v_2d
         self._deterministic = deterministic
         if type(codebook_refresh_every) is not int:
@@ -1201,6 +1192,17 @@ class Gefen(torch.optim.Optimizer):
         # one device counter per parameter device and advance it in the captured
         # step tail; state_dict synchronizes the host mirror before serializing.
         self._gefen_global_step_by_device = {}
+        # Native parameter-state offload is an eager, target-local runtime
+        # policy rather than optimizer checkpoint meaning. None keeps the
+        # historical co-located path. A CPU device means declared persistent
+        # per-parameter tensors are CPU-authoritative between steps while the
+        # small optimizer-common codebook remains resident/cached normally.
+        self._gefen_state_offload_device = None
+        # A failed CUDA-to-CPU copyback can leave a parameter updated while its
+        # last published CPU state is stale. Preserve that diagnosis across
+        # restore/movement and reject later steps until a successful load
+        # establishes a complete known-good state again.
+        self._gefen_state_offload_poisoned = False
 
         defaults = dict(
             lr=lr,
@@ -1255,9 +1257,13 @@ class Gefen(torch.optim.Optimizer):
             canonical_global_same_topology = _portable_runtime_layouts(self)
         except Exception:
             canonical_global_same_topology = frozenset()
-        has_factored_matrix = canonical_global_same_topology and self._factored_v_2d and any(
-            len(slot.shard.parameter.global_shape) == 2
-            for slot in self._gefen_logical_slots
+        has_factored_matrix = (
+            canonical_global_same_topology
+            and self._factored_v_2d
+            and any(
+                len(slot.shard.parameter.global_shape) == 2
+                for slot in self._gefen_logical_slots
+            )
         )
         if canonical_global_same_topology and not has_factored_matrix:
             canonical_global_topology_changing = frozenset(
@@ -1282,6 +1288,7 @@ class Gefen(torch.optim.Optimizer):
             canonical_global_topology_changing=canonical_global_topology_changing,
             canonical_global_topology_change_kinds=canonical_global_topology_change_kinds,
             atomic_state_movement=self._atomic_state_movement_supported(),
+            state_offload=self._state_offload_supported(),
             native_flattened_checkpoint=(
                 self._codebook_scope_ready()
                 and any(
@@ -1317,6 +1324,8 @@ class Gefen(torch.optim.Optimizer):
         }
 
     def _canonical_state_layouts(self):
+        if self.state_offload_poisoned:
+            return frozenset()
         if not self._canonical_identity_ready():
             return frozenset()
         if self._stochastic_round:
@@ -1389,9 +1398,7 @@ class Gefen(torch.optim.Optimizer):
                     )
                 except (TypeError, ValueError, RuntimeError):
                     return frozenset()
-        return frozenset(
-            shard.layout for _, shard in self._gefen_local_shard_bindings
-        )
+        return frozenset(shard.layout for _, shard in self._gefen_local_shard_bindings)
 
     def _codebook_scope_ready(self) -> bool:
         return (
@@ -1500,9 +1507,7 @@ class Gefen(torch.optim.Optimizer):
                 live_group = []
                 name_group = []
                 for logical_slot in logical_group:
-                    parameter, shard = local_bindings[
-                        logical_slot.shard.parameter.fqn
-                    ]
+                    parameter, shard = local_bindings[logical_slot.shard.parameter.fqn]
                     if shard != logical_slot.shard:
                         return False
                     pruned = (
@@ -1538,9 +1543,7 @@ class Gefen(torch.optim.Optimizer):
 
             if len(self._param_names) != len(expected_live_bindings):
                 return False
-            if {
-                id(parameter) for parameter in self._param_names
-            } != expected_live_ids:
+            if {id(parameter) for parameter in self._param_names} != expected_live_ids:
                 return False
             for group_index, (group, expected_params, expected_names) in enumerate(
                 zip(self.param_groups, expected_live_groups, expected_name_groups)
@@ -1588,7 +1591,10 @@ class Gefen(torch.optim.Optimizer):
             return False
 
     def _assert_finalized_binding_layout(self) -> None:
-        if self._gefen_post_sharding_finalized and not self._finalized_binding_layout_matches():
+        if (
+            self._gefen_post_sharding_finalized
+            and not self._finalized_binding_layout_matches()
+        ):
             raise RuntimeError(
                 "Gefen finalized parameter layout changed outside post_sharding"
             )
@@ -1795,9 +1801,7 @@ class Gefen(torch.optim.Optimizer):
                 )
             placements = []
             for placement_record in record["placements"]:
-                if not isinstance(placement_record, dict) or set(
-                    placement_record
-                ) != {
+                if not isinstance(placement_record, dict) or set(placement_record) != {
                     "mesh_axis",
                     "kind",
                     "coordinate",
@@ -1817,9 +1821,7 @@ class Gefen(torch.optim.Optimizer):
             shard = ShardIdentity(
                 parameter,
                 ParameterLayout(record["layout"]),
-                LogicalSlice(
-                    slice_record["flat_offset"], slice_record["length"]
-                ),
+                LogicalSlice(slice_record["flat_offset"], slice_record["length"]),
                 process_group=process_group,
                 local_member=record["local_member"],
                 owner=record["owner"],
@@ -1901,9 +1903,7 @@ class Gefen(torch.optim.Optimizer):
             "placements",
         }
         if not isinstance(record, dict) or set(record) != expected:
-            raise ValueError(
-                "Gefen native local-shard metadata has an invalid schema"
-            )
+            raise ValueError("Gefen native local-shard metadata has an invalid schema")
         group_record = record["process_group"]
         if not isinstance(group_record, dict) or set(group_record) != {
             "semantic_name",
@@ -1913,9 +1913,7 @@ class Gefen(torch.optim.Optimizer):
                 "Gefen native local-shard process-group metadata is invalid"
             )
         if not isinstance(group_record["ordered_members"], list):
-            raise ValueError(
-                "Gefen native local-shard ordered_members must be a list"
-            )
+            raise ValueError("Gefen native local-shard ordered_members must be a list")
         if not isinstance(record["global_shape"], list) or not isinstance(
             record["placements"], list
         ):
@@ -1923,18 +1921,14 @@ class Gefen(torch.optim.Optimizer):
                 "Gefen native local-shard shapes and placements must be lists"
             )
         try:
-            parameter = ParameterIdentity(
-                record["fqn"], tuple(record["global_shape"])
-            )
+            parameter = ParameterIdentity(record["fqn"], tuple(record["global_shape"]))
             group = ProcessGroupIdentity(
                 group_record["semantic_name"],
                 tuple(group_record["ordered_members"]),
             )
             placements = []
             for placement_record in record["placements"]:
-                if not isinstance(placement_record, dict) or set(
-                    placement_record
-                ) != {
+                if not isinstance(placement_record, dict) or set(placement_record) != {
                     "mesh_axis",
                     "kind",
                     "coordinate",
@@ -1961,9 +1955,7 @@ class Gefen(torch.optim.Optimizer):
                 placements=tuple(placements),
             )
         except (TypeError, ValueError) as exc:
-            raise ValueError(
-                "Gefen native local-shard metadata is invalid"
-            ) from exc
+            raise ValueError("Gefen native local-shard metadata is invalid") from exc
         if shard.layout not in {
             ParameterLayout.REPLICATED,
             ParameterLayout.FLATTENED_ELEMENT_SHARD,
@@ -1981,9 +1973,7 @@ class Gefen(torch.optim.Optimizer):
             "param_groups",
             "pruned_shards",
         }:
-            raise ValueError(
-                "Gefen native local-shard metadata has an invalid schema"
-            )
+            raise ValueError("Gefen native local-shard metadata has an invalid schema")
         format_version = value["format_version"]
         if (
             type(format_version) is not int
@@ -2035,9 +2025,7 @@ class Gefen(torch.optim.Optimizer):
             "format_version",
             "logical_slots",
         }:
-            raise ValueError(
-                "Gefen native local-shard metadata has an invalid schema"
-            )
+            raise ValueError("Gefen native local-shard metadata has an invalid schema")
         format_version = value["format_version"]
         if (
             type(format_version) is not int
@@ -2136,9 +2124,7 @@ class Gefen(torch.optim.Optimizer):
         if value is None:
             return None
         if type(value) is not dict or "format_version" not in value:
-            raise ValueError(
-                "Gefen native local-shard metadata has an invalid schema"
-            )
+            raise ValueError("Gefen native local-shard metadata has an invalid schema")
         format_version = value["format_version"]
         if type(format_version) is not int:
             raise ValueError(
@@ -2215,6 +2201,10 @@ class Gefen(torch.optim.Optimizer):
     def _assert_rebinding_pristine(self, rebindings) -> None:
         if self._gefen_post_sharding_finalized:
             raise RuntimeError("Gefen post-sharding identity is already finalized")
+        if self.state_offload_active or self.state_offload_poisoned:
+            raise RuntimeError(
+                "Gefen parameter rebinding requires resident known-good state; restore state first"
+            )
         if (
             self._gefen_shard_bindings
             or self._gefen_local_shard_bindings
@@ -2325,8 +2315,7 @@ class Gefen(torch.optim.Optimizer):
                 )
         else:
             raise ValueError(
-                "plain Gefen rebinding supports replicated or flattened element "
-                "shards only"
+                "plain Gefen rebinding supports replicated or flattened element shards only"
             )
         if target.numel() != shard.logical_slice.length:
             raise ValueError(
@@ -2366,8 +2355,7 @@ class Gefen(torch.optim.Optimizer):
                 ParameterLayout.WHOLE_PARAMETER_OWNER,
             }:
                 raise ValueError(
-                    "explicit codebook scope supports replicated, flattened, or "
-                    "whole-parameter owner identities"
+                    "explicit codebook scope supports replicated, flattened, or whole-parameter owner identities"
                 )
 
         self._validate_codebook_runtime_binding(binding)
@@ -2390,7 +2378,10 @@ class Gefen(torch.optim.Optimizer):
             raise ValueError(
                 "a multi-member codebook scope requires an explicit runtime process group"
             )
-        if not torch.distributed.is_available() or not torch.distributed.is_initialized():
+        if (
+            not torch.distributed.is_available()
+            or not torch.distributed.is_initialized()
+        ):
             raise RuntimeError(
                 "a multi-member codebook scope requires initialized torch.distributed"
             )
@@ -2398,9 +2389,7 @@ class Gefen(torch.optim.Optimizer):
 
         try:
             world = dist.get_world_size(binding.process_group)
-            group_rank = dist.get_group_rank(
-                binding.process_group, dist.get_rank()
-            )
+            group_rank = dist.get_group_rank(binding.process_group, dist.get_rank())
             backend = dist.get_backend(binding.process_group)
         except Exception as exc:
             raise ValueError(
@@ -2451,9 +2440,7 @@ class Gefen(torch.optim.Optimizer):
             return shard.local_member == binding.identity.ordered_members[0]
         return True
 
-    def _stage_post_sharding(
-        self, rebindings, manifest, codebook_process_group=None
-    ):
+    def _stage_post_sharding(self, rebindings, manifest, codebook_process_group=None):
         self._assert_rebinding_pristine(rebindings)
         live_slots = []
         for group_index, group in enumerate(self.param_groups):
@@ -2462,17 +2449,13 @@ class Gefen(torch.optim.Optimizer):
             if len(names) != len(params):
                 names = [self._param_name(param) for param in params]
             for parameter_index, (parameter, name) in enumerate(zip(params, names)):
-                live_slots.append(
-                    (group_index, parameter_index, parameter, str(name))
-                )
+                live_slots.append((group_index, parameter_index, parameter, str(name)))
         if len(rebindings) != len(live_slots):
             raise ValueError(
                 "post_sharding requires exactly one rebinding for every optimizer slot"
             )
 
-        manifest_fqns = {
-            shard.parameter.fqn for shard in manifest.shards
-        }
+        manifest_fqns = {shard.parameter.fqn for shard in manifest.shards}
         local_fqns = [item.shard.parameter.fqn for item in rebindings]
         if len(set(local_fqns)) != len(local_fqns):
             raise ValueError("local canonical parameter FQNs must be unique")
@@ -2507,11 +2490,12 @@ class Gefen(torch.optim.Optimizer):
                     raise TypeError("rebinding target must be a Tensor or None")
                 if self._is_dtensor_parameter(target):
                     raise ValueError(
-                        "stable DTensor rebinding requires the deferred logical-region "
-                        "identity schema"
+                        "stable DTensor rebinding requires the deferred logical-region identity schema"
                     )
                 if torch.is_complex(target):
-                    raise ValueError("Gefen does not support complex rebound parameters")
+                    raise ValueError(
+                        "Gefen does not support complex rebound parameters"
+                    )
                 if target.layout is not torch.strided or target.dtype not in (
                     torch.float16,
                     torch.bfloat16,
@@ -2524,8 +2508,7 @@ class Gefen(torch.optim.Optimizer):
                 if target.is_meta:
                     raise ValueError("rebound parameters require materialized storage")
                 if (
-                    rebinding.shard.layout
-                    is ParameterLayout.FLATTENED_ELEMENT_SHARD
+                    rebinding.shard.layout is ParameterLayout.FLATTENED_ELEMENT_SHARD
                     and not target.is_contiguous()
                 ):
                     raise ValueError(
@@ -2533,8 +2516,7 @@ class Gefen(torch.optim.Optimizer):
                     )
                 if self._target_may_have_internal_storage_overlap(target):
                     raise ValueError(
-                        "rebound target storage must be provably free of internal "
-                        "storage overlap"
+                        "rebound target storage must be provably free of internal storage overlap"
                     )
                 if not target.is_leaf and not target.retains_grad:
                     raise ValueError("can't optimize a non-leaf rebound Tensor")
@@ -2565,9 +2547,7 @@ class Gefen(torch.optim.Optimizer):
             target_positions = []
             if target is not None:
                 target_positions = [
-                    index
-                    for index, slot in enumerate(live_slots)
-                    if slot[2] is target
+                    index for index, slot in enumerate(live_slots) if slot[2] is target
                 ]
             if len(source_positions) == 1:
                 position = source_positions[0]
@@ -2708,9 +2688,7 @@ class Gefen(torch.optim.Optimizer):
             if self._parameter_in(sources, rebinding.old_parameter):
                 raise ValueError("rebinding source tensors must be unique")
             sources.append(rebinding.old_parameter)
-        staged = self._stage_post_sharding(
-            rebindings, manifest, codebook_process_group
-        )
+        staged = self._stage_post_sharding(rebindings, manifest, codebook_process_group)
         self.__dict__.update(staged.__dict__)
 
     def rebind_shard(
@@ -2755,10 +2733,7 @@ class Gefen(torch.optim.Optimizer):
         if value is None or value_type in _STATE_MOVEMENT_METADATA_LEAF_TYPES:
             return True
         is_mapping = value_type in _STATE_MOVEMENT_METADATA_MAPPING_TYPES
-        if (
-            not is_mapping
-            and value_type not in _STATE_MOVEMENT_METADATA_SEQUENCE_TYPES
-        ):
+        if not is_mapping and value_type not in _STATE_MOVEMENT_METADATA_SEQUENCE_TYPES:
             return False
         if seen is None:
             seen = set()
@@ -2774,24 +2749,464 @@ class Gefen(torch.optim.Optimizer):
                 for key, item in items
             )
         return all(
-            Gefen._state_value_is_movement_safe_metadata(item, seen)
-            for item in items
+            Gefen._state_value_is_movement_safe_metadata(item, seen) for item in items
         )
 
     @staticmethod
     def _state_movement_tensor_supported(value) -> bool:
         return (
             type(value) is torch.Tensor
-            and not (
-                hasattr(value, "to_local")
-                and hasattr(value, "placements")
-            )
+            and not (hasattr(value, "to_local") and hasattr(value, "placements"))
             and value.layout is torch.strided
             and not value.is_nested
             and not value.is_quantized
             and getattr(value, "fake_mode", None) is None
             and value.device.type in _STATE_MOVEMENT_DEVICE_TYPES
         )
+
+    @property
+    def state_offload_active(self) -> bool:
+        """Whether native parameter-state CPU offload is currently enabled."""
+
+        return getattr(self, "_gefen_state_offload_device", None) is not None
+
+    @property
+    def state_offload_device(self):
+        """Return the active state-offload device, or ``None`` when disabled."""
+
+        return getattr(self, "_gefen_state_offload_device", None)
+
+    @property
+    def state_offload_poisoned(self) -> bool:
+        """Whether a failed copyback made further stepping unsafe."""
+
+        return bool(getattr(self, "_gefen_state_offload_poisoned", False))
+
+    def _assert_state_export_safe(self) -> None:
+        if self.state_offload_poisoned:
+            raise RuntimeError(
+                "Gefen cannot export optimizer state after a failed state-offload copyback; "
+                "load a known-good checkpoint first"
+            )
+
+    @staticmethod
+    def _state_offload_parameter_supported(parameter) -> bool:
+        return (
+            type(parameter) in {torch.Tensor, nn.Parameter}
+            and not (
+                hasattr(parameter, "to_local") and hasattr(parameter, "placements")
+            )
+            and parameter.layout is torch.strided
+            and parameter.device.type == "cuda"
+            and parameter.dtype
+            in {torch.float16, torch.bfloat16, torch.float32, torch.float64}
+            and not torch.is_complex(parameter)
+            and not parameter.is_meta
+            and not parameter.is_nested
+            and not parameter.is_quantized
+            and getattr(parameter, "fake_mode", None) is None
+        )
+
+    @classmethod
+    def _state_offload_cpu_tensor_supported(cls, value) -> bool:
+        return (
+            cls._state_movement_tensor_supported(value)
+            and value.device.type == "cpu"
+            and not value.requires_grad
+            and value.is_contiguous()
+            and value.storage_offset() == 0
+            and value.untyped_storage().nbytes() == value.numel() * value.element_size()
+        )
+
+    @classmethod
+    def _state_offload_storage_disjoint(cls, parameters, state, codebook) -> bool:
+        """Conservatively reject aliases that parameter-scoped paging cannot preserve."""
+
+        tensors = [("parameter", parameter) for parameter in parameters]
+        if torch.is_tensor(codebook):
+            tensors.append(("common_state", codebook))
+        for parameter_state in state.values():
+            for key, value in parameter_state.items():
+                if key in _STATE_MOVEMENT_TENSOR_KEYS and torch.is_tensor(value):
+                    tensors.append(("parameter_state", value))
+
+        storage_ranges = []
+        try:
+            for kind, tensor in tensors:
+                if tensor.numel() == 0:
+                    continue
+                if (
+                    kind != "parameter"
+                    and cls._target_may_have_internal_storage_overlap(tensor)
+                ):
+                    return False
+                storage = tensor.untyped_storage()
+                storage_id = (str(tensor.device), storage.data_ptr())
+                if tensor.is_contiguous():
+                    start = tensor.storage_offset() * tensor.element_size()
+                    end = start + tensor.numel() * tensor.element_size()
+                else:
+                    start = end = None
+                for other_kind, other_id, other_start, other_end in storage_ranges:
+                    if other_id != storage_id or (kind == other_kind == "parameter"):
+                        continue
+                    if (
+                        start is None
+                        or other_start is None
+                        or max(start, other_start) < min(end, other_end)
+                    ):
+                        return False
+                storage_ranges.append((kind, storage_id, start, end))
+        except Exception:
+            return False
+        return True
+
+    @staticmethod
+    def _state_offload_capturing_on_parameter_device(parameters) -> bool:
+        if torch.cuda.is_available() and torch.cuda.is_current_stream_capturing():
+            return True
+        devices = {
+            parameter.device
+            for parameter in parameters
+            if torch.is_tensor(parameter) and parameter.device.type == "cuda"
+        }
+        devices = sorted(
+            devices,
+            key=lambda device: -1 if device.index is None else device.index,
+        )
+        for device in devices:
+            with torch.cuda.device(device):
+                if torch.cuda.is_current_stream_capturing():
+                    return True
+        return False
+
+    def _state_offload_rejection_reason(
+        self, *, require_cpu_state: bool, allow_poisoned: bool = False
+    ):
+        if type(self) is not Gefen:
+            return "native state offload is implemented only by plain Gefen"
+        if self.state_offload_active and self.state_offload_device != torch.device(
+            "cpu"
+        ):
+            return "the active state-offload policy has an invalid device"
+        if self.state_offload_poisoned and not allow_poisoned:
+            return "a previous state copyback failed; load a known-good checkpoint"
+        scope = self._gefen_codebook_process_group
+        if scope is not None:
+            if type(scope) is not CodebookProcessGroupBinding:
+                return "the explicit codebook process-group binding is invalid"
+            if len(scope.identity.ordered_members) > 1:
+                return "state offload does not support multi-member explicit codebook scopes"
+        if self.capturable:
+            return "capturable optimizers have device-authoritative replay state"
+        try:
+            parameters = [
+                parameter
+                for group in self.param_groups
+                for parameter in group["params"]
+            ]
+        except (KeyError, TypeError):
+            return "parameter groups have an invalid structure"
+        if torch.compiler.is_compiling():
+            return "state offload cannot run during torch.compile"
+        if torch.cuda.is_available():
+            try:
+                if self._state_offload_capturing_on_parameter_device(parameters):
+                    return "state offload cannot run during CUDA graph capture"
+            except RuntimeError:
+                return "the CUDA graph-capture state could not be inspected"
+
+        movement_reason = self._state_movement_rejection_reason()
+        if movement_reason is not None:
+            return movement_reason
+
+        if not parameters:
+            return "state offload requires at least one CUDA parameter"
+        if any(
+            not self._state_offload_parameter_supported(parameter)
+            for parameter in parameters
+        ):
+            return "state offload requires ordinary replicated CUDA parameters"
+
+        if self._gefen_post_sharding_finalized:
+            if len(self._gefen_local_shard_bindings) != len(parameters):
+                return "the finalized local shard registry is incomplete"
+            if any(
+                parameter is None or shard.layout is not ParameterLayout.REPLICATED
+                for parameter, shard in self._gefen_local_shard_bindings
+            ):
+                return "state offload supports only finalized replicated layouts"
+
+        state_type = type(self.state)
+        if not (
+            state_type is dict
+            or (state_type is defaultdict and self.state.default_factory is dict)
+        ):
+            return "optimizer state must use a supported standard mapping"
+        if set(self.state) != set(parameters):
+            return "state offload requires exactly one state entry per live parameter"
+
+        allowed_keys = (
+            _CANONICAL_PARAMETER_STATE_KEYS | _CANONICAL_DERIVED_PARAMETER_STATE_KEYS
+        )
+        for parameter in parameters:
+            parameter_state = self.state.get(parameter)
+            if type(parameter_state) is not dict:
+                return "per-parameter optimizer state must use a plain dictionary"
+            if any(key not in allowed_keys for key in parameter_state):
+                return "state offload does not support custom per-parameter state"
+            if require_cpu_state and any(
+                key in _STATE_MOVEMENT_SCRATCH_KEYS for key in parameter_state
+            ):
+                return "offloaded state contains device-side runtime scratch"
+            for key, value in parameter_state.items():
+                if key in _STATE_MOVEMENT_COUNTER_KEYS:
+                    if type(value) is not int:
+                        return (
+                            "noncapturable offloaded counters must be Python integers"
+                        )
+                    continue
+                if key not in _STATE_MOVEMENT_TENSOR_KEYS:
+                    continue
+                if not torch.is_tensor(value):
+                    return "authoritative offloaded state has an invalid value"
+                if require_cpu_state:
+                    if not self._state_offload_cpu_tensor_supported(value):
+                        return (
+                            "authoritative offloaded tensors must be tight CPU tensors"
+                        )
+                elif not self._state_movement_tensor_supported(value):
+                    return (
+                        "authoritative tensor state has an unsupported representation"
+                    )
+
+        if not self._state_offload_storage_disjoint(
+            parameters,
+            self.state,
+            self._gefen_codebook,
+        ):
+            return "persistent optimizer-state storage aliases another live tensor"
+
+        try:
+            self._validate_loaded_native_state()
+        except Exception:
+            return "optimizer state does not match Gefen's declared native schema"
+        if (
+            require_cpu_state
+            and self._gefen_codebook is not None
+            and self._gefen_codebook.device.type != "cuda"
+        ):
+            return "the optimizer-common codebook must remain CUDA-resident"
+        return None
+
+    def _state_offload_supported(self) -> bool:
+        """Return whether this live optimizer can safely enter or retain offload."""
+
+        try:
+            reason = self._state_offload_rejection_reason(
+                require_cpu_state=self.state_offload_active
+            )
+        except Exception:
+            return False
+        return reason is None
+
+    @staticmethod
+    def _normalize_state_offload_target(device) -> torch.device:
+        try:
+            target = torch.device(device)
+        except (TypeError, RuntimeError) as exc:
+            raise TypeError("state offload device must be CPU") from exc
+        if target.type != "cpu":
+            raise ValueError("Gefen native state offload currently supports only CPU")
+        return torch.device("cpu")
+
+    def _copy_state_tensor_to_offload_cpu(self, tensor: torch.Tensor) -> torch.Tensor:
+        return self._copy_state_tensor_for_move(tensor, torch.device("cpu"))
+
+    def _stage_state_offload_resident_codebook(self):
+        codebook = self._gefen_codebook
+        if codebook is None or codebook.device.type == "cuda":
+            return codebook
+        parameter = next(
+            parameter for group in self.param_groups for parameter in group["params"]
+        )
+        target = parameter.device
+        staged = self._copy_state_tensor_for_move(codebook, target)
+        self._validate_staged_state_tensor(codebook, staged, target)
+        torch.cuda.synchronize(target)
+        return staged
+
+    def _prepare_offloaded_cpu_parameter_state(self, parameter_state):
+        if type(parameter_state) is not dict:
+            raise RuntimeError("offloaded runtime state must use a plain dictionary")
+        result = {}
+        cuda_devices = set()
+        allowed_keys = (
+            _CANONICAL_PARAMETER_STATE_KEYS | _CANONICAL_DERIVED_PARAMETER_STATE_KEYS
+        )
+        for key, value in parameter_state.items():
+            if key not in allowed_keys:
+                raise RuntimeError(
+                    "offloaded stepping produced unsupported state key {!r}".format(key)
+                )
+            if key in _STATE_MOVEMENT_SCRATCH_KEYS:
+                continue
+            if key in _STATE_MOVEMENT_CAPTURABLE_KEYS:
+                raise RuntimeError(
+                    "offloaded stepping produced capturable runtime state"
+                )
+            if key in _STATE_MOVEMENT_COUNTER_KEYS:
+                if type(value) is not int:
+                    raise RuntimeError(
+                        "offloaded stepping produced a device-authoritative counter"
+                    )
+                result[key] = value
+                continue
+            if key in _STATE_MOVEMENT_TENSOR_KEYS:
+                if not self._state_movement_tensor_supported(value):
+                    raise RuntimeError(
+                        "offloaded stepping produced unsupported tensor state"
+                    )
+                staged = self._copy_state_tensor_to_offload_cpu(value)
+                self._validate_staged_state_tensor(value, staged, torch.device("cpu"))
+                result[key] = staged
+                if value.device.type == "cuda":
+                    cuda_devices.add(value.device)
+                continue
+            result[key] = value
+
+        for cuda_device in sorted(
+            cuda_devices, key=lambda item: -1 if item.index is None else item.index
+        ):
+            torch.cuda.synchronize(cuda_device)
+        return result
+
+    def _stage_all_parameter_state_to_cpu(self):
+        staged_state = defaultdict(dict)
+        for parameter, parameter_state in self.state.items():
+            staged_state[parameter] = self._prepare_offloaded_cpu_parameter_state(
+                parameter_state
+            )
+        return staged_state
+
+    def _stage_offloaded_parameter_state(self, parameter):
+        cpu_state = self.state[parameter]
+        if type(cpu_state) is not dict:
+            raise RuntimeError("offloaded parameter state must use a plain dictionary")
+        target = parameter.device
+        runtime_state = {}
+        for key, value in cpu_state.items():
+            if key in _STATE_MOVEMENT_COUNTER_KEYS:
+                if type(value) is not int:
+                    raise RuntimeError(
+                        "offloaded parameter counters must remain Python integers"
+                    )
+                runtime_state[key] = value
+            elif key in _STATE_MOVEMENT_TENSOR_KEYS:
+                if not self._state_offload_cpu_tensor_supported(value):
+                    raise RuntimeError(
+                        "offloaded parameter tensors must remain tight CPU tensors"
+                    )
+                staged = self._copy_state_tensor_for_move(value, target)
+                self._validate_staged_state_tensor(value, staged, target)
+                runtime_state[key] = staged
+            else:
+                runtime_state[key] = value
+        torch.cuda.synchronize(target)
+        return runtime_state
+
+    def _step_with_offloaded_parameter_state(
+        self, update, group, param_name, parameter, grad
+    ) -> None:
+        runtime_state = self._stage_offloaded_parameter_state(parameter)
+        try:
+            update(group, param_name, parameter, grad, state=runtime_state)
+        except BaseException as operation_error:
+            try:
+                cpu_state = self._prepare_offloaded_cpu_parameter_state(runtime_state)
+            except BaseException as copyback_error:
+                self._gefen_state_offload_poisoned = True
+                if hasattr(operation_error, "add_note"):
+                    operation_error.add_note(
+                        "Gefen state copyback also failed; the optimizer is poisoned"
+                    )
+                raise operation_error from copyback_error
+            self.state[parameter] = cpu_state
+            raise
+
+        try:
+            cpu_state = self._prepare_offloaded_cpu_parameter_state(runtime_state)
+        except BaseException as exc:
+            self._gefen_state_offload_poisoned = True
+            raise RuntimeError(
+                "Gefen state copyback failed after a parameter update; load a "
+                "known-good checkpoint before stepping again"
+            ) from exc
+        self.state[parameter] = cpu_state
+
+    def _assert_state_offload_step_ready(self) -> None:
+        if self.state_offload_poisoned:
+            raise RuntimeError(
+                "Gefen state offload is poisoned after a failed copyback; load a "
+                "known-good checkpoint before stepping again"
+            )
+        if not self.state_offload_active:
+            return
+        reason = self._state_offload_rejection_reason(require_cpu_state=True)
+        if reason is not None:
+            raise RuntimeError("Gefen state offload cannot step: {}".format(reason))
+
+    @torch.no_grad()
+    def offload_state_(self, device="cpu") -> None:
+        """Atomically enable synchronous CPU-authoritative parameter state."""
+
+        target = self._normalize_state_offload_target(device)
+        self._assert_finalized_binding_layout()
+        reason = self._state_offload_rejection_reason(require_cpu_state=False)
+        if reason is not None:
+            raise RuntimeError("Gefen state offload is unavailable: {}".format(reason))
+        staged_state = self._stage_all_parameter_state_to_cpu()
+        staged_codebook = self._stage_state_offload_resident_codebook()
+        updates = {
+            "state": staged_state,
+            "_gefen_state_offload_device": target,
+            "_static_mark_sig": None,
+            "_lr_scalar_cache": None,
+        }
+        if staged_codebook is not self._gefen_codebook:
+            updates.update(
+                {
+                    "_gefen_codebook": staged_codebook,
+                    "_gefen_codebook_by_device": {},
+                    "_gefen_codebook_lut_by_device": {},
+                    "_gefen_codebook_scope_validated": False,
+                }
+            )
+        self.__dict__.update(updates)
+
+    @torch.no_grad()
+    def restore_state_(self) -> None:
+        """Atomically co-locate parameter state and disable native offload."""
+
+        if not self.state_offload_active:
+            return
+        parameters = [
+            parameter for group in self.param_groups for parameter in group["params"]
+        ]
+        if torch.cuda.is_available():
+            try:
+                capturing = self._state_offload_capturing_on_parameter_device(
+                    parameters
+                )
+            except RuntimeError as exc:
+                raise RuntimeError(
+                    "Gefen state restore could not inspect CUDA graph-capture state"
+                ) from exc
+            if capturing:
+                raise RuntimeError(
+                    "Gefen state restore cannot run during CUDA graph capture"
+                )
+        self.move_state_()
 
     def _state_movement_rejection_reason(self):
         if (
@@ -2827,10 +3242,7 @@ class Gefen(torch.optim.Optimizer):
         state_type = type(self.state)
         if not (
             state_type is dict
-            or (
-                state_type is defaultdict
-                and self.state.default_factory is dict
-            )
+            or (state_type is defaultdict and self.state.default_factory is dict)
         ):
             return "optimizer state must use a supported standard mapping"
         for parameter, parameter_state in self.state.items():
@@ -2855,7 +3267,10 @@ class Gefen(torch.optim.Optimizer):
                     if torch.is_tensor(value):
                         if not self._state_movement_tensor_supported(value):
                             return "authoritative tensor state has an unsupported representation"
-                    elif key not in _STATE_MOVEMENT_COUNTER_KEYS or type(value) is not int:
+                    elif (
+                        key not in _STATE_MOVEMENT_COUNTER_KEYS
+                        or type(value) is not int
+                    ):
                         return "authoritative tensor state has an invalid value"
                     continue
                 if isinstance(key, str) and key.startswith(
@@ -2865,7 +3280,9 @@ class Gefen(torch.optim.Optimizer):
                         if not self._state_movement_tensor_supported(value):
                             return "rank-local transport state has an unsupported representation"
                     elif not self._state_value_is_movement_safe_metadata(value):
-                        return "rank-local transport state contains unsupported metadata"
+                        return (
+                            "rank-local transport state contains unsupported metadata"
+                        )
                     continue
                 if not self._state_value_is_movement_safe_metadata(value):
                     return "undeclared optimizer state is not provably tensor-free metadata"
@@ -2886,7 +3303,12 @@ class Gefen(torch.optim.Optimizer):
             return False
         if torch.cuda.is_available():
             try:
-                if torch.cuda.is_current_stream_capturing():
+                parameters = [
+                    parameter
+                    for group in self.param_groups
+                    for parameter in group["params"]
+                ]
+                if self._state_offload_capturing_on_parameter_device(parameters):
                     return False
             except RuntimeError:
                 return False
@@ -2923,7 +3345,9 @@ class Gefen(torch.optim.Optimizer):
             target = torch.device("cpu")
         else:
             if not torch.cuda.is_available():
-                raise ValueError("CUDA state movement requires an available CUDA device")
+                raise ValueError(
+                    "CUDA state movement requires an available CUDA device"
+                )
             if target.index is None:
                 unique_devices = set(live_devices)
                 if len(unique_devices) != 1:
@@ -2932,10 +3356,14 @@ class Gefen(torch.optim.Optimizer):
                     )
                 candidate = next(iter(unique_devices))
                 if candidate.type != "cuda":
-                    raise ValueError("CUDA state movement requires CUDA-resident parameters")
+                    raise ValueError(
+                        "CUDA state movement requires CUDA-resident parameters"
+                    )
                 target = candidate
             if target.index < 0 or target.index >= torch.cuda.device_count():
-                raise ValueError("CUDA state movement target is not an available device")
+                raise ValueError(
+                    "CUDA state movement target is not an available device"
+                )
 
         if not live_devices:
             if target.type != "cpu":
@@ -2944,8 +3372,9 @@ class Gefen(torch.optim.Optimizer):
                 )
         elif any(parameter_device != target for parameter_device in live_devices):
             raise ValueError(
-                "explicit state movement requires every live parameter to already be "
-                "co-located on {}".format(target)
+                "explicit state movement requires every live parameter to already be co-located on {}".format(
+                    target
+                )
             )
         return target
 
@@ -2981,12 +3410,11 @@ class Gefen(torch.optim.Optimizer):
 
     def _stage_state_move(self, device):
         live_parameters = [
-            parameter
-            for group in self.param_groups
-            for parameter in group["params"]
+            parameter for group in self.param_groups for parameter in group["params"]
         ]
         live_devices = [
-            self._state_move_parameter_device(parameter) for parameter in live_parameters
+            self._state_move_parameter_device(parameter)
+            for parameter in live_parameters
         ]
         live_parameter_ids = {id(parameter) for parameter in live_parameters}
         explicit_target = (
@@ -3054,11 +3482,29 @@ class Gefen(torch.optim.Optimizer):
                 "Gefen atomic state movement could not inspect live optimizer state"
             ) from exc
         if reason is not None:
-            raise RuntimeError("Gefen atomic state movement is unavailable: {}".format(reason))
+            raise RuntimeError(
+                "Gefen atomic state movement is unavailable: {}".format(reason)
+            )
         if torch.compiler.is_compiling():
             raise RuntimeError("Gefen state movement cannot run during torch.compile")
-        if torch.cuda.is_available() and torch.cuda.is_current_stream_capturing():
-            raise RuntimeError("Gefen state movement cannot run during CUDA graph capture")
+        if torch.cuda.is_available():
+            parameters = [
+                parameter
+                for group in self.param_groups
+                for parameter in group["params"]
+            ]
+            try:
+                capturing = self._state_offload_capturing_on_parameter_device(
+                    parameters
+                )
+            except RuntimeError as exc:
+                raise RuntimeError(
+                    "Gefen state movement could not inspect CUDA graph-capture state"
+                ) from exc
+            if capturing:
+                raise RuntimeError(
+                    "Gefen state movement cannot run during CUDA graph capture"
+                )
 
         staged_state, staged_codebook = self._stage_state_move(device)
         self.__dict__.update(
@@ -3070,6 +3516,7 @@ class Gefen(torch.optim.Optimizer):
                 "_gefen_codebook_scope_validated": False,
                 "_static_mark_sig": None,
                 "_lr_scalar_cache": None,
+                "_gefen_state_offload_device": None,
             }
         )
 
@@ -3094,13 +3541,9 @@ class Gefen(torch.optim.Optimizer):
         if not 0.0 <= lr:
             raise ValueError("Invalid learning rate: {}".format(lr))
         elif not 0.0 <= betas[0] < 1.0:
-            raise ValueError(
-                "Invalid beta parameter at index 0: {}".format(betas[0])
-            )
+            raise ValueError("Invalid beta parameter at index 0: {}".format(betas[0]))
         elif not 0.0 <= betas[1] < 1.0:
-            raise ValueError(
-                "Invalid beta parameter at index 1: {}".format(betas[1])
-            )
+            raise ValueError("Invalid beta parameter at index 1: {}".format(betas[1]))
         elif not 0.0 <= weight_decay:
             raise ValueError("Invalid weight_decay value: {}".format(weight_decay))
         elif not math.isfinite(eps) or eps <= 0.0:
@@ -3126,8 +3569,9 @@ class Gefen(torch.optim.Optimizer):
                 )
             if torch.is_complex(param):
                 raise ValueError(
-                    "Gefen does not support complex parameters, but got a "
-                    "parameter with dtype {}".format(param.dtype)
+                    "Gefen does not support complex parameters, but got a parameter with dtype {}".format(
+                        param.dtype
+                    )
                 )
             yield param_name, param
 
@@ -3184,8 +3628,7 @@ class Gefen(torch.optim.Optimizer):
             logical_groups = [[] for _ in self.param_groups]
             for logical_slot in self._gefen_logical_slots:
                 if (
-                    logical_slot.shard.layout
-                    is ParameterLayout.WHOLE_PARAMETER_OWNER
+                    logical_slot.shard.layout is ParameterLayout.WHOLE_PARAMETER_OWNER
                     and logical_slot.shard.local_member != logical_slot.shard.owner
                 ):
                     continue
@@ -3202,8 +3645,7 @@ class Gefen(torch.optim.Optimizer):
                 names = logical_groups[group_index]
                 if len(names) != len(params):
                     raise RuntimeError(
-                        "Gefen finalized logical-slot registry does not match the "
-                        "loaded layout"
+                        "Gefen finalized logical-slot registry does not match the loaded layout"
                     )
             normalized_names = []
             for param, name in zip(params, names):
@@ -3223,15 +3665,17 @@ class Gefen(torch.optim.Optimizer):
         stable lowercase name is stored in its per-param state and in the
         group's ``param_names`` list for introspection.
         """
+        if getattr(self, "_gefen_state_offload_device", None) is not None:
+            raise RuntimeError(
+                "Gefen cannot add parameter groups while state offload is active; restore state first"
+            )
         if getattr(self, "_gefen_post_sharding_finalized", False):
             raise RuntimeError(
                 "Gefen cannot add parameter groups after post_sharding finalization"
             )
         if not isinstance(param_group, dict):
             raise TypeError(
-                "param_group must be a dict, got {}".format(
-                    type(param_group).__name__
-                )
+                "param_group must be a dict, got {}".format(type(param_group).__name__)
             )
         if "params" not in param_group:
             raise ValueError("Gefen parameter group is missing the 'params' key.")
@@ -3435,9 +3879,7 @@ class Gefen(torch.optim.Optimizer):
             )
         if capturing:
             devices = {
-                param.device
-                for group in self.param_groups
-                for param in group["params"]
+                param.device for group in self.param_groups for param in group["params"]
             }
             capture_device = torch.device("cuda", torch.cuda.current_device())
             if devices != {capture_device}:
@@ -3470,9 +3912,7 @@ class Gefen(torch.optim.Optimizer):
             acc += sum(map(id, params))
             acc ^= sum(id(p.grad) for p in params)
         state = self.state
-        acc += sum(
-            map(id, chain.from_iterable(map(dict.values, state.values())))
-        )
+        acc += sum(map(id, chain.from_iterable(map(dict.values, state.values()))))
         stacks = self._capt_stacks
         return (
             acc,
@@ -3525,9 +3965,7 @@ class Gefen(torch.optim.Optimizer):
             mark(self._gefen_codebook)
             lut = _codebook_search_lut(self._gefen_codebook)
             mark(lut)
-            self._gefen_codebook_lut_by_device[
-                self._gefen_codebook.device
-            ] = lut
+            self._gefen_codebook_lut_by_device[self._gefen_codebook.device] = lut
         for device, cached in self._gefen_codebook_by_device.items():
             mark(cached)
             lut = _codebook_search_lut(cached)
@@ -3600,8 +4038,10 @@ class Gefen(torch.optim.Optimizer):
                 else int(global_counter.item())
             )
             seed = torch.full(
-                (), initial_step,
-                dtype=torch.int64, device=device,
+                (),
+                initial_step,
+                dtype=torch.int64,
+                device=device,
             )
             self._sr_seed_by_device[device] = seed
         return seed
@@ -3626,8 +4066,9 @@ class Gefen(torch.optim.Optimizer):
         ]
         if any(step != steps[0] for step in steps[1:]):
             raise RuntimeError(
-                "Gefen capturable global-step counters disagree across devices: "
-                "{}".format(steps)
+                "Gefen capturable global-step counters disagree across devices: {}".format(
+                    steps
+                )
             )
         return steps[0]
 
@@ -3643,7 +4084,9 @@ class Gefen(torch.optim.Optimizer):
         ]
         if missing:
             device_step = self._device_gefen_global_step()
-            initial_step = self._gefen_global_step if device_step is None else device_step
+            initial_step = (
+                self._gefen_global_step if device_step is None else device_step
+            )
             self._gefen_global_step = initial_step
             for device in missing:
                 self._gefen_global_step_by_device[device] = torch.full(
@@ -3667,13 +4110,10 @@ class Gefen(torch.optim.Optimizer):
         if device_step is not None:
             self._gefen_global_step = device_step
         if self.capturable and self._stochastic_round:
-            seed_steps = [
-                int(seed.item()) for seed in self._sr_seed_by_device.values()
-            ]
+            seed_steps = [int(seed.item()) for seed in self._sr_seed_by_device.values()]
             if any(seed_step != self._gefen_global_step for seed_step in seed_steps):
                 raise RuntimeError(
-                    "Gefen capturable stochastic-round seeds disagree with the "
-                    "optimizer global step: {} != {}".format(
+                    "Gefen capturable stochastic-round seeds disagree with the optimizer global step: {} != {}".format(
                         seed_steps, self._gefen_global_step
                     )
                 )
@@ -3928,10 +4368,7 @@ class Gefen(torch.optim.Optimizer):
                 steps2d = torch.empty((2, n), dtype=torch.float32, device=device)
                 steps2d[0].copy_(
                     torch.stack(
-                        [
-                            self.state[p][key].detach()
-                            for p, key in zip(rows, d["keys"])
-                        ]
+                        [self.state[p][key].detach() for p, key in zip(rows, d["keys"])]
                     )
                 )
                 steps2d[1].copy_(
@@ -4057,9 +4494,7 @@ class Gefen(torch.optim.Optimizer):
         # per-row alias/routing guard, but validate group-owned hypers once per
         # contiguous device run instead of once per parameter. Heterogeneous
         # registries take the fully general path below.
-        if stacks and all(
-            len(device_stacks) == 1 for device_stacks in stacks.values()
-        ):
+        if stacks and all(len(device_stacks) == 1 for device_stacks in stacks.values()):
             if self._capt_single_cohort_ready(stacks):
                 return True
             if capturing:
@@ -4100,8 +4535,7 @@ class Gefen(torch.optim.Optimizer):
                     or state["step"] is not stack["step_views"][i]
                     or state.get(info[0]) is not stack["bc2_views"][i]
                     or state.get("_capt_scalars") is not stack["scalar_views"][i]
-                    or stack["betas"][i]
-                    != (group["beta1"], group["beta2"])
+                    or stack["betas"][i] != (group["beta1"], group["beta2"])
                     or group["weight_decay"] != stack["weight_decay0"]
                 ):
                     ok = False
@@ -4290,9 +4724,7 @@ class Gefen(torch.optim.Optimizer):
             self._gefen_codebook_by_device[device] = cached
         return cached
 
-    def _gefen_codebook_lut_on(
-        self, device: torch.device
-    ) -> Optional[torch.Tensor]:
+    def _gefen_codebook_lut_on(self, device: torch.device) -> Optional[torch.Tensor]:
         # Resolve once per device and retain the tensor on the optimizer.  The
         # eager Muon momentum path calls this per matrix; returning a stable
         # cached tensor avoids rebuilding the data_ptr/version cache key in the
@@ -4421,9 +4853,7 @@ class Gefen(torch.optim.Optimizer):
                 )
 
         if backend == "cpu":
-            period_input = (
-                grad_work.detach().float().square().reshape(-1).cpu().numpy()
-            )
+            period_input = grad_work.detach().float().square().reshape(-1).cpu().numpy()
         elif backend == "gpu":
             if grad_work.device.type != "cuda":
                 raise ValueError("FIND_PERIOD_BACKEND='gpu' requires a CUDA tensor")
@@ -4566,8 +4996,9 @@ class Gefen(torch.optim.Optimizer):
             elif torch.is_tensor(found_inf):
                 if found_inf.numel() != 1:
                     raise RuntimeError(
-                        "GradScaler supplied a non-scalar found_inf tensor with "
-                        "shape {}".format(tuple(found_inf.shape))
+                        "GradScaler supplied a non-scalar found_inf tensor with shape {}".format(
+                            tuple(found_inf.shape)
+                        )
                     )
                 local_overflow = bool(found_inf.detach().item())
             else:
@@ -4583,17 +5014,16 @@ class Gefen(torch.optim.Optimizer):
             elif torch.is_tensor(grad_scale):
                 if grad_scale.numel() != 1:
                     raise RuntimeError(
-                        "GradScaler supplied a non-scalar grad_scale tensor with "
-                        "shape {}".format(tuple(grad_scale.shape))
+                        "GradScaler supplied a non-scalar grad_scale tensor with shape {}".format(
+                            tuple(grad_scale.shape)
+                        )
                     )
                 scale_present = True
                 local_scale = float(grad_scale.detach().item())
             else:
                 scale_present = True
                 local_scale = float(grad_scale)
-            if scale_present and (
-                not math.isfinite(local_scale) or local_scale <= 0.0
-            ):
+            if scale_present and (not math.isfinite(local_scale) or local_scale <= 0.0):
                 raise RuntimeError(
                     "GradScaler supplied a non-finite or non-positive grad_scale"
                 )
@@ -4603,9 +5033,7 @@ class Gefen(torch.optim.Optimizer):
             scale_present = False
             local_scale = 0.0
             local_error = exc
-        self._synchronize_codebook_scope_failure(
-            local_error, "AMP overflow preflight"
-        )
+        self._synchronize_codebook_scope_failure(local_error, "AMP overflow preflight")
         if len(binding.identity.ordered_members) > 1:
             import torch.distributed as dist
 
@@ -4615,8 +5043,7 @@ class Gefen(torch.optim.Optimizer):
                 device=binding.collective_device,
             )
             controls = [
-                torch.empty_like(amp_control)
-                for _ in binding.identity.ordered_members
+                torch.empty_like(amp_control) for _ in binding.identity.ordered_members
             ]
             dist.all_gather(controls, amp_control, group=binding.process_group)
             if any(not torch.equal(item, controls[0]) for item in controls[1:]):
@@ -4686,11 +5113,7 @@ class Gefen(torch.optim.Optimizer):
         if self._gefen_codebook is None:
             return (0, 0, 0, 0)
         raw = bytes(
-            self._gefen_codebook.detach()
-            .cpu()
-            .contiguous()
-            .view(torch.uint8)
-            .tolist()
+            self._gefen_codebook.detach().cpu().contiguous().view(torch.uint8).tolist()
         )
         return self._sha256_int64(raw)
 
@@ -4804,8 +5227,7 @@ class Gefen(torch.optim.Optimizer):
                     }
                     if len(nonempty_activity) > 1:
                         raise RuntimeError(
-                            "scoped flattened parameters require every nonempty "
-                            "shard to agree on gradient presence"
+                            "scoped flattened parameters require every nonempty shard to agree on gradient presence"
                         )
                 continue
             replicated_controls = {
@@ -4825,9 +5247,11 @@ class Gefen(torch.optim.Optimizer):
         self._assert_runtime_codebook_process_group()
         import torch.distributed as dist
 
-        local = codebook.detach().to(
-            device=binding.collective_device, dtype=torch.float32
-        ).contiguous()
+        local = (
+            codebook.detach()
+            .to(device=binding.collective_device, dtype=torch.float32)
+            .contiguous()
+        )
         gathered = [torch.empty_like(local) for _ in binding.identity.ordered_members]
         dist.all_gather(gathered, local, group=binding.process_group)
         if any(not torch.equal(item, gathered[0]) for item in gathered[1:]):
@@ -4859,9 +5283,7 @@ class Gefen(torch.optim.Optimizer):
             dtype=torch.int64,
             device=binding.collective_device,
         )
-        controls = [
-            torch.empty_like(control) for _ in binding.identity.ordered_members
-        ]
+        controls = [torch.empty_like(control) for _ in binding.identity.ordered_members]
         dist.all_gather(controls, control, group=binding.process_group)
         if any(not torch.equal(item, controls[0]) for item in controls[1:]):
             raise RuntimeError(
@@ -4987,7 +5409,13 @@ class Gefen(torch.optim.Optimizer):
             )
 
     def _step_automatic_factored(
-        self, group, param_name: str, p: torch.Tensor, grad: torch.Tensor
+        self,
+        group,
+        param_name: str,
+        p: torch.Tensor,
+        grad: torch.Tensor,
+        *,
+        state=None,
     ) -> None:
         # Adafactor-style factored second moment for a 2D param (opt-in via
         # factored_v_2d). The quantized-momentum machinery is byte-identical to
@@ -5002,7 +5430,7 @@ class Gefen(torch.optim.Optimizer):
             grad = grad.to_local()
         if hasattr(grad, "wait"):
             grad = grad.wait()
-        state = self.state[p]
+        state = self.state[p] if state is None else state
         beta1 = group["beta1"]
         beta2 = group["beta2"]
         lr = group["lr"]
@@ -5018,9 +5446,7 @@ class Gefen(torch.optim.Optimizer):
             elif flat_grad.numel() == 1:
                 automatic_period = 1
             else:
-                automatic_period = self._resolve_automatic_period(
-                    param_name, p, grad
-                )
+                automatic_period = self._resolve_automatic_period(param_name, p, grad)
             if flat_grad.numel() % automatic_period != 0:
                 raise ValueError(
                     "Automatic partition period {} does not divide parameter {} with numel {}".format(
@@ -5078,8 +5504,7 @@ class Gefen(torch.optim.Optimizer):
             codebook = self._gefen_codebook_on(p.device)
             if codebook is None:
                 raise ValueError(
-                    "Expected Gefen codebook to be initialized before the "
-                    "factored update."
+                    "Expected Gefen codebook to be initialized before the factored update."
                 )
             # The raw kernel flat-indexes a contiguous matrix.  A strided leaf
             # Parameter is uncommon but valid (and can arise from model surgery
@@ -5237,14 +5662,10 @@ class Gefen(torch.optim.Optimizer):
             return
         staged_indices = []
         if self._gefen_codebook_process_group is None:
-            parameters = [
-                p for pgroup in self.param_groups for p in pgroup["params"]
-            ]
+            parameters = [p for pgroup in self.param_groups for p in pgroup["params"]]
         else:
             parameters = [
-                p
-                for p, _ in self._gefen_local_shard_bindings
-                if p is not None
+                p for p, _ in self._gefen_local_shard_bindings if p is not None
             ]
         try:
             for p in parameters:
@@ -5300,9 +5721,8 @@ class Gefen(torch.optim.Optimizer):
 
         binding = self._gefen_codebook_process_group
         if (
-            (binding is None or len(binding.identity.ordered_members) == 1)
-            and not self._has_local_codebook_gradients()
-        ):
+            binding is None or len(binding.identity.ordered_members) == 1
+        ) and not self._has_local_codebook_gradients():
             # No local histogram exists, so learning would return None. This
             # fast no-op is also what keeps a no-gradient capturable step free
             # of the host-driven exact-DP preparation path. Multi-member scopes
@@ -5338,9 +5758,7 @@ class Gefen(torch.optim.Optimizer):
         except Exception as exc:
             local_error = exc
         if self._gefen_codebook_process_group is not None:
-            self._synchronize_codebook_scope_failure(
-                local_error, "gradient preflight"
-            )
+            self._synchronize_codebook_scope_failure(local_error, "gradient preflight")
         elif local_error is not None:
             raise local_error
         self._ensure_codebook_scope_agreement()
@@ -5376,9 +5794,7 @@ class Gefen(torch.optim.Optimizer):
         except Exception as exc:
             local_error = exc
         if self._gefen_codebook_process_group is not None:
-            self._synchronize_codebook_scope_failure(
-                local_error, "gradient preflight"
-            )
+            self._synchronize_codebook_scope_failure(local_error, "gradient preflight")
         elif local_error is not None:
             raise local_error
         self._ensure_codebook_scope_agreement()
@@ -5694,9 +6110,7 @@ class Gefen(torch.optim.Optimizer):
                 * m_magnitude[r0:r1]
             )
             # lerp() needs matching dtypes, so promote the (bf16) grad rows to fp32.
-            updated_m = current_m.lerp(
-                grad_view[r0:r1].to(current_m.dtype), 1 - beta1
-            )
+            updated_m = current_m.lerp(grad_view[r0:r1].to(current_m.dtype), 1 - beta1)
 
             # New per-block magnitude = max |updated_m| over each row, written back
             # into the persistent fp32 m_magnitude state in place.
@@ -5780,7 +6194,13 @@ class Gefen(torch.optim.Optimizer):
         return quantized_m * state["m_magnitude"]
 
     def _step_automatic(
-        self, group, param_name: str, p: torch.Tensor, grad: torch.Tensor
+        self,
+        group,
+        param_name: str,
+        p: torch.Tensor,
+        grad: torch.Tensor,
+        *,
+        state=None,
     ) -> None:
         # Unwrap the gradient to its local shard for both the fused and
         # non-fused paths. Under FSDP2 the gradient arrives as a sharded DTensor;
@@ -5792,7 +6212,7 @@ class Gefen(torch.optim.Optimizer):
         if hasattr(grad, "wait"):
             grad = grad.wait()
 
-        state = self.state[p]
+        state = self.state[p] if state is None else state
         beta1 = group["beta1"]
         beta2 = group["beta2"]
         lr = group["lr"]
@@ -5823,9 +6243,7 @@ class Gefen(torch.optim.Optimizer):
             elif local_numel == 1:
                 automatic_period = 1
             elif local_numel > 1:
-                automatic_period = self._resolve_automatic_period(
-                    param_name, p, grad
-                )
+                automatic_period = self._resolve_automatic_period(param_name, p, grad)
             else:
                 raise ValueError(
                     "Automatic partition received an empty parameter {}".format(
@@ -5875,9 +6293,7 @@ class Gefen(torch.optim.Optimizer):
             # A capturable (tensor) step must be CLONED -- assigning the same
             # 0-dim tensor would alias the two counters and double-increment.
             step = state["step"]
-            state["vmean_step"] = (
-                step.clone() if torch.is_tensor(step) else step
-            )
+            state["vmean_step"] = step.clone() if torch.is_tensor(step) else step
 
         # Tier-1 uses a separately calibrated predicate for the current full
         # v1/v2 kernels. Both fold the vmean EMA, per-block stepsize math, and
@@ -5905,8 +6321,12 @@ class Gefen(torch.optim.Optimizer):
         # Deterministic mode keeps the fused update and selects v1-full, whose
         # fixed thread tree produces bit-identical vmean/parameter writes for
         # identical inputs on a homogeneous architecture.
-        route_v2 = False if self._deterministic else _should_use_v2_full(
-            grad_view.shape[0], automatic_period, grad_view.device
+        route_v2 = (
+            False
+            if self._deterministic
+            else _should_use_v2_full(
+                grad_view.shape[0], automatic_period, grad_view.device
+            )
         )
         if (
             route_v2
@@ -5938,9 +6358,7 @@ class Gefen(torch.optim.Optimizer):
         # local shard's storage. DTensor.to_local() returns a view of that
         # storage, so in-place ops propagate back to the param.
         p_local = (
-            p.to_local()
-            if (hasattr(p, "to_local") and hasattr(p, "placements"))
-            else p
+            p.to_local() if (hasattr(p, "to_local") and hasattr(p, "placements")) else p
         )
 
         if self.capturable and (use_full_fused or use_v2_full):
@@ -5978,8 +6396,7 @@ class Gefen(torch.optim.Optimizer):
             # contiguous; a non-contiguous shard is updated on a contiguous
             # copy that is copied back to preserve the in-place semantics.
             weight_decay_factor = (
-                1.0 if step_scalars is not None
-                else 1.0 - lr * group["weight_decay"]
+                1.0 if step_scalars is not None else 1.0 - lr * group["weight_decay"]
             )
             if p_local.is_contiguous():
                 self._automatic_gefen_fused_full_update(
@@ -6019,8 +6436,7 @@ class Gefen(torch.optim.Optimizer):
             # (see _automatic_gefen_fused_update_v2_full). Same contiguity
             # handling as the v1-full branch.
             weight_decay_factor = (
-                1.0 if step_scalars is not None
-                else 1.0 - lr * group["weight_decay"]
+                1.0 if step_scalars is not None else 1.0 - lr * group["weight_decay"]
             )
             if p_local.is_contiguous():
                 self._automatic_gefen_fused_update_v2_full(
@@ -6254,7 +6670,7 @@ class Gefen(torch.optim.Optimizer):
         if weight_decay > 0.0:
             torch._foreach_mul_(params, 1 - lr * weight_decay)
 
-        bias_correction_1 = 1 - beta1 ** step_count
+        bias_correction_1 = 1 - beta1**step_count
         bias_correction_2 = 1 - beta2 ** first_state["vmean_step"]
         h = (merged_vmean.sqrt() / math.sqrt(bias_correction_2)).add_(eps)
         stepsize = (1 / bias_correction_1) / h
@@ -6277,7 +6693,9 @@ class Gefen(torch.optim.Optimizer):
         update_views = update.reshape(k, nblocks, period)
         param_updates = [update_views[i].reshape(params[i].shape) for i in range(k)]
         torch._foreach_add_(params, param_updates, alpha=-1.0)
-        torch._foreach_copy_(vmeans, list(merged_vmean.reshape(k, nblocks, 1).unbind(0)))
+        torch._foreach_copy_(
+            vmeans, list(merged_vmean.reshape(k, nblocks, 1).unbind(0))
+        )
         torch._foreach_copy_(mags, list(merged_mag.reshape(k, nblocks, 1).unbind(0)))
         torch._foreach_copy_(
             codebooks, list(merged_codebook.reshape(k, nblocks, period).unbind(0))
@@ -6297,13 +6715,10 @@ class Gefen(torch.optim.Optimizer):
         device_step = self._device_gefen_global_step()
         step = self._gefen_global_step if device_step is None else device_step
         if self.capturable and self._stochastic_round:
-            seed_steps = [
-                int(seed.item()) for seed in self._sr_seed_by_device.values()
-            ]
+            seed_steps = [int(seed.item()) for seed in self._sr_seed_by_device.values()]
             if any(seed_step != step for seed_step in seed_steps):
                 raise RuntimeError(
-                    "Gefen capturable stochastic-round seeds disagree with the "
-                    "canonical optimizer global step"
+                    "Gefen capturable stochastic-round seeds disagree with the canonical optimizer global step"
                 )
         return step
 
@@ -6385,12 +6800,9 @@ class Gefen(torch.optim.Optimizer):
                 id(group),
                 tuple(id(parameter) for parameter in group["params"]),
                 tuple(
-                    str(name)
-                    for name, _ in self._iter_group_params_with_names(group)
+                    str(name) for name, _ in self._iter_group_params_with_names(group)
                 ),
-                self._canonical_value_token(
-                    self._canonical_group_options_value(group)
-                ),
+                self._canonical_value_token(self._canonical_group_options_value(group)),
             )
             for group in self.param_groups
         )
@@ -6421,6 +6833,8 @@ class Gefen(torch.optim.Optimizer):
             self.fused,
             self.verbose,
             self._fused_build_ok,
+            self.state_offload_device,
+            self.state_offload_poisoned,
             id(self._gefen_codebook_process_group),
             self._canonical_value_token(self._serialized_codebook_scope()),
             id(self._gefen_sharding_manifest),
@@ -6485,9 +6899,7 @@ class Gefen(torch.optim.Optimizer):
         if self._force_2d_period_one and parameter.ndim == 2:
             return True
         fqn = shard.parameter.fqn.lower()
-        return any(
-            substring in fqn for substring in self._period_one_substrings
-        )
+        return any(substring in fqn for substring in self._period_one_substrings)
 
     def _validate_canonical_parameter_semantics(
         self,
@@ -6519,8 +6931,9 @@ class Gefen(torch.optim.Optimizer):
             counters[counter_key] = counter
             if counter > global_step:
                 raise ValueError(
-                    "Gefen canonical parameter counter {} exceeds the optimizer "
-                    "global step".format(counter_key)
+                    "Gefen canonical parameter counter {} exceeds the optimizer global step".format(
+                        counter_key
+                    )
                 )
         if "step" in counters and any(
             counters[counter_key] > counters["step"]
@@ -6556,17 +6969,14 @@ class Gefen(torch.optim.Optimizer):
             shard, group_options, parameter_state, state_layout
         ):
             raise ValueError(
-                "Gefen canonical parameter state does not match a declared state "
-                "variant"
+                "Gefen canonical parameter state does not match a declared state variant"
             )
 
     @staticmethod
     def _assert_canonical_state_outside_cuda_capture(operation) -> None:
         if torch.cuda.is_available() and torch.cuda.is_current_stream_capturing():
             raise RuntimeError(
-                "canonical state {} cannot run during CUDA capture".format(
-                    operation
-                )
+                "canonical state {} cannot run during CUDA capture".format(operation)
             )
 
     def _assert_canonical_import_target_safe(self) -> None:
@@ -6594,11 +7004,11 @@ class Gefen(torch.optim.Optimizer):
         """Export an exact-binding, device-neutral local state fragment."""
 
         self._assert_finalized_binding_layout()
+        self._assert_state_export_safe()
         self._assert_canonical_state_outside_cuda_capture("export")
         if not self._canonical_state_layouts():
             raise RuntimeError(
-                "canonical state export requires a supported finalized identity "
-                "layout and primitive algorithm policy"
+                "canonical state export requires a supported finalized identity layout and primitive algorithm policy"
             )
         entries = self._canonical_live_entries()
         parameters = {}
@@ -6612,8 +7022,9 @@ class Gefen(torch.optim.Optimizer):
                     continue
                 if key not in _CANONICAL_PARAMETER_STATE_KEYS:
                     raise RuntimeError(
-                        "canonical state export found undeclared parameter state key "
-                        "{!r}".format(key)
+                        "canonical state export found undeclared parameter state key {!r}".format(
+                            key
+                        )
                     )
                 state[key] = clone_canonical_value(
                     value, path="parameters.{}.state.{}".format(fqn, key)
@@ -6631,9 +7042,7 @@ class Gefen(torch.optim.Optimizer):
             "format_version": CANONICAL_STATE_FORMAT_VERSION,
             "coverage": "local_optimizer_fragment",
             "implementation": self.optimizer_contract().implementation,
-            "policy": clone_canonical_value(
-                self._canonical_policy(), path="policy"
-            ),
+            "policy": clone_canonical_value(self._canonical_policy(), path="policy"),
             "common": {
                 "gefen_global_step": self._canonical_common_global_step(),
                 "gefen_codebook": clone_canonical_value(
@@ -6721,8 +7130,7 @@ class Gefen(torch.optim.Optimizer):
         if type(manifest) is not list:
             raise ValueError("Gefen canonical manifest must be a list")
         normalized_manifest = [
-            self._normalize_serialized_canonical_shard(record)
-            for record in manifest
+            self._normalize_serialized_canonical_shard(record) for record in manifest
         ]
         if normalized_manifest != self._serialized_sharding_manifest():
             raise ValueError(
@@ -6747,14 +7155,10 @@ class Gefen(torch.optim.Optimizer):
                 "state",
             }:
                 raise ValueError(
-                    "Gefen canonical parameter {!r} has an invalid schema".format(
-                        fqn
-                    )
+                    "Gefen canonical parameter {!r} has an invalid schema".format(fqn)
                 )
             if type(record["compatibility_name"]) is not str:
-                raise ValueError(
-                    "Gefen canonical compatibility names must be strings"
-                )
+                raise ValueError("Gefen canonical compatibility names must be strings")
             parameter, shard, _, live_options = live_entries[fqn]
             normalized_shard = self._normalize_serialized_canonical_shard(
                 record["shard"]
@@ -6887,9 +7291,7 @@ class Gefen(torch.optim.Optimizer):
     def import_canonical_state(self, state) -> None:
         """Atomically prepare and commit an exact-binding canonical fragment."""
 
-        self.commit_canonical_state_import(
-            self.prepare_canonical_state_import(state)
-        )
+        self.commit_canonical_state_import(self.prepare_canonical_state_import(state))
 
     def export_portable_state(
         self,
@@ -6936,9 +7338,11 @@ class Gefen(torch.optim.Optimizer):
         """Run optimizer state-dict hooks around Gefen's complete schema."""
 
         self._assert_finalized_binding_layout()
+        self._assert_state_export_safe()
         for pre_hook in self._optimizer_state_dict_pre_hooks.values():
             pre_hook(self)
         self._assert_finalized_binding_layout()
+        self._assert_state_export_safe()
         state_dict = self._state_dict_impl()
         for post_hook in self._optimizer_state_dict_post_hooks.values():
             hook_result = post_hook(self, state_dict)
@@ -7027,10 +7431,12 @@ class Gefen(torch.optim.Optimizer):
                 raise RuntimeError(message)
             return None
 
-        if not torch.distributed.is_available() or not torch.distributed.is_initialized():
+        if (
+            not torch.distributed.is_available()
+            or not torch.distributed.is_initialized()
+        ):
             return reject(
-                "Gefen rank-local DTensor checkpointing requires an initialized "
-                "default distributed process group"
+                "Gefen rank-local DTensor checkpointing requires an initialized default distributed process group"
             )
 
         import torch.distributed as dist
@@ -7187,9 +7593,7 @@ class Gefen(torch.optim.Optimizer):
                             for item in p.placements
                         ],
                         "mesh": self._device_mesh_checkpoint_signature(mesh),
-                        "coordinate": None
-                        if coordinate is None
-                        else list(coordinate),
+                        "coordinate": None if coordinate is None else list(coordinate),
                         "sharded_mode": group.get("sharded_mode"),
                     }
                 )
@@ -7281,13 +7685,15 @@ class Gefen(torch.optim.Optimizer):
     def _serialize_rank_local_payload(payload) -> torch.Tensor:
         buffer = io.BytesIO()
         torch.save(payload, buffer)
-        return torch.frombuffer(
-            bytearray(buffer.getvalue()), dtype=torch.uint8
-        ).clone()
+        return torch.frombuffer(bytearray(buffer.getvalue()), dtype=torch.uint8).clone()
 
     @staticmethod
     def _deserialize_rank_local_payload(payload: torch.Tensor):
-        if not torch.is_tensor(payload) or payload.dtype != torch.uint8 or payload.dim() != 1:
+        if (
+            not torch.is_tensor(payload)
+            or payload.dtype != torch.uint8
+            or payload.dim() != 1
+        ):
             raise ValueError(
                 "Gefen rank-local checkpoint payload must be a 1-D uint8 tensor"
             )
@@ -7369,24 +7775,27 @@ class Gefen(torch.optim.Optimizer):
             )
         if any(control["manifest"] != local_manifest for control in controls):
             raise RuntimeError(
-                "Gefen DTensor checkpoint parameter identifiers, names, dtypes, "
-                "or global shapes differ across ranks"
+                "Gefen DTensor checkpoint parameter identifiers, names, dtypes, or global shapes differ across ranks"
             )
         global_steps = [control["global_step"] for control in controls]
-        if any(type(step) is not int for step in global_steps) or len(
-            set(global_steps)
-        ) != 1:
+        if (
+            any(type(step) is not int for step in global_steps)
+            or len(set(global_steps)) != 1
+        ):
             raise RuntimeError(
-                "Gefen rank-local checkpoint global_step differs across ranks: "
-                "{}".format(global_steps)
+                "Gefen rank-local checkpoint global_step differs across ranks: {}".format(
+                    global_steps
+                )
             )
         deterministic_values = [control["deterministic"] for control in controls]
-        if any(type(value) is not bool for value in deterministic_values) or len(
-            set(deterministic_values)
-        ) != 1:
+        if (
+            any(type(value) is not bool for value in deterministic_values)
+            or len(set(deterministic_values)) != 1
+        ):
             raise RuntimeError(
-                "Gefen rank-local checkpoint deterministic policy differs across "
-                "ranks: {}".format(deterministic_values)
+                "Gefen rank-local checkpoint deterministic policy differs across ranks: {}".format(
+                    deterministic_values
+                )
             )
 
         signatures = {
@@ -7426,8 +7835,9 @@ class Gefen(torch.optim.Optimizer):
         dist.all_gather_object(serialization_statuses, serialization_status)
         if any(not item.get("ok", False) for item in serialization_statuses):
             raise RuntimeError(
-                "Gefen rank-local checkpoint payload serialization failed across "
-                "ranks: {}".format(serialization_statuses)
+                "Gefen rank-local checkpoint payload serialization failed across ranks: {}".format(
+                    serialization_statuses
+                )
             )
         serialized_payloads = {
             str(src): self._broadcast_checkpoint_payload(
@@ -7506,9 +7916,7 @@ class Gefen(torch.optim.Optimizer):
         # membership matches the id()-keyed param_mappings the base class
         # builds. The no-orphan path (every non-wrapped run) takes the plain
         # super() call, bit-for-bit unchanged.
-        reachable = {
-            param for group in self.param_groups for param in group["params"]
-        }
+        reachable = {param for group in self.param_groups for param in group["params"]}
         orphaned = [param for param in self.state if param not in reachable]
         if orphaned:
             original_order = list(self.state)
@@ -7557,8 +7965,7 @@ class Gefen(torch.optim.Optimizer):
 
         def _is_scratch_key(key):
             return key in scratch_keys or (
-                isinstance(key, str)
-                and key.startswith(_RANK_LOCAL_PAYLOAD_KEY_PREFIX)
+                isinstance(key, str) and key.startswith(_RANK_LOCAL_PAYLOAD_KEY_PREFIX)
             )
 
         def _compact(value):
@@ -7579,11 +7986,7 @@ class Gefen(torch.optim.Optimizer):
 
         state_dict["state"] = {
             pid: (
-                {
-                    k: _compact(v)
-                    for k, v in pstate.items()
-                    if not _is_scratch_key(k)
-                }
+                {k: _compact(v) for k, v in pstate.items() if not _is_scratch_key(k)}
                 if isinstance(pstate, dict)
                 else pstate
             )
@@ -7615,9 +8018,7 @@ class Gefen(torch.optim.Optimizer):
         # handing groups to torch, so it never leaks into live scheduler groups.
         checkpoint_metadata = {
             "format_version": (
-                _SCOPED_NATIVE_METADATA_VERSION
-                if codebook_scope is not None
-                else 1
+                _SCOPED_NATIVE_METADATA_VERSION if codebook_scope is not None else 1
             ),
             "global_step": self._gefen_global_step,
             "codebook": self._gefen_codebook,
@@ -7635,9 +8036,7 @@ class Gefen(torch.optim.Optimizer):
         if native_local_shards is not None:
             checkpoint_metadata["native_local_shards"] = native_local_shards
         if consolidate_rank_local:
-            self._consolidate_rank_local_sharded_state(
-                state_dict, checkpoint_metadata
-            )
+            self._consolidate_rank_local_sharded_state(state_dict, checkpoint_metadata)
         for group in state_dict["param_groups"]:
             group["_gefen_checkpoint_metadata"] = checkpoint_metadata
         return state_dict
@@ -7745,7 +8144,23 @@ class Gefen(torch.optim.Optimizer):
         staged._capt_stacks = None
 
         staged._load_state_dict_impl(state_dict)
+        if staged.state_offload_active:
+            reason = staged._state_offload_rejection_reason(
+                require_cpu_state=False,
+                allow_poisoned=True,
+            )
+            if reason is not None:
+                raise RuntimeError(
+                    "Gefen could not preserve active state offload while loading: {}".format(
+                        reason
+                    )
+                )
+            staged.state = staged._stage_all_parameter_state_to_cpu()
+            staged._gefen_codebook = staged._stage_state_offload_resident_codebook()
         staged._validate_loaded_native_state()
+        # A complete successfully validated load is the only operation that can
+        # re-establish known-good optimizer state after a failed copyback.
+        staged._gefen_state_offload_poisoned = False
         return staged
 
     def _commit_staged_load_state_dict(self, staged) -> None:
@@ -7762,9 +8177,7 @@ class Gefen(torch.optim.Optimizer):
     def _validate_loaded_native_state(self) -> None:
         """Validate the complete prepared native state before publication."""
 
-        self._validate_rank_local_counter(
-            "gefen_global_step", self._gefen_global_step
-        )
+        self._validate_rank_local_counter("gefen_global_step", self._gefen_global_step)
         signature = self._rank_local_sharded_signature(context={})
         states = [
             self.state[param]
@@ -7777,8 +8190,7 @@ class Gefen(torch.optim.Optimizer):
             self._gefen_codebook,
             allow_legacy_vmean_counter=True,
             allow_preinitialized_periods=(
-                self._gefen_global_step == 0
-                and self._gefen_codebook is not None
+                self._gefen_global_step == 0 and self._gefen_codebook is not None
             ),
         )
         for group in self.param_groups:
@@ -7799,6 +8211,70 @@ class Gefen(torch.optim.Optimizer):
         finally:
             self._optimizer_load_state_dict_pre_hooks = pre_hooks
             self._optimizer_load_state_dict_post_hooks = post_hooks
+
+    def _base_load_state_dict_to_offload_cpu(self, state_dict) -> None:
+        """Apply the base optimizer mapping while keeping parameter state on CPU."""
+
+        groups = self.param_groups
+        saved_groups = deepcopy(state_dict["param_groups"])
+        if len(groups) != len(saved_groups):
+            raise ValueError(
+                "loaded state dict has a different number of parameter groups"
+            )
+        if any(
+            len(group["params"]) != len(saved_group["params"])
+            for group, saved_group in zip(groups, saved_groups)
+        ):
+            raise ValueError(
+                "loaded state dict contains a parameter group that doesn't match the size of optimizer's group"
+            )
+
+        id_map = dict(
+            zip(
+                chain.from_iterable(group["params"] for group in saved_groups),
+                chain.from_iterable(group["params"] for group in groups),
+            )
+        )
+
+        def clone_to_cpu(value):
+            if torch.is_tensor(value):
+                return value.to(
+                    device="cpu",
+                    dtype=value.dtype,
+                    non_blocking=False,
+                    copy=True,
+                    memory_format=torch.contiguous_format,
+                ).detach()
+            if isinstance(value, dict):
+                return {key: clone_to_cpu(item) for key, item in value.items()}
+            if type(value) is list:
+                return [clone_to_cpu(item) for item in value]
+            if type(value) is tuple:
+                return tuple(clone_to_cpu(item) for item in value)
+            if type(value) is set:
+                return {clone_to_cpu(item) for item in value}
+            if type(value) is frozenset:
+                return frozenset(clone_to_cpu(item) for item in value)
+            if type(value) is deque:
+                return deque(
+                    (clone_to_cpu(item) for item in value), maxlen=value.maxlen
+                )
+            return deepcopy(value)
+
+        loaded_state = defaultdict(dict)
+        for key, value in state_dict["state"].items():
+            if key in id_map:
+                loaded_state[id_map[key]] = clone_to_cpu(value)
+            else:
+                loaded_state[key] = value
+
+        param_groups = []
+        for live_group, saved_group in zip(groups, saved_groups):
+            saved_group["params"] = live_group["params"]
+            if "param_names" in live_group and "param_names" not in saved_group:
+                saved_group["param_names"] = live_group["param_names"]
+            param_groups.append(saved_group)
+        self.__setstate__({"state": loaded_state, "param_groups": param_groups})
 
     @staticmethod
     def _validate_rank_local_codebook(codebook, *, required: bool) -> None:
@@ -7880,17 +8356,14 @@ class Gefen(torch.optim.Optimizer):
             expected_name = param_signature["name"]
             if pstate.get("name") != expected_name:
                 raise ValueError(
-                    "Gefen rank-local checkpoint state name/order differs: "
-                    "checkpoint={!r} expected={!r}".format(
+                    "Gefen rank-local checkpoint state name/order differs: checkpoint={!r} expected={!r}".format(
                         pstate.get("name"), expected_name
                     )
                 )
             counters = {}
             for key in counter_keys:
                 if key in pstate:
-                    counters[key] = self._validate_rank_local_counter(
-                        key, pstate[key]
-                    )
+                    counters[key] = self._validate_rank_local_counter(key, pstate[key])
 
             local_shape = param_signature["local_shape"]
             state_shape = (
@@ -7907,8 +8380,7 @@ class Gefen(torch.optim.Optimizer):
                     )
                 if state_numel == 0 or state_numel % period != 0:
                     raise ValueError(
-                        "Gefen rank-local checkpoint automatic_period does not divide "
-                        "the parameter state geometry"
+                        "Gefen rank-local checkpoint automatic_period does not divide the parameter state geometry"
                     )
 
             momentum_keys = ("m_codebook", "m_magnitude")
@@ -7925,8 +8397,7 @@ class Gefen(torch.optim.Optimizer):
             )
             if any(key in pstate for key in initialized_keys) and not carries_momentum:
                 raise ValueError(
-                    "Gefen rank-local checkpoint initialized state is missing "
-                    "quantized momentum"
+                    "Gefen rank-local checkpoint initialized state is missing quantized momentum"
                 )
             if (
                 period is not None
@@ -7941,8 +8412,7 @@ class Gefen(torch.optim.Optimizer):
                 )
             ):
                 raise ValueError(
-                    "Gefen rank-local checkpoint automatic_period is invalid without "
-                    "initialized momentum"
+                    "Gefen rank-local checkpoint automatic_period is invalid without initialized momentum"
                 )
             if carries_momentum:
                 has_quantized_momentum = True
@@ -7977,8 +8447,7 @@ class Gefen(torch.optim.Optimizer):
                     or not bool((magnitude >= 0).all())
                 ):
                     raise ValueError(
-                        "Gefen rank-local checkpoint m_magnitude geometry/dtype/values "
-                        "are invalid"
+                        "Gefen rank-local checkpoint m_magnitude geometry/dtype/values are invalid"
                     )
                 vmean = pstate.get("vmean")
                 if vmean is not None and (
@@ -7989,8 +8458,7 @@ class Gefen(torch.optim.Optimizer):
                     or not bool((vmean >= 0).all())
                 ):
                     raise ValueError(
-                        "Gefen rank-local checkpoint vmean geometry/dtype/values "
-                        "are invalid"
+                        "Gefen rank-local checkpoint vmean geometry/dtype/values are invalid"
                     )
 
                 has_vmean = "vmean" in pstate
@@ -7999,14 +8467,9 @@ class Gefen(torch.optim.Optimizer):
                     raise ValueError(
                         "Gefen rank-local checkpoint block second moment is incomplete"
                     )
-                if (
-                    has_vmean
-                    and not has_vmean_step
-                    and not allow_legacy_vmean_counter
-                ):
+                if has_vmean and not has_vmean_step and not allow_legacy_vmean_counter:
                     raise ValueError(
-                        "Gefen rank-local checkpoint block second moment is missing "
-                        "vmean_step"
+                        "Gefen rank-local checkpoint block second moment is missing vmean_step"
                     )
 
                 # GefenMuon groups carry a sharded_mode and intentionally use
@@ -8017,26 +8480,19 @@ class Gefen(torch.optim.Optimizer):
                     if carries_factored:
                         if "factored_step" not in pstate:
                             raise ValueError(
-                                "Gefen rank-local checkpoint factored state is missing "
-                                "factored_step"
+                                "Gefen rank-local checkpoint factored state is missing factored_step"
                             )
                         if counters["factored_step"] < 1:
                             raise ValueError(
-                                "Gefen rank-local checkpoint initialized factored "
-                                "state requires factored_step >= 1"
+                                "Gefen rank-local checkpoint initialized factored state requires factored_step >= 1"
                             )
                     elif "vmean" not in pstate:
                         raise ValueError(
-                            "Gefen rank-local checkpoint plain momentum is missing a "
-                            "second moment"
+                            "Gefen rank-local checkpoint plain momentum is missing a second moment"
                         )
-                    elif (
-                        "vmean_step" in counters
-                        and counters["vmean_step"] < 1
-                    ):
+                    elif "vmean_step" in counters and counters["vmean_step"] < 1:
                         raise ValueError(
-                            "Gefen rank-local checkpoint initialized vmean requires "
-                            "vmean_step >= 1"
+                            "Gefen rank-local checkpoint initialized vmean requires vmean_step >= 1"
                         )
 
             factored = (pstate.get("v_row"), pstate.get("v_col"))
@@ -8067,8 +8523,9 @@ class Gefen(torch.optim.Optimizer):
                         or not bool((tensor >= 0).all())
                     ):
                         raise ValueError(
-                            "Gefen rank-local checkpoint {} geometry/dtype/values "
-                            "are invalid".format(key)
+                            "Gefen rank-local checkpoint {} geometry/dtype/values are invalid".format(
+                                key
+                            )
                         )
 
             has_normuon_v = "normuon_v" in pstate
@@ -8080,18 +8537,15 @@ class Gefen(torch.optim.Optimizer):
             if has_normuon_v:
                 if param_signature.get("sharded_mode") is None:
                     raise ValueError(
-                        "Gefen rank-local checkpoint NorMuon state is invalid for "
-                        "a plain Gefen parameter"
+                        "Gefen rank-local checkpoint NorMuon state is invalid for a plain Gefen parameter"
                     )
                 if not carries_momentum:
                     raise ValueError(
-                        "Gefen rank-local checkpoint NorMuon state is missing "
-                        "initialized momentum"
+                        "Gefen rank-local checkpoint NorMuon state is missing initialized momentum"
                     )
                 if len(state_shape) != 2:
                     raise ValueError(
-                        "Gefen rank-local checkpoint NorMuon state requires a 2-D "
-                        "parameter"
+                        "Gefen rank-local checkpoint NorMuon state requires a 2-D parameter"
                     )
                 normuon_v = pstate["normuon_v"]
                 if (
@@ -8102,18 +8556,14 @@ class Gefen(torch.optim.Optimizer):
                     or not bool((normuon_v >= 0).all())
                 ):
                     raise ValueError(
-                        "Gefen rank-local checkpoint normuon_v geometry/dtype/values "
-                        "are invalid"
+                        "Gefen rank-local checkpoint normuon_v geometry/dtype/values are invalid"
                     )
                 if counters["normuon_step"] < 1:
                     raise ValueError(
-                        "Gefen rank-local checkpoint initialized NorMuon state "
-                        "requires normuon_step >= 1"
+                        "Gefen rank-local checkpoint initialized NorMuon state requires normuon_step >= 1"
                     )
 
-        self._validate_rank_local_codebook(
-            codebook, required=has_quantized_momentum
-        )
+        self._validate_rank_local_codebook(codebook, required=has_quantized_momentum)
 
     def _unwrap_rank_local_sharded_checkpoint(self, state_dict) -> None:
         groups = state_dict.get("param_groups", ())
@@ -8145,8 +8595,7 @@ class Gefen(torch.optim.Optimizer):
         if not markers:
             if wrapped_state:
                 raise ValueError(
-                    "Gefen checkpoint carries rank-local DTensor payloads but "
-                    "is missing their topology metadata"
+                    "Gefen checkpoint carries rank-local DTensor payloads but is missing their topology metadata"
                 )
             has_quantized_momentum = any(
                 isinstance(pstate, dict) and "m_codebook" in pstate
@@ -8158,15 +8607,12 @@ class Gefen(torch.optim.Optimizer):
                     "rank-local DTensor optimizer state. Older generic FSDP/DCP "
                     "full optimizer checkpoints kept rank 0's codebook and block "
                     "state for every rank. Re-save from the original run with a "
-                    "Gefen version that writes {} payloads.".format(
-                        _RANK_LOCAL_FORMAT
-                    )
+                    "Gefen version that writes {} payloads.".format(_RANK_LOCAL_FORMAT)
                 )
             return
         if len(markers) != len(groups) or any(item is None for item in metadata):
             raise ValueError(
-                "Gefen rank-local DTensor checkpoint metadata is present on only "
-                "some parameter groups"
+                "Gefen rank-local DTensor checkpoint metadata is present on only some parameter groups"
             )
         marker = markers[0]
         if not isinstance(marker, dict):
@@ -8183,8 +8629,7 @@ class Gefen(torch.optim.Optimizer):
             )
         if not self._uses_rank_local_sharded_state():
             raise ValueError(
-                "A rank-local DTensor Gefen checkpoint can only load into the "
-                "same sharded optimizer topology"
+                "A rank-local DTensor Gefen checkpoint can only load into the same sharded optimizer topology"
             )
         try:
             context = self._rank_local_checkpoint_context()
@@ -8194,8 +8639,7 @@ class Gefen(torch.optim.Optimizer):
         rank = context["global_rank"]
         if marker.get("world_size") != world:
             raise ValueError(
-                "Gefen rank-local DTensor checkpoints require the same world "
-                "size; checkpoint={} current={}".format(
+                "Gefen rank-local DTensor checkpoints require the same world size; checkpoint={} current={}".format(
                     marker.get("world_size"), world
                 )
             )
@@ -8212,8 +8656,7 @@ class Gefen(torch.optim.Optimizer):
         current_signature = self._rank_local_sharded_signature(context)
         if signatures[str(rank)] != current_signature:
             raise ValueError(
-                "Gefen rank-local DTensor checkpoint topology differs on rank {}: "
-                "checkpoint={!r} current={!r}".format(
+                "Gefen rank-local DTensor checkpoint topology differs on rank {}: checkpoint={!r} current={!r}".format(
                     rank, signatures[str(rank)], current_signature
                 )
             )
@@ -8261,14 +8704,19 @@ class Gefen(torch.optim.Optimizer):
                 if isinstance(key, str)
                 and key.startswith(_RANK_LOCAL_PAYLOAD_KEY_PREFIX)
             }
-            extras = set(pstate) - carrier_keys - {
-                _RANK_LOCAL_MEMBER_KEY,
-                "name",
-            }
+            extras = (
+                set(pstate)
+                - carrier_keys
+                - {
+                    _RANK_LOCAL_MEMBER_KEY,
+                    "name",
+                }
+            )
             if extras:
                 raise ValueError(
-                    "Gefen rank-local checkpoint parameter state has an invalid "
-                    "schema: {!r}".format(pstate)
+                    "Gefen rank-local checkpoint parameter state has an invalid schema: {!r}".format(
+                        pstate
+                    )
                 )
             if pstate.get("name") != 0:
                 raise ValueError(
@@ -8283,17 +8731,14 @@ class Gefen(torch.optim.Optimizer):
             if has_carrier:
                 if carrier_keys != expected_carrier_keys:
                     raise ValueError(
-                        "Gefen rank-local checkpoint carrier has missing or "
-                        "unexpected per-rank payload keys"
+                        "Gefen rank-local checkpoint carrier has missing or unexpected per-rank payload keys"
                     )
                 if serialized_payloads is not None:
                     raise ValueError(
                         "Gefen rank-local checkpoint repeats its payload transport"
                     )
                 serialized_payloads = {
-                    str(global_rank): pstate[
-                        _rank_local_payload_key(global_rank)
-                    ]
+                    str(global_rank): pstate[_rank_local_payload_key(global_rank)]
                     for global_rank in context["world_ranks"]
                 }
             elif pstate.get(_RANK_LOCAL_MEMBER_KEY) is not True:
@@ -8323,8 +8768,13 @@ class Gefen(torch.optim.Optimizer):
             "states",
             "codebook",
         }
-        if not isinstance(selected_payload, dict) or set(selected_payload) != expected_payload_keys:
-            raise ValueError("Gefen rank-local checkpoint payload has an invalid schema")
+        if (
+            not isinstance(selected_payload, dict)
+            or set(selected_payload) != expected_payload_keys
+        ):
+            raise ValueError(
+                "Gefen rank-local checkpoint payload has an invalid schema"
+            )
         payload_identity = (
             selected_payload["format"] == _RANK_LOCAL_FORMAT
             and selected_payload["global_rank"] == rank
@@ -8396,12 +8846,8 @@ class Gefen(torch.optim.Optimizer):
             gefen_codebook_scope = self._normalize_serialized_codebook_scope(
                 gefen_codebook_scope
             )
-        has_top_level_native_local_shards = (
-            "gefen_native_local_shards" in state_dict
-        )
-        native_local_shards = state_dict.pop(
-            "gefen_native_local_shards", None
-        )
+        has_top_level_native_local_shards = "gefen_native_local_shards" in state_dict
+        native_local_shards = state_dict.pop("gefen_native_local_shards", None)
         if has_top_level_native_local_shards:
             native_local_shards = self._normalize_serialized_native_local_shards(
                 native_local_shards
@@ -8410,8 +8856,9 @@ class Gefen(torch.optim.Optimizer):
         gefen_deterministic = state_dict.pop("gefen_deterministic", None)
         if has_top_level_deterministic and type(gefen_deterministic) is not bool:
             raise ValueError(
-                "Gefen checkpoint top-level deterministic policy must be a bool, "
-                "got {!r}".format(gefen_deterministic)
+                "Gefen checkpoint top-level deterministic policy must be a bool, got {!r}".format(
+                    gefen_deterministic
+                )
             )
         if group_metadata:
             if len(group_metadata) != len(state_dict["param_groups"]):
@@ -8446,32 +8893,28 @@ class Gefen(torch.optim.Optimizer):
                     and type(metadata["deterministic"]) is not bool
                 ):
                     raise ValueError(
-                        "Gefen checkpoint parameter-group deterministic policy "
-                        "must be a bool, got {!r}".format(metadata["deterministic"])
+                        "Gefen checkpoint parameter-group deterministic policy must be a bool, got {!r}".format(
+                            metadata["deterministic"]
+                        )
                     )
                 normalized_metadata_native_local_shards.append(
                     self._normalize_serialized_native_local_shards(
                         metadata.get("native_local_shards")
                     )
                 )
-            for metadata_index, metadata in enumerate(
-                group_metadata[1:], start=1
-            ):
-                same_version = metadata.get(
+            for metadata_index, metadata in enumerate(group_metadata[1:], start=1):
+                same_version = metadata.get("format_version") == first_metadata.get(
                     "format_version"
-                ) == first_metadata.get("format_version")
+                )
                 same_step = metadata.get("global_step") == first_metadata.get(
                     "global_step"
                 )
                 left_codebook = metadata.get("codebook")
                 right_codebook = first_metadata.get("codebook")
-                same_codebook = (
-                    left_codebook is right_codebook
-                    or (
-                        torch.is_tensor(left_codebook)
-                        and torch.is_tensor(right_codebook)
-                        and torch.equal(left_codebook, right_codebook)
-                    )
+                same_codebook = left_codebook is right_codebook or (
+                    torch.is_tensor(left_codebook)
+                    and torch.is_tensor(right_codebook)
+                    and torch.equal(left_codebook, right_codebook)
                 )
                 same_deterministic = metadata.get(
                     "deterministic"
@@ -8492,8 +8935,7 @@ class Gefen(torch.optim.Optimizer):
                     or not same_native_local_shards
                 ):
                     raise ValueError(
-                        "Gefen checkpoint parameter groups carry inconsistent "
-                        "optimizer metadata"
+                        "Gefen checkpoint parameter groups carry inconsistent optimizer metadata"
                     )
             metadata_step = first_metadata.get("global_step", 0)
             metadata_codebook = first_metadata.get("codebook")
@@ -8501,9 +8943,7 @@ class Gefen(torch.optim.Optimizer):
             metadata_codebook_scope = self._normalize_serialized_codebook_scope(
                 first_metadata.get("codebook_scope")
             )
-            metadata_native_local_shards = normalized_metadata_native_local_shards[
-                0
-            ]
+            metadata_native_local_shards = normalized_metadata_native_local_shards[0]
             if gefen_global_step is None:
                 gefen_global_step = metadata_step
             elif gefen_global_step != metadata_step:
@@ -8530,8 +8970,7 @@ class Gefen(torch.optim.Optimizer):
                 and gefen_deterministic != metadata_deterministic
             ):
                 raise ValueError(
-                    "Gefen checkpoint top-level and parameter-group deterministic "
-                    "policies disagree"
+                    "Gefen checkpoint top-level and parameter-group deterministic policies disagree"
                 )
             if not has_top_level_codebook_scope:
                 gefen_codebook_scope = metadata_codebook_scope
@@ -8557,8 +8996,9 @@ class Gefen(torch.optim.Optimizer):
         if gefen_deterministic is not None:
             if type(gefen_deterministic) is not bool:
                 raise ValueError(
-                    "Gefen checkpoint deterministic policy must be a bool, got "
-                    "{!r}".format(gefen_deterministic)
+                    "Gefen checkpoint deterministic policy must be a bool, got {!r}".format(
+                        gefen_deterministic
+                    )
                 )
             if gefen_deterministic != self._deterministic:
                 raise ValueError(
@@ -8604,7 +9044,10 @@ class Gefen(torch.optim.Optimizer):
         # and re-aliases lazily).
         self._capt_invalidate()
 
-        self._base_load_state_dict_without_hooks(state_dict)
+        if self.state_offload_active:
+            self._base_load_state_dict_to_offload_cpu(state_dict)
+        else:
+            self._base_load_state_dict_without_hooks(state_dict)
         self._gefen_global_step = gefen_global_step
         # Capturable SR seeds are optimizer-level scratch (a device mirror of
         # gefen_global_step): drop them so the first post-load SR kernel call
@@ -8648,7 +9091,10 @@ class Gefen(torch.optim.Optimizer):
                 if not torch.is_tensor(saved_value):
                     continue
                 live_value = live_state.get(key)
-                if torch.is_tensor(live_value) and live_value.dtype == saved_value.dtype:
+                if (
+                    torch.is_tensor(live_value)
+                    and live_value.dtype == saved_value.dtype
+                ):
                     continue
                 device = (
                     live_value.device if torch.is_tensor(live_value) else param.device
@@ -8701,6 +9147,7 @@ class Gefen(torch.optim.Optimizer):
                 closure feed the first step's codebook learning correctly. The
                 returned loss is passed through.
         """
+        self._assert_state_offload_step_ready()
         self._assert_finalized_binding_layout()
         self._assert_runtime_codebook_process_group()
         self._assert_capturable_if_capturing()
@@ -8711,6 +9158,7 @@ class Gefen(torch.optim.Optimizer):
             with torch.enable_grad():
                 loss = closure()
 
+        self._assert_state_offload_step_ready()
         self._assert_finalized_binding_layout()
         self._assert_runtime_codebook_process_group()
         try:
@@ -8778,6 +9226,7 @@ class Gefen(torch.optim.Optimizer):
             not self._use_fused_gefen_automatic_step()
             and not self._use_fused_automatic_vmean()
             and not self.capturable
+            and not self.state_offload_active
         )
 
         # Collect parameters that share block geometry + hyperparameters so they
@@ -8801,12 +9250,17 @@ class Gefen(torch.optim.Optimizer):
                 # path) instead of any vmean path. Sharded (DTensor) params
                 # fall through to the standard path: local-shard row/col
                 # statistics would be wrong under sharding.
-                if (
-                    self._factored_v_2d
-                    and p.ndim == 2
-                    and not hasattr(p, "placements")
-                ):
-                    self._step_automatic_factored(group, name, p, grad)
+                if self._factored_v_2d and p.ndim == 2 and not hasattr(p, "placements"):
+                    if self.state_offload_active:
+                        self._step_with_offloaded_parameter_state(
+                            self._step_automatic_factored,
+                            group,
+                            name,
+                            p,
+                            grad,
+                        )
+                    else:
+                        self._step_automatic_factored(group, name, p, grad)
                     continue
                 if (
                     batch_nonfused
@@ -8819,7 +9273,16 @@ class Gefen(torch.optim.Optimizer):
                             (group, name, p, grad)
                         )
                         continue
-                self._step_automatic(group, name, p, grad)
+                if self.state_offload_active:
+                    self._step_with_offloaded_parameter_state(
+                        self._step_automatic,
+                        group,
+                        name,
+                        p,
+                        grad,
+                    )
+                else:
+                    self._step_automatic(group, name, p, grad)
 
         for items in nonfused_groups.values():
             if len(items) == 1:

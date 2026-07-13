@@ -7,6 +7,7 @@ import pytest
 import torch
 
 import gefen
+import gefen.contracts as contracts_module
 import gefen.portable_schema as portable_schema_module
 from gefen.portable_schema import (
     PORTABLE_STATE_COVERAGE,
@@ -57,15 +58,15 @@ def test_portable_document_is_complete_device_neutral_and_weights_only_safe():
     assert document["format_version"] == PORTABLE_STATE_FORMAT_VERSION
     assert document["coverage"] == PORTABLE_STATE_COVERAGE
     assert document["completion"]["status"] == "complete"
-    assert (
-        document["completion"]["digest_algorithm"]
-        == PORTABLE_STATE_DIGEST_ALGORITHM
-    )
+    assert document["completion"]["digest_algorithm"] == PORTABLE_STATE_DIGEST_ALGORITHM
     momentum = document["parameters"]["Model.Weight"]["state"]["momentum"]
     assert momentum.device.type == "cpu"
     assert momentum.is_contiguous()
     assert momentum.storage_offset() == 0
-    assert momentum.untyped_storage().nbytes() == momentum.numel() * momentum.element_size()
+    assert (
+        momentum.untyped_storage().nbytes()
+        == momentum.numel() * momentum.element_size()
+    )
     assert torch.equal(momentum, view)
     assert momentum is not view
 
@@ -83,10 +84,18 @@ def test_portable_digest_is_deterministic_and_type_shape_dtype_sensitive():
     baseline = portable_state_digest(left)
 
     assert baseline == portable_state_digest(right)
-    assert baseline != portable_state_digest({"a": torch.tensor([[1.0, 2.0]]), "b": [1, 2]})
-    assert baseline != portable_state_digest({"a": torch.tensor([1.0, 2.0], dtype=torch.float64), "b": [1, 2]})
-    assert baseline != portable_state_digest({"a": torch.tensor([1.0, 3.0]), "b": [1, 2]})
-    assert baseline != portable_state_digest({"a": torch.tensor([1.0, 2.0]), "b": (1, 2)})
+    assert baseline != portable_state_digest(
+        {"a": torch.tensor([[1.0, 2.0]]), "b": [1, 2]}
+    )
+    assert baseline != portable_state_digest(
+        {"a": torch.tensor([1.0, 2.0], dtype=torch.float64), "b": [1, 2]}
+    )
+    assert baseline != portable_state_digest(
+        {"a": torch.tensor([1.0, 3.0]), "b": [1, 2]}
+    )
+    assert baseline != portable_state_digest(
+        {"a": torch.tensor([1.0, 2.0]), "b": (1, 2)}
+    )
 
 
 def test_portable_digest_streams_tensor_bytes_without_changing_the_digest(monkeypatch):
@@ -113,8 +122,7 @@ def test_portable_digest_v3_grammar_has_a_cross_version_golden_vector():
     }
 
     assert portable_state_digest(payload) == (
-        "348e09a77f1b3eae286adda1573722df9"
-        "38be6d8100631b272665f8c22c6e23a"
+        "348e09a77f1b3eae286adda1573722df938be6d8100631b272665f8c22c6e23a"
     )
 
 
@@ -149,7 +157,9 @@ def test_builder_and_normalizer_each_hash_the_tensor_tree_once(monkeypatch):
         calls.append(value)
         return original(value)
 
-    monkeypatch.setattr(portable_schema_module, "_canonical_portable_state_digest", tracked)
+    monkeypatch.setattr(
+        portable_schema_module, "_canonical_portable_state_digest", tracked
+    )
 
     document = _document()
     assert len(calls) == 1
@@ -272,8 +282,14 @@ def test_builder_and_normalizer_do_not_alias_or_mutate_inputs():
     assert document is not normalized
     assert document["parameters"] is not parameters
     assert document["parameters"]["Model.Weight"] is not record
-    assert document["parameters"]["Model.Weight"]["state"]["momentum"] is not source_momentum
-    assert normalized["parameters"]["Model.Weight"]["state"]["momentum"] is not document["parameters"]["Model.Weight"]["state"]["momentum"]
+    assert (
+        document["parameters"]["Model.Weight"]["state"]["momentum"]
+        is not source_momentum
+    )
+    assert (
+        normalized["parameters"]["Model.Weight"]["state"]["momentum"]
+        is not document["parameters"]["Model.Weight"]["state"]["momentum"]
+    )
 
 
 def test_portable_schema_and_checkpoint_binding_exports_are_public():
@@ -284,6 +300,7 @@ def test_portable_schema_and_checkpoint_binding_exports_are_public():
     assert gefen.CheckpointProcessGroupBinding.__module__ == "gefen.checkpoint"
     assert gefen.PortableStateLimits.__module__ == "gefen.portable_state"
     assert gefen.PortableStateProvider.__module__ == "gefen.contracts"
+    assert "PortableStateProvider" in contracts_module.__all__
     assert gefen.load_portable_dcp.__module__ == "gefen.portable_dcp"
     assert gefen.save_portable_dcp.__module__ == "gefen.portable_dcp"
     assert gefen.LogicalRegion.__module__ == "gefen.contracts"

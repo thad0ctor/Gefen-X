@@ -53,6 +53,7 @@ constructor defaults stay backward-compatible (Gefen backup, shared LR,
 period-one off, stochastic rounding off), with ``ns_schedule="tuned3"`` and
 ``normuon=True`` as the hybrid-specific defaults.
 """
+
 import copy
 import logging
 from collections import OrderedDict
@@ -60,7 +61,16 @@ from collections import OrderedDict
 import torch
 import torch.nn as nn
 
-from gefen.contracts import OptimizerContract, _hybrid_contract
+from gefen.codebook import CodebookProcessGroupBinding
+from gefen.contracts import (
+    LogicalSlice,
+    OptimizerContract,
+    ParameterIdentity,
+    ParameterLayout,
+    ShardIdentity,
+    ShardingManifest,
+    _hybrid_contract,
+)
 from gefen.gefen import (
     Gefen,
     _amp_native_scaling_required,
@@ -74,6 +84,7 @@ from gefen.params import (
     split_params_for_muon,
     validate_split,
 )
+from gefen.rebinding import ParameterRebinding
 
 logger = logging.getLogger(__name__)
 
@@ -337,9 +348,7 @@ class GefenMuonHybrid(torch.optim.Optimizer):
         if backup_named_params is None:
             # Single-argument convenience form: the first arg is a model or a
             # named-param iterable to split internally.
-            muon_named_params, backup_named_params = self._auto_split(
-                muon_named_params, backup_substrings
-            )
+            muon_named_params, backup_named_params = self._auto_split(muon_named_params, backup_substrings)
         elif backup_substrings is not None:
             raise TypeError(
                 "backup_substrings is only valid with the single-argument "
@@ -359,9 +368,7 @@ class GefenMuonHybrid(torch.optim.Optimizer):
         # 1D-only model (all params with real storage) still constructs a
         # backup-only hybrid exactly as before.
         if not muon_named_params and backup_named_params:
-            zero_numel = [
-                name for name, p in backup_named_params if p.numel() == 0
-            ]
+            zero_numel = [name for name, p in backup_named_params if p.numel() == 0]
             # Only the ALL-placeholder set is the ZeRO-3 signature; a mixed
             # set (e.g. an intentionally empty slot among real 1-D weights)
             # still constructs a backup-only hybrid as before.
@@ -383,11 +390,7 @@ class GefenMuonHybrid(torch.optim.Optimizer):
                     )
                 )
         if backup_optimizer not in ("gefen", "adamw"):
-            raise ValueError(
-                "backup_optimizer must be 'gefen' or 'adamw' but is: {!r}".format(
-                    backup_optimizer
-                )
-            )
+            raise ValueError("backup_optimizer must be 'gefen' or 'adamw' but is: {!r}".format(backup_optimizer))
         self.backup_optimizer = backup_optimizer
         # Catch the silent footguns: a param routed to both halves (stepped
         # twice) or a duplicate name (codebook cache key collision). Completeness
@@ -408,9 +411,7 @@ class GefenMuonHybrid(torch.optim.Optimizer):
                 "GefenMuonHybrid: adjust_lr_fn={!r} uses Muon-native LR scaling, so "
                 "an AdamW-scale lr will mis-scale the 2D Muon matrices relative to "
                 "the backup half. Use adjust_lr_fn='match_rms_adamw' (the default) "
-                "to share one AdamW-scale lr, or set muon_lr explicitly.".format(
-                    adjust_lr_fn
-                ),
+                "to share one AdamW-scale lr, or set muon_lr explicitly.".format(adjust_lr_fn),
                 stacklevel=2,
             )
 
@@ -430,9 +431,7 @@ class GefenMuonHybrid(torch.optim.Optimizer):
         # matrices while leaving the backup (norms/biases/embeddings/head) on a
         # different schedule. Both default to the shared weight_decay.
         muon_weight_decay = weight_decay if muon_weight_decay is None else muon_weight_decay
-        backup_weight_decay = (
-            weight_decay if backup_weight_decay is None else backup_weight_decay
-        )
+        backup_weight_decay = weight_decay if backup_weight_decay is None else backup_weight_decay
 
         self.muon = (
             GefenMuon(
@@ -566,6 +565,17 @@ class GefenMuonHybrid(torch.optim.Optimizer):
                 for p in group["params"]:
                     self._state_param_owner[id(p)] = (p, o)
 
+        # Composite stable identity is installed only after every present Gefen
+        # child has staged the same complete post-sharding transaction. These
+        # fields remain separate from either child's rank-local metadata so a
+        # failed second-child preparation cannot leave the Hybrid half-bound.
+        self._hybrid_post_sharding_finalized = False
+        self._hybrid_sharding_manifest = None
+        self._hybrid_local_shard_bindings = ()
+        self._hybrid_fqn_roles = ()
+        self._hybrid_codebook_process_group = None
+        self._hybrid_finalized_slots = ()
+
         # Deliberately do NOT call super().__init__(): we expose each
         # sub-optimizer's real param_groups/state via properties (shared dict
         # refs), so the LR scheduler's in-place ``group["lr"] = ...`` updates
@@ -624,16 +634,470 @@ class GefenMuonHybrid(torch.optim.Optimizer):
         # unknown key (DeepSpeed ZeRO's flattened 1-D fp32 partitions) fails
         # fast with a self-explanatory KeyError instead of silently landing in
         # a rebuilt-per-access throwaway dict.
+        self._assert_finalized_binding_layout()
         return _HybridMergedState(self._subopts, self._state_param_owner)
 
+    def _gefen_rebinding_children(self):
+        children = []
+        if self.muon is not None:
+            if type(self.muon) is not GefenMuon:
+                raise TypeError("GefenMuonHybrid post_sharding requires an exact GefenMuon child")
+            children.append(("muon", self.muon))
+        if self.backup is not None:
+            if self.backup_optimizer != "gefen" or type(self.backup) is not Gefen:
+                raise NotImplementedError(
+                    "GefenMuonHybrid post_sharding does not yet support an AdamW "
+                    "backup; use backup_optimizer='gefen' until AdamW has stable "
+                    "rebinding identity and atomic staged state I/O"
+                )
+            children.append(("backup", self.backup))
+        if not children:
+            raise RuntimeError("GefenMuonHybrid has no child optimizer to rebind")
+        return tuple(children)
+
+    @staticmethod
+    def _same_local_binding(left, right) -> bool:
+        return left[0] is right[0] and left[1] == right[1]
+
+    @staticmethod
+    def _reject_rebinding_method_shadows(value) -> None:
+        if type(value.__dict__) is not dict:
+            raise TypeError("GefenMuonHybrid rebinding requires exact attribute dictionaries")
+        for name in value.__dict__:
+            descriptor = None
+            for owner in type(value).__mro__:
+                if name in owner.__dict__:
+                    descriptor = owner.__dict__[name]
+                    break
+            if isinstance(descriptor, (staticmethod, classmethod)):
+                descriptor = descriptor.__func__
+            if callable(descriptor):
+                raise TypeError("GefenMuonHybrid rebinding rejects instance-level method shadows")
+
+    def _hybrid_identity_metadata_empty(self) -> bool:
+        return (
+            self._hybrid_sharding_manifest is None
+            and self._hybrid_local_shard_bindings == ()
+            and self._hybrid_fqn_roles == ()
+            and self._hybrid_codebook_process_group is None
+            and self._hybrid_finalized_slots == ()
+        )
+
+    def _assert_composite_rebinding_pristine(self, children) -> None:
+        if self._hybrid_post_sharding_finalized:
+            raise RuntimeError("GefenMuonHybrid post-sharding identity is already finalized")
+        if not self._hybrid_identity_metadata_empty():
+            raise RuntimeError("GefenMuonHybrid parameter rebinding found an incomplete prior identity plan")
+        if type(self._subopts) is not list or len(self._subopts) != len(children):
+            raise RuntimeError("GefenMuonHybrid child optimizer order changed before post_sharding")
+        if any(live is not expected for live, (_role, expected) in zip(self._subopts, children)):
+            raise RuntimeError("GefenMuonHybrid child optimizer order changed before post_sharding")
+        if type(self._state_param_owner) is not dict:
+            raise TypeError("GefenMuonHybrid parameter ownership must use an exact dictionary")
+        child_set = {child for _role, child in children}
+        owner_counts = {child: 0 for child in child_set}
+        for parameter_id, live in self._state_param_owner.items():
+            if (
+                type(live) is not tuple
+                or len(live) != 2
+                or not isinstance(live[0], torch.Tensor)
+                or parameter_id != id(live[0])
+                or live[1] not in child_set
+            ):
+                raise RuntimeError("GefenMuonHybrid parameter ownership changed before post_sharding")
+            owner_counts[live[1]] += 1
+        for _role, child in children:
+            live_slot_count = sum(len(group["params"]) for group in child.param_groups)
+            if owner_counts[child] != live_slot_count:
+                raise RuntimeError("GefenMuonHybrid child slot counts changed before post_sharding")
+
+    def _stage_post_sharding(
+        self,
+        rebindings,
+        manifest: ShardingManifest,
+        codebook_process_group=None,
+    ):
+        GefenMuonHybrid._reject_rebinding_method_shadows(self)
+        children = GefenMuonHybrid._gefen_rebinding_children(self)
+        for _role, child in children:
+            GefenMuonHybrid._reject_rebinding_method_shadows(child)
+        GefenMuonHybrid._assert_composite_rebinding_pristine(self, children)
+        if type(manifest) is not ShardingManifest:
+            raise TypeError("manifest must be an exact ShardingManifest")
+        validated_manifest = ShardingManifest(
+            manifest.shards,
+            schema_version=manifest.schema_version,
+        )
+        if validated_manifest != manifest:
+            raise ValueError("GefenMuonHybrid requires a canonical manifest")
+        if type(rebindings) is not tuple or not rebindings:
+            raise TypeError("rebindings must be a non-empty tuple of ParameterRebinding values")
+        if any(type(item) is not ParameterRebinding for item in rebindings):
+            raise TypeError("rebindings must contain exact ParameterRebinding values")
+        if codebook_process_group is not None and type(codebook_process_group) is not CodebookProcessGroupBinding:
+            raise TypeError("codebook_process_group must be an exact CodebookProcessGroupBinding")
+
+        source_entries = {}
+        source_roles = {}
+        child_by_role = dict(children)
+        for parameter_id, (parameter, child) in self._state_param_owner.items():
+            if parameter_id != id(parameter):
+                raise RuntimeError("GefenMuonHybrid parameter ownership contains a stale key")
+            role = "muon" if child is self.muon else "backup"
+            if role not in child_by_role or child_by_role[role] is not child:
+                raise RuntimeError("GefenMuonHybrid parameter ownership names a foreign child")
+            source_entries[parameter_id] = parameter
+            source_roles[parameter_id] = role
+        if len(rebindings) != len(source_entries):
+            raise ValueError(
+                "GefenMuonHybrid post_sharding requires exactly one rebinding for every original child slot"
+            )
+
+        seen_sources = set()
+        seen_targets = set()
+        seen_fqns = set()
+        targets = []
+        by_role = {role: [] for role, _child in children}
+        fqn_roles = {}
+        for rebinding in rebindings:
+            source = rebinding.old_parameter
+            source_id = id(source)
+            if source_id not in source_entries or source_entries[source_id] is not source:
+                raise ValueError("GefenMuonHybrid rebinding source is not an original child slot")
+            if source_id in seen_sources:
+                raise ValueError("GefenMuonHybrid rebinding source tensors must be unique")
+            seen_sources.add(source_id)
+            target = rebinding.new_parameter
+            if target is not None:
+                if not isinstance(target, torch.Tensor):
+                    raise TypeError("GefenMuonHybrid rebinding target must be a Tensor or None")
+                target_id = id(target)
+                if target_id in seen_targets:
+                    raise ValueError("GefenMuonHybrid rebound target tensors must be unique")
+                seen_targets.add(target_id)
+                original_target = source_entries.get(target_id)
+                if original_target is not None and original_target is not source:
+                    raise ValueError("GefenMuonHybrid rebound targets cannot steal another original child slot")
+                targets.append(target)
+            fqn = rebinding.shard.parameter.fqn
+            if fqn in seen_fqns:
+                raise ValueError("GefenMuonHybrid local canonical parameter FQNs must be unique")
+            seen_fqns.add(fqn)
+            role = source_roles[source_id]
+            fqn_roles[fqn] = role
+            by_role[role].append(rebinding)
+
+        if seen_sources != set(source_entries):
+            raise ValueError("GefenMuonHybrid post_sharding did not bind every original child slot")
+        Gefen._assert_rebound_storage_disjoint(targets)
+
+        manifest_fqns = {shard.parameter.fqn for shard in manifest.shards}
+        if seen_fqns != manifest_fqns:
+            raise ValueError("GefenMuonHybrid manifest FQNs must exactly match all child slots")
+        if codebook_process_group is not None:
+            if any(shard.process_group != codebook_process_group.identity for shard in manifest.shards):
+                raise ValueError("every Hybrid manifest shard must use the shared codebook process-group identity")
+            if any(item.shard.local_member != codebook_process_group.local_member for item in rebindings):
+                raise ValueError("every Hybrid local shard must match the shared codebook member")
+
+        staged_children = []
+        for role, child in children:
+            child_rebindings = tuple(by_role[role])
+            if not child_rebindings:
+                raise ValueError("GefenMuonHybrid child {!r} has no routed rebinding".format(role))
+            child_fqns = {item.shard.parameter.fqn for item in child_rebindings}
+            child_manifest = ShardingManifest(
+                tuple(shard for shard in manifest.shards if shard.parameter.fqn in child_fqns),
+                schema_version=manifest.schema_version,
+            )
+            staged = child._stage_post_sharding(
+                child_rebindings,
+                child_manifest,
+                codebook_process_group,
+            )
+            if (
+                type(child.__dict__) is not dict
+                or type(staged.__dict__) is not dict
+                or staged._gefen_codebook_process_group is not codebook_process_group
+                or not staged._finalized_binding_layout_matches()
+            ):
+                raise TypeError("GefenMuonHybrid child staging produced an unsafe finalized optimizer")
+            staged_children.append((role, child, staged, child_manifest))
+
+        local_bindings = []
+        local_fqns = set()
+        new_state_param_owner = {}
+        finalized_slots = []
+        for role, child, staged, _child_manifest in staged_children:
+            finalized_slots.append(
+                (
+                    role,
+                    tuple(tuple(group["params"]) for group in staged.param_groups),
+                )
+            )
+            for parameter, shard in staged._gefen_local_shard_bindings:
+                fqn = shard.parameter.fqn
+                if fqn in local_fqns or fqn_roles.get(fqn) != role:
+                    raise ValueError("GefenMuonHybrid staged child identities overlap or changed routing")
+                local_fqns.add(fqn)
+                local_bindings.append((parameter, shard))
+            for group in staged.param_groups:
+                for parameter in group["params"]:
+                    parameter_id = id(parameter)
+                    if parameter_id in new_state_param_owner:
+                        raise ValueError("GefenMuonHybrid staged children share a live parameter")
+                    new_state_param_owner[parameter_id] = (parameter, child)
+        if local_fqns != seen_fqns:
+            raise ValueError("GefenMuonHybrid staged children do not cover the full manifest")
+        local_bindings.sort(key=lambda item: item[1].sort_key)
+        if type(self.__dict__) is not dict:
+            raise TypeError("GefenMuonHybrid publication requires an exact attribute dictionary")
+        return {
+            "children": tuple(staged_children),
+            "state_param_owner": new_state_param_owner,
+            "manifest": manifest,
+            "local_bindings": tuple(local_bindings),
+            "fqn_roles": tuple(sorted(fqn_roles.items())),
+            "codebook_process_group": codebook_process_group,
+            "finalized_slots": tuple(finalized_slots),
+        }
+
+    def post_sharding(
+        self,
+        rebindings,
+        *,
+        manifest: ShardingManifest,
+        codebook_process_group=None,
+    ) -> None:
+        """Atomically finalize every present Gefen child after sharding."""
+
+        if isinstance(rebindings, (str, bytes)):
+            raise TypeError("rebindings must be a sequence")
+        try:
+            rebindings = tuple(rebindings)
+        except TypeError as exc:
+            raise TypeError("rebindings must be a sequence") from exc
+        staged = GefenMuonHybrid._stage_post_sharding(
+            self,
+            rebindings,
+            manifest,
+            codebook_process_group,
+        )
+        for _role, child, staged_child, _child_manifest in staged["children"]:
+            dict.update(child.__dict__, staged_child.__dict__)
+        dict.update(
+            self.__dict__,
+            {
+                "_state_param_owner": staged["state_param_owner"],
+                "_hybrid_post_sharding_finalized": True,
+                "_hybrid_sharding_manifest": staged["manifest"],
+                "_hybrid_local_shard_bindings": staged["local_bindings"],
+                "_hybrid_fqn_roles": staged["fqn_roles"],
+                "_hybrid_codebook_process_group": staged["codebook_process_group"],
+                "_hybrid_finalized_slots": staged["finalized_slots"],
+            },
+        )
+
+    def rebind_shard(
+        self,
+        old_parameter,
+        new_parameter,
+        *,
+        shard: ShardIdentity,
+        manifest: ShardingManifest,
+    ) -> None:
+        """Apply a complete one-slot Hybrid shard plan."""
+
+        self.post_sharding(
+            (ParameterRebinding(old_parameter, new_parameter, shard),),
+            manifest=manifest,
+        )
+
+    def rebind_parameter(
+        self,
+        old_parameter,
+        new_parameter,
+        *,
+        identity: ParameterIdentity,
+    ) -> None:
+        """Bind one complete replicated parameter on a one-slot Hybrid."""
+
+        if type(identity) is not ParameterIdentity:
+            raise TypeError("identity must be an exact ParameterIdentity")
+        shard = ShardIdentity(
+            identity,
+            ParameterLayout.REPLICATED,
+            LogicalSlice.full(identity),
+        )
+        self.rebind_shard(
+            old_parameter,
+            new_parameter,
+            shard=shard,
+            manifest=ShardingManifest((shard,)),
+        )
+
+    def _finalized_binding_layout_matches(self) -> bool:
+        try:
+            if (
+                not self._hybrid_post_sharding_finalized
+                or type(self._hybrid_sharding_manifest) is not ShardingManifest
+                or type(self._hybrid_local_shard_bindings) is not tuple
+                or type(self._hybrid_fqn_roles) is not tuple
+                or type(self._hybrid_finalized_slots) is not tuple
+                or type(self._state_param_owner) is not dict
+            ):
+                return False
+            children = self._gefen_rebinding_children()
+            if (
+                type(self._subopts) is not list
+                or len(self._subopts) != len(children)
+                or any(live is not child for live, (_role, child) in zip(self._subopts, children))
+                or self.defaults is not children[0][1].defaults
+            ):
+                return False
+            role_by_fqn = dict(self._hybrid_fqn_roles)
+            if (
+                len(role_by_fqn) != len(self._hybrid_fqn_roles)
+                or tuple(sorted(role_by_fqn.items())) != self._hybrid_fqn_roles
+                or any(role not in {"muon", "backup"} for role in role_by_fqn.values())
+            ):
+                return False
+            manifest_fqns = {shard.parameter.fqn for shard in self._hybrid_sharding_manifest.shards}
+            if manifest_fqns != set(role_by_fqn):
+                return False
+            binding = self._hybrid_codebook_process_group
+            if binding is not None:
+                if type(binding) is not CodebookProcessGroupBinding:
+                    return False
+                if any(shard.process_group != binding.identity for shard in self._hybrid_sharding_manifest.shards):
+                    return False
+
+            expected_local = []
+            expected_owner = {}
+            expected_slots = []
+            for role, child in children:
+                if (
+                    not child._finalized_binding_layout_matches()
+                    or child._gefen_codebook_process_group is not self._hybrid_codebook_process_group
+                ):
+                    return False
+                expected_child_shards = tuple(
+                    shard
+                    for shard in self._hybrid_sharding_manifest.shards
+                    if role_by_fqn.get(shard.parameter.fqn) == role
+                )
+                if child._gefen_sharding_manifest.shards != expected_child_shards:
+                    return False
+                expected_slots.append(
+                    (
+                        role,
+                        tuple(tuple(group["params"]) for group in child.param_groups),
+                    )
+                )
+                for parameter, shard in child._gefen_local_shard_bindings:
+                    if role_by_fqn.get(shard.parameter.fqn) != role:
+                        return False
+                    if binding is not None and (
+                        shard.process_group != binding.identity or shard.local_member != binding.local_member
+                    ):
+                        return False
+                    expected_local.append((parameter, shard))
+                for group in child.param_groups:
+                    for parameter in group["params"]:
+                        parameter_id = id(parameter)
+                        if parameter_id in expected_owner:
+                            return False
+                        expected_owner[parameter_id] = (parameter, child)
+            expected_local.sort(key=lambda item: item[1].sort_key)
+            if len(expected_local) != len(self._hybrid_local_shard_bindings):
+                return False
+            if any(
+                not self._same_local_binding(live, expected)
+                for live, expected in zip(
+                    self._hybrid_local_shard_bindings,
+                    expected_local,
+                )
+            ):
+                return False
+            if tuple(expected_slots) != self._hybrid_finalized_slots:
+                return False
+            if set(expected_owner) != set(self._state_param_owner):
+                return False
+            for parameter_id, (parameter, child) in expected_owner.items():
+                live = self._state_param_owner[parameter_id]
+                if type(live) is not tuple or len(live) != 2 or live[0] is not parameter or live[1] is not child:
+                    return False
+            return True
+        except (
+            AttributeError,
+            KeyError,
+            NotImplementedError,
+            RuntimeError,
+            TypeError,
+            ValueError,
+        ):
+            return False
+
+    def _canonical_identity_ready(self) -> bool:
+        return self._hybrid_post_sharding_finalized and self._finalized_binding_layout_matches()
+
+    def _codebook_scope_ready(self) -> bool:
+        return self._hybrid_codebook_process_group is not None and self._canonical_identity_ready()
+
+    def _assert_finalized_binding_layout(self) -> None:
+        if self._hybrid_post_sharding_finalized:
+            if not self._finalized_binding_layout_matches():
+                raise RuntimeError("GefenMuonHybrid finalized parameter layout changed outside post_sharding")
+        elif not self._hybrid_identity_metadata_empty():
+            raise RuntimeError("GefenMuonHybrid found an incomplete post_sharding identity plan")
+
+    def parameter_identity(self, parameter) -> ParameterIdentity:
+        """Return the canonical identity bound to one live Hybrid parameter."""
+
+        return self.shard_identity(parameter).parameter
+
+    def shard_identity(self, parameter) -> ShardIdentity:
+        """Return the stable shard identity bound to one live parameter."""
+
+        self._assert_finalized_binding_layout()
+        entry = self._state_param_owner.get(id(parameter))
+        if entry is None or entry[0] is not parameter:
+            raise KeyError("parameter has no finalized GefenMuonHybrid shard identity")
+        return entry[1].shard_identity(parameter)
+
+    def shard_bindings(self):
+        """Return all local tensor/identity pairs in canonical order."""
+
+        self._assert_finalized_binding_layout()
+        return self._hybrid_local_shard_bindings
+
+    def parameter_routing(self):
+        """Return the immutable canonical FQN-to-child-role routing."""
+
+        self._assert_finalized_binding_layout()
+        if not self._canonical_identity_ready():
+            raise RuntimeError("GefenMuonHybrid parameter routing is not finalized")
+        return self._hybrid_fqn_roles
+
+    def sharding_manifest(self):
+        """Return the complete composite manifest, or ``None``."""
+
+        self._assert_finalized_binding_layout()
+        return self._hybrid_sharding_manifest
+
+    def codebook_process_group_binding(self):
+        """Return the one binding shared by every present Gefen child."""
+
+        self._assert_finalized_binding_layout()
+        return self._hybrid_codebook_process_group
+
     def zero_grad(self, set_to_none: bool = True):
+        self._assert_finalized_binding_layout()
         for o in self._subopts:
             o.zero_grad(set_to_none=set_to_none)
 
     def _assert_capturable_devices_if_capturing(self) -> None:
-        capturing = (
-            torch.cuda.is_available() and torch.cuda.is_current_stream_capturing()
-        )
+        capturing = torch.cuda.is_available() and torch.cuda.is_current_stream_capturing()
         if not capturing:
             return
         if not self.capturable:
@@ -643,21 +1107,17 @@ class GefenMuonHybrid(torch.optim.Optimizer):
                 "to make step() graph-safe."
             )
         devices = {
-            param.device
-            for optimizer in self._subopts
-            for group in optimizer.param_groups
-            for param in group["params"]
+            param.device for optimizer in self._subopts for group in optimizer.param_groups for param in group["params"]
         }
         capture_device = torch.device("cuda", torch.cuda.current_device())
         if devices != {capture_device}:
             raise RuntimeError(
                 "CUDA graph capture requires every GefenMuonHybrid parameter on "
-                "the current capture device {}; found {}".format(
-                    capture_device, sorted(map(str, devices))
-                )
+                "the current capture device {}; found {}".format(capture_device, sorted(map(str, devices)))
             )
 
     def step(self, closure=None):
+        self._assert_finalized_binding_layout()
         self._assert_capturable_devices_if_capturing()
         # Dispatch the INSTANCE step hooks around the composite step, mirroring
         # torch.optim.Optimizer.profile_hook_step exactly: hooks receive
@@ -687,17 +1147,14 @@ class GefenMuonHybrid(torch.optim.Optimizer):
         if closure is not None:
             with torch.enable_grad():
                 loss = closure()
+        self._assert_finalized_binding_layout()
         for child in self._subopts:
-            _assert_optimizer_gradients_structurally_valid(
-                child, require_2d_params=child is self.muon
-            )
+            _assert_optimizer_gradients_structurally_valid(child, require_2d_params=child is self.muon)
         # A non-finite gradient in either half skips BOTH children before their
         # codebooks, states, counters, or parameters can move. Explicit
         # scaler.unscale_(hybrid) is detected by grad_scale=None and is not
         # repeated; automatic unscale covers every child parameter exactly once.
-        if (
-            hasattr(self, "found_inf") or hasattr(self, "grad_scale")
-        ) and not _amp_prepare_optimizer_step(self):
+        if (hasattr(self, "found_inf") or hasattr(self, "grad_scale")) and not _amp_prepare_optimizer_step(self):
             for post_hook in self._optimizer_step_post_hooks.values():
                 post_hook(self, args, kwargs)
             return loss
@@ -710,11 +1167,13 @@ class GefenMuonHybrid(torch.optim.Optimizer):
         return loss
 
     def state_dict(self):
+        self._assert_finalized_binding_layout()
         # Instance state-dict pre/post hooks, mirroring Optimizer.state_dict:
         # pre-hooks take (optimizer) and return nothing; a post-hook may return
         # a replacement state_dict.
         for pre_hook in self._optimizer_state_dict_pre_hooks.values():
             pre_hook(self)
+        self._assert_finalized_binding_layout()
         state_dict = {
             "muon": self.muon.state_dict() if self.muon is not None else None,
             "backup": self.backup.state_dict() if self.backup is not None else None,
@@ -729,9 +1188,26 @@ class GefenMuonHybrid(torch.optim.Optimizer):
     def optimizer_contract(self) -> OptimizerContract:
         """Return the composite contract without flattening either child schema."""
 
-        muon_contract = (
-            self.muon.optimizer_contract() if self.muon is not None else None
-        )
+        try:
+            GefenMuonHybrid._reject_rebinding_method_shadows(self)
+            rebinding_ready = bool(GefenMuonHybrid._gefen_rebinding_children(self))
+            identity_ready = GefenMuonHybrid._canonical_identity_ready(self)
+        except Exception:
+            rebinding_ready = False
+            identity_ready = False
+        try:
+            from gefen.portable_hybrid import _hybrid_portable_contract_support
+
+            (
+                canonical_global_same_topology,
+                canonical_global_topology_changing,
+                canonical_global_topology_change_kinds,
+            ) = _hybrid_portable_contract_support(self)
+        except Exception:
+            canonical_global_same_topology = frozenset()
+            canonical_global_topology_changing = frozenset()
+            canonical_global_topology_change_kinds = frozenset()
+        muon_contract = self.muon.optimizer_contract() if self.muon is not None else None
         backup_contract = (
             self.backup.optimizer_contract()
             if self.backup is not None and hasattr(self.backup, "optimizer_contract")
@@ -748,9 +1224,56 @@ class GefenMuonHybrid(torch.optim.Optimizer):
             muon=muon_contract,
             backup=backup_contract,
             backup_implementation=backup_implementation,
+            canonical_parameter_fqns=identity_ready,
+            stable_shard_identity=identity_ready,
+            explicit_process_group_codebook_scope=rebinding_ready,
+            shard_rebinding=rebinding_ready,
+            post_sharding=rebinding_ready,
+            canonical_global_same_topology=canonical_global_same_topology,
+            canonical_global_topology_changing=canonical_global_topology_changing,
+            canonical_global_topology_change_kinds=canonical_global_topology_change_kinds,
+        )
+
+    def export_portable_state(
+        self,
+        *,
+        checkpoint_process_group,
+        transaction_id,
+        limits,
+    ):
+        """Collectively export one complete Gefen-backed composite document."""
+
+        from gefen.portable_hybrid import _export_hybrid_portable_state
+
+        return _export_hybrid_portable_state(
+            self,
+            checkpoint_process_group=checkpoint_process_group,
+            transaction_id=transaction_id,
+            limits=limits,
+        )
+
+    def import_portable_state(
+        self,
+        state,
+        *,
+        checkpoint_process_group,
+        transaction_id,
+        limits,
+    ) -> None:
+        """Collectively stage and atomically publish composite portable state."""
+
+        from gefen.portable_hybrid import _import_hybrid_portable_state
+
+        _import_hybrid_portable_state(
+            self,
+            state,
+            checkpoint_process_group=checkpoint_process_group,
+            transaction_id=transaction_id,
+            limits=limits,
         )
 
     def load_state_dict(self, state_dict):
+        self._assert_finalized_binding_layout()
         # Instance load pre-hooks first (a pre-hook may return a replacement
         # dict -- e.g. one that converts a foreign schema), mirroring
         # Optimizer.load_state_dict's shallow copy + hook pass.
@@ -759,6 +1282,7 @@ class GefenMuonHybrid(torch.optim.Optimizer):
             hook_result = pre_hook(self, state_dict)
             if hook_result is not None:
                 state_dict = hook_result
+        self._assert_finalized_binding_layout()
 
         # Schema guard: this used to silently skip loading whenever the keys
         # were absent, so resuming from a standard {"state", "param_groups"}
@@ -799,9 +1323,7 @@ class GefenMuonHybrid(torch.optim.Optimizer):
         # optimizer loader otherwise accepts the other backend's group/state
         # layout and fails only on a later step (or, worse, misinterprets state).
         if self.backup is not None:
-            checkpoint_backup_optimizer = state_dict.get(
-                "backup_optimizer", "gefen"
-            )
+            checkpoint_backup_optimizer = state_dict.get("backup_optimizer", "gefen")
             if checkpoint_backup_optimizer != self.backup_optimizer:
                 raise ValueError(
                     "GefenMuonHybrid.load_state_dict: checkpoint backup_optimizer "
@@ -841,15 +1363,9 @@ class GefenMuonHybrid(torch.optim.Optimizer):
         T5 ``shared``, would slip to Muon, so a model is preferred). Bare tensors
         raise, since they carry neither names nor module type to route on.
         """
-        subs = (
-            DEFAULT_BACKUP_SUBSTRINGS
-            if backup_substrings is None
-            else tuple(backup_substrings)
-        )
+        subs = DEFAULT_BACKUP_SUBSTRINGS if backup_substrings is None else tuple(backup_substrings)
         if isinstance(params_or_model, nn.Module):
-            muon_named, backup_named = split_params_for_muon(
-                params_or_model, backup_substrings=subs
-            )
+            muon_named, backup_named = split_params_for_muon(params_or_model, backup_substrings=subs)
             validate_split(muon_named, backup_named, model=params_or_model)
             return muon_named, backup_named
         items = list(params_or_model)
@@ -865,9 +1381,7 @@ class GefenMuonHybrid(torch.optim.Optimizer):
                     "an iterable of (name, param) pairs (e.g. model.named_parameters()); "
                     "got a bare {}. Bare tensors can't be routed (embeddings/heads "
                     "would go to Muon) -- pass the model or use "
-                    "GefenMuonHybrid.from_model(model, ...).".format(
-                        type(item).__name__
-                    )
+                    "GefenMuonHybrid.from_model(model, ...).".format(type(item).__name__)
                 )
         muon_named, backup_named = [], []
         for name, param in items:
@@ -899,22 +1413,9 @@ class GefenMuonHybrid(torch.optim.Optimizer):
         return cls(muon_named, backup_named, **kwargs)
 
     def add_param_group(self, param_group):
-        raise NotImplementedError(
-            "GefenMuonHybrid splits params at construction; add_param_group is unsupported"
-        )
+        raise NotImplementedError("GefenMuonHybrid splits params at construction; add_param_group is unsupported")
 
     def __repr__(self):
-        nm = (
-            sum(len(group["params"]) for group in self.muon.param_groups)
-            if self.muon is not None
-            else 0
-        )
-        nb = (
-            sum(len(group["params"]) for group in self.backup.param_groups)
-            if self.backup is not None
-            else 0
-        )
-        return (
-            f"GefenMuonHybrid(muon_params={nm}, backup_params={nb}, "
-            f"backup_optimizer={self.backup_optimizer!r})"
-        )
+        nm = sum(len(group["params"]) for group in self.muon.param_groups) if self.muon is not None else 0
+        nb = sum(len(group["params"]) for group in self.backup.param_groups) if self.backup is not None else 0
+        return f"GefenMuonHybrid(muon_params={nm}, backup_params={nb}, backup_optimizer={self.backup_optimizer!r})"

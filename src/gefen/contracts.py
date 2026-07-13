@@ -140,7 +140,9 @@ def _validate_dimensions(name, values, *, positive):
 
 def _validate_identity_name(name, value):
     if not isinstance(value, str) or not value or value != value.strip():
-        raise ValueError("{} must be a non-empty string without outer whitespace".format(name))
+        raise ValueError(
+            "{} must be a non-empty string without outer whitespace".format(name)
+        )
     if "\x00" in value:
         raise ValueError("{} must not contain NUL".format(name))
 
@@ -161,12 +163,18 @@ class ParameterIdentity:
     def __post_init__(self) -> None:
         _validate_identity_name("ParameterIdentity.fqn", self.fqn)
         if self.fqn.startswith(".") or self.fqn.endswith(".") or ".." in self.fqn:
-            raise ValueError("ParameterIdentity.fqn must contain non-empty dot-separated components")
+            raise ValueError(
+                "ParameterIdentity.fqn must contain non-empty dot-separated components"
+            )
         if isinstance(self.global_shape, (str, bytes, bytearray)):
-            raise TypeError("ParameterIdentity.global_shape must be a sequence of dimensions")
+            raise TypeError(
+                "ParameterIdentity.global_shape must be a sequence of dimensions"
+            )
         object.__setattr__(self, "global_shape", _tuple(self.global_shape))
         if any(type(dim) is not int or dim < 0 for dim in self.global_shape):
-            raise ValueError("ParameterIdentity.global_shape must contain nonnegative integers")
+            raise ValueError(
+                "ParameterIdentity.global_shape must contain nonnegative integers"
+            )
         _validate_identity_schema_version("parameter identity", self.schema_version)
 
     @property
@@ -185,9 +193,13 @@ class ProcessGroupIdentity:
     schema_version: int = IDENTITY_SCHEMA_VERSION
 
     def __post_init__(self) -> None:
-        _validate_identity_name("ProcessGroupIdentity.semantic_name", self.semantic_name)
+        _validate_identity_name(
+            "ProcessGroupIdentity.semantic_name", self.semantic_name
+        )
         if isinstance(self.ordered_members, (str, bytes)):
-            raise TypeError("ProcessGroupIdentity.ordered_members must be a sequence of member IDs")
+            raise TypeError(
+                "ProcessGroupIdentity.ordered_members must be a sequence of member IDs"
+            )
         object.__setattr__(self, "ordered_members", _tuple(self.ordered_members))
         if not self.ordered_members:
             raise ValueError("ProcessGroupIdentity.ordered_members must be non-empty")
@@ -214,13 +226,24 @@ class ShardPlacement:
             raise TypeError("ShardPlacement.kind must be a PlacementKind")
         if type(self.parts) is not int or self.parts <= 0:
             raise ValueError("ShardPlacement.parts must be a positive integer")
-        if type(self.coordinate) is not int or self.coordinate < 0 or self.coordinate >= self.parts:
+        if (
+            type(self.coordinate) is not int
+            or self.coordinate < 0
+            or self.coordinate >= self.parts
+        ):
             raise ValueError("ShardPlacement.coordinate must be within parts")
         if self.kind is PlacementKind.DIMENSION_SHARD:
-            if type(self.parameter_dimension) is not int or self.parameter_dimension < 0:
-                raise ValueError("dimension-shard placement requires a nonnegative parameter dimension")
+            if (
+                type(self.parameter_dimension) is not int
+                or self.parameter_dimension < 0
+            ):
+                raise ValueError(
+                    "dimension-shard placement requires a nonnegative parameter dimension"
+                )
         elif self.parameter_dimension is not None:
-            raise ValueError("only a dimension-shard placement may name a parameter dimension")
+            raise ValueError(
+                "only a dimension-shard placement may name a parameter dimension"
+            )
 
 
 @dataclass(frozen=True)
@@ -266,9 +289,7 @@ class LogicalRegion:
                     "{} must be a sequence of dimensions".format(name)
                 ) from exc
             if any(type(value) is not int or value < 0 for value in normalized):
-                raise ValueError(
-                    "{} must contain nonnegative integers".format(name)
-                )
+                raise ValueError("{} must contain nonnegative integers".format(name))
             object.__setattr__(self, name.rsplit(".", 1)[1], normalized)
         if len(self.offsets) != len(self.lengths):
             raise ValueError(
@@ -301,9 +322,7 @@ class LogicalRegion:
         if not isinstance(parameter, ParameterIdentity):
             raise TypeError("parameter must be a ParameterIdentity")
         if self.rank != len(parameter.global_shape):
-            raise ValueError(
-                "LogicalRegion rank must match the global parameter rank"
-            )
+            raise ValueError("LogicalRegion rank must match the global parameter rank")
         if any(
             offset + length > dimension
             for offset, length, dimension in zip(
@@ -320,8 +339,7 @@ class LogicalRegion:
         if self.rank != other.rank:
             raise ValueError("LogicalRegion intersection requires equal ranks")
         offsets = tuple(
-            max(left, right)
-            for left, right in zip(self.offsets, other.offsets)
+            max(left, right) for left, right in zip(self.offsets, other.offsets)
         )
         ends = tuple(
             min(left_offset + left_length, right_offset + right_length)
@@ -366,9 +384,7 @@ class LogicalRegion:
             if any(region.overlaps(other) for other in regions[index + 1 :]):
                 raise ValueError("LogicalRegions must not overlap")
         if sum(region.numel for region in regions) != parameter.numel:
-            raise ValueError(
-                "LogicalRegions must exactly cover the global parameter"
-            )
+            raise ValueError("LogicalRegions must exactly cover the global parameter")
 
 
 @dataclass(frozen=True)
@@ -393,8 +409,7 @@ class ShardIdentity:
         if self.layout is ParameterLayout.DTENSOR_1D_DEFAULT_WORLD:
             if not uses_logical_region:
                 raise ValueError(
-                    "stable DTensor identity requires a logical-region descriptor "
-                    "(LogicalRegion)"
+                    "stable DTensor identity requires a logical-region descriptor (LogicalRegion)"
                 )
             self.logical_slice.validate_bounds(self.parameter)
         elif not isinstance(self.logical_slice, LogicalSlice):
@@ -403,7 +418,9 @@ class ShardIdentity:
             )
         placements = _tuple(self.placements)
         if any(not isinstance(item, ShardPlacement) for item in placements):
-            raise TypeError("ShardIdentity.placements must contain ShardPlacement values")
+            raise TypeError(
+                "ShardIdentity.placements must contain ShardPlacement values"
+            )
         axes = tuple(item.mesh_axis for item in placements)
         if len(set(axes)) != len(axes):
             raise ValueError("ShardIdentity placement mesh axes must be unique")
@@ -420,16 +437,30 @@ class ShardIdentity:
             raise ValueError("ShardIdentity.logical_slice exceeds the global parameter")
         if self.process_group is None:
             if self.local_member is not None or self.owner is not None:
-                raise ValueError("ShardIdentity members and owners require a process-group identity")
+                raise ValueError(
+                    "ShardIdentity members and owners require a process-group identity"
+                )
         else:
             if not isinstance(self.process_group, ProcessGroupIdentity):
-                raise TypeError("ShardIdentity.process_group must be a ProcessGroupIdentity")
+                raise TypeError(
+                    "ShardIdentity.process_group must be a ProcessGroupIdentity"
+                )
             if self.local_member not in self.process_group.ordered_members:
-                raise ValueError("ShardIdentity.local_member must belong to the process group")
-            if self.owner is not None and self.owner not in self.process_group.ordered_members:
+                raise ValueError(
+                    "ShardIdentity.local_member must belong to the process group"
+                )
+            if (
+                self.owner is not None
+                and self.owner not in self.process_group.ordered_members
+            ):
                 raise ValueError("ShardIdentity.owner must belong to the process group")
-        if self.layout is not ParameterLayout.WHOLE_PARAMETER_OWNER and self.owner is not None:
-            raise ValueError("ShardIdentity.owner is valid only for whole-parameter ownership")
+        if (
+            self.layout is not ParameterLayout.WHOLE_PARAMETER_OWNER
+            and self.owner is not None
+        ):
+            raise ValueError(
+                "ShardIdentity.owner is valid only for whole-parameter ownership"
+            )
 
         full = (
             self.logical_slice == LogicalRegion.full(self.parameter)
@@ -440,13 +471,21 @@ class ShardIdentity:
         if self.process_group is not None:
             member_index = self.process_group.ordered_members.index(self.local_member)
             for placement in self.placements:
-                if placement.parts != len(self.process_group.ordered_members) or placement.coordinate != member_index:
-                    raise ValueError("ShardIdentity placement coordinates must match the ordered process-group members")
+                if (
+                    placement.parts != len(self.process_group.ordered_members)
+                    or placement.coordinate != member_index
+                ):
+                    raise ValueError(
+                        "ShardIdentity placement coordinates must match the ordered process-group members"
+                    )
         for placement in self.placements:
-            if placement.parameter_dimension is not None and placement.parameter_dimension >= len(
-                self.parameter.global_shape
+            if (
+                placement.parameter_dimension is not None
+                and placement.parameter_dimension >= len(self.parameter.global_shape)
             ):
-                raise ValueError("ShardIdentity placement dimension exceeds parameter rank")
+                raise ValueError(
+                    "ShardIdentity placement dimension exceeds parameter rank"
+                )
         if self.layout is ParameterLayout.REPLICATED:
             if not full or self.owner is not None:
                 raise ValueError("replicated identity must cover the full parameter")
@@ -455,22 +494,34 @@ class ShardIdentity:
             if self.process_group is None and self.placements:
                 raise ValueError("an ungrouped replicated identity has no placements")
             if self.process_group is not None and len(self.placements) != 1:
-                raise ValueError("a process-group replicated identity requires one placement")
+                raise ValueError(
+                    "a process-group replicated identity requires one placement"
+                )
         elif self.layout is ParameterLayout.FLATTENED_ELEMENT_SHARD:
             if self.process_group is None or self.owner is not None:
-                raise ValueError("flattened element shards require a process group and no owner")
+                raise ValueError(
+                    "flattened element shards require a process group and no owner"
+                )
             if len(kinds) != 1 or kinds[0] is not PlacementKind.FLAT_SHARD:
-                raise ValueError("flattened element shards require one flat-shard placement")
+                raise ValueError(
+                    "flattened element shards require one flat-shard placement"
+                )
         elif self.layout is ParameterLayout.WHOLE_PARAMETER_OWNER:
             if self.process_group is None or self.owner is None:
-                raise ValueError("whole-parameter ownership requires a process group and owner")
+                raise ValueError(
+                    "whole-parameter ownership requires a process group and owner"
+                )
             owns_parameter = self.local_member == self.owner
             if owns_parameter and not full:
-                raise ValueError("the owner must carry the full whole-parameter logical slice")
+                raise ValueError(
+                    "the owner must carry the full whole-parameter logical slice"
+                )
             if not owns_parameter and self.logical_slice != LogicalSlice(0, 0):
                 raise ValueError("a non-owner whole-parameter slice must be empty")
             if len(kinds) != 1 or kinds[0] is not PlacementKind.WHOLE_PARAMETER_OWNER:
-                raise ValueError("whole-parameter ownership requires one owner placement")
+                raise ValueError(
+                    "whole-parameter ownership requires one owner placement"
+                )
         elif self.layout is ParameterLayout.DTENSOR_1D_DEFAULT_WORLD:
             if self.process_group is None or self.owner is not None:
                 raise ValueError(
@@ -481,8 +532,7 @@ class ShardIdentity:
                 PlacementKind.REPLICATE,
             }:
                 raise ValueError(
-                    "one-dimensional DTensor identities require one dimension-shard "
-                    "or replicate placement"
+                    "one-dimensional DTensor identities require one dimension-shard or replicate placement"
                 )
             placement = self.placements[0]
             if placement.kind is PlacementKind.REPLICATE:
@@ -503,8 +553,7 @@ class ShardIdentity:
                         offset != 0 or length != global_length
                     ):
                         raise ValueError(
-                            "a dimension-sharded DTensor region must cover every "
-                            "unsharded parameter dimension"
+                            "a dimension-sharded DTensor region must cover every unsharded parameter dimension"
                         )
         _validate_identity_schema_version("shard identity", self.schema_version)
 
@@ -599,19 +648,33 @@ class ShardingManifest:
         for fqn, parameter_shards in by_fqn.items():
             parameter = parameter_shards[0].parameter
             if any(item.parameter != parameter for item in parameter_shards[1:]):
-                raise ValueError("manifest shards for {!r} disagree on parameter identity".format(fqn))
+                raise ValueError(
+                    "manifest shards for {!r} disagree on parameter identity".format(
+                        fqn
+                    )
+                )
             layouts = {item.layout for item in parameter_shards}
             groups = {item.process_group for item in parameter_shards}
             if len(layouts) != 1 or len(groups) != 1:
-                raise ValueError("manifest shards for {!r} disagree on layout or process group".format(fqn))
+                raise ValueError(
+                    "manifest shards for {!r} disagree on layout or process group".format(
+                        fqn
+                    )
+                )
             layout = parameter_shards[0].layout
             group = parameter_shards[0].process_group
             members = tuple(item.local_member for item in parameter_shards)
             if group is None:
                 if len(parameter_shards) != 1:
-                    raise ValueError("an ungrouped parameter must have exactly one manifest shard")
-            elif set(members) != set(group.ordered_members) or len(members) != len(group.ordered_members):
-                raise ValueError("manifest shards must contain each process-group member exactly once")
+                    raise ValueError(
+                        "an ungrouped parameter must have exactly one manifest shard"
+                    )
+            elif set(members) != set(group.ordered_members) or len(members) != len(
+                group.ordered_members
+            ):
+                raise ValueError(
+                    "manifest shards must contain each process-group member exactly once"
+                )
             if group is not None:
                 placement_shapes = {
                     tuple(
@@ -626,7 +689,9 @@ class ShardingManifest:
                     for item in parameter_shards
                 }
                 if len(placement_shapes) != 1:
-                    raise ValueError("manifest member placements must agree on one topology")
+                    raise ValueError(
+                        "manifest member placements must agree on one topology"
+                    )
 
             if layout is ParameterLayout.FLATTENED_ELEMENT_SHARD:
                 cursor = 0
@@ -643,22 +708,31 @@ class ShardingManifest:
                         empty_offsets.append(item.logical_slice.flat_offset)
                         continue
                     if item.logical_slice.flat_offset != cursor:
-                        raise ValueError("flattened manifest slices must be gapless and non-overlapping")
+                        raise ValueError(
+                            "flattened manifest slices must be gapless and non-overlapping"
+                        )
                     cursor += item.logical_slice.length
                     boundaries.add(cursor)
                 if cursor != parameter.numel:
-                    raise ValueError("flattened manifest slices must cover the global parameter")
+                    raise ValueError(
+                        "flattened manifest slices must cover the global parameter"
+                    )
                 if any(offset not in boundaries for offset in empty_offsets):
                     raise ValueError(
                         "empty flattened manifest slices must use a partition boundary"
                     )
             elif layout is ParameterLayout.REPLICATED:
-                if any(item.logical_slice != LogicalSlice.full(parameter) for item in parameter_shards):
+                if any(
+                    item.logical_slice != LogicalSlice.full(parameter)
+                    for item in parameter_shards
+                ):
                     raise ValueError("replicated manifest shards must all be complete")
             elif layout is ParameterLayout.WHOLE_PARAMETER_OWNER:
                 owners = {item.owner for item in parameter_shards}
                 if len(owners) != 1:
-                    raise ValueError("whole-parameter manifest shards must agree on one owner")
+                    raise ValueError(
+                        "whole-parameter manifest shards must agree on one owner"
+                    )
             elif layout is ParameterLayout.DTENSOR_1D_DEFAULT_WORLD:
                 placements = tuple(item.placements[0] for item in parameter_shards)
                 placement_kind = placements[0].kind
@@ -688,8 +762,7 @@ class ShardingManifest:
                     cursor += region.lengths[shard_dimension]
                 if cursor != parameter.global_shape[shard_dimension]:
                     raise ValueError(
-                        "dimension-sharded DTensor manifest regions must cover "
-                        "the global parameter"
+                        "dimension-sharded DTensor manifest regions must cover the global parameter"
                     )
 
     def for_parameter(self, fqn: str) -> Tuple[ShardIdentity, ...]:
@@ -782,12 +855,14 @@ class StateVariant:
             raise TypeError("StateVariant.role must be a ParameterStateRole")
         if not set(self.inactive_fields).issubset(self.fields):
             raise ValueError("StateVariant.inactive_fields must be present in fields")
-        if self.parameter_ranks is not None and set(
-            self.parameter_ranks
-        ) & set(self.excluded_parameter_ranks):
+        if self.parameter_ranks is not None and set(self.parameter_ranks) & set(
+            self.excluded_parameter_ranks
+        ):
             raise ValueError("included and excluded parameter ranks must be disjoint")
         if self.parameter_ranks is not None:
-            _validate_dimensions("parameter_ranks", self.parameter_ranks, positive=False)
+            _validate_dimensions(
+                "parameter_ranks", self.parameter_ranks, positive=False
+            )
         _validate_dimensions(
             "excluded_parameter_ranks",
             self.excluded_parameter_ranks,
@@ -806,7 +881,9 @@ class OptimizerStateLayout:
     def __post_init__(self) -> None:
         object.__setattr__(self, "fields", _tuple(self.fields))
         object.__setattr__(self, "parameter_variants", _tuple(self.parameter_variants))
-        object.__setattr__(self, "composite_namespaces", _tuple(self.composite_namespaces))
+        object.__setattr__(
+            self, "composite_namespaces", _tuple(self.composite_namespaces)
+        )
         names = tuple(field.name for field in self.fields)
         if len(set(names)) != len(names):
             raise ValueError("OptimizerStateLayout fields must have unique names")
@@ -856,9 +933,7 @@ class TrainingSupport:
     def __post_init__(self) -> None:
         if self.mesh_dimensions is not None:
             object.__setattr__(self, "mesh_dimensions", _tuple(self.mesh_dimensions))
-            _validate_dimensions(
-                "mesh_dimensions", self.mesh_dimensions, positive=True
-            )
+            _validate_dimensions("mesh_dimensions", self.mesh_dimensions, positive=True)
         if not isinstance(self.layout, ParameterLayout):
             raise TypeError("TrainingSupport.layout must be a ParameterLayout")
         if not isinstance(self.process_group_scope, ProcessGroupScope):
@@ -896,7 +971,9 @@ class CheckpointSupport:
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "same_topology", _frozenset(self.same_topology))
-        object.__setattr__(self, "topology_changing", _frozenset(self.topology_changing))
+        object.__setattr__(
+            self, "topology_changing", _frozenset(self.topology_changing)
+        )
         object.__setattr__(
             self, "topology_change_kinds", _frozenset(self.topology_change_kinds)
         )
@@ -907,9 +984,7 @@ class CheckpointSupport:
         )
         if self.mesh_dimensions is not None:
             object.__setattr__(self, "mesh_dimensions", _tuple(self.mesh_dimensions))
-            _validate_dimensions(
-                "mesh_dimensions", self.mesh_dimensions, positive=True
-            )
+            _validate_dimensions("mesh_dimensions", self.mesh_dimensions, positive=True)
         if not isinstance(self.transport, CheckpointTransport):
             raise TypeError("CheckpointSupport.transport must be a CheckpointTransport")
         if not isinstance(self.process_group_scope, ProcessGroupScope):
@@ -1050,6 +1125,21 @@ class StateMovementProvider(Protocol):
         """Co-locate authoritative state with the optimizer's live parameters."""
 
 
+@runtime_checkable
+class StateOffloadProvider(Protocol):
+    """Structural protocol for persistent live optimizer-state offload."""
+
+    @property
+    def state_offload_device(self):
+        """Return the active offload device, or ``None`` while resident."""
+
+    def offload_state_(self, device="cpu") -> None:
+        """Atomically park supported state and enable transparent step paging."""
+
+    def restore_state_(self) -> None:
+        """Atomically co-locate state with parameters and disable offload."""
+
+
 _ALL_PRECISIONS = frozenset(
     {Precision.FLOAT32, Precision.BFLOAT16, Precision.FLOAT16, Precision.FLOAT64}
 )
@@ -1094,7 +1184,9 @@ def _common_fields() -> Tuple[StateField, ...]:
 def _base_parameter_fields() -> Tuple[StateField, ...]:
     return (
         StateField("name", StateScope.PARAMETER, StateGeometry.OPAQUE, True),
-        StateField("automatic_period", StateScope.PARAMETER, StateGeometry.SCALAR, True),
+        StateField(
+            "automatic_period", StateScope.PARAMETER, StateGeometry.SCALAR, True
+        ),
         StateField("step", StateScope.PARAMETER, StateGeometry.SCALAR, True),
         StateField("m_codebook", StateScope.PARAMETER, StateGeometry.PARAMETER, True),
         StateField("m_magnitude", StateScope.PARAMETER, StateGeometry.BLOCK, True),
@@ -1147,7 +1239,9 @@ def _derived_fields() -> Tuple[StateField, ...]:
             False,
             description="Rebuildable cross-member scope-agreement cache.",
         ),
-        StateField("_sr_seed_by_device", StateScope.DERIVED, StateGeometry.SCALAR, False),
+        StateField(
+            "_sr_seed_by_device", StateScope.DERIVED, StateGeometry.SCALAR, False
+        ),
         StateField(
             "_gefen_global_step_by_device",
             StateScope.DERIVED,
@@ -1210,6 +1304,7 @@ def _negative_capabilities(
     post_sharding: bool = False,
     canonical_state_io: bool = False,
     atomic_state_movement: bool = False,
+    state_offload: bool = False,
 ) -> OptimizerCapabilities:
     return OptimizerCapabilities(
         training=training,
@@ -1224,7 +1319,7 @@ def _negative_capabilities(
         post_sharding=post_sharding,
         canonical_state_io=canonical_state_io,
         atomic_state_movement=atomic_state_movement,
-        state_offload=False,
+        state_offload=state_offload,
     )
 
 
@@ -1240,12 +1335,11 @@ def _gefen_contract(
     canonical_global_topology_changing: AbstractSet[ParameterLayout] = frozenset(),
     canonical_global_topology_change_kinds: AbstractSet[TopologyChange] = frozenset(),
     atomic_state_movement: bool = False,
+    state_offload: bool = False,
 ) -> OptimizerContract:
     canonical_state_layouts = _frozenset(canonical_state_layouts)
     canonical_global_same_topology = _frozenset(canonical_global_same_topology)
-    canonical_global_topology_changing = _frozenset(
-        canonical_global_topology_changing
-    )
+    canonical_global_topology_changing = _frozenset(canonical_global_topology_changing)
     canonical_global_topology_change_kinds = _frozenset(
         canonical_global_topology_change_kinds
     )
@@ -1388,10 +1482,7 @@ def _gefen_contract(
             )
         )
     fields = (
-        _common_fields()
-        + _base_parameter_fields()
-        + block_fields
-        + factored_fields
+        _common_fields() + _base_parameter_fields() + block_fields + factored_fields
     )
     fields += _derived_fields()
     training = _base_training() + (
@@ -1463,6 +1554,7 @@ def _gefen_contract(
                 or canonical_global_topology_changing
             ),
             atomic_state_movement=atomic_state_movement,
+            state_offload=state_offload,
         ),
     )
 
@@ -1504,9 +1596,7 @@ def _gefen_muon_contract(
 ) -> OptimizerContract:
     canonical_state_layouts = _frozenset(canonical_state_layouts)
     canonical_global_same_topology = _frozenset(canonical_global_same_topology)
-    canonical_global_topology_changing = _frozenset(
-        canonical_global_topology_changing
-    )
+    canonical_global_topology_changing = _frozenset(canonical_global_topology_changing)
     canonical_global_topology_change_kinds = _frozenset(
         canonical_global_topology_change_kinds
     )
@@ -1757,10 +1847,7 @@ def _gefen_muon_contract(
             atomic_load=True,
         )
     ]
-    if (
-        "approx" in sharded_modes
-        and sharded_modes.issubset({"approx", "distributed"})
-    ):
+    if "approx" in sharded_modes and sharded_modes.issubset({"approx", "distributed"}):
         checkpoints.append(
             CheckpointSupport(
                 CheckpointTransport.PYTORCH_RANK_LOCAL,
@@ -1840,6 +1927,14 @@ def _hybrid_contract(
     muon: Optional[OptimizerContract],
     backup: Optional[OptimizerContract],
     backup_implementation: str,
+    canonical_parameter_fqns: bool = False,
+    stable_shard_identity: bool = False,
+    explicit_process_group_codebook_scope: bool = False,
+    shard_rebinding: bool = False,
+    post_sharding: bool = False,
+    canonical_global_same_topology: AbstractSet[ParameterLayout] = frozenset(),
+    canonical_global_topology_changing: AbstractSet[ParameterLayout] = frozenset(),
+    canonical_global_topology_change_kinds: AbstractSet[TopologyChange] = frozenset(),
 ) -> OptimizerContract:
     fields = (
         StateField(
@@ -1853,21 +1948,36 @@ def _hybrid_contract(
     if muon is not None:
         children.append(OptimizerChildContract("muon", muon.implementation, muon))
     if backup_implementation:
-        children.append(
-            OptimizerChildContract("backup", backup_implementation, backup)
-        )
+        children.append(OptimizerChildContract("backup", backup_implementation, backup))
     if muon is None:
         training = _base_training()
     else:
         training = muon.capabilities.training
-    checkpoints = (
+    canonical_global_same_topology = _frozenset(canonical_global_same_topology)
+    canonical_global_topology_changing = _frozenset(canonical_global_topology_changing)
+    canonical_global_topology_change_kinds = _frozenset(
+        canonical_global_topology_change_kinds
+    )
+    checkpoints = [
         CheckpointSupport(
             CheckpointTransport.COMPOSITE_NATIVE,
             frozenset({ParameterLayout.REPLICATED}),
             frozenset(),
             ProcessGroupScope.NONE,
         ),
-    )
+    ]
+    if canonical_global_same_topology or canonical_global_topology_changing:
+        checkpoints.append(
+            CheckpointSupport(
+                CheckpointTransport.CANONICAL_GLOBAL,
+                canonical_global_same_topology,
+                canonical_global_topology_changing,
+                ProcessGroupScope.ADAPTER_DEFINED,
+                topology_change_kinds=canonical_global_topology_change_kinds,
+                requires_collective=True,
+                atomic_load=True,
+            )
+        )
     return OptimizerContract(
         implementation="gefen.GefenMuonHybrid",
         state_layout=OptimizerStateLayout(
@@ -1877,8 +1987,16 @@ def _hybrid_contract(
         ),
         capabilities=_negative_capabilities(
             training=training,
-            checkpoints=checkpoints,
+            checkpoints=tuple(checkpoints),
             supported_parameter_ranks=None,
+            canonical_parameter_fqns=canonical_parameter_fqns,
+            stable_shard_identity=stable_shard_identity,
+            explicit_process_group_codebook_scope=explicit_process_group_codebook_scope,
+            shard_rebinding=shard_rebinding,
+            post_sharding=post_sharding,
+            canonical_state_io=bool(
+                canonical_global_same_topology or canonical_global_topology_changing
+            ),
         ),
         children=tuple(children),
     )
@@ -1900,6 +2018,7 @@ __all__ = [
     "ParameterLayout",
     "ParameterIdentity",
     "ParameterStateRole",
+    "PortableStateProvider",
     "PlacementKind",
     "Precision",
     "ProcessGroupScope",
@@ -1912,6 +2031,7 @@ __all__ = [
     "StateGeometry",
     "StateKeyMatch",
     "StateMovementProvider",
+    "StateOffloadProvider",
     "StateScope",
     "StateVariant",
     "TrainingSupport",
