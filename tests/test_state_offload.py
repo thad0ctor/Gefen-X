@@ -314,6 +314,9 @@ def test_activation_and_restore_copy_failures_are_atomic(monkeypatch):
     state_before = optimizer.state
     parameter_state_before = optimizer.state[parameter]
     codebook_before = optimizer._gefen_codebook
+    codebook_value_before = optimizer._gefen_codebook.detach().cpu().clone()
+    persistent_before = _persistent_snapshot(optimizer, parameter)
+    global_step_before = optimizer._gefen_global_step
 
     def fail_cpu_copy(_tensor):
         raise RuntimeError("injected activation copy failure")
@@ -325,11 +328,15 @@ def test_activation_and_restore_copy_failures_are_atomic(monkeypatch):
     assert optimizer.state[parameter] is parameter_state_before
     assert optimizer._gefen_codebook is codebook_before
     assert not optimizer.state_offload_active
+    _assert_persistent_equal(_persistent_snapshot(optimizer, parameter), persistent_before)
+    assert torch.equal(optimizer._gefen_codebook.detach().cpu(), codebook_value_before)
+    assert optimizer._gefen_global_step == global_step_before
 
     monkeypatch.undo()
     optimizer.offload_state_()
     state_before = optimizer.state
     parameter_state_before = optimizer.state[parameter]
+    persistent_before = _persistent_snapshot(optimizer, parameter)
 
     def fail_move(_tensor, _device):
         raise RuntimeError("injected restore copy failure")
@@ -341,6 +348,9 @@ def test_activation_and_restore_copy_failures_are_atomic(monkeypatch):
     assert optimizer.state[parameter] is parameter_state_before
     assert optimizer.state_offload_active
     _assert_cpu_boundary(optimizer)
+    _assert_persistent_equal(_persistent_snapshot(optimizer, parameter), persistent_before)
+    assert torch.equal(optimizer._gefen_codebook.detach().cpu(), codebook_value_before)
+    assert optimizer._gefen_global_step == global_step_before
 
 
 @_CUDA_REQUIRED
