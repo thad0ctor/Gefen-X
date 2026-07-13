@@ -7,7 +7,12 @@ from typing import Iterable, Optional, Tuple, Union
 import torch
 import torch.nn as nn
 
-from gefen.contracts import OptimizerContract, ParameterLayout, _gefen_muon_contract
+from gefen.contracts import (
+    OptimizerContract,
+    ParameterLayout,
+    TopologyChange,
+    _gefen_muon_contract,
+)
 from gefen.gefen import (
     Gefen,
     _assert_optimizer_gradients_structurally_valid,
@@ -772,6 +777,28 @@ class GefenMuon(Gefen):
             canonical_state_layouts = self._canonical_state_layouts()
         except Exception:
             canonical_state_layouts = frozenset()
+        try:
+            from gefen.portable_runtime import _portable_runtime_layouts
+
+            canonical_global_same_topology = _portable_runtime_layouts(self)
+        except Exception:
+            canonical_global_same_topology = frozenset()
+        if canonical_global_same_topology and sharded_modes == frozenset({"distributed"}):
+            canonical_global_topology_changing = frozenset(
+                {
+                    ParameterLayout.REPLICATED,
+                    ParameterLayout.WHOLE_PARAMETER_OWNER,
+                }
+            )
+            canonical_global_topology_change_kinds = frozenset(
+                {
+                    TopologyChange.PLACEMENT_RESHARD,
+                    TopologyChange.WORLD_SIZE_OWNER_REDISTRIBUTION,
+                }
+            )
+        else:
+            canonical_global_topology_changing = frozenset()
+            canonical_global_topology_change_kinds = frozenset()
         return _gefen_muon_contract(
             sharded_modes=sharded_modes,
             normuon_modes=normuon_modes,
@@ -780,6 +807,9 @@ class GefenMuon(Gefen):
             stable_shard_identity=self._canonical_identity_ready(),
             explicit_process_group_codebook_scope=True,
             canonical_state_layouts=canonical_state_layouts,
+            canonical_global_same_topology=canonical_global_same_topology,
+            canonical_global_topology_changing=canonical_global_topology_changing,
+            canonical_global_topology_change_kinds=canonical_global_topology_change_kinds,
             atomic_state_movement=self._atomic_state_movement_supported(),
             whole_parameter_owner=(
                 self._codebook_scope_ready()

@@ -21,6 +21,8 @@ __all__ = [
     "CheckpointProcessGroupBinding",
     "CodebookProcessGroupBinding",
     "PreparedCanonicalStateImport",
+    "PortableStateLimits",
+    "PortableStateProvider",
     "OptimizerCapabilities",
     "OptimizerChildContract",
     "OptimizerContract",
@@ -103,6 +105,10 @@ def __getattr__(name):
         from . import portable_schema
 
         return getattr(portable_schema, name)
+    if name == "PortableStateLimits":
+        from .portable_state import PortableStateLimits
+
+        return PortableStateLimits
     if name in (
         "CONTRACT_SCHEMA_VERSION",
         "IDENTITY_SCHEMA_VERSION",
@@ -120,6 +126,7 @@ def __getattr__(name):
         "ParameterIdentity",
         "ParameterStateRole",
         "PlacementKind",
+        "PortableStateProvider",
         "Precision",
         "ProcessGroupScope",
         "ProcessGroupIdentity",

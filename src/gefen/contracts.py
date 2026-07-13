@@ -1023,6 +1023,26 @@ class CanonicalStateProvider(Protocol):
 
 
 @runtime_checkable
+class PortableStateProvider(Protocol):
+    """Structural protocol for collective topology-neutral state I/O."""
+
+    def export_portable_state(
+        self, *, checkpoint_process_group, transaction_id, limits
+    ):
+        """Collectively return one complete portable global-state document."""
+
+    def import_portable_state(
+        self,
+        state,
+        *,
+        checkpoint_process_group,
+        transaction_id,
+        limits,
+    ) -> None:
+        """Collectively stage and atomically publish portable global state."""
+
+
+@runtime_checkable
 class StateMovementProvider(Protocol):
     """Structural protocol for quiescent atomic optimizer-state movement."""
 
@@ -1216,9 +1236,19 @@ def _gefen_contract(
     explicit_process_group_codebook_scope: bool = False,
     native_flattened_checkpoint: bool = False,
     canonical_state_layouts: AbstractSet[ParameterLayout] = frozenset(),
+    canonical_global_same_topology: AbstractSet[ParameterLayout] = frozenset(),
+    canonical_global_topology_changing: AbstractSet[ParameterLayout] = frozenset(),
+    canonical_global_topology_change_kinds: AbstractSet[TopologyChange] = frozenset(),
     atomic_state_movement: bool = False,
 ) -> OptimizerContract:
     canonical_state_layouts = _frozenset(canonical_state_layouts)
+    canonical_global_same_topology = _frozenset(canonical_global_same_topology)
+    canonical_global_topology_changing = _frozenset(
+        canonical_global_topology_changing
+    )
+    canonical_global_topology_change_kinds = _frozenset(
+        canonical_global_topology_change_kinds
+    )
     block_fields = (
         StateField("vmean", StateScope.PARAMETER, StateGeometry.BLOCK, True),
         StateField("vmean_step", StateScope.PARAMETER, StateGeometry.SCALAR, True),
@@ -1403,6 +1433,18 @@ def _gefen_contract(
                 atomic_load=True,
             )
         )
+    if canonical_global_same_topology or canonical_global_topology_changing:
+        checkpoints.append(
+            CheckpointSupport(
+                CheckpointTransport.CANONICAL_GLOBAL,
+                canonical_global_same_topology,
+                canonical_global_topology_changing,
+                ProcessGroupScope.ADAPTER_DEFINED,
+                topology_change_kinds=canonical_global_topology_change_kinds,
+                requires_collective=True,
+                atomic_load=True,
+            )
+        )
     return OptimizerContract(
         implementation="gefen.Gefen",
         state_layout=OptimizerStateLayout(fields, tuple(variants)),
@@ -1415,7 +1457,11 @@ def _gefen_contract(
             explicit_process_group_codebook_scope=explicit_process_group_codebook_scope,
             shard_rebinding=True,
             post_sharding=True,
-            canonical_state_io=bool(canonical_state_layouts),
+            canonical_state_io=bool(
+                canonical_state_layouts
+                or canonical_global_same_topology
+                or canonical_global_topology_changing
+            ),
             atomic_state_movement=atomic_state_movement,
         ),
     )
@@ -1451,9 +1497,19 @@ def _gefen_muon_contract(
     explicit_process_group_codebook_scope: bool = False,
     whole_parameter_owner: bool = False,
     canonical_state_layouts: AbstractSet[ParameterLayout] = frozenset(),
+    canonical_global_same_topology: AbstractSet[ParameterLayout] = frozenset(),
+    canonical_global_topology_changing: AbstractSet[ParameterLayout] = frozenset(),
+    canonical_global_topology_change_kinds: AbstractSet[TopologyChange] = frozenset(),
     atomic_state_movement: bool = False,
 ) -> OptimizerContract:
     canonical_state_layouts = _frozenset(canonical_state_layouts)
+    canonical_global_same_topology = _frozenset(canonical_global_same_topology)
+    canonical_global_topology_changing = _frozenset(
+        canonical_global_topology_changing
+    )
+    canonical_global_topology_change_kinds = _frozenset(
+        canonical_global_topology_change_kinds
+    )
     sharded_modes = _frozenset(sharded_modes)
     normuon_modes = _frozenset(normuon_modes)
     non_normuon_modes = _frozenset(non_normuon_modes)
@@ -1744,6 +1800,19 @@ def _gefen_muon_contract(
                 atomic_load=True,
             )
         )
+    if canonical_global_same_topology or canonical_global_topology_changing:
+        checkpoints.append(
+            CheckpointSupport(
+                CheckpointTransport.CANONICAL_GLOBAL,
+                canonical_global_same_topology,
+                canonical_global_topology_changing,
+                ProcessGroupScope.ADAPTER_DEFINED,
+                topology_change_kinds=canonical_global_topology_change_kinds,
+                required_sharded_modes=sharded_modes,
+                requires_collective=True,
+                atomic_load=True,
+            )
+        )
     return OptimizerContract(
         implementation="gefen.GefenMuon",
         state_layout=OptimizerStateLayout(fields, tuple(variants)),
@@ -1756,7 +1825,11 @@ def _gefen_muon_contract(
             explicit_process_group_codebook_scope=explicit_process_group_codebook_scope,
             shard_rebinding=True,
             post_sharding=True,
-            canonical_state_io=bool(canonical_state_layouts),
+            canonical_state_io=bool(
+                canonical_state_layouts
+                or canonical_global_same_topology
+                or canonical_global_topology_changing
+            ),
             atomic_state_movement=atomic_state_movement,
         ),
     )

@@ -43,6 +43,7 @@ from gefen.contracts import (
     ShardIdentity,
     ShardPlacement,
     ShardingManifest,
+    TopologyChange,
     _gefen_contract,
 )
 from gefen.partitioning import find_period_by_block_variance
@@ -1248,12 +1249,38 @@ class Gefen(torch.optim.Optimizer):
             canonical_state_layouts = self._canonical_state_layouts()
         except Exception:
             canonical_state_layouts = frozenset()
+        try:
+            from gefen.portable_runtime import _portable_runtime_layouts
+
+            canonical_global_same_topology = _portable_runtime_layouts(self)
+        except Exception:
+            canonical_global_same_topology = frozenset()
+        has_factored_matrix = canonical_global_same_topology and self._factored_v_2d and any(
+            len(slot.shard.parameter.global_shape) == 2
+            for slot in self._gefen_logical_slots
+        )
+        if canonical_global_same_topology and not has_factored_matrix:
+            canonical_global_topology_changing = frozenset(
+                {
+                    ParameterLayout.REPLICATED,
+                    ParameterLayout.FLATTENED_ELEMENT_SHARD,
+                }
+            )
+            canonical_global_topology_change_kinds = frozenset(
+                {TopologyChange.PLACEMENT_RESHARD}
+            )
+        else:
+            canonical_global_topology_changing = frozenset()
+            canonical_global_topology_change_kinds = frozenset()
         return _gefen_contract(
             factored_v_2d=self._factored_v_2d,
             canonical_parameter_fqns=identity_ready,
             stable_shard_identity=identity_ready,
             explicit_process_group_codebook_scope=True,
             canonical_state_layouts=canonical_state_layouts,
+            canonical_global_same_topology=canonical_global_same_topology,
+            canonical_global_topology_changing=canonical_global_topology_changing,
+            canonical_global_topology_change_kinds=canonical_global_topology_change_kinds,
             atomic_state_movement=self._atomic_state_movement_supported(),
             native_flattened_checkpoint=(
                 self._codebook_scope_ready()
@@ -6864,6 +6891,44 @@ class Gefen(torch.optim.Optimizer):
             self.prepare_canonical_state_import(state)
         )
 
+    def export_portable_state(
+        self,
+        *,
+        checkpoint_process_group,
+        transaction_id,
+        limits,
+    ):
+        """Collectively export exact period-one state by logical identity."""
+
+        from gefen.portable_runtime import _export_portable_state
+
+        return _export_portable_state(
+            self,
+            checkpoint_process_group=checkpoint_process_group,
+            transaction_id=transaction_id,
+            limits=limits,
+        )
+
+    def import_portable_state(
+        self,
+        state,
+        *,
+        checkpoint_process_group,
+        transaction_id,
+        limits,
+    ) -> None:
+        """Collectively stage and atomically publish exact portable state."""
+
+        from gefen.portable_runtime import _import_portable_state
+
+        _import_portable_state(
+            self,
+            state,
+            checkpoint_process_group=checkpoint_process_group,
+            transaction_id=transaction_id,
+            limits=limits,
+        )
+
     canonical_state_dict = export_canonical_state
     load_canonical_state_dict = import_canonical_state
 
@@ -7690,9 +7755,9 @@ class Gefen(torch.optim.Optimizer):
         # preserve that public object identity while publishing the staged
         # value. Both mappings are ordinary built-in dicts created by Optimizer.
         live_defaults = self.defaults
-        live_defaults.update(staged.defaults)
+        dict.update(live_defaults, staged.defaults)
         staged.defaults = live_defaults
-        self.__dict__.update(staged.__dict__)
+        dict.update(self.__dict__, staged.__dict__)
 
     def _validate_loaded_native_state(self) -> None:
         """Validate the complete prepared native state before publication."""
