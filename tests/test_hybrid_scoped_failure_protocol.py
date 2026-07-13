@@ -354,6 +354,30 @@ def _preflight_divergent_result(rank, group):
     }
 
 
+def _closure_divergent_result(rank, group):
+    # The closure runs BEFORE any scope synchronization. A rank-local closure
+    # failure must raise on every scope member together instead of leaving the
+    # failing rank to exit step() while the peer enters the composite preflight
+    # synchronize / a child's scoped step collectives and hangs.
+    optimizer, muon_parameter, backup_parameter, backup_shard = _make_scoped_hybrid(rank, group)
+    _set_local_gradients(muon_parameter, backup_parameter, backup_shard)
+
+    def closure():
+        if rank == 0:
+            raise RuntimeError("closure boom on rank:0")
+        return torch.tensor(1.0)
+
+    try:
+        optimizer.step(closure)
+        message = None
+    except RuntimeError as exc:
+        message = str(exc)
+    return {
+        "message": message,
+        "untouched": _untouched(optimizer, muon_parameter, backup_parameter),
+    }
+
+
 def _distributed_worker(rank, init_file, result_queue):
     try:
         dist.init_process_group(
@@ -372,6 +396,8 @@ def _distributed_worker(rank, init_file, result_queue):
         dist.barrier()
         preflight = _preflight_divergent_result(rank, group)
         dist.barrier()
+        closure_divergent = _closure_divergent_result(rank, group)
+        dist.barrier()
         result_queue.put(
             {
                 "rank": rank,
@@ -379,6 +405,7 @@ def _distributed_worker(rank, init_file, result_queue):
                 "amp_group_wide": amp_group_wide,
                 "amp_finite": amp_finite,
                 "preflight": preflight,
+                "closure_divergent": closure_divergent,
             }
         )
     except BaseException:
@@ -412,6 +439,12 @@ def _run_distributed_workers():
             pass
         for process in processes:
             process.join(timeout=10)
+        # A worker that queued its result but then hangs in
+        # destroy_process_group() (or exits nonzero) means the release-critical
+        # synchronization did not shut down cleanly; fail rather than silently
+        # terminate it below.
+        hung = [index for index, process in enumerate(processes) if process.is_alive()]
+        exit_codes = [process.exitcode for process in processes]
     finally:
         for process in processes:
             if process.is_alive():
@@ -421,7 +454,9 @@ def _run_distributed_workers():
         result_queue.join_thread()
         if os.path.exists(init_file):
             os.unlink(init_file)
-    assert len(results) == _WORLD, (results, [process.exitcode for process in processes])
+    assert not hung, ("hybrid scoped-failure workers hung", hung, exit_codes)
+    assert all(code == 0 for code in exit_codes), exit_codes
+    assert len(results) == _WORLD, (results, exit_codes)
     return sorted(results, key=lambda item: item["rank"])
 
 
@@ -469,6 +504,16 @@ def test_hybrid_step_synchronizes_amp_and_preflight_across_the_scope():
     assert "sparse gradients" in preflight[0]["message"]
     assert "gradient preflight failed on another process-group member" in preflight[1]["message"]
     assert all(item["untouched"] for item in preflight), preflight
+
+    # A rank-local closure failure (before any scope synchronization) raises on
+    # every scope member together through the composite preamble synchronization
+    # instead of stranding the peer inside a later scoped collective. Both ranks
+    # exit with an error and leave both children untouched.
+    closure_divergent = [result["closure_divergent"] for result in results]
+    assert closure_divergent[0]["message"] is not None and closure_divergent[1]["message"] is not None, closure_divergent
+    assert "closure boom on rank:0" in closure_divergent[0]["message"]
+    assert "step preamble failed on another process-group member" in closure_divergent[1]["message"]
+    assert all(item["untouched"] for item in closure_divergent), closure_divergent
 
 
 def _make_plain_hybrid():

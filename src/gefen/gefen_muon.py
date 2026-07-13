@@ -2864,12 +2864,30 @@ class GefenMuon(Gefen):
                 "GefenMuon whole-parameter owner stepping requires the separate "
                 "explicit process-group codebook scope"
             )
-        self._assert_capturable_if_capturing()
-        self._assert_codebook_capture_ready()
+        # Capture-readiness depends on rank-local gradients and the closure is
+        # user code, so both can fail on only a subset of scope members. Capture
+        # such a failure and synchronize it on the codebook binding BEFORE any
+        # member enters the scoped operation-header or later collectives, so it
+        # raises on every member together instead of stranding peers inside a
+        # collective. The finalized-layout and runtime-process-group guards above
+        # stay local: they establish the very binding used to synchronize.
         loss = None
-        if closure is not None:
-            with torch.enable_grad():
-                loss = closure()
+        try:
+            self._assert_capturable_if_capturing()
+            self._assert_codebook_capture_ready()
+            if closure is not None:
+                with torch.enable_grad():
+                    loss = closure()
+            local_preamble_error = None
+        except Exception as exc:
+            loss = None
+            local_preamble_error = exc
+        if self._gefen_codebook_process_group is not None:
+            self._synchronize_codebook_scope_failure(
+                local_preamble_error, "step preamble"
+            )
+        elif local_preamble_error is not None:
+            raise local_preamble_error
 
         self._assert_finalized_binding_layout()
         self._assert_runtime_codebook_process_group()

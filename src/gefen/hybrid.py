@@ -1251,7 +1251,6 @@ class GefenMuonHybrid(torch.optim.Optimizer):
 
     def step(self, closure=None):
         self._assert_finalized_binding_layout()
-        self._assert_capturable_devices_if_capturing()
         # Dispatch the INSTANCE step hooks around the composite step, mirroring
         # torch.optim.Optimizer.profile_hook_step exactly: hooks receive
         # (optimizer, args, kwargs) where args are the raw step() call args
@@ -1260,26 +1259,45 @@ class GefenMuonHybrid(torch.optim.Optimizer):
         # _patch_step_function); without this, registered hooks would silently
         # never fire. GLOBAL step hooks are NOT dispatched here -- they fire on
         # each child sub-optimizer's (wrapped) step; see the class docstring.
+        #
+        # The capturable-device check, the user step pre-hooks, and the closure
+        # can all fail on only a subset of scope members. Capture such a failure
+        # and synchronize it on the one shared codebook binding BEFORE any member
+        # enters the composite preflight synchronize or a child's scoped step
+        # collectives, so it raises on every member together instead of stranding
+        # peers. The finalized-layout guard above stays local: it establishes the
+        # binding used to synchronize.
         args = (self, closure) if closure is not None else (self,)
         kwargs = {}
-        for pre_hook in self._optimizer_step_pre_hooks.values():
-            result = pre_hook(self, args, kwargs)
-            if result is not None:
-                if isinstance(result, tuple) and len(result) == 2:
-                    args, kwargs = result
-                else:
-                    raise RuntimeError(
-                        f"{self.__class__.__name__}.step pre hook must return None "
-                        f"or a tuple of (new_args, new_kwargs), but got {result}."
-                    )
-        # Re-read the closure from the (possibly hook-rewritten) call args, as
-        # torch's wrapper would by calling step(*args, **kwargs).
-        closure = args[1] if len(args) > 1 else kwargs.get("closure")
-
         loss = None
-        if closure is not None:
-            with torch.enable_grad():
-                loss = closure()
+        try:
+            self._assert_capturable_devices_if_capturing()
+            for pre_hook in self._optimizer_step_pre_hooks.values():
+                result = pre_hook(self, args, kwargs)
+                if result is not None:
+                    if isinstance(result, tuple) and len(result) == 2:
+                        args, kwargs = result
+                    else:
+                        raise RuntimeError(
+                            f"{self.__class__.__name__}.step pre hook must return None "
+                            f"or a tuple of (new_args, new_kwargs), but got {result}."
+                        )
+            # Re-read the closure from the (possibly hook-rewritten) call args, as
+            # torch's wrapper would by calling step(*args, **kwargs).
+            closure = args[1] if len(args) > 1 else kwargs.get("closure")
+            if closure is not None:
+                with torch.enable_grad():
+                    loss = closure()
+            local_preamble_error = None
+        except Exception as exc:
+            loss = None
+            local_preamble_error = exc
+        if self._hybrid_codebook_process_group is not None:
+            self._synchronize_codebook_scope_failure(
+                local_preamble_error, "step preamble"
+            )
+        elif local_preamble_error is not None:
+            raise local_preamble_error
         self._assert_finalized_binding_layout()
         # Composite structural preflight, atomically over BOTH children before
         # either child steps. Under a shared codebook scope the failure is
