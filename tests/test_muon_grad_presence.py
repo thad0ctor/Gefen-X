@@ -570,23 +570,62 @@ def _reversed_order_worker(rank, world, port, result_queue):
             timeout=timedelta(seconds=12),
         )
         mesh = init_device_mesh("cpu", (world,))
+        second_mesh = init_device_mesh("cpu", (world,))
         results = []
 
-        for case in ("reversed_mismatch", "reversed_consistent", "aligned_mismatch"):
+        import warnings
+
+        for case in (
+            "reversed_mismatch",
+            "reversed_consistent",
+            "aligned_mismatch",
+            "aligned_consistent",
+            "bare_ambiguous",
+            "duplicate_names",
+            "duplicate_one_rank",
+            "cross_mesh_reversed",
+        ):
             generator = torch.Generator(device="cpu").manual_seed(
                 6100 + len(results)
             )
+            # The ambiguity cases need two same-shape parameters: identical
+            # shape and dtype is exactly what makes positional auto-names or
+            # shared explicit names ambiguous.
+            b_shape = (
+                (8, 8)
+                if case
+                in ("bare_ambiguous", "duplicate_names", "duplicate_one_rank")
+                else (6, 10)
+            )
+            b_mesh = second_mesh if case == "cross_mesh_reversed" else mesh
             full_a = torch.randn(8, 8, generator=generator)
             full_a_grad = torch.randn(8, 8, generator=generator) * 0.01
-            full_b = torch.randn(6, 10, generator=generator)
-            full_b_grad = torch.randn(6, 10, generator=generator) * 0.01
+            full_b = torch.randn(*b_shape, generator=generator)
+            full_b_grad = torch.randn(*b_shape, generator=generator) * 0.01
             a = nn.Parameter(distribute_tensor(full_a.clone(), mesh, [Shard(0)]))
-            b = nn.Parameter(distribute_tensor(full_b.clone(), mesh, [Shard(0)]))
-            named = [("a", a), ("b", b)]
-            if case.startswith("reversed") and rank == 1:
-                named = list(reversed(named))
+            b = nn.Parameter(
+                distribute_tensor(full_b.clone(), b_mesh, [Shard(0)])
+            )
+            if case == "bare_ambiguous":
+                params = [a, b]
+            elif case == "duplicate_names":
+                params = [("w", a), ("w", b)]
+            elif case == "duplicate_one_rank":
+                # Only rank 1 carries the duplicate labels; rank 0 must still
+                # learn about them through the reduced flag and take the same
+                # error path instead of blocking in a peer-abandoned
+                # collective.
+                params = (
+                    [("w", a), ("w", b)] if rank == 1 else [("a", a), ("b", b)]
+                )
+            else:
+                params = [("a", a), ("b", b)]
+                if (
+                    case.startswith("reversed") or case == "cross_mesh_reversed"
+                ) and rank == 1:
+                    params = list(reversed(params))
             optimizer = GefenMuon(
-                named,
+                params,
                 lr=1e-3,
                 fused=False,
                 ns_steps=1,
@@ -596,7 +635,7 @@ def _reversed_order_worker(rank, world, port, result_queue):
             # gradients on every rank first, then drop one per rank to build
             # the divergent presence pattern.
             a.grad = distribute_tensor(full_a_grad.clone(), mesh, [Shard(0)])
-            b.grad = distribute_tensor(full_b_grad.clone(), mesh, [Shard(0)])
+            b.grad = distribute_tensor(full_b_grad.clone(), b_mesh, [Shard(0)])
             if case.endswith("mismatch"):
                 if rank == 0:
                     b.grad = None
@@ -604,16 +643,25 @@ def _reversed_order_worker(rank, world, port, result_queue):
                     a.grad = None
 
             # Call the preflight directly instead of step(): before the
-            # order-insensitivity fix, the reversed_mismatch case falsely
-            # passed here and the corresponding step() would deadlock inside
-            # full_tensor(), so the isolated call is what keeps a regression
-            # loud instead of hung.
+            # order hardening, the reversed cases either falsely passed here
+            # (complementary grads) or sailed into step()'s misaligned owner
+            # assignment (consistent grads), and the corresponding step()
+            # would deadlock inside full_tensor(), so the isolated call is
+            # what keeps a regression loud instead of hung.
             message = None
-            try:
-                optimizer._assert_sharded_grad_presence_consistent()
-            except RuntimeError as exc:
-                message = str(exc)
-            results.append({"case": case, "message": message})
+            with warnings.catch_warnings(record=True) as caught:
+                warnings.simplefilter("always")
+                try:
+                    optimizer._assert_sharded_grad_presence_consistent()
+                except RuntimeError as exc:
+                    message = str(exc)
+            warned = any(
+                "cannot verify cross-rank parameter order" in str(item.message)
+                for item in caught
+            )
+            results.append(
+                {"case": case, "message": message, "warned": warned}
+            )
             a.grad = None
             b.grad = None
             dist.barrier()
@@ -630,13 +678,16 @@ def _reversed_order_worker(rank, world, port, result_queue):
     not torch.distributed.is_available() or not torch.distributed.is_gloo_available(),
     reason="order-insensitive grad-presence regression needs Gloo",
 )
-def test_sharded_grad_presence_check_is_order_insensitive():
-    """Rank-divergent param-group order must not defeat the presence check.
+def test_sharded_grad_presence_check_rejects_rank_divergent_order():
+    """Rank-divergent param-group order must be rejected, not merely survived.
 
     The activity vector is compared positionally across ranks, so without
     content-keyed meshes and sorted items a reversed group order with
     complementary gradient presence sums to a full count on every position
-    and the check falsely passes right before full_tensor() deadlocks.
+    and the check falsely passes right before full_tensor() deadlocks. And
+    even with consistent gradient presence, exact/distributed stepping enters
+    collectives and assigns momentum owners by insertion order, so divergent
+    order itself must raise on every rank before any of that starts.
     """
     import torch.multiprocessing as mp
 
@@ -674,7 +725,7 @@ def test_sharded_grad_presence_check_is_order_insensitive():
     errors = [payload for kind, _, payload in messages if kind == "error"]
     assert not errors, "\n".join(errors)
     rank_results = {
-        rank: {item["case"]: item["message"] for item in payload}
+        rank: {item["case"]: item for item in payload}
         for kind, rank, payload in messages
         if kind == "result"
     }
@@ -685,29 +736,76 @@ def test_sharded_grad_presence_check_is_order_insensitive():
             "reversed_mismatch",
             "reversed_consistent",
             "aligned_mismatch",
+            "aligned_consistent",
+            "bare_ambiguous",
+            "duplicate_names",
+            "duplicate_one_rank",
+            "cross_mesh_reversed",
         }, (rank, cases)
-        for case in ("reversed_mismatch", "aligned_mismatch"):
-            message = cases[case]
+        # Duplicate explicit labels defeat cross-rank identification, so they
+        # fail closed even with aligned order and full gradient presence —
+        # and the rank whose own labels are clean must raise too, via the
+        # reduced flag, instead of blocking in an abandoned collective.
+        for case in ("duplicate_names", "duplicate_one_rank"):
+            message = cases[case]["message"]
             assert message is not None, (rank, case)
-            assert "identical gradient presence" in message, (rank, case, message)
-            assert "a (1/2 mesh ranks have gradients)" in message, (
+            assert "unique name" in message, (rank, case, message)
+        # Order swaps between parameters on different meshes are step-fatal
+        # too; the optimizer-wide position probe must catch them.
+        message = cases["cross_mesh_reversed"]["message"]
+        assert message is not None, (rank, "cross_mesh_reversed")
+        assert "identical parameter-group order" in message, (rank, message)
+        # Rank-divergent order is rejected up front, with or without a
+        # gradient-presence mismatch layered on top.
+        for case in ("reversed_mismatch", "reversed_consistent"):
+            message = cases[case]["message"]
+            assert message is not None, (rank, case)
+            assert "identical parameter-group order" in message, (
                 rank,
                 case,
                 message,
             )
-            assert "b (1/2 mesh ranks have gradients)" in message, (
-                rank,
-                case,
-                message,
-            )
-        assert cases["reversed_consistent"] is None, (
+            assert "a" in message and "b" in message, (rank, case, message)
+        message = cases["aligned_mismatch"]["message"]
+        assert message is not None, (rank, "aligned_mismatch")
+        assert "identical gradient presence" in message, (rank, message)
+        assert "a (1/2 mesh ranks have gradients)" in message, (rank, message)
+        assert "b (1/2 mesh ranks have gradients)" in message, (rank, message)
+        assert cases["aligned_consistent"]["message"] is None, (
             rank,
-            cases["reversed_consistent"],
+            cases["aligned_consistent"],
         )
+        # Same-shape bare parameters have no cross-rank identity, so the
+        # preflight cannot police their order; it must say so once instead
+        # of failing, and must stay silent for named construction.
+        assert cases["bare_ambiguous"]["message"] is None, (
+            rank,
+            cases["bare_ambiguous"],
+        )
+        assert cases["bare_ambiguous"]["warned"], (rank, cases["bare_ambiguous"])
+        for case in (
+            "reversed_mismatch",
+            "reversed_consistent",
+            "aligned_mismatch",
+            "aligned_consistent",
+            "duplicate_names",
+            "duplicate_one_rank",
+            "cross_mesh_reversed",
+        ):
+            assert not cases[case]["warned"], (rank, case)
 
-    # Sorted item names make the diagnostic identical on every rank.
-    for case in ("reversed_mismatch", "aligned_mismatch"):
-        assert rank_results[0][case] == rank_results[1][case]
+    # Reduced order/activity vectors make the diagnostic identical on every
+    # rank, which is what lets the job fail synchronously.
+    for case in (
+        "reversed_mismatch",
+        "reversed_consistent",
+        "aligned_mismatch",
+        "duplicate_names",
+        "cross_mesh_reversed",
+    ):
+        assert (
+            rank_results[0][case]["message"] == rank_results[1][case]["message"]
+        )
 
 
 def _cpu_mesh_no_cuda_query_worker(rank, world, port, result_queue):
