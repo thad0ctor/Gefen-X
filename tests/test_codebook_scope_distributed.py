@@ -307,6 +307,7 @@ def _distributed_worker(rank, world, init_file, queue):
         flat_agreement = all(torch.equal(item, gathered_codebooks[0]) for item in gathered_codebooks[1:])
         flat_optimizer.step()
         flat_checkpoint = copy.deepcopy(flat_optimizer.state_dict())
+        flat_canonical = flat_optimizer.export_canonical_state()
         checkpoint_scopes = [None] * world
         dist.all_gather_object(
             checkpoint_scopes,
@@ -337,6 +338,33 @@ def _distributed_worker(rank, world, init_file, queue):
             cross_member_guard = rank == 0
         except ValueError as exc:
             cross_member_guard = rank == 1 and "local-shard identity" in str(exc)
+        canonical_shards = [None] * world
+        dist.all_gather_object(
+            canonical_shards,
+            flat_canonical["parameters"]["Flat"]["shard"],
+            group=runtime_group,
+        )
+        canonical_rank_local_identity = canonical_shards[0] != canonical_shards[1]
+        rank_zero_canonical = [flat_canonical if rank == 0 else None]
+        dist.broadcast_object_list(rank_zero_canonical, src=0, group=runtime_group)
+        cross_canonical_param = torch.nn.Parameter(flat_param.detach().clone())
+        cross_canonical = Gefen(
+            [("flat", cross_canonical_param)],
+            fused=False,
+            factored_v_2d=False,
+        )
+        _finalize(
+            cross_canonical,
+            cross_canonical_param,
+            flat_records[rank],
+            ShardingManifest(flat_records),
+            _binding(group, rank, runtime_group),
+        )
+        try:
+            cross_canonical.import_canonical_state(rank_zero_canonical[0])
+            canonical_cross_member_guard = rank == 0
+        except ValueError as exc:
+            canonical_cross_member_guard = rank == 1 and "shard" in str(exc)
         resumed_param = torch.nn.Parameter(flat_param.detach().clone())
         resumed = Gefen([("flat", resumed_param)], fused=False, factored_v_2d=False)
         resumed_binding = _binding(group, rank, runtime_group)
@@ -348,15 +376,40 @@ def _distributed_worker(rank, world, init_file, queue):
             resumed_binding,
         )
         resumed.load_state_dict(flat_checkpoint)
+        canonical_param = torch.nn.Parameter(flat_param.detach().clone())
+        canonical_resumed = Gefen(
+            [("flat", canonical_param)],
+            fused=False,
+            factored_v_2d=False,
+        )
+        canonical_binding = _binding(group, rank, runtime_group)
+        _finalize(
+            canonical_resumed,
+            canonical_param,
+            flat_records[rank],
+            ShardingManifest(flat_records),
+            canonical_binding,
+        )
+        canonical_resumed.import_canonical_state(flat_canonical)
         continuation_grad = flat_grads[rank].flip(0).clone()
         resumed_param.grad = continuation_grad.clone()
+        canonical_param.grad = continuation_grad.clone()
         flat_param.grad = continuation_grad.clone()
+        canonical_resumed.step()
         resumed.step()
         flat_optimizer.step()
         flat_checkpoint_continuation = (
             torch.equal(resumed_param, flat_param)
             and resumed.codebook_process_group_binding() is resumed_binding
             and torch.equal(resumed._gefen_codebook, flat_optimizer._gefen_codebook)
+        )
+        flat_canonical_continuation = (
+            torch.equal(canonical_param, flat_param)
+            and canonical_resumed.codebook_process_group_binding() is canonical_binding
+            and torch.equal(
+                canonical_resumed._gefen_codebook,
+                flat_optimizer._gefen_codebook,
+            )
         )
         refresh_succeeded = flat_optimizer.refresh_codebook()
         continuation_grads = tuple(gradient.flip(0) for gradient in flat_grads)
@@ -606,6 +659,9 @@ def _distributed_worker(rank, world, init_file, queue):
                 "rank_neutral_checkpoint_scope": rank_neutral_checkpoint_scope,
                 "rank_local_checkpoint_identity": rank_local_checkpoint_identity,
                 "cross_member_guard": cross_member_guard,
+                "canonical_rank_local_identity": canonical_rank_local_identity,
+                "canonical_cross_member_guard": canonical_cross_member_guard,
+                "flat_canonical_continuation": flat_canonical_continuation,
                 "refresh_succeeded": refresh_succeeded,
                 "refresh_matches_oracle": refresh_matches_oracle,
                 "refresh_agreement": refresh_agreement,
@@ -692,6 +748,9 @@ def test_explicit_gloo_scope_aggregates_logical_state_and_fails_atomically():
         assert item["rank_neutral_checkpoint_scope"], item
         assert item["rank_local_checkpoint_identity"], item
         assert item["cross_member_guard"], item
+        assert item["canonical_rank_local_identity"], item
+        assert item["canonical_cross_member_guard"], item
+        assert item["flat_canonical_continuation"], item
         assert item["refresh_succeeded"], item
         assert item["refresh_matches_oracle"], item
         assert item["refresh_agreement"], item

@@ -768,6 +768,7 @@ class GefenMuon(Gefen):
             canonical_parameter_fqns=self._canonical_identity_ready(),
             stable_shard_identity=self._canonical_identity_ready(),
             explicit_process_group_codebook_scope=True,
+            canonical_state_layouts=self._canonical_state_layouts(),
             whole_parameter_owner=(
                 self._codebook_scope_ready()
                 and any(
@@ -776,6 +777,29 @@ class GefenMuon(Gefen):
                 )
             ),
         )
+
+    def _canonical_state_layout_supported(self, layout) -> bool:
+        return layout is ParameterLayout.REPLICATED
+
+    def _canonical_state_variant_layout(self):
+        sharded_modes = frozenset(
+            group["sharded_mode"] for group in self.param_groups
+        )
+        normuon_modes = frozenset(
+            group["sharded_mode"]
+            for group in self.param_groups
+            if group.get("normuon", False)
+        )
+        non_normuon_modes = frozenset(
+            group["sharded_mode"]
+            for group in self.param_groups
+            if not group.get("normuon", False)
+        )
+        return _gefen_muon_contract(
+            sharded_modes=sharded_modes,
+            normuon_modes=normuon_modes,
+            non_normuon_modes=non_normuon_modes,
+        ).state_layout
 
     def _validate_rebinding_layout(self, rebinding) -> None:
         shard = rebinding.shard

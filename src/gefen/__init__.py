@@ -12,10 +12,13 @@ __all__ = [
     "GefenMuon",
     "GefenMuonHybrid",
     "CONTRACT_SCHEMA_VERSION",
+    "CANONICAL_STATE_FORMAT_VERSION",
     "IDENTITY_SCHEMA_VERSION",
     "CheckpointSupport",
     "CheckpointTransport",
+    "CanonicalStateProvider",
     "CodebookProcessGroupBinding",
+    "PreparedCanonicalStateImport",
     "OptimizerCapabilities",
     "OptimizerChildContract",
     "OptimizerContract",
@@ -74,10 +77,18 @@ def __getattr__(name):
 
         return CodebookProcessGroupBinding
     if name in (
+        "CANONICAL_STATE_FORMAT_VERSION",
+        "PreparedCanonicalStateImport",
+    ):
+        from . import canonical
+
+        return getattr(canonical, name)
+    if name in (
         "CONTRACT_SCHEMA_VERSION",
         "IDENTITY_SCHEMA_VERSION",
         "CheckpointSupport",
         "CheckpointTransport",
+        "CanonicalStateProvider",
         "OptimizerCapabilities",
         "OptimizerChildContract",
         "OptimizerContract",

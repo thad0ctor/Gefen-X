@@ -100,6 +100,7 @@ class CheckpointTransport(str, Enum):
     NATIVE_OPTIMIZER = "native_optimizer"
     PYTORCH_RANK_LOCAL = "pytorch_rank_local"
     COMPOSITE_NATIVE = "composite_native"
+    CANONICAL_LOCAL = "canonical_local"
 
 
 class TopologyChange(str, Enum):
@@ -764,6 +765,23 @@ class OptimizerContractProvider(Protocol):
         """Return the optimizer's immutable state and capability declaration."""
 
 
+@runtime_checkable
+class CanonicalStateProvider(Protocol):
+    """Structural protocol for exact-binding canonical local state."""
+
+    def export_canonical_state(self):
+        """Return a versioned local canonical state fragment."""
+
+    def prepare_canonical_state_import(self, state):
+        """Validate and stage a canonical fragment without live mutation."""
+
+    def commit_canonical_state_import(self, prepared) -> None:
+        """Commit one still-current prepared import."""
+
+    def import_canonical_state(self, state) -> None:
+        """Prepare and commit a canonical fragment atomically."""
+
+
 _ALL_PRECISIONS = frozenset(
     {Precision.FLOAT32, Precision.BFLOAT16, Precision.FLOAT16, Precision.FLOAT64}
 )
@@ -922,6 +940,7 @@ def _negative_capabilities(
     explicit_process_group_codebook_scope: bool = False,
     shard_rebinding: bool = False,
     post_sharding: bool = False,
+    canonical_state_io: bool = False,
 ) -> OptimizerCapabilities:
     return OptimizerCapabilities(
         training=training,
@@ -934,7 +953,7 @@ def _negative_capabilities(
         explicit_process_group_codebook_scope=explicit_process_group_codebook_scope,
         shard_rebinding=shard_rebinding,
         post_sharding=post_sharding,
-        canonical_state_io=False,
+        canonical_state_io=canonical_state_io,
         atomic_state_movement=False,
         state_offload=False,
     )
@@ -947,7 +966,9 @@ def _gefen_contract(
     stable_shard_identity: bool = False,
     explicit_process_group_codebook_scope: bool = False,
     native_flattened_checkpoint: bool = False,
+    canonical_state_layouts: AbstractSet[ParameterLayout] = frozenset(),
 ) -> OptimizerContract:
+    canonical_state_layouts = _frozenset(canonical_state_layouts)
     block_fields = (
         StateField("vmean", StateScope.PARAMETER, StateGeometry.BLOCK, True),
         StateField("vmean_step", StateScope.PARAMETER, StateGeometry.SCALAR, True),
@@ -969,6 +990,13 @@ def _gefen_contract(
         StateVariant(
             "name_only",
             ("name",),
+            layouts,
+            StateExtent.METADATA_ONLY,
+            initialized=False,
+        ),
+        StateVariant(
+            "period_selected",
+            ("name", "automatic_period"),
             layouts,
             StateExtent.METADATA_ONLY,
             initialized=False,
@@ -1092,7 +1120,7 @@ def _gefen_contract(
             ProcessGroupScope.NONE,
         ),
     )
-    checkpoints = (
+    checkpoints = [
         CheckpointSupport(
             CheckpointTransport.NATIVE_OPTIMIZER,
             frozenset({ParameterLayout.REPLICATED})
@@ -1114,19 +1142,30 @@ def _gefen_contract(
             requires_collective=True,
             atomic_load=True,
         ),
-    )
+    ]
+    if canonical_state_layouts:
+        checkpoints.append(
+            CheckpointSupport(
+                CheckpointTransport.CANONICAL_LOCAL,
+                canonical_state_layouts,
+                frozenset(),
+                ProcessGroupScope.NONE,
+                atomic_load=True,
+            )
+        )
     return OptimizerContract(
         implementation="gefen.Gefen",
         state_layout=OptimizerStateLayout(fields, tuple(variants)),
         capabilities=_negative_capabilities(
             training=training,
-            checkpoints=checkpoints,
+            checkpoints=tuple(checkpoints),
             supported_parameter_ranks=None,
             canonical_parameter_fqns=canonical_parameter_fqns,
             stable_shard_identity=stable_shard_identity,
             explicit_process_group_codebook_scope=explicit_process_group_codebook_scope,
             shard_rebinding=True,
             post_sharding=True,
+            canonical_state_io=bool(canonical_state_layouts),
         ),
     )
 
@@ -1160,7 +1199,9 @@ def _gefen_muon_contract(
     stable_shard_identity: bool = False,
     explicit_process_group_codebook_scope: bool = False,
     whole_parameter_owner: bool = False,
+    canonical_state_layouts: AbstractSet[ParameterLayout] = frozenset(),
 ) -> OptimizerContract:
+    canonical_state_layouts = _frozenset(canonical_state_layouts)
     sharded_modes = _frozenset(sharded_modes)
     normuon_modes = _frozenset(normuon_modes)
     non_normuon_modes = _frozenset(non_normuon_modes)
@@ -1199,11 +1240,34 @@ def _gefen_muon_contract(
                 sharded_mode=mode,
             )
         )
+        variants.append(
+            StateVariant(
+                "period_selected_replicated_" + mode,
+                ("name", "automatic_period"),
+                frozenset({ParameterLayout.REPLICATED}),
+                StateExtent.METADATA_ONLY,
+                initialized=False,
+                parameter_ranks=(2,),
+                sharded_mode=mode,
+            )
+        )
         if mode == "distributed":
             variants.append(
                 StateVariant(
                     "distributed_owner_name_only",
                     ("name",),
+                    frozenset({_DTENSOR_LAYOUT}),
+                    StateExtent.METADATA_ONLY,
+                    role=ParameterStateRole.OWNER,
+                    initialized=False,
+                    parameter_ranks=(2,),
+                    sharded_mode=mode,
+                )
+            )
+            variants.append(
+                StateVariant(
+                    "distributed_owner_period_selected",
+                    ("name", "automatic_period"),
                     frozenset({_DTENSOR_LAYOUT}),
                     StateExtent.METADATA_ONLY,
                     role=ParameterStateRole.OWNER,
@@ -1224,11 +1288,34 @@ def _gefen_muon_contract(
                     sharded_mode=mode,
                 )
             )
+            variants.append(
+                StateVariant(
+                    "period_selected_dtensor_" + mode,
+                    ("name", "automatic_period"),
+                    frozenset({_DTENSOR_LAYOUT}),
+                    StateExtent.METADATA_ONLY,
+                    initialized=False,
+                    parameter_ranks=(2,),
+                    sharded_mode=mode,
+                )
+            )
         if whole_parameter_owner:
             variants.append(
                 StateVariant(
                     "name_only_whole_owner_" + mode,
                     ("name",),
+                    frozenset({ParameterLayout.WHOLE_PARAMETER_OWNER}),
+                    StateExtent.METADATA_ONLY,
+                    role=ParameterStateRole.OWNER,
+                    initialized=False,
+                    parameter_ranks=(2,),
+                    sharded_mode=mode,
+                )
+            )
+            variants.append(
+                StateVariant(
+                    "period_selected_whole_owner_" + mode,
+                    ("name", "automatic_period"),
                     frozenset({ParameterLayout.WHOLE_PARAMETER_OWNER}),
                     StateExtent.METADATA_ONLY,
                     role=ParameterStateRole.OWNER,
@@ -1394,6 +1481,17 @@ def _gefen_muon_contract(
                 atomic_load=True,
             )
         )
+    if canonical_state_layouts:
+        checkpoints.append(
+            CheckpointSupport(
+                CheckpointTransport.CANONICAL_LOCAL,
+                canonical_state_layouts,
+                frozenset(),
+                ProcessGroupScope.NONE,
+                required_sharded_modes=sharded_modes,
+                atomic_load=True,
+            )
+        )
     return OptimizerContract(
         implementation="gefen.GefenMuon",
         state_layout=OptimizerStateLayout(fields, tuple(variants)),
@@ -1406,6 +1504,7 @@ def _gefen_muon_contract(
             explicit_process_group_codebook_scope=explicit_process_group_codebook_scope,
             shard_rebinding=True,
             post_sharding=True,
+            canonical_state_io=bool(canonical_state_layouts),
         ),
     )
 
@@ -1464,6 +1563,7 @@ __all__ = [
     "IDENTITY_SCHEMA_VERSION",
     "CheckpointSupport",
     "CheckpointTransport",
+    "CanonicalStateProvider",
     "OptimizerCapabilities",
     "OptimizerChildContract",
     "OptimizerContract",

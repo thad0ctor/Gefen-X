@@ -187,7 +187,7 @@ def test_replicated_rebind_preserves_legacy_name_and_enables_identity_contract()
     assert contract.capabilities.stable_shard_identity
     assert contract.capabilities.shard_rebinding
     assert contract.capabilities.post_sharding
-    assert not contract.capabilities.canonical_state_io
+    assert contract.capabilities.canonical_state_io
     assert contract.capabilities.explicit_process_group_codebook_scope
     with pytest.raises(RuntimeError, match="already finalized"):
         optimizer.rebind_parameter(new, new, identity=identity)

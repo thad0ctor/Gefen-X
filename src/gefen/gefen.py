@@ -23,12 +23,21 @@ from typing import Iterable, Optional, Tuple, Union
 import torch
 import torch.nn as nn
 
+from gefen.canonical import (
+    CANONICAL_STATE_FORMAT_VERSION,
+    PreparedCanonicalStateImport,
+    canonical_value_supported,
+    canonical_values_equal,
+    clone_canonical_value,
+    make_prepared_canonical_state_import,
+)
 from gefen.codebook import CodebookProcessGroupBinding
 from gefen.contracts import (
     LogicalSlice,
     OptimizerContract,
     ParameterIdentity,
     ParameterLayout,
+    ParameterStateRole,
     PlacementKind,
     ProcessGroupIdentity,
     ShardIdentity,
@@ -73,6 +82,34 @@ _RANK_LOCAL_METADATA_VERSION = 3
 _CODEBOOK_SCOPE_FORMAT_VERSION = 1
 _SCOPED_NATIVE_METADATA_VERSION = 4
 _NATIVE_LOCAL_SHARDS_FORMAT_VERSION = 1
+_CANONICAL_PARAMETER_STATE_KEYS = frozenset(
+    {
+        "name",
+        "automatic_period",
+        "step",
+        "m_codebook",
+        "m_magnitude",
+        "vmean",
+        "vmean_step",
+        "v_row",
+        "v_col",
+        "factored_step",
+        "normuon_v",
+        "normuon_step",
+    }
+)
+_CANONICAL_DERIVED_PARAMETER_STATE_KEYS = frozenset(
+    {
+        "stepsize",
+        "_h_buf",
+        "_capt_scalars",
+        "_capt_consts",
+        "_capt_consts_key",
+        "_capt_stack",
+        "_capt_row",
+        "m_codebook_shape",
+    }
+)
 
 
 def _rank_local_payload_key(global_rank: int) -> str:
@@ -1022,6 +1059,8 @@ class Gefen(torch.optim.Optimizer):
         )
         self._factored_v_2d = factored_v_2d
         self._deterministic = deterministic
+        if type(codebook_refresh_every) is not int:
+            raise TypeError("codebook_refresh_every must be an integer")
         if codebook_refresh_every < 0:
             raise ValueError(
                 "codebook_refresh_every must be >= 0 but is: {}".format(
@@ -1150,11 +1189,13 @@ class Gefen(torch.optim.Optimizer):
         """Return the immutable state-layout and integration capability contract."""
 
         identity_ready = self._canonical_identity_ready()
+        canonical_state_layouts = self._canonical_state_layouts()
         return _gefen_contract(
             factored_v_2d=self._factored_v_2d,
             canonical_parameter_fqns=identity_ready,
             stable_shard_identity=identity_ready,
             explicit_process_group_codebook_scope=True,
+            canonical_state_layouts=canonical_state_layouts,
             native_flattened_checkpoint=(
                 self._codebook_scope_ready()
                 and any(
@@ -1162,6 +1203,108 @@ class Gefen(torch.optim.Optimizer):
                     for _, shard in self._gefen_local_shard_bindings
                 )
             ),
+        )
+
+    def _canonical_state_variant_layout(self):
+        return _gefen_contract(
+            factored_v_2d=self._factored_v_2d,
+        ).state_layout
+
+    def _canonical_state_layout_supported(self, layout) -> bool:
+        return layout in {
+            ParameterLayout.REPLICATED,
+            ParameterLayout.FLATTENED_ELEMENT_SHARD,
+        }
+
+    @staticmethod
+    def _canonical_group_options_value(group):
+        return {
+            key: value
+            for key, value in group.items()
+            if key
+            not in {
+                "params",
+                "param_names",
+                "name",
+                "_gefen_checkpoint_metadata",
+            }
+        }
+
+    def _canonical_state_layouts(self):
+        if not self._canonical_identity_ready():
+            return frozenset()
+        if self._stochastic_round:
+            return frozenset()
+        if any(
+            parameter is None
+            or not self._canonical_state_layout_supported(shard.layout)
+            for parameter, shard in self._gefen_local_shard_bindings
+        ):
+            return frozenset()
+        if any(
+            not canonical_value_supported(
+                self._canonical_group_options_value(group),
+                finite_tensors=True,
+            )
+            for group in self.param_groups
+        ):
+            return frozenset()
+        if not canonical_value_supported(
+            self._canonical_policy(),
+            finite_tensors=True,
+        ):
+            return frozenset()
+        if not canonical_value_supported(
+            self._gefen_codebook,
+            finite_tensors=True,
+        ):
+            return frozenset()
+        try:
+            global_step = self._canonical_common_global_step()
+            if type(global_step) is not int or global_step < 0:
+                return frozenset()
+            self._validate_loaded_native_state()
+        except Exception:
+            return frozenset()
+        state_layout = self._canonical_state_variant_layout()
+        for group in self.param_groups:
+            group_options = self._canonical_group_options_value(group)
+            for parameter in group["params"]:
+                state = self.state.get(parameter, {})
+                if any(
+                    key not in _CANONICAL_PARAMETER_STATE_KEYS
+                    and key not in _CANONICAL_DERIVED_PARAMETER_STATE_KEYS
+                    for key in state
+                ):
+                    return frozenset()
+                if any(
+                    not canonical_value_supported(
+                        value,
+                        finite_tensors=True,
+                    )
+                    for key, value in state.items()
+                    if key in _CANONICAL_PARAMETER_STATE_KEYS
+                ):
+                    return frozenset()
+                canonical_state = {
+                    key: value
+                    for key, value in state.items()
+                    if key in _CANONICAL_PARAMETER_STATE_KEYS and key != "name"
+                }
+                shard = self._gefen_shard_bindings[parameter]
+                try:
+                    self._validate_canonical_parameter_semantics(
+                        parameter,
+                        shard,
+                        group_options,
+                        canonical_state,
+                        state_layout,
+                        global_step,
+                    )
+                except (TypeError, ValueError, RuntimeError):
+                    return frozenset()
+        return frozenset(
+            shard.layout for _, shard in self._gefen_local_shard_bindings
         )
 
     def _codebook_scope_ready(self) -> bool:
@@ -1324,6 +1467,130 @@ class Gefen(torch.optim.Optimizer):
                 for placement in shard.placements
             ],
         }
+
+    @staticmethod
+    def _serialized_canonical_shard(shard):
+        process_group = None
+        if shard.process_group is not None:
+            process_group = {
+                "schema_version": shard.process_group.schema_version,
+                "semantic_name": shard.process_group.semantic_name,
+                "ordered_members": list(shard.process_group.ordered_members),
+            }
+        return {
+            "schema_version": shard.schema_version,
+            "parameter": {
+                "schema_version": shard.parameter.schema_version,
+                "fqn": shard.parameter.fqn,
+                "global_shape": list(shard.parameter.global_shape),
+            },
+            "layout": shard.layout.value,
+            "logical_slice": {
+                "flat_offset": shard.logical_slice.flat_offset,
+                "length": shard.logical_slice.length,
+            },
+            "process_group": process_group,
+            "local_member": shard.local_member,
+            "owner": shard.owner,
+            "placements": [
+                {
+                    "mesh_axis": placement.mesh_axis,
+                    "kind": placement.kind.value,
+                    "coordinate": placement.coordinate,
+                    "parts": placement.parts,
+                    "parameter_dimension": placement.parameter_dimension,
+                }
+                for placement in shard.placements
+            ],
+        }
+
+    @classmethod
+    def _normalize_serialized_canonical_shard(cls, record):
+        if not isinstance(record, dict) or set(record) != {
+            "schema_version",
+            "parameter",
+            "layout",
+            "logical_slice",
+            "process_group",
+            "local_member",
+            "owner",
+            "placements",
+        }:
+            raise ValueError("Gefen canonical shard has an invalid schema")
+        parameter_record = record["parameter"]
+        if not isinstance(parameter_record, dict) or set(parameter_record) != {
+            "schema_version",
+            "fqn",
+            "global_shape",
+        }:
+            raise ValueError("Gefen canonical parameter identity is invalid")
+        if not isinstance(parameter_record["global_shape"], list):
+            raise ValueError("Gefen canonical global_shape must be a list")
+        slice_record = record["logical_slice"]
+        if not isinstance(slice_record, dict) or set(slice_record) != {
+            "flat_offset",
+            "length",
+        }:
+            raise ValueError("Gefen canonical logical slice is invalid")
+        group_record = record["process_group"]
+        if group_record is not None and (
+            not isinstance(group_record, dict)
+            or set(group_record)
+            != {"schema_version", "semantic_name", "ordered_members"}
+            or not isinstance(group_record["ordered_members"], list)
+        ):
+            raise ValueError("Gefen canonical process-group identity is invalid")
+        if not isinstance(record["placements"], list):
+            raise ValueError("Gefen canonical placements must be a list")
+        try:
+            parameter = ParameterIdentity(
+                parameter_record["fqn"],
+                tuple(parameter_record["global_shape"]),
+                schema_version=parameter_record["schema_version"],
+            )
+            process_group = None
+            if group_record is not None:
+                process_group = ProcessGroupIdentity(
+                    group_record["semantic_name"],
+                    tuple(group_record["ordered_members"]),
+                    schema_version=group_record["schema_version"],
+                )
+            placements = []
+            for placement_record in record["placements"]:
+                if not isinstance(placement_record, dict) or set(
+                    placement_record
+                ) != {
+                    "mesh_axis",
+                    "kind",
+                    "coordinate",
+                    "parts",
+                    "parameter_dimension",
+                }:
+                    raise ValueError("invalid placement schema")
+                placements.append(
+                    ShardPlacement(
+                        placement_record["mesh_axis"],
+                        PlacementKind(placement_record["kind"]),
+                        placement_record["coordinate"],
+                        placement_record["parts"],
+                        placement_record["parameter_dimension"],
+                    )
+                )
+            shard = ShardIdentity(
+                parameter,
+                ParameterLayout(record["layout"]),
+                LogicalSlice(
+                    slice_record["flat_offset"], slice_record["length"]
+                ),
+                process_group=process_group,
+                local_member=record["local_member"],
+                owner=record["owner"],
+                placements=tuple(placements),
+                schema_version=record["schema_version"],
+            )
+        except (TypeError, ValueError) as exc:
+            raise ValueError("Gefen canonical shard identity is invalid") from exc
+        return cls._serialized_canonical_shard(shard)
 
     def _serialized_native_local_shards(self):
         if self._gefen_codebook_process_group is None:
@@ -3331,15 +3598,19 @@ class Gefen(torch.optim.Optimizer):
         # Single decision point for a parameter's automatic period so the
         # codebook-learning pass and the step agree. force_1d_period_one short-
         # circuits 1D params to per-element (period==1) before the block search.
+        routing_name = param_name
+        shard = self._gefen_shard_bindings.get(param)
+        if shard is not None:
+            routing_name = shard.parameter.fqn
         if self._force_1d_period_one and param.ndim == 1:
             return 1
         if self._force_2d_period_one and param.ndim == 2:
             return 1
         if self._period_one_substrings:
-            lname = str(param_name).lower()
+            lname = str(routing_name).lower()
             if any(sub in lname for sub in self._period_one_substrings):
                 return 1
-        return self._predict_period_from_grad_sq(param_name, param, grad)
+        return self._predict_period_from_grad_sq(routing_name, param, grad)
 
     def _predict_period_from_grad_sq(
         self, param_name: str, param: torch.Tensor, grad: torch.Tensor
@@ -5263,6 +5534,604 @@ class Gefen(torch.optim.Optimizer):
             codebooks, list(merged_codebook.reshape(k, nblocks, period).unbind(0))
         )
 
+    def _canonical_policy(self):
+        return {
+            "factored_v_2d": self._factored_v_2d,
+            "force_1d_period_one": self._force_1d_period_one,
+            "force_2d_period_one": self._force_2d_period_one,
+            "period_one_substrings": list(self._period_one_substrings),
+            "stochastic_round": self._stochastic_round,
+            "codebook_refresh_every": self._codebook_refresh_every,
+        }
+
+    def _canonical_common_global_step(self) -> int:
+        device_step = self._device_gefen_global_step()
+        step = self._gefen_global_step if device_step is None else device_step
+        if self.capturable and self._stochastic_round:
+            seed_steps = [
+                int(seed.item()) for seed in self._sr_seed_by_device.values()
+            ]
+            if any(seed_step != step for seed_step in seed_steps):
+                raise RuntimeError(
+                    "Gefen capturable stochastic-round seeds disagree with the "
+                    "canonical optimizer global step"
+                )
+        return step
+
+    def _serialized_sharding_manifest(self):
+        return [
+            self._serialized_canonical_shard(shard)
+            for shard in self._gefen_sharding_manifest.shards
+        ]
+
+    def _canonical_live_entries(self):
+        entries = {}
+        for group in self.param_groups:
+            options = clone_canonical_value(
+                self._canonical_group_options_value(group),
+                path="parameter group options",
+            )
+            for compatibility_name, parameter in self._iter_group_params_with_names(
+                group
+            ):
+                shard = self._gefen_shard_bindings[parameter]
+                entries[shard.parameter.fqn] = (
+                    parameter,
+                    shard,
+                    str(compatibility_name),
+                    options,
+                )
+        return entries
+
+    @staticmethod
+    def _canonical_value_token(value):
+        if torch.is_tensor(value):
+            raw = (
+                value.detach()
+                .to(device="cpu")
+                .resolve_conj()
+                .resolve_neg()
+                .contiguous()
+                .reshape(-1)
+                .view(torch.uint8)
+                .numpy()
+                .tobytes()
+            )
+            try:
+                version = value._version
+            except RuntimeError:
+                version = None
+            return (
+                "tensor",
+                id(value),
+                version,
+                hashlib.sha256(raw).digest(),
+                str(value.device),
+                str(value.dtype),
+                tuple(value.shape),
+            )
+        if type(value) is dict:
+            return (
+                "dict",
+                tuple(
+                    (key, Gefen._canonical_value_token(value[key]))
+                    for key in sorted(value, key=repr)
+                ),
+            )
+        if type(value) in {list, tuple}:
+            return (
+                type(value).__name__,
+                tuple(Gefen._canonical_value_token(item) for item in value),
+            )
+        try:
+            hash(value)
+            token = value
+        except TypeError:
+            token = (id(value), repr(value))
+        return (type(value).__name__, token)
+
+    def _canonical_import_live_token(self):
+        groups = tuple(
+            (
+                id(group),
+                tuple(id(parameter) for parameter in group["params"]),
+                tuple(
+                    str(name)
+                    for name, _ in self._iter_group_params_with_names(group)
+                ),
+                self._canonical_value_token(
+                    self._canonical_group_options_value(group)
+                ),
+            )
+            for group in self.param_groups
+        )
+        states = tuple(
+            (
+                id(parameter),
+                id(self.state.get(parameter)),
+                self._canonical_value_token(self.state.get(parameter, {})),
+            )
+            for group in self.param_groups
+            for parameter in group["params"]
+        )
+        return (
+            id(self.param_groups),
+            id(self.state),
+            id(self.defaults),
+            self._canonical_value_token(self.defaults),
+            groups,
+            states,
+            self._gefen_global_step,
+            self._device_gefen_global_step(),
+            self._canonical_value_token(self._gefen_codebook),
+            self._canonical_value_token(self._gefen_global_step_by_device),
+            self._canonical_value_token(self._sr_seed_by_device),
+            self._canonical_value_token(self._canonical_policy()),
+            self._deterministic,
+            self.capturable,
+            self.fused,
+            self.verbose,
+            self._fused_build_ok,
+            id(self._gefen_codebook_process_group),
+            self._canonical_value_token(self._serialized_codebook_scope()),
+            id(self._gefen_sharding_manifest),
+            tuple(
+                (id(parameter), shard.sort_key)
+                for parameter, shard in self._gefen_local_shard_bindings
+            ),
+        )
+
+    def _canonical_parameter_state_matches_variant(
+        self, shard, group_options, parameter_state, state_layout
+    ) -> bool:
+        carries_momentum = any(
+            key in parameter_state for key in ("m_codebook", "m_magnitude")
+        )
+        carries_normuon = any(
+            key in parameter_state for key in ("normuon_v", "normuon_step")
+        )
+        if bool(group_options.get("normuon", False)):
+            if carries_momentum and not carries_normuon:
+                return False
+        elif carries_normuon:
+            return False
+        fields = frozenset({"name", *parameter_state})
+        parameter_rank = len(shard.parameter.global_shape)
+        sharded_mode = group_options.get("sharded_mode")
+        for variant in state_layout.parameter_variants:
+            if frozenset(variant.fields) != fields:
+                continue
+            if shard.layout not in variant.layouts:
+                continue
+            if variant.role is not ParameterStateRole.ANY:
+                continue
+            if variant.sharded_mode != sharded_mode:
+                continue
+            if (
+                variant.parameter_ranks is not None
+                and parameter_rank not in variant.parameter_ranks
+            ):
+                continue
+            if parameter_rank in variant.excluded_parameter_ranks:
+                continue
+            return True
+        return False
+
+    def _canonical_period_must_be_one(self, parameter, shard) -> bool:
+        if self._force_1d_period_one and parameter.ndim == 1:
+            return True
+        if self._force_2d_period_one and parameter.ndim == 2:
+            return True
+        fqn = shard.parameter.fqn.lower()
+        return any(
+            substring in fqn for substring in self._period_one_substrings
+        )
+
+    def _validate_canonical_parameter_semantics(
+        self,
+        parameter,
+        shard,
+        group_options,
+        parameter_state,
+        state_layout,
+        global_step,
+    ) -> None:
+        carries_momentum = any(
+            key in parameter_state for key in ("m_codebook", "m_magnitude")
+        )
+        carries_normuon = any(
+            key in parameter_state for key in ("normuon_v", "normuon_step")
+        )
+        counters = {}
+        for counter_key in (
+            "step",
+            "vmean_step",
+            "factored_step",
+            "normuon_step",
+        ):
+            if counter_key not in parameter_state:
+                continue
+            counter = self._validate_rank_local_counter(
+                counter_key, parameter_state[counter_key]
+            )
+            counters[counter_key] = counter
+            if counter > global_step:
+                raise ValueError(
+                    "Gefen canonical parameter counter {} exceeds the optimizer "
+                    "global step".format(counter_key)
+                )
+        if "step" in counters and any(
+            counters[counter_key] > counters["step"]
+            for counter_key in (
+                "vmean_step",
+                "factored_step",
+                "normuon_step",
+            )
+            if counter_key in counters
+        ):
+            raise ValueError(
+                "Gefen canonical secondary counter exceeds the parameter step"
+            )
+        period = parameter_state.get("automatic_period")
+        if (
+            period is not None
+            and self._canonical_period_must_be_one(parameter, shard)
+            and (type(period) is not int or period != 1)
+        ):
+            raise ValueError(
+                "Gefen canonical automatic period violates period-one policy"
+            )
+        if bool(group_options.get("normuon", False)):
+            if carries_momentum and not carries_normuon:
+                raise ValueError(
+                    "Gefen canonical initialized NorMuon state is incomplete"
+                )
+        elif carries_normuon:
+            raise ValueError(
+                "Gefen canonical NorMuon state is invalid for the target policy"
+            )
+        if not self._canonical_parameter_state_matches_variant(
+            shard, group_options, parameter_state, state_layout
+        ):
+            raise ValueError(
+                "Gefen canonical parameter state does not match a declared state "
+                "variant"
+            )
+
+    @staticmethod
+    def _assert_canonical_state_outside_cuda_capture(operation) -> None:
+        if torch.cuda.is_available() and torch.cuda.is_current_stream_capturing():
+            raise RuntimeError(
+                "canonical state {} cannot run during CUDA capture".format(
+                    operation
+                )
+            )
+
+    def _assert_canonical_import_target_safe(self) -> None:
+        if not self.capturable:
+            return
+        device_step = self._device_gefen_global_step()
+        initialized_state = any(
+            any(key != "name" for key in self.state.get(parameter, {}))
+            for group in self.param_groups
+            for parameter in group["params"]
+        )
+        if (
+            self._capt_stacks is not None
+            or self._gefen_codebook is not None
+            or self._gefen_global_step != 0
+            or (device_step is not None and device_step != 0)
+            or initialized_state
+        ):
+            raise RuntimeError(
+                "canonical import into a capturable optimizer requires a fresh "
+                "target before device state or CUDA graphs are initialized"
+            )
+
+    def export_canonical_state(self):
+        """Export an exact-binding, device-neutral local state fragment."""
+
+        self._assert_finalized_binding_layout()
+        self._assert_canonical_state_outside_cuda_capture("export")
+        if not self._canonical_state_layouts():
+            raise RuntimeError(
+                "canonical state export requires a supported finalized identity "
+                "layout and primitive algorithm policy"
+            )
+        entries = self._canonical_live_entries()
+        parameters = {}
+        for fqn in sorted(entries):
+            parameter, shard, compatibility_name, options = entries[fqn]
+            state = {}
+            for key, value in self.state.get(parameter, {}).items():
+                if key in _CANONICAL_DERIVED_PARAMETER_STATE_KEYS:
+                    continue
+                if key == "name":
+                    continue
+                if key not in _CANONICAL_PARAMETER_STATE_KEYS:
+                    raise RuntimeError(
+                        "canonical state export found undeclared parameter state key "
+                        "{!r}".format(key)
+                    )
+                state[key] = clone_canonical_value(
+                    value, path="parameters.{}.state.{}".format(fqn, key)
+                )
+            parameters[fqn] = {
+                "compatibility_name": compatibility_name,
+                "shard": self._serialized_canonical_shard(shard),
+                "group_options": clone_canonical_value(
+                    options, path="parameters.{}.group_options".format(fqn)
+                ),
+                "state": state,
+            }
+        return {
+            "format": "gefen.bound_state",
+            "format_version": CANONICAL_STATE_FORMAT_VERSION,
+            "coverage": "local_optimizer_fragment",
+            "implementation": self.optimizer_contract().implementation,
+            "policy": clone_canonical_value(
+                self._canonical_policy(), path="policy"
+            ),
+            "common": {
+                "gefen_global_step": self._canonical_common_global_step(),
+                "gefen_codebook": clone_canonical_value(
+                    self._gefen_codebook, path="common.gefen_codebook"
+                ),
+                "gefen_deterministic": self._deterministic,
+                "gefen_codebook_scope": clone_canonical_value(
+                    self._serialized_codebook_scope(),
+                    path="common.gefen_codebook_scope",
+                ),
+            },
+            "manifest": clone_canonical_value(
+                self._serialized_sharding_manifest(), path="manifest"
+            ),
+            "parameters": parameters,
+        }
+
+    def _normalize_canonical_state_import(self, state):
+        state = clone_canonical_value(state, path="canonical state")
+        expected_top = {
+            "format",
+            "format_version",
+            "coverage",
+            "implementation",
+            "policy",
+            "common",
+            "manifest",
+            "parameters",
+        }
+        if type(state) is not dict or set(state) != expected_top:
+            raise ValueError("Gefen canonical state has an invalid top-level schema")
+        if state["format"] != "gefen.bound_state":
+            raise ValueError("Unsupported Gefen canonical state format")
+        if (
+            type(state["format_version"]) is not int
+            or state["format_version"] != CANONICAL_STATE_FORMAT_VERSION
+        ):
+            raise ValueError(
+                "Unsupported Gefen canonical state format_version: {}".format(
+                    state["format_version"]
+                )
+            )
+        if state["coverage"] != "local_optimizer_fragment":
+            raise ValueError("Unsupported Gefen canonical state coverage")
+        implementation = self.optimizer_contract().implementation
+        if state["implementation"] != implementation:
+            raise ValueError(
+                "Gefen canonical state implementation does not match the target"
+            )
+        live_policy = clone_canonical_value(
+            self._canonical_policy(), path="live policy"
+        )
+        if not canonical_values_equal(state["policy"], live_policy):
+            raise ValueError(
+                "Gefen canonical state algorithm policy does not match the target"
+            )
+
+        common = state["common"]
+        if type(common) is not dict or set(common) != {
+            "gefen_global_step",
+            "gefen_codebook",
+            "gefen_deterministic",
+            "gefen_codebook_scope",
+        }:
+            raise ValueError("Gefen canonical common state has an invalid schema")
+        if (
+            type(common["gefen_global_step"]) is not int
+            or common["gefen_global_step"] < 0
+        ):
+            raise ValueError(
+                "Gefen canonical global step must be a nonnegative integer"
+            )
+        if type(common["gefen_deterministic"]) is not bool:
+            raise ValueError("Gefen canonical deterministic policy must be a bool")
+        normalized_scope = self._normalize_serialized_codebook_scope(
+            common["gefen_codebook_scope"]
+        )
+        if normalized_scope != self._serialized_codebook_scope():
+            raise ValueError(
+                "Gefen canonical codebook scope does not match the live binding"
+            )
+        common["gefen_codebook_scope"] = normalized_scope
+
+        manifest = state["manifest"]
+        if type(manifest) is not list:
+            raise ValueError("Gefen canonical manifest must be a list")
+        normalized_manifest = [
+            self._normalize_serialized_canonical_shard(record)
+            for record in manifest
+        ]
+        if normalized_manifest != self._serialized_sharding_manifest():
+            raise ValueError(
+                "Gefen canonical manifest does not match the finalized target"
+            )
+        state["manifest"] = normalized_manifest
+
+        parameters = state["parameters"]
+        if type(parameters) is not dict:
+            raise ValueError("Gefen canonical parameters must be an FQN mapping")
+        live_entries = self._canonical_live_entries()
+        state_layout = self._canonical_state_variant_layout()
+        if set(parameters) != set(live_entries):
+            raise ValueError(
+                "Gefen canonical parameter FQNs do not match the finalized target"
+            )
+        for fqn, record in parameters.items():
+            if type(record) is not dict or set(record) != {
+                "compatibility_name",
+                "shard",
+                "group_options",
+                "state",
+            }:
+                raise ValueError(
+                    "Gefen canonical parameter {!r} has an invalid schema".format(
+                        fqn
+                    )
+                )
+            if type(record["compatibility_name"]) is not str:
+                raise ValueError(
+                    "Gefen canonical compatibility names must be strings"
+                )
+            parameter, shard, _, live_options = live_entries[fqn]
+            normalized_shard = self._normalize_serialized_canonical_shard(
+                record["shard"]
+            )
+            if normalized_shard != self._serialized_canonical_shard(shard):
+                raise ValueError(
+                    "Gefen canonical parameter shard does not match the live binding"
+                )
+            record["shard"] = normalized_shard
+            if not canonical_values_equal(record["group_options"], live_options):
+                raise ValueError(
+                    "Gefen canonical parameter-group options do not match the target"
+                )
+            parameter_state = record["state"]
+            if type(parameter_state) is not dict or any(
+                key == "name" or key not in _CANONICAL_PARAMETER_STATE_KEYS
+                for key in parameter_state
+            ):
+                raise ValueError(
+                    "Gefen canonical parameter state has undeclared fields"
+                )
+            self._validate_canonical_parameter_semantics(
+                parameter,
+                shard,
+                live_options,
+                parameter_state,
+                state_layout,
+                common["gefen_global_step"],
+            )
+            record["state"] = clone_canonical_value(
+                parameter_state, path="parameters.{}.state".format(fqn)
+            )
+            del parameter
+        return state
+
+    def _canonical_native_state_dict(self, canonical_state):
+        native = self._base_state_dict_without_hooks()
+        native["state"] = {}
+        live_entries = self._canonical_live_entries()
+        for saved_group, live_group in zip(native["param_groups"], self.param_groups):
+            for parameter_id, parameter in zip(
+                saved_group["params"], live_group["params"]
+            ):
+                shard = self._gefen_shard_bindings[parameter]
+                record = canonical_state["parameters"][shard.parameter.fqn]
+                parameter_state = {
+                    "name": self._param_name(parameter),
+                    **clone_canonical_value(
+                        record["state"],
+                        path="parameters.{}.state".format(shard.parameter.fqn),
+                    ),
+                }
+                native["state"][parameter_id] = parameter_state
+
+        common = canonical_state["common"]
+        native["gefen_global_step"] = common["gefen_global_step"]
+        native["gefen_codebook"] = common["gefen_codebook"]
+        native["gefen_deterministic"] = common["gefen_deterministic"]
+        scope = common["gefen_codebook_scope"]
+        if scope is not None:
+            native["gefen_codebook_scope"] = scope
+        else:
+            native.pop("gefen_codebook_scope", None)
+        local_shards = self._serialized_native_local_shards()
+        if local_shards is not None:
+            native["gefen_native_local_shards"] = local_shards
+        else:
+            native.pop("gefen_native_local_shards", None)
+        metadata = {
+            "format_version": (
+                _SCOPED_NATIVE_METADATA_VERSION if scope is not None else 1
+            ),
+            "global_step": common["gefen_global_step"],
+            "codebook": common["gefen_codebook"],
+            "deterministic": common["gefen_deterministic"],
+            "device_anchor": self._checkpoint_device_anchor(),
+        }
+        if scope is not None:
+            metadata["codebook_scope"] = scope
+        if local_shards is not None:
+            metadata["native_local_shards"] = local_shards
+        for group in native["param_groups"]:
+            group["_gefen_checkpoint_metadata"] = metadata
+        del live_entries
+        return native
+
+    def _preserve_canonical_target_configuration(self, staged) -> None:
+        staged.defaults = self.defaults.copy()
+        staged.param_groups = self.param_groups
+
+    def prepare_canonical_state_import(self, state):
+        """Validate and stage a canonical local import without live mutation."""
+
+        self._assert_finalized_binding_layout()
+        self._assert_canonical_state_outside_cuda_capture("import preparation")
+        self._assert_canonical_import_target_safe()
+        if not self._canonical_state_layouts():
+            raise RuntimeError(
+                "canonical state import requires a supported finalized identity layout"
+            )
+        normalized = self._normalize_canonical_state_import(state)
+        live_token = self._canonical_import_live_token()
+        staged = self._stage_load_state_dict(
+            self._canonical_native_state_dict(normalized)
+        )
+        self._preserve_canonical_target_configuration(staged)
+        return make_prepared_canonical_state_import(self, live_token, staged)
+
+    def commit_canonical_state_import(self, prepared) -> None:
+        """Commit one still-current prepared canonical import exactly once."""
+
+        if not isinstance(prepared, PreparedCanonicalStateImport):
+            raise TypeError(
+                "prepared must be a PreparedCanonicalStateImport from this optimizer"
+            )
+        if prepared._optimizer is not self:
+            raise ValueError("prepared canonical state belongs to another optimizer")
+        if prepared._consumed:
+            raise RuntimeError("prepared canonical state import was already consumed")
+        self._assert_finalized_binding_layout()
+        self._assert_canonical_state_outside_cuda_capture("import commit")
+        self._assert_canonical_import_target_safe()
+        if prepared._live_token != self._canonical_import_live_token():
+            raise RuntimeError(
+                "live optimizer state changed after canonical import preparation"
+            )
+        prepared._consumed = True
+        self._commit_staged_load_state_dict(prepared._staged)
+
+    def import_canonical_state(self, state) -> None:
+        """Atomically prepare and commit an exact-binding canonical fragment."""
+
+        self.commit_canonical_state_import(
+            self.prepare_canonical_state_import(state)
+        )
+
+    canonical_state_dict = export_canonical_state
+    load_canonical_state_dict = import_canonical_state
+
     def state_dict(self):
         """Run optimizer state-dict hooks around Gefen's complete schema."""
 
@@ -6109,6 +6978,10 @@ class Gefen(torch.optim.Optimizer):
             signature,
             self._gefen_codebook,
             allow_legacy_vmean_counter=True,
+            allow_preinitialized_periods=(
+                self._gefen_global_step == 0
+                and self._gefen_codebook is not None
+            ),
         )
         for group in self.param_groups:
             self._validate_group_options(
@@ -6193,6 +7066,7 @@ class Gefen(torch.optim.Optimizer):
         codebook,
         *,
         allow_legacy_vmean_counter: bool = False,
+        allow_preinitialized_periods: bool = False,
     ) -> None:
         if not isinstance(states, list) or len(states) != len(signature):
             raise ValueError(
@@ -6262,6 +7136,10 @@ class Gefen(torch.optim.Optimizer):
                 and not (
                     param_signature.get("sharded")
                     and param_signature.get("sharded_mode") == "distributed"
+                )
+                and not (
+                    allow_preinitialized_periods
+                    and not any(key in pstate for key in initialized_keys)
                 )
             ):
                 raise ValueError(
