@@ -405,6 +405,13 @@ def _reduce_block_second_moment(
         dtype=torch.float32,
         device=dense.device,
     )
+    if period == 1:
+        reduced_flat = reduced.reshape(-1)
+        for start, stop in _element_chunks(dense.numel()):
+            reduced_flat[start:stop].copy_(
+                _read_flat_chunk(dense, start, stop)
+            )
+        return _finish_output(reduced, name="block second moment")
     for row_start, row_stop in _whole_row_chunks(blocks, period):
         flat_start = row_start * period
         flat_stop = row_stop * period

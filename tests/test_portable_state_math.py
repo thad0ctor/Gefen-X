@@ -150,6 +150,27 @@ def test_period_one_recompression_is_exact_for_every_finite_fp32_scale():
     assert indices[4].item() == codebook.numel() - 1
 
 
+def test_period_one_block_reduction_preserves_every_fp32_bit():
+    tiny = torch.nextafter(torch.tensor(0.0), torch.tensor(1.0))
+    dense = torch.stack(
+        (
+            torch.tensor(-0.0),
+            torch.tensor(0.0),
+            tiny,
+            torch.tensor(torch.finfo(torch.float32).tiny),
+            torch.tensor(19.125),
+            torch.tensor(torch.finfo(torch.float32).max),
+        )
+    )
+
+    reduced = _reduce_block_second_moment(dense, period=1, step=99)
+
+    assert torch.equal(
+        reduced.reshape(-1).view(torch.int32),
+        dense.view(torch.int32),
+    )
+
+
 def test_scalar_momentum_roundtrips_as_zero_dimensional_logical_state():
     momentum = torch.tensor(-123.75, requires_grad=True)
     indices, magnitudes = _recompress_dense_momentum(
