@@ -380,9 +380,15 @@ def _hybrid_portable_contract_support(optimizer):
             optimizer,
             binding,
         )
-        same_topology = set()
-        topology_changing = set()
-        topology_change_kinds = set()
+        # A composite canonical-global save/load processes EVERY child, so the
+        # Hybrid may only advertise a checkpoint guarantee that every child
+        # supports: intersect (not union) the children's guarantee sets. (This
+        # is the opposite of the per-routed-parameter TRAINING claims, which are
+        # legitimately unioned.) None marks "no child seen yet" so the first
+        # child seeds each set and later children narrow it.
+        same_topology = None
+        topology_changing = None
+        topology_change_kinds = None
         for _role, child in children:
             supports = tuple(
                 support
@@ -392,13 +398,26 @@ def _hybrid_portable_contract_support(optimizer):
             if len(supports) != 1:
                 return frozenset(), frozenset(), frozenset()
             support = supports[0]
-            same_topology.update(support.same_topology)
-            topology_changing.update(support.topology_changing)
-            topology_change_kinds.update(support.topology_change_kinds)
+            child_same = set(support.same_topology)
+            child_changing = set(support.topology_changing)
+            child_kinds = set(support.topology_change_kinds)
+            same_topology = (
+                child_same if same_topology is None else same_topology & child_same
+            )
+            topology_changing = (
+                child_changing
+                if topology_changing is None
+                else topology_changing & child_changing
+            )
+            topology_change_kinds = (
+                child_kinds
+                if topology_change_kinds is None
+                else topology_change_kinds & child_kinds
+            )
         return (
-            frozenset(same_topology),
-            frozenset(topology_changing),
-            frozenset(topology_change_kinds),
+            frozenset(same_topology or ()),
+            frozenset(topology_changing or ()),
+            frozenset(topology_change_kinds or ()),
         )
     except Exception:
         return frozenset(), frozenset(), frozenset()

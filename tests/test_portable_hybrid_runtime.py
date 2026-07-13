@@ -389,3 +389,68 @@ def test_adamw_backed_hybrid_remains_explicitly_nonportable():
             transaction_id="adamw-hybrid-reject-v1",
             limits=_limits(),
         )
+
+
+def test_hybrid_canonical_global_checkpoint_guarantees_are_intersected(monkeypatch):
+    # A composite canonical-global save/load processes EVERY child, so the
+    # Hybrid may advertise a checkpoint guarantee only when both children
+    # support it. The children's guarantee sets must intersect, not union.
+    from types import SimpleNamespace
+
+    from gefen.contracts import (
+        CheckpointSupport,
+        ProcessGroupScope,
+        TopologyChange,
+    )
+    from gefen.portable_hybrid import _hybrid_portable_contract_support
+
+    source, _matrix, _bias, _binding = _initialized_source()
+
+    def _support(same_topology, kinds):
+        return CheckpointSupport(
+            transport=CheckpointTransport.CANONICAL_GLOBAL,
+            same_topology=same_topology,
+            topology_changing=frozenset({ParameterLayout.REPLICATED}),
+            process_group_scope=ProcessGroupScope.DEFAULT_WORLD,
+            topology_change_kinds=kinds,
+            atomic_load=True,
+        )
+
+    muon_support = _support(
+        frozenset(
+            {ParameterLayout.REPLICATED, ParameterLayout.FLATTENED_ELEMENT_SHARD}
+        ),
+        frozenset(
+            {
+                TopologyChange.WORLD_SIZE_OWNER_REDISTRIBUTION,
+                TopologyChange.PLACEMENT_RESHARD,
+            }
+        ),
+    )
+    backup_support = _support(
+        frozenset({ParameterLayout.REPLICATED}),
+        frozenset({TopologyChange.WORLD_SIZE_OWNER_REDISTRIBUTION}),
+    )
+
+    def _stub(support):
+        # Patch at the class level: portable readiness rejects instance-level
+        # method shadows. The muon and backup children are distinct classes.
+        return lambda _self: SimpleNamespace(
+            capabilities=SimpleNamespace(checkpoints=(support,))
+        )
+
+    assert type(source.muon) is not type(source.backup)
+    monkeypatch.setattr(type(source.muon), "optimizer_contract", _stub(muon_support))
+    monkeypatch.setattr(
+        type(source.backup), "optimizer_contract", _stub(backup_support)
+    )
+
+    same_topology, topology_changing, topology_change_kinds = (
+        _hybrid_portable_contract_support(source)
+    )
+
+    assert same_topology == frozenset({ParameterLayout.REPLICATED})
+    assert topology_changing == frozenset({ParameterLayout.REPLICATED})
+    assert topology_change_kinds == frozenset(
+        {TopologyChange.WORLD_SIZE_OWNER_REDISTRIBUTION}
+    )
