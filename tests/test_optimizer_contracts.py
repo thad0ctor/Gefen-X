@@ -30,6 +30,7 @@ from gefen import (
     StateScope,
     StateVariant,
     TopologyChange,
+    TrainingSupport,
 )
 
 
@@ -759,6 +760,60 @@ def test_portable_global_transport_is_defined_but_not_claimed_before_integration
         support.transport is not CheckpointTransport.CANONICAL_GLOBAL
         for support in optimizer.optimizer_contract().capabilities.checkpoints
     )
+
+
+@pytest.mark.parametrize("backup_optimizer", ["gefen", "adamw"])
+def test_backup_only_hybrid_training_claims_come_from_backup_child(backup_optimizer):
+    bias = torch.nn.Parameter(torch.arange(4, dtype=torch.float32))
+    optimizer = GefenMuonHybrid(
+        [],
+        [("layer.bias", bias)],
+        lr=1e-3,
+        fused=False,
+        backup_optimizer=backup_optimizer,
+    )
+    assert optimizer.muon is None
+    contract = optimizer.optimizer_contract()
+    assert tuple(child.role for child in contract.children) == ("backup",)
+    if backup_optimizer == "gefen":
+        backup_training = contract.children[0].contract.capabilities.training
+        assert contract.capabilities.training == backup_training
+        assert any(
+            item.layout is ParameterLayout.FLATTENED_ELEMENT_SHARD
+            for item in contract.capabilities.training
+        )
+    else:
+        # AdamW publishes no contract, so the composite keeps only the plain
+        # replicated layout the hybrid actually exercises for that child; a
+        # DTensor claim no code validated would be an over-claim.
+        assert contract.children[0].contract is None
+        assert contract.capabilities.training == (
+            TrainingSupport(ParameterLayout.REPLICATED, ProcessGroupScope.NONE),
+        )
+
+
+@pytest.mark.parametrize("backup_optimizer", ["gefen", "adamw"])
+def test_hybrid_training_claims_are_the_union_of_routed_children(backup_optimizer):
+    matrix = torch.nn.Parameter(torch.ones(4, 4))
+    bias = torch.nn.Parameter(torch.ones(4))
+    optimizer = GefenMuonHybrid(
+        [("layer.weight", matrix)],
+        [("layer.bias", bias)],
+        lr=1e-3,
+        fused=False,
+        backup_optimizer=backup_optimizer,
+    )
+    contract = optimizer.optimizer_contract()
+    training = contract.capabilities.training
+    muon_training = contract.children[0].contract.capabilities.training
+    if backup_optimizer == "gefen":
+        backup_training = contract.children[1].contract.capabilities.training
+    else:
+        backup_training = (
+            TrainingSupport(ParameterLayout.REPLICATED, ProcessGroupScope.NONE),
+        )
+    assert set(training) == set(muon_training) | set(backup_training)
+    assert len(set(training)) == len(training)
 
 
 def test_capabilities_reject_untyped_entries_and_flags():

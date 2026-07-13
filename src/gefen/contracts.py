@@ -1955,6 +1955,39 @@ def _gefen_muon_contract(
     )
 
 
+def _hybrid_training(
+    muon: Optional[OptimizerContract],
+    backup: Optional[OptimizerContract],
+    backup_present: bool,
+) -> Tuple[TrainingSupport, ...]:
+    """Compose hybrid training claims from the routed children's own claims.
+
+    The hybrid routes each parameter to exactly one child, so the composite
+    declares the ordered union of the present children's validated claims; an
+    adapter must read each role's child contract together with the frozen
+    parameter routing rather than apply one entry to every parameter. A backup
+    child without a contract of its own (AdamW) contributes only the plain
+    replicated layout the composite actually exercises for it, because no code
+    validates any other layout for that child.
+    """
+
+    child_claims = []
+    if muon is not None:
+        child_claims.append(muon.capabilities.training)
+    if backup is not None:
+        child_claims.append(backup.capabilities.training)
+    elif backup_present:
+        child_claims.append(
+            (TrainingSupport(ParameterLayout.REPLICATED, ProcessGroupScope.NONE),)
+        )
+    training = []
+    for claims in child_claims:
+        for support in claims:
+            if support not in training:
+                training.append(support)
+    return tuple(training)
+
+
 def _hybrid_contract(
     *,
     muon: Optional[OptimizerContract],
@@ -1982,10 +2015,7 @@ def _hybrid_contract(
         children.append(OptimizerChildContract("muon", muon.implementation, muon))
     if backup_implementation:
         children.append(OptimizerChildContract("backup", backup_implementation, backup))
-    if muon is None:
-        training = _base_training()
-    else:
-        training = muon.capabilities.training
+    training = _hybrid_training(muon, backup, bool(backup_implementation))
     canonical_global_same_topology = _frozenset(canonical_global_same_topology)
     canonical_global_topology_changing = _frozenset(canonical_global_topology_changing)
     canonical_global_topology_change_kinds = _frozenset(
