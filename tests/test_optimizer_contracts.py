@@ -157,7 +157,7 @@ def test_plain_contract_matches_live_persistent_state(factored_v_2d):
         for item in contract.capabilities.checkpoints
         if item.transport is CheckpointTransport.NATIVE_OPTIMIZER
     )
-    assert not native.atomic_load
+    assert native.atomic_load
     assert contract.capabilities.accepts_semantic_parameter_names
     assert not contract.capabilities.canonical_parameter_fqns
     assert not contract.capabilities.stable_shard_identity
@@ -337,6 +337,13 @@ def test_muon_contract_separates_mode_topology_and_state_extent(
 
     assert contract.implementation == "gefen.GefenMuon"
     assert contract.capabilities.supported_parameter_ranks == (2,)
+    native = next(
+        item
+        for item in contract.capabilities.checkpoints
+        if item.transport is CheckpointTransport.NATIVE_OPTIMIZER
+        and ParameterLayout.REPLICATED in item.same_topology
+    )
+    assert native.atomic_load
     replicated = _training_support(contract, ParameterLayout.REPLICATED)
     assert replicated.requires_complete_logical_matrix
     assert not replicated.requires_complete_parameter_storage
@@ -469,6 +476,7 @@ def test_hybrid_contract_preserves_child_namespaces(backup_optimizer):
     assert checkpoint[0].transport is CheckpointTransport.COMPOSITE_NATIVE
     assert checkpoint[0].same_topology == frozenset({ParameterLayout.REPLICATED})
     assert not checkpoint[0].topology_changing
+    assert not checkpoint[0].atomic_load
 
 
 def test_muon_contract_keeps_mixed_normuon_variants_in_one_mode():

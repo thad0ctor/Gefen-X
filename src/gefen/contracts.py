@@ -291,7 +291,13 @@ class TrainingSupport:
 
 @dataclass(frozen=True)
 class CheckpointSupport:
-    """One transport's separately qualified checkpoint capability."""
+    """One transport's separately qualified checkpoint capability.
+
+    ``atomic_load`` means each participating optimizer instance validates and
+    prepares its core restore before local mutation. It does not claim a
+    coordinated all-rank commit after failures outside the declared process
+    group or arbitrary user hook side effects.
+    """
 
     transport: CheckpointTransport
     same_topology: AbstractSet[ParameterLayout]
@@ -712,6 +718,7 @@ def _gefen_contract(*, factored_v_2d: bool) -> OptimizerContract:
             ),
             frozenset(),
             ProcessGroupScope.NONE,
+            atomic_load=True,
         ),
         CheckpointSupport(
             CheckpointTransport.PYTORCH_RANK_LOCAL,
@@ -922,6 +929,7 @@ def _gefen_muon_contract(
             frozenset(),
             ProcessGroupScope.NONE,
             required_sharded_modes=sharded_modes,
+            atomic_load=True,
         )
     ]
     if (

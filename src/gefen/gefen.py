@@ -4464,16 +4464,83 @@ class Gefen(torch.optim.Optimizer):
         return migrated
 
     def load_state_dict(self, state_dict):
-        """Run load hooks around Gefen's complete restore transaction."""
+        """Atomically restore Gefen state between the public load hooks."""
 
         state_dict = state_dict.copy()
         for pre_hook in self._optimizer_load_state_dict_pre_hooks.values():
             hook_result = pre_hook(self, state_dict)
             if hook_result is not None:
                 state_dict = hook_result
-        self._load_state_dict_impl(state_dict)
+        staged = self._stage_load_state_dict(state_dict)
+        self._commit_staged_load_state_dict(staged)
         for post_hook in self._optimizer_load_state_dict_post_hooks.values():
             post_hook(self)
+
+    def _stage_load_state_dict(self, state_dict):
+        """Prepare a complete restore without mutating the live optimizer.
+
+        ``Optimizer.load_state_dict`` commits before Gefen restores auxiliary
+        dtypes, normalizes counters, rebuilds names, and prepares checkpoint
+        schema. Run that complete dynamically dispatched path on an isolated
+        shadow first so a failure in any of those operations is a true no-op.
+        ``copy.copy`` cannot be used here because ``Optimizer.__getstate__``
+        intentionally omits Gefen's private runtime attributes.
+        """
+
+        staged = object.__new__(type(self))
+        staged.__dict__ = self.__dict__.copy()
+
+        # ``Optimizer.__setstate__`` mutates defaults, while the remaining
+        # containers are cleared or invalidated by Gefen before/after the base
+        # load. Isolate them so even a late staging failure cannot disturb live
+        # caches, capturable views, or device counters.
+        staged.defaults = self.defaults.copy()
+        staged._gefen_codebook_by_device = {}
+        staged._gefen_codebook_lut_by_device = {}
+        staged._sr_seed_by_device = {}
+        staged._gefen_global_step_by_device = {}
+        staged._capt_stacks = None
+
+        staged._load_state_dict_impl(state_dict)
+        staged._validate_loaded_native_state()
+        return staged
+
+    def _commit_staged_load_state_dict(self, staged) -> None:
+        """Publish an already prepared restore through non-throwing swaps."""
+
+        # The base loader mutates the existing defaults mapping via setdefault;
+        # preserve that public object identity while publishing the staged
+        # value. Both mappings are ordinary built-in dicts created by Optimizer.
+        live_defaults = self.defaults
+        live_defaults.update(staged.defaults)
+        staged.defaults = live_defaults
+        self.__dict__.update(staged.__dict__)
+
+    def _validate_loaded_native_state(self) -> None:
+        """Validate the complete prepared native state before publication."""
+
+        self._validate_rank_local_counter(
+            "gefen_global_step", self._gefen_global_step
+        )
+        signature = self._rank_local_sharded_signature(context={})
+        states = [
+            self.state[param]
+            for group in self.param_groups
+            for param in group["params"]
+        ]
+        self._validate_rank_local_states(
+            states,
+            signature,
+            self._gefen_codebook,
+            allow_legacy_vmean_counter=True,
+        )
+        for group in self.param_groups:
+            self._validate_group_options(
+                group["lr"],
+                (group["beta1"], group["beta2"]),
+                group["eps"],
+                group["weight_decay"],
+            )
 
     def _base_load_state_dict_without_hooks(self, state_dict):
         pre_hooks = self._optimizer_load_state_dict_pre_hooks
@@ -4543,7 +4610,14 @@ class Gefen(torch.optim.Optimizer):
             )
         return scalar
 
-    def _validate_rank_local_states(self, states, signature, codebook) -> None:
+    def _validate_rank_local_states(
+        self,
+        states,
+        signature,
+        codebook,
+        *,
+        allow_legacy_vmean_counter: bool = False,
+    ) -> None:
         if not isinstance(states, list) or len(states) != len(signature):
             raise ValueError(
                 "Gefen rank-local checkpoint payload has the wrong parameter count"
@@ -4591,6 +4665,33 @@ class Gefen(torch.optim.Optimizer):
 
             momentum_keys = ("m_codebook", "m_magnitude")
             carries_momentum = any(key in pstate for key in momentum_keys)
+            initialized_keys = (
+                "step",
+                "vmean",
+                "vmean_step",
+                "v_row",
+                "v_col",
+                "factored_step",
+                "normuon_v",
+                "normuon_step",
+            )
+            if any(key in pstate for key in initialized_keys) and not carries_momentum:
+                raise ValueError(
+                    "Gefen rank-local checkpoint initialized state is missing "
+                    "quantized momentum"
+                )
+            if (
+                period is not None
+                and not carries_momentum
+                and not (
+                    param_signature.get("sharded")
+                    and param_signature.get("sharded_mode") == "distributed"
+                )
+            ):
+                raise ValueError(
+                    "Gefen rank-local checkpoint automatic_period is invalid without "
+                    "initialized momentum"
+                )
             if carries_momentum:
                 has_quantized_momentum = True
                 if not all(key in pstate for key in momentum_keys) or period is None:
@@ -4640,6 +4741,22 @@ class Gefen(torch.optim.Optimizer):
                         "are invalid"
                     )
 
+                has_vmean = "vmean" in pstate
+                has_vmean_step = "vmean_step" in pstate
+                if has_vmean_step and not has_vmean:
+                    raise ValueError(
+                        "Gefen rank-local checkpoint block second moment is incomplete"
+                    )
+                if (
+                    has_vmean
+                    and not has_vmean_step
+                    and not allow_legacy_vmean_counter
+                ):
+                    raise ValueError(
+                        "Gefen rank-local checkpoint block second moment is missing "
+                        "vmean_step"
+                    )
+
                 # GefenMuon groups carry a sharded_mode and intentionally use
                 # quantized momentum without Adam's second moment. Plain Gefen
                 # must carry one complete second-moment representation.
@@ -4656,12 +4773,15 @@ class Gefen(torch.optim.Optimizer):
                                 "Gefen rank-local checkpoint initialized factored "
                                 "state requires factored_step >= 1"
                             )
-                    elif "vmean" not in pstate or "vmean_step" not in pstate:
+                    elif "vmean" not in pstate:
                         raise ValueError(
-                            "Gefen rank-local checkpoint plain momentum is missing "
-                            "vmean/vmean_step"
+                            "Gefen rank-local checkpoint plain momentum is missing a "
+                            "second moment"
                         )
-                    elif counters["vmean_step"] < 1:
+                    elif (
+                        "vmean_step" in counters
+                        and counters["vmean_step"] < 1
+                    ):
                         raise ValueError(
                             "Gefen rank-local checkpoint initialized vmean requires "
                             "vmean_step >= 1"
@@ -4669,6 +4789,11 @@ class Gefen(torch.optim.Optimizer):
 
             factored = (pstate.get("v_row"), pstate.get("v_col"))
             if (factored[0] is None) != (factored[1] is None):
+                raise ValueError(
+                    "Gefen rank-local checkpoint factored second moment is incomplete"
+                )
+            has_factored_step = "factored_step" in pstate
+            if has_factored_step != (factored[0] is not None):
                 raise ValueError(
                     "Gefen rank-local checkpoint factored second moment is incomplete"
                 )
@@ -5214,6 +5339,7 @@ class Gefen(torch.optim.Optimizer):
                     if key not in pstate:
                         continue
                     value = pstate[key]
+                    self._validate_rank_local_counter(key, value)
                     if self.capturable:
                         if not torch.is_tensor(value):
                             pstate[key] = torch.full(
