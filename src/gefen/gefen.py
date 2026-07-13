@@ -46,6 +46,10 @@ from gefen.contracts import (
     _gefen_contract,
 )
 from gefen.partitioning import find_period_by_block_variance
+from gefen.portable_identity import (
+    _parse_shard_identity,
+    _serialize_shard_identity,
+)
 from gefen.rebinding import LogicalSlotBinding, ParameterRebinding
 import gefen.quantization as quantization_module
 from gefen.kernels.automatic_vmean import (
@@ -81,7 +85,8 @@ _RANK_LOCAL_FORMAT = "rank_local_dtensor_v2"
 _RANK_LOCAL_METADATA_VERSION = 3
 _CODEBOOK_SCOPE_FORMAT_VERSION = 1
 _SCOPED_NATIVE_METADATA_VERSION = 4
-_NATIVE_LOCAL_SHARDS_FORMAT_VERSION = 1
+_NATIVE_LOCAL_SHARDS_LEGACY_FORMAT_VERSION = 1
+_NATIVE_LOCAL_SHARDS_FORMAT_VERSION = 2
 _CANONICAL_PARAMETER_STATE_KEYS = frozenset(
     {
         "name",
@@ -1798,7 +1803,7 @@ class Gefen(torch.optim.Optimizer):
             raise ValueError("Gefen canonical shard identity is invalid") from exc
         return cls._serialized_canonical_shard(shard)
 
-    def _serialized_native_local_shards(self):
+    def _serialized_native_local_shards_v1(self):
         if self._gefen_codebook_process_group is None:
             return None
         if not any(
@@ -1829,9 +1834,30 @@ class Gefen(torch.optim.Optimizer):
             if parameter is None
         ]
         return {
-            "format_version": _NATIVE_LOCAL_SHARDS_FORMAT_VERSION,
+            "format_version": _NATIVE_LOCAL_SHARDS_LEGACY_FORMAT_VERSION,
             "param_groups": param_groups,
             "pruned_shards": pruned_shards,
+        }
+
+    def _serialized_native_local_shards(self):
+        if self._gefen_codebook_process_group is None:
+            return None
+        if not any(
+            shard.layout is not ParameterLayout.REPLICATED
+            for _, shard in self._gefen_local_shard_bindings
+        ):
+            return None
+        return {
+            "format_version": _NATIVE_LOCAL_SHARDS_FORMAT_VERSION,
+            "logical_slots": [
+                {
+                    "group_index": slot.group_index,
+                    "original_slot_index": slot.original_slot_index,
+                    "compatibility_name": slot.compatibility_name,
+                    "shard": _serialize_shard_identity(slot.shard),
+                }
+                for slot in self._gefen_logical_slots
+            ],
         }
 
     @classmethod
@@ -1922,9 +1948,7 @@ class Gefen(torch.optim.Optimizer):
         return cls._serialized_native_local_shard(shard)
 
     @classmethod
-    def _normalize_serialized_native_local_shards(cls, value):
-        if value is None:
-            return None
+    def _normalize_serialized_native_local_shards_v1(cls, value):
         if not isinstance(value, dict) or set(value) != {
             "format_version",
             "param_groups",
@@ -1936,7 +1960,7 @@ class Gefen(torch.optim.Optimizer):
         format_version = value["format_version"]
         if (
             type(format_version) is not int
-            or format_version != _NATIVE_LOCAL_SHARDS_FORMAT_VERSION
+            or format_version != _NATIVE_LOCAL_SHARDS_LEGACY_FORMAT_VERSION
         ):
             raise ValueError(
                 "Unsupported Gefen native local-shard format_version: {}".format(
@@ -1973,10 +1997,146 @@ class Gefen(torch.optim.Optimizer):
                 "Gefen native pruned-shard metadata must describe whole-parameter nonowners"
             )
         return {
-            "format_version": _NATIVE_LOCAL_SHARDS_FORMAT_VERSION,
+            "format_version": _NATIVE_LOCAL_SHARDS_LEGACY_FORMAT_VERSION,
             "param_groups": normalized_groups,
             "pruned_shards": normalized_pruned,
         }
+
+    @classmethod
+    def _normalize_serialized_native_local_shards_v2(cls, value):
+        if type(value) is not dict or set(value) != {
+            "format_version",
+            "logical_slots",
+        }:
+            raise ValueError(
+                "Gefen native local-shard metadata has an invalid schema"
+            )
+        format_version = value["format_version"]
+        if (
+            type(format_version) is not int
+            or format_version != _NATIVE_LOCAL_SHARDS_FORMAT_VERSION
+        ):
+            raise ValueError(
+                "Unsupported Gefen native local-shard format_version: {}".format(
+                    format_version
+                )
+            )
+        records = value["logical_slots"]
+        if type(records) is not list or not records:
+            raise ValueError(
+                "Gefen native local-shard logical_slots must be a nonempty list"
+            )
+
+        normalized_records = []
+        seen_fqns = set()
+        previous_position = None
+        supported_layouts = {
+            ParameterLayout.REPLICATED,
+            ParameterLayout.FLATTENED_ELEMENT_SHARD,
+            ParameterLayout.WHOLE_PARAMETER_OWNER,
+        }
+        for record in records:
+            if type(record) is not dict or set(record) != {
+                "group_index",
+                "original_slot_index",
+                "compatibility_name",
+                "shard",
+            }:
+                raise ValueError(
+                    "Gefen native local-shard logical slot has an invalid schema"
+                )
+            if (
+                type(record["shard"]) is dict
+                and "process_group" in record["shard"]
+                and record["shard"]["process_group"] is None
+            ):
+                raise ValueError(
+                    "Gefen native local-shard metadata requires a process-group identity"
+                )
+            try:
+                shard = _parse_shard_identity(record["shard"])
+                slot = LogicalSlotBinding(
+                    record["group_index"],
+                    record["original_slot_index"],
+                    record["compatibility_name"],
+                    shard,
+                )
+            except (TypeError, ValueError) as exc:
+                raise ValueError(
+                    "Gefen native local-shard logical slot is invalid"
+                ) from exc
+            position = (slot.group_index, slot.original_slot_index)
+            if previous_position is None:
+                valid_position = position == (0, 0)
+            elif position[0] == previous_position[0]:
+                valid_position = position[1] == previous_position[1] + 1
+            else:
+                valid_position = position == (previous_position[0] + 1, 0)
+            if not valid_position:
+                raise ValueError(
+                    "Gefen native local-shard logical slot positions must be contiguous"
+                )
+            previous_position = position
+            if slot.shard.layout not in supported_layouts:
+                raise ValueError(
+                    "Gefen native local-shard metadata has an unsupported layout"
+                )
+            if slot.shard.process_group is None:
+                raise ValueError(
+                    "Gefen native local-shard metadata requires a process-group identity"
+                )
+            fqn = slot.shard.parameter.fqn
+            if fqn in seen_fqns:
+                raise ValueError(
+                    "Gefen native local-shard logical slot FQNs must be unique"
+                )
+            seen_fqns.add(fqn)
+            normalized_records.append(
+                {
+                    "group_index": slot.group_index,
+                    "original_slot_index": slot.original_slot_index,
+                    "compatibility_name": slot.compatibility_name,
+                    "shard": _serialize_shard_identity(slot.shard),
+                }
+            )
+        return {
+            "format_version": _NATIVE_LOCAL_SHARDS_FORMAT_VERSION,
+            "logical_slots": normalized_records,
+        }
+
+    @classmethod
+    def _normalize_serialized_native_local_shards(cls, value):
+        if value is None:
+            return None
+        if type(value) is not dict or "format_version" not in value:
+            raise ValueError(
+                "Gefen native local-shard metadata has an invalid schema"
+            )
+        format_version = value["format_version"]
+        if type(format_version) is not int:
+            raise ValueError(
+                "Unsupported Gefen native local-shard format_version: {}".format(
+                    format_version
+                )
+            )
+        if format_version == _NATIVE_LOCAL_SHARDS_LEGACY_FORMAT_VERSION:
+            return cls._normalize_serialized_native_local_shards_v1(value)
+        if format_version == _NATIVE_LOCAL_SHARDS_FORMAT_VERSION:
+            return cls._normalize_serialized_native_local_shards_v2(value)
+        raise ValueError(
+            "Unsupported Gefen native local-shard format_version: {}".format(
+                format_version
+            )
+        )
+
+    def _native_local_shards_matches_live(self, value):
+        if value is None:
+            return self._serialized_native_local_shards() is None
+        if value["format_version"] == _NATIVE_LOCAL_SHARDS_LEGACY_FORMAT_VERSION:
+            return value == self._serialized_native_local_shards_v1()
+        if value["format_version"] == _NATIVE_LOCAL_SHARDS_FORMAT_VERSION:
+            return value == self._serialized_native_local_shards()
+        return False
 
     @staticmethod
     def _parameter_in(parameters, candidate) -> bool:
@@ -7408,9 +7568,7 @@ class Gefen(torch.optim.Optimizer):
         if codebook_scope is not None:
             checkpoint_metadata["codebook_scope"] = self._serialized_codebook_scope()
         if native_local_shards is not None:
-            checkpoint_metadata["native_local_shards"] = (
-                self._serialized_native_local_shards()
-            )
+            checkpoint_metadata["native_local_shards"] = native_local_shards
         if consolidate_rank_local:
             self._consolidate_rank_local_sharded_state(
                 state_dict, checkpoint_metadata
@@ -8196,6 +8354,7 @@ class Gefen(torch.optim.Optimizer):
                     "Gefen checkpoint metadata is present on only some parameter groups"
                 )
             first_metadata = group_metadata[0]
+            normalized_metadata_native_local_shards = []
             for metadata in group_metadata:
                 metadata_version = metadata.get("format_version")
                 if metadata_version not in (
@@ -8225,7 +8384,14 @@ class Gefen(torch.optim.Optimizer):
                         "Gefen checkpoint parameter-group deterministic policy "
                         "must be a bool, got {!r}".format(metadata["deterministic"])
                     )
-            for metadata in group_metadata[1:]:
+                normalized_metadata_native_local_shards.append(
+                    self._normalize_serialized_native_local_shards(
+                        metadata.get("native_local_shards")
+                    )
+                )
+            for metadata_index, metadata in enumerate(
+                group_metadata[1:], start=1
+            ):
                 same_version = metadata.get(
                     "format_version"
                 ) == first_metadata.get("format_version")
@@ -8248,9 +8414,10 @@ class Gefen(torch.optim.Optimizer):
                 same_codebook_scope = metadata.get(
                     "codebook_scope"
                 ) == first_metadata.get("codebook_scope")
-                same_native_local_shards = metadata.get(
-                    "native_local_shards"
-                ) == first_metadata.get("native_local_shards")
+                same_native_local_shards = (
+                    normalized_metadata_native_local_shards[metadata_index]
+                    == normalized_metadata_native_local_shards[0]
+                )
                 if (
                     not same_version
                     or not same_step
@@ -8269,11 +8436,9 @@ class Gefen(torch.optim.Optimizer):
             metadata_codebook_scope = self._normalize_serialized_codebook_scope(
                 first_metadata.get("codebook_scope")
             )
-            metadata_native_local_shards = (
-                self._normalize_serialized_native_local_shards(
-                    first_metadata.get("native_local_shards")
-                )
-            )
+            metadata_native_local_shards = normalized_metadata_native_local_shards[
+                0
+            ]
             if gefen_global_step is None:
                 gefen_global_step = metadata_step
             elif gefen_global_step != metadata_step:
@@ -8320,7 +8485,7 @@ class Gefen(torch.optim.Optimizer):
             raise ValueError(
                 "Gefen checkpoint codebook scope does not match the live explicit binding"
             )
-        if native_local_shards != self._serialized_native_local_shards():
+        if not self._native_local_shards_matches_live(native_local_shards):
             raise ValueError(
                 "Gefen checkpoint native local-shard identity does not match the live binding"
             )

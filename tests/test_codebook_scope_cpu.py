@@ -122,6 +122,12 @@ def _assert_snapshot_identity(optimizer, snapshot):
         assert optimizer.__dict__[key] is value
 
 
+def _replace_native_guard(checkpoint, guard):
+    checkpoint["gefen_native_local_shards"] = copy.deepcopy(guard)
+    for group in checkpoint["param_groups"]:
+        group["_gefen_checkpoint_metadata"]["native_local_shards"] = copy.deepcopy(guard)
+
+
 def test_codebook_process_group_binding_is_public_frozen_and_ordered():
     group = ProcessGroupIdentity("replica", ("worker:b", "worker:a"))
     binding = CodebookProcessGroupBinding(group, "worker:b", object(), torch.device("cpu"))
@@ -352,10 +358,12 @@ def test_native_flat_checkpoint_guard_rejects_reordered_equal_shape_slots_atomic
     source_second.grad = torch.tensor([9.0, -1.0, -2.0, -3.0])
     source.step()
     checkpoint = source.state_dict()
-    source_slots = checkpoint["gefen_native_local_shards"]["param_groups"]
+    source_guard = checkpoint["gefen_native_local_shards"]
+    source_slots = source_guard["logical_slots"]
+    assert source_guard["format_version"] == 2
     assert (
         checkpoint["param_groups"][0]["_gefen_checkpoint_metadata"]["native_local_shards"]
-        == checkpoint["gefen_native_local_shards"]
+        is source_guard
     )
     buffer = io.BytesIO()
     torch.save(checkpoint, buffer)
@@ -369,9 +377,70 @@ def test_native_flat_checkpoint_guard_rejects_reordered_equal_shape_slots_atomic
     with pytest.raises(ValueError, match="format_version"):
         source.load_state_dict(malformed_version)
     _assert_snapshot_identity(source, source_before)
-    assert [[record["fqn"] for record in records] for records in source_slots] == [["Model.First", "Model.Second"]]
+    assert [
+        (
+            record["group_index"],
+            record["original_slot_index"],
+            record["compatibility_name"],
+            record["shard"]["parameter"]["fqn"],
+        )
+        for record in source_slots
+    ] == [
+        (0, 0, "first", "Model.First"),
+        (0, 1, "second", "Model.Second"),
+    ]
     if second_layout is ParameterLayout.REPLICATED:
-        assert source_slots[0][1]["layout"] == ParameterLayout.REPLICATED.value
+        assert source_slots[1]["shard"]["layout"] == ParameterLayout.REPLICATED.value
+
+    legacy_checkpoint = copy.deepcopy(checkpoint)
+    legacy_guard = source._serialized_native_local_shards_v1()
+    legacy_checkpoint["gefen_native_local_shards"] = legacy_guard
+    for group_record in legacy_checkpoint["param_groups"]:
+        group_record["_gefen_checkpoint_metadata"]["native_local_shards"] = copy.deepcopy(legacy_guard)
+    legacy_first = torch.nn.Parameter(torch.zeros(4))
+    legacy_second = torch.nn.Parameter(torch.zeros(4))
+    legacy_target = Gefen(
+        [("target_first", legacy_first), ("target_second", legacy_second)],
+        fused=False,
+        factored_v_2d=False,
+    )
+    legacy_target.post_sharding(
+        (
+            ParameterRebinding(legacy_first, legacy_first, first_shard),
+            ParameterRebinding(legacy_second, legacy_second, second_shard),
+        ),
+        manifest=manifest,
+        codebook_process_group=_single_member_binding(group),
+    )
+    legacy_target.load_state_dict(copy.deepcopy(legacy_checkpoint))
+    assert torch.equal(legacy_target._gefen_codebook, source._gefen_codebook)
+    assert legacy_target.param_groups[0]["param_names"] == [
+        "target_first",
+        "target_second",
+    ]
+    assert legacy_target.state[legacy_first]["name"] == "target_first"
+    assert legacy_target.state[legacy_second]["name"] == "target_second"
+
+    mirror_only_checkpoint = copy.deepcopy(legacy_checkpoint)
+    mirror_only_checkpoint.pop("gefen_native_local_shards")
+    legacy_target.load_state_dict(mirror_only_checkpoint)
+    assert torch.equal(legacy_target._gefen_codebook, source._gefen_codebook)
+
+    top_only_checkpoint = copy.deepcopy(legacy_checkpoint)
+    for group_record in top_only_checkpoint["param_groups"]:
+        group_record.pop("_gefen_checkpoint_metadata")
+    legacy_target.load_state_dict(top_only_checkpoint)
+    assert torch.equal(legacy_target._gefen_codebook, source._gefen_codebook)
+
+    mixed_version_checkpoint = copy.deepcopy(checkpoint)
+    for group_record in mixed_version_checkpoint["param_groups"]:
+        group_record["_gefen_checkpoint_metadata"]["native_local_shards"] = (
+            copy.deepcopy(legacy_guard)
+        )
+    source_before = _snapshot(source)
+    with pytest.raises(ValueError, match="local shards disagree"):
+        source.load_state_dict(mixed_version_checkpoint)
+    _assert_snapshot_identity(source, source_before)
 
     target_second = torch.nn.Parameter(torch.zeros(4))
     target_first = torch.nn.Parameter(torch.zeros(4))
@@ -394,6 +463,204 @@ def test_native_flat_checkpoint_guard_rejects_reordered_equal_shape_slots_atomic
         target.load_state_dict(copy.deepcopy(checkpoint))
 
     _assert_snapshot_identity(target, target_before)
+
+
+def test_native_v2_guard_retains_pruned_logical_positions_and_rejects_corruption_atomically(
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        Gefen,
+        "_validate_codebook_runtime_binding",
+        lambda self, binding: None,
+    )
+    group = ProcessGroupIdentity("data_parallel", ("rank:0", "rank:1"))
+
+    def build():
+        owned = torch.nn.Parameter(torch.ones(2, 2))
+        remote = torch.nn.Parameter(torch.full((2, 2), 2.0))
+        replicated = torch.nn.Parameter(torch.full((2, 2), 3.0))
+        optimizer = GefenMuon(
+            [
+                {"params": [("owned", owned), ("remote", remote)]},
+                {"params": [("replicated", replicated)]},
+            ],
+            fused=False,
+        )
+        owned_identity = ParameterIdentity("Model.Owned", (2, 2))
+        remote_identity = ParameterIdentity("Model.Remote", (2, 2))
+        replicated_identity = ParameterIdentity("Model.Replicated", (2, 2))
+        owned_records = tuple(
+            _whole_owner_shard(owned_identity, group, member, "rank:0")
+            for member in group.ordered_members
+        )
+        remote_records = tuple(
+            _whole_owner_shard(remote_identity, group, member, "rank:1")
+            for member in group.ordered_members
+        )
+        replicated_records = tuple(
+            _replicated_shard(replicated_identity, group, member)
+            for member in group.ordered_members
+        )
+        local_owned = owned_records[0]
+        local_remote = remote_records[0]
+        local_replicated = replicated_records[0]
+        optimizer.post_sharding(
+            (
+                ParameterRebinding(remote, None, local_remote),
+                ParameterRebinding(replicated, replicated, local_replicated),
+                ParameterRebinding(owned, owned, local_owned),
+            ),
+            manifest=ShardingManifest(
+                owned_records + remote_records + replicated_records
+            ),
+            codebook_process_group=CodebookProcessGroupBinding(
+                group,
+                "rank:0",
+                object(),
+                torch.device("cpu"),
+            ),
+        )
+        return optimizer
+
+    source = build()
+    checkpoint = source.state_dict()
+    guard = checkpoint["gefen_native_local_shards"]
+    assert guard["format_version"] == 2
+    assert [
+        (
+            record["group_index"],
+            record["original_slot_index"],
+            record["compatibility_name"],
+            record["shard"]["parameter"]["fqn"],
+        )
+        for record in guard["logical_slots"]
+    ] == [
+        (0, 0, "owned", "Model.Owned"),
+        (0, 1, "remote", "Model.Remote"),
+        (1, 0, "replicated", "Model.Replicated"),
+    ]
+    assert source.param_groups[0]["param_names"] == ["owned"]
+
+    matching = build()
+    matching.load_state_dict(copy.deepcopy(checkpoint))
+    assert matching._gefen_logical_slots == source._gefen_logical_slots
+
+    malformed_second_mirror = copy.deepcopy(checkpoint)
+    second_metadata = copy.deepcopy(
+        malformed_second_mirror["param_groups"][1][
+            "_gefen_checkpoint_metadata"
+        ]
+    )
+    second_metadata["native_local_shards"]["logical_slots"] = tuple(
+        second_metadata["native_local_shards"]["logical_slots"]
+    )
+    malformed_second_mirror["param_groups"][1][
+        "_gefen_checkpoint_metadata"
+    ] = second_metadata
+    malformed_target = build()
+    malformed_before = _snapshot(malformed_target)
+    with pytest.raises(ValueError, match="logical_slots must be a nonempty list"):
+        malformed_target.load_state_dict(malformed_second_mirror)
+    _assert_snapshot_identity(malformed_target, malformed_before)
+
+    corruptions = []
+
+    class GuardDict(dict):
+        pass
+
+    corruptions.append((GuardDict(copy.deepcopy(guard)), "invalid schema"))
+
+    invalid_schema = copy.deepcopy(guard)
+    invalid_schema["logical_slots"][0]["extra"] = None
+    corruptions.append((invalid_schema, "invalid schema"))
+
+    bool_position = copy.deepcopy(guard)
+    bool_position["logical_slots"][0]["group_index"] = False
+    corruptions.append((bool_position, "logical slot is invalid"))
+
+    skipped_position = copy.deepcopy(guard)
+    skipped_position["logical_slots"][2]["group_index"] = 2
+    corruptions.append((skipped_position, "positions must be contiguous"))
+
+    uppercase_name = copy.deepcopy(guard)
+    uppercase_name["logical_slots"][1]["compatibility_name"] = "Remote"
+    corruptions.append((uppercase_name, "logical slot is invalid"))
+
+    duplicate_fqn = copy.deepcopy(guard)
+    duplicate_fqn["logical_slots"][1]["shard"]["parameter"] = copy.deepcopy(
+        duplicate_fqn["logical_slots"][0]["shard"]["parameter"]
+    )
+    corruptions.append((duplicate_fqn, "FQNs must be unique"))
+
+    missing_group = copy.deepcopy(guard)
+    missing_group["logical_slots"][0]["shard"]["process_group"] = None
+    corruptions.append((missing_group, "requires a process-group identity"))
+
+    changed_layout = copy.deepcopy(guard)
+    changed_layout["logical_slots"][0]["shard"]["layout"] = (
+        ParameterLayout.REPLICATED.value
+    )
+    changed_layout["logical_slots"][0]["shard"]["owner"] = None
+    changed_layout["logical_slots"][0]["shard"]["placements"][0]["kind"] = (
+        PlacementKind.REPLICATE.value
+    )
+    corruptions.append((changed_layout, "does not match"))
+
+    changed_fqn = copy.deepcopy(guard)
+    changed_fqn["logical_slots"][1]["shard"]["parameter"]["fqn"] = (
+        "Model.OtherRemote"
+    )
+    corruptions.append((changed_fqn, "does not match"))
+
+    changed_name = copy.deepcopy(guard)
+    changed_name["logical_slots"][1]["compatibility_name"] = "other"
+    corruptions.append((changed_name, "does not match"))
+
+    for corrupted_guard, match in corruptions:
+        target = build()
+        before = _snapshot(target)
+        corrupted = copy.deepcopy(checkpoint)
+        _replace_native_guard(corrupted, corrupted_guard)
+        with pytest.raises(ValueError, match=match):
+            target.load_state_dict(corrupted)
+        _assert_snapshot_identity(target, before)
+
+    def build_all_nonowner():
+        remote = torch.nn.Parameter(torch.full((2, 2), 2.0))
+        optimizer = GefenMuon([("remote", remote)], fused=False)
+        identity = ParameterIdentity("Model.Remote", (2, 2))
+        records = tuple(
+            _whole_owner_shard(identity, group, member, "rank:1")
+            for member in group.ordered_members
+        )
+        optimizer.post_sharding(
+            (ParameterRebinding(remote, None, records[0]),),
+            manifest=ShardingManifest(records),
+            codebook_process_group=CodebookProcessGroupBinding(
+                group,
+                "rank:0",
+                object(),
+                torch.device("cpu"),
+            ),
+        )
+        return optimizer
+
+    all_nonowner = build_all_nonowner()
+    all_nonowner_checkpoint = all_nonowner.state_dict()
+    all_nonowner_guard = all_nonowner_checkpoint["gefen_native_local_shards"]
+    assert all_nonowner.param_groups[0]["params"] == []
+    assert [
+        (
+            record["group_index"],
+            record["original_slot_index"],
+            record["compatibility_name"],
+            record["shard"]["parameter"]["fqn"],
+        )
+        for record in all_nonowner_guard["logical_slots"]
+    ] == [(0, 0, "remote", "Model.Remote")]
+    all_nonowner_target = build_all_nonowner()
+    all_nonowner_target.load_state_dict(copy.deepcopy(all_nonowner_checkpoint))
+    assert all_nonowner_target._gefen_logical_slots == all_nonowner._gefen_logical_slots
 
 
 def test_unscoped_native_checkpoint_does_not_serialize_a_none_scope():

@@ -322,6 +322,27 @@ def _distributed_worker(rank, world, init_file, queue):
             group=runtime_group,
         )
         rank_local_checkpoint_identity = local_shard_records[0] != local_shard_records[1]
+        flat_v2_guard_valid = (
+            flat_checkpoint["gefen_native_local_shards"]["format_version"] == 2
+            and len(flat_checkpoint["gefen_native_local_shards"]["logical_slots"])
+            == 1
+            and flat_checkpoint["gefen_native_local_shards"]["logical_slots"][0][
+                "group_index"
+            ]
+            == 0
+            and flat_checkpoint["gefen_native_local_shards"]["logical_slots"][0][
+                "original_slot_index"
+            ]
+            == 0
+            and flat_checkpoint["gefen_native_local_shards"]["logical_slots"][0][
+                "compatibility_name"
+            ]
+            == "flat"
+            and flat_checkpoint["gefen_native_local_shards"]["logical_slots"][0][
+                "shard"
+            ]["local_member"]
+            == "rank:{}".format(rank)
+        )
         rank_zero_checkpoint = [flat_checkpoint if rank == 0 else None]
         dist.broadcast_object_list(rank_zero_checkpoint, src=0, group=runtime_group)
         cross_param = torch.nn.Parameter(flat_param.detach().clone())
@@ -376,6 +397,35 @@ def _distributed_worker(rank, world, init_file, queue):
             resumed_binding,
         )
         resumed.load_state_dict(flat_checkpoint)
+        legacy_checkpoint = copy.deepcopy(flat_checkpoint)
+        legacy_guard = flat_optimizer._serialized_native_local_shards_v1()
+        legacy_checkpoint["gefen_native_local_shards"] = legacy_guard
+        for legacy_group in legacy_checkpoint["param_groups"]:
+            legacy_group["_gefen_checkpoint_metadata"][
+                "native_local_shards"
+            ] = copy.deepcopy(legacy_guard)
+        legacy_param = torch.nn.Parameter(flat_param.detach().clone())
+        legacy_resumed = Gefen(
+            [("flat", legacy_param)],
+            fused=False,
+            factored_v_2d=False,
+        )
+        legacy_binding = _binding(group, rank, runtime_group)
+        _finalize(
+            legacy_resumed,
+            legacy_param,
+            flat_records[rank],
+            ShardingManifest(flat_records),
+            legacy_binding,
+        )
+        legacy_resumed.load_state_dict(legacy_checkpoint)
+        legacy_v1_guard_accepted = (
+            legacy_resumed.codebook_process_group_binding() is legacy_binding
+            and torch.equal(
+                legacy_resumed._gefen_codebook,
+                flat_optimizer._gefen_codebook,
+            )
+        )
         canonical_param = torch.nn.Parameter(flat_param.detach().clone())
         canonical_resumed = Gefen(
             [("flat", canonical_param)],
@@ -624,6 +674,8 @@ def _distributed_worker(rank, world, init_file, queue):
             failure_optimizer._gefen_codebook = restored_codebook
         original_manifest = failure_optimizer._gefen_sharding_manifest
         failure_optimizer._gefen_codebook_scope_validated = False
+        manifest_guard_codebook = failure_optimizer._gefen_codebook
+        manifest_guard_step = failure_optimizer._gefen_global_step
         if rank == 0:
             alternate_identity = ParameterIdentity("Alternate", (8,))
             alternate_records = tuple(
@@ -633,8 +685,13 @@ def _distributed_worker(rank, world, init_file, queue):
         try:
             failure_optimizer.initialize_codebook()
             manifest_mismatch_rejected = False
-        except RuntimeError as exc:
-            manifest_mismatch_rejected = "manifest" in str(exc)
+        except RuntimeError:
+            manifest_mismatch_rejected = True
+        manifest_mismatch_rejected = (
+            manifest_mismatch_rejected
+            and failure_optimizer._gefen_codebook is manifest_guard_codebook
+            and failure_optimizer._gefen_global_step == manifest_guard_step
+        )
         failure_optimizer._gefen_sharding_manifest = original_manifest
 
         queue.put(
@@ -658,6 +715,8 @@ def _distributed_worker(rank, world, init_file, queue):
                 "flat_checkpoint_continuation": flat_checkpoint_continuation,
                 "rank_neutral_checkpoint_scope": rank_neutral_checkpoint_scope,
                 "rank_local_checkpoint_identity": rank_local_checkpoint_identity,
+                "flat_v2_guard_valid": flat_v2_guard_valid,
+                "legacy_v1_guard_accepted": legacy_v1_guard_accepted,
                 "cross_member_guard": cross_member_guard,
                 "canonical_rank_local_identity": canonical_rank_local_identity,
                 "canonical_cross_member_guard": canonical_cross_member_guard,
@@ -747,6 +806,8 @@ def test_explicit_gloo_scope_aggregates_logical_state_and_fails_atomically():
         assert item["flat_checkpoint_continuation"], item
         assert item["rank_neutral_checkpoint_scope"], item
         assert item["rank_local_checkpoint_identity"], item
+        assert item["flat_v2_guard_valid"], item
+        assert item["legacy_v1_guard_accepted"], item
         assert item["cross_member_guard"], item
         assert item["canonical_rank_local_identity"], item
         assert item["canonical_cross_member_guard"], item
