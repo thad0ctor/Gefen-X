@@ -125,6 +125,9 @@ def _snapshot(optimizer):
     return {
         "children": tuple((child, deep_state_snapshot(child)) for child in optimizer._subopts),
         "owner": optimizer._state_param_owner,
+        # id(param) -> (param, owning child); copy the mapping so an in-place
+        # remap that keeps the registry object identity is still caught.
+        "owner_contents": dict(optimizer._state_param_owner),
         "finalized": optimizer._hybrid_post_sharding_finalized,
         "manifest": optimizer._hybrid_sharding_manifest,
         "local": optimizer._hybrid_local_shard_bindings,
@@ -136,6 +139,12 @@ def _snapshot(optimizer):
 
 def _assert_snapshot(optimizer, snapshot):
     assert optimizer._state_param_owner is snapshot["owner"]
+    expected_owner = snapshot["owner_contents"]
+    assert optimizer._state_param_owner.keys() == expected_owner.keys()
+    for key, (expected_param, expected_child) in expected_owner.items():
+        live_param, live_child = optimizer._state_param_owner[key]
+        assert live_param is expected_param
+        assert live_child is expected_child
     assert optimizer._hybrid_post_sharding_finalized is snapshot["finalized"]
     assert optimizer._hybrid_sharding_manifest is snapshot["manifest"]
     assert optimizer._hybrid_local_shard_bindings is snapshot["local"]

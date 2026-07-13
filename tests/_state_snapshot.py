@@ -26,10 +26,26 @@ def _cloned(value):
     return copy.deepcopy(value)
 
 
+def _tensors_bitwise_equal(live, expected):
+    # ``torch.equal`` reports +0.0/-0.0 as equal and every NaN as unequal, so it
+    # can miss a failed transaction that flips a sign bit and can spuriously fail
+    # on unchanged NaN payloads. A fail-before-mutation snapshot needs exact byte
+    # preservation, so compare dtype/layout/shape and then the raw bytes.
+    if (
+        live.dtype != expected.dtype
+        or live.layout != expected.layout
+        or tuple(live.shape) != tuple(expected.shape)
+    ):
+        return False
+    live_bytes = live.detach().contiguous().view(torch.uint8)
+    expected_bytes = expected.detach().contiguous().view(torch.uint8)
+    return bool(torch.equal(live_bytes, expected_bytes))
+
+
 def _nested_equal(live, expected):
     if torch.is_tensor(expected):
         assert torch.is_tensor(live)
-        assert torch.equal(live, expected)
+        assert _tensors_bitwise_equal(live, expected)
         return
     assert type(live) is type(expected)
     if isinstance(expected, dict):
@@ -123,4 +139,4 @@ def assert_deep_state_snapshot(optimizer, snapshot):
             expected_options,
         )
     for tensor, expected in snapshot["tensors"]:
-        assert torch.equal(tensor, expected)
+        assert _tensors_bitwise_equal(tensor, expected)

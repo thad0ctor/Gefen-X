@@ -137,6 +137,9 @@ def _snapshot(optimizer):
         "param_names": optimizer._param_names,
         "param_names_value": dict(optimizer._param_names),
         "bindings": optimizer._gefen_shard_bindings,
+        # Copy the mapping so an in-place add/remove/replace of a binding that
+        # keeps the registry object identity is still caught.
+        "bindings_contents": dict(optimizer._gefen_shard_bindings),
         "local_bindings": optimizer._gefen_local_shard_bindings,
         "manifest": optimizer._gefen_sharding_manifest,
         "finalized": optimizer._gefen_post_sharding_finalized,
@@ -144,6 +147,23 @@ def _snapshot(optimizer):
         "logical_slots": optimizer._gefen_logical_slots,
         "caches": tuple(
             (name, getattr(optimizer, name))
+            for name in (
+                "_gefen_codebook_by_device",
+                "_gefen_codebook_lut_by_device",
+                "_sr_seed_by_device",
+                "_gefen_global_step_by_device",
+            )
+        ),
+        # Bitwise clone of each device-cache entry so an in-place copy_() into a
+        # cached tensor that preserves the cache identity is still caught.
+        "caches_contents": tuple(
+            (
+                name,
+                {
+                    device: value.detach().clone() if torch.is_tensor(value) else copy.deepcopy(value)
+                    for device, value in getattr(optimizer, name).items()
+                },
+            )
             for name in (
                 "_gefen_codebook_by_device",
                 "_gefen_codebook_lut_by_device",
@@ -164,6 +184,10 @@ def _assert_snapshot(optimizer, snapshot):
     assert optimizer._param_names is snapshot["param_names"]
     assert optimizer._param_names == snapshot["param_names_value"]
     assert optimizer._gefen_shard_bindings is snapshot["bindings"]
+    expected_bindings = snapshot["bindings_contents"]
+    assert optimizer._gefen_shard_bindings.keys() == expected_bindings.keys()
+    for key, expected_binding in expected_bindings.items():
+        assert optimizer._gefen_shard_bindings[key] is expected_binding
     assert optimizer._gefen_local_shard_bindings is snapshot["local_bindings"]
     assert optimizer._gefen_sharding_manifest is snapshot["manifest"]
     assert optimizer._gefen_post_sharding_finalized is snapshot["finalized"]
@@ -186,6 +210,16 @@ def _assert_snapshot(optimizer, snapshot):
         )
     for name, cache_ref in snapshot["caches"]:
         assert getattr(optimizer, name) is cache_ref
+    for name, expected_cache in snapshot["caches_contents"]:
+        live_cache = getattr(optimizer, name)
+        assert live_cache.keys() == expected_cache.keys()
+        for device, expected_value in expected_cache.items():
+            live_value = live_cache[device]
+            if torch.is_tensor(expected_value):
+                assert torch.is_tensor(live_value)
+                assert torch.equal(live_value, expected_value)
+            else:
+                assert live_value == expected_value
 
 
 @pytest.mark.parametrize(

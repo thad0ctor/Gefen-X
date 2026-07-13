@@ -24,6 +24,8 @@ from gefen import (
     ShardingManifest,
 )
 
+from _state_snapshot import assert_deep_state_snapshot, deep_state_snapshot
+
 
 _WORLD = 2
 
@@ -384,10 +386,13 @@ def test_parameter_storage_retarget_invalidates_prepared_canonical_import():
     with torch.no_grad():
         target_parameter.data = target_parameter.data.clone()
 
+    before_rejection = deep_state_snapshot(target)
     with pytest.raises(
         RuntimeError, match="changed after canonical import preparation"
     ):
         target.commit_canonical_state_import(prepared)
+    # The rejected commit must be a no-op before any recovery import masks it.
+    assert_deep_state_snapshot(target, before_rejection)
 
     # The refusal must keep canonical I/O available with a fresh preparation.
     target.import_canonical_state(exported)
@@ -402,10 +407,13 @@ def test_parameter_inplace_mutation_invalidates_prepared_canonical_import():
     with torch.no_grad():
         target_parameter.mul_(2.0)
 
+    before_rejection = deep_state_snapshot(target)
     with pytest.raises(
         RuntimeError, match="changed after canonical import preparation"
     ):
         target.commit_canonical_state_import(prepared)
+    # The rejected commit must be a no-op before any recovery import masks it.
+    assert_deep_state_snapshot(target, before_rejection)
 
     target.import_canonical_state(exported)
     assert "automatic_period" in target.state[target_parameter]

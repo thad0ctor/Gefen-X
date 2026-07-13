@@ -24,6 +24,8 @@ from gefen import (
 )
 import gefen.gefen as gefen_module
 
+from _state_snapshot import assert_deep_state_snapshot, deep_state_snapshot
+
 
 def _replicated_shard(parameter, group, member):
     coordinate = group.ordered_members.index(member)
@@ -108,6 +110,10 @@ def _snapshot(optimizer):
         "codebook": optimizer._gefen_codebook,
         "binding": optimizer._gefen_codebook_process_group,
         "validated": optimizer._gefen_codebook_scope_validated,
+        # Bitwise clones of every reachable state tensor, param-group option, and
+        # mutable registry so a rejected transaction that mutates contents in
+        # place (without swapping the top-level container) is still caught.
+        "deep": deep_state_snapshot(optimizer),
     }
 
 
@@ -120,6 +126,7 @@ def _assert_snapshot_identity(optimizer, snapshot):
     assert optimizer.__dict__.keys() == snapshot["dict"].keys()
     for key, value in snapshot["dict"].items():
         assert optimizer.__dict__[key] is value
+    assert_deep_state_snapshot(optimizer, snapshot["deep"])
 
 
 def _replace_native_guard(checkpoint, guard):
