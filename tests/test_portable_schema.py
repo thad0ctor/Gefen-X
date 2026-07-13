@@ -149,6 +149,37 @@ def test_portable_clone_streams_noncontiguous_values_and_finite_checks(monkeypat
     assert max(stop - start for start, stop in calls) <= 4
 
 
+def test_noncontiguous_chunk_elements_stay_within_the_clone_budget():
+    budget = portable_schema_module._PORTABLE_CLONE_CHUNK_BYTES
+    # A high-rank non-contiguous view: the strided read path materializes an
+    # int64 linear index, its running quotient, and one int64 coordinate tensor
+    # per dimension. The chunk size must keep that scratch within the fixed clone
+    # budget rather than sizing on the element size alone (which would
+    # oversubscribe it and risk OOM on high-rank tensors).
+    base = torch.arange(2 * 3 * 4 * 5 * 6 * 7, dtype=torch.float32).reshape(
+        2, 3, 4, 5, 6, 7
+    )
+    view = base.permute(5, 4, 3, 2, 1, 0)
+    assert not view.is_contiguous()
+
+    chunk_elements = portable_schema_module._portable_tensor_chunk_elements(view)
+    scratch_per_element = view.element_size() + 8 * (view.ndim + 2)
+    assert chunk_elements >= 1
+    assert chunk_elements * scratch_per_element <= budget
+    # Element-size-only sizing (the prior behavior) would blow past the budget.
+    assert (budget // view.element_size()) * scratch_per_element > budget
+
+    contiguous = base.reshape(-1)
+    assert portable_schema_module._portable_tensor_chunk_elements(contiguous) == max(
+        1, budget // contiguous.element_size()
+    )
+
+    # End-to-end the clone still reproduces a high-rank strided tensor exactly.
+    cloned = portable_schema_module._clone_portable_value(view, path="tensor")
+    assert torch.equal(cloned, view)
+    assert cloned.is_contiguous()
+
+
 def test_builder_and_normalizer_each_hash_the_tensor_tree_once(monkeypatch):
     calls = []
     original = portable_schema_module._canonical_portable_state_digest

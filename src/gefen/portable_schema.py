@@ -53,7 +53,15 @@ def _portable_tensor_chunk_elements(value: torch.Tensor) -> int:
     budget = _PORTABLE_CLONE_CHUNK_BYTES
     if type(budget) is not int or budget <= 0:
         raise RuntimeError("portable clone chunk budget must be a positive int")
-    return max(1, budget // value.element_size())
+    scratch_bytes_per_element = value.element_size()
+    if not value.is_contiguous():
+        # The non-contiguous read path (_read_portable_tensor_chunk) materializes
+        # one int64 coordinate vector per dimension plus the int64 linear index
+        # and its running quotient. Size the chunk for that scratch too, so a
+        # high-rank strided tensor stays within the fixed clone budget instead of
+        # oversubscribing it. Mirrors portable_wire._clone_tensor.
+        scratch_bytes_per_element += 8 * (value.ndim + 2)
+    return max(1, budget // scratch_bytes_per_element)
 
 
 def _read_portable_tensor_chunk(
