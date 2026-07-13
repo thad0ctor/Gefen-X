@@ -782,6 +782,14 @@ class CanonicalStateProvider(Protocol):
         """Prepare and commit a canonical fragment atomically."""
 
 
+@runtime_checkable
+class StateMovementProvider(Protocol):
+    """Structural protocol for quiescent atomic optimizer-state movement."""
+
+    def move_state_(self, device=None) -> None:
+        """Co-locate authoritative state with the optimizer's live parameters."""
+
+
 _ALL_PRECISIONS = frozenset(
     {Precision.FLOAT32, Precision.BFLOAT16, Precision.FLOAT16, Precision.FLOAT64}
 )
@@ -941,6 +949,7 @@ def _negative_capabilities(
     shard_rebinding: bool = False,
     post_sharding: bool = False,
     canonical_state_io: bool = False,
+    atomic_state_movement: bool = False,
 ) -> OptimizerCapabilities:
     return OptimizerCapabilities(
         training=training,
@@ -954,7 +963,7 @@ def _negative_capabilities(
         shard_rebinding=shard_rebinding,
         post_sharding=post_sharding,
         canonical_state_io=canonical_state_io,
-        atomic_state_movement=False,
+        atomic_state_movement=atomic_state_movement,
         state_offload=False,
     )
 
@@ -967,6 +976,7 @@ def _gefen_contract(
     explicit_process_group_codebook_scope: bool = False,
     native_flattened_checkpoint: bool = False,
     canonical_state_layouts: AbstractSet[ParameterLayout] = frozenset(),
+    atomic_state_movement: bool = False,
 ) -> OptimizerContract:
     canonical_state_layouts = _frozenset(canonical_state_layouts)
     block_fields = (
@@ -1166,6 +1176,7 @@ def _gefen_contract(
             shard_rebinding=True,
             post_sharding=True,
             canonical_state_io=bool(canonical_state_layouts),
+            atomic_state_movement=atomic_state_movement,
         ),
     )
 
@@ -1200,6 +1211,7 @@ def _gefen_muon_contract(
     explicit_process_group_codebook_scope: bool = False,
     whole_parameter_owner: bool = False,
     canonical_state_layouts: AbstractSet[ParameterLayout] = frozenset(),
+    atomic_state_movement: bool = False,
 ) -> OptimizerContract:
     canonical_state_layouts = _frozenset(canonical_state_layouts)
     sharded_modes = _frozenset(sharded_modes)
@@ -1505,6 +1517,7 @@ def _gefen_muon_contract(
             shard_rebinding=True,
             post_sharding=True,
             canonical_state_io=bool(canonical_state_layouts),
+            atomic_state_movement=atomic_state_movement,
         ),
     )
 
@@ -1584,6 +1597,7 @@ __all__ = [
     "StateField",
     "StateGeometry",
     "StateKeyMatch",
+    "StateMovementProvider",
     "StateScope",
     "StateVariant",
     "TrainingSupport",

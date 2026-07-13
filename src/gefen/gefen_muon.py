@@ -761,6 +761,10 @@ class GefenMuon(Gefen):
             for group in self.param_groups
             if not group.get("normuon", False)
         )
+        try:
+            canonical_state_layouts = self._canonical_state_layouts()
+        except Exception:
+            canonical_state_layouts = frozenset()
         return _gefen_muon_contract(
             sharded_modes=sharded_modes,
             normuon_modes=normuon_modes,
@@ -768,7 +772,8 @@ class GefenMuon(Gefen):
             canonical_parameter_fqns=self._canonical_identity_ready(),
             stable_shard_identity=self._canonical_identity_ready(),
             explicit_process_group_codebook_scope=True,
-            canonical_state_layouts=self._canonical_state_layouts(),
+            canonical_state_layouts=canonical_state_layouts,
+            atomic_state_movement=self._atomic_state_movement_supported(),
             whole_parameter_owner=(
                 self._codebook_scope_ready()
                 and any(
@@ -1829,15 +1834,6 @@ class GefenMuon(Gefen):
         eff_numel = grad.reshape(-1).numel() if approx else p.numel()
         update = self._compute_muon_update(group, param_name, p, grad, eff_numel)
         self._apply_muon_update(group, p, update, is_sharded, approx)
-
-    @staticmethod
-    def _state_tensor_device(p: torch.Tensor) -> torch.device:
-        if hasattr(p, "to_local"):
-            local = p.to_local()
-            if hasattr(local, "wait"):
-                local = local.wait()
-            return local.device
-        return p.device
 
     def _distributed_state_items(self, state_dict):
         saved_ids = []

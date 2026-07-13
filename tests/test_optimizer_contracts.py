@@ -1,7 +1,8 @@
 """CPU coverage for public optimizer capability and state-layout contracts."""
 
 import copy
-from dataclasses import FrozenInstanceError
+from collections import defaultdict, OrderedDict
+from dataclasses import FrozenInstanceError, dataclass
 
 import pytest
 import torch
@@ -23,6 +24,7 @@ from gefen import (
     StateField,
     StateGeometry,
     StateKeyMatch,
+    StateMovementProvider,
     StateScope,
     StateVariant,
     TopologyChange,
@@ -128,6 +130,7 @@ def test_plain_contract_matches_live_persistent_state(factored_v_2d):
         factored_v_2d=factored_v_2d,
     )
     assert isinstance(optimizer, OptimizerContractProvider)
+    assert isinstance(optimizer, StateMovementProvider)
     contract = optimizer.optimizer_contract()
 
     assert contract.schema_version == CONTRACT_SCHEMA_VERSION
@@ -166,7 +169,7 @@ def test_plain_contract_matches_live_persistent_state(factored_v_2d):
     assert contract.capabilities.shard_rebinding
     assert contract.capabilities.post_sharding
     assert not contract.capabilities.canonical_state_io
-    assert not contract.capabilities.atomic_state_movement
+    assert contract.capabilities.atomic_state_movement
     assert not contract.capabilities.state_offload
     assert Precision.FLOAT64 in contract.capabilities.precisions
     flattened = _training_support(
@@ -348,11 +351,14 @@ def test_muon_contract_separates_mode_topology_and_state_extent(
         sharded_mode=sharded_mode,
         normuon=normuon,
     )
+    assert isinstance(optimizer, StateMovementProvider)
     contract = optimizer.optimizer_contract()
 
     assert contract.implementation == "gefen.GefenMuon"
     assert contract.capabilities.supported_parameter_ranks == (2,)
     assert contract.capabilities.explicit_process_group_codebook_scope
+    assert contract.capabilities.atomic_state_movement
+    assert not contract.capabilities.state_offload
     native = next(
         item
         for item in contract.capabilities.checkpoints
@@ -473,6 +479,7 @@ def test_hybrid_contract_preserves_child_namespaces(backup_optimizer):
         fused=False,
         backup_optimizer=backup_optimizer,
     )
+    assert not isinstance(optimizer, StateMovementProvider)
     contract = optimizer.optimizer_contract()
 
     assert contract.implementation == "gefen.GefenMuonHybrid"
@@ -485,6 +492,8 @@ def test_hybrid_contract_preserves_child_namespaces(backup_optimizer):
         assert contract.children[1].contract is None
     assert contract.state_layout.composite_namespaces == ("muon", "backup")
     assert not contract.capabilities.explicit_process_group_codebook_scope
+    assert not contract.capabilities.atomic_state_movement
+    assert not contract.capabilities.state_offload
     assert contract.children[0].contract.capabilities.explicit_process_group_codebook_scope
     if backup_optimizer == "gefen":
         assert contract.children[1].contract.capabilities.explicit_process_group_codebook_scope
@@ -515,6 +524,86 @@ def test_muon_contract_keeps_mixed_normuon_variants_in_one_mode():
     }
     assert "quantized_muon_replicated_exact" in variants
     assert "quantized_normuon_replicated_exact" in variants
+
+
+@pytest.mark.parametrize("implementation", ["gefen", "muon"])
+def test_capturable_contract_declines_atomic_state_movement(implementation):
+    shape = (4,) if implementation == "gefen" else (2, 2)
+    parameter = torch.nn.Parameter(torch.ones(shape))
+    optimizer_type = Gefen if implementation == "gefen" else GefenMuon
+    optimizer = optimizer_type(
+        [("parameter", parameter)],
+        fused=False,
+        capturable=True,
+    )
+
+    capabilities = optimizer.optimizer_contract().capabilities
+    assert not capabilities.atomic_state_movement
+    assert not capabilities.state_offload
+
+
+@pytest.mark.parametrize("implementation", ["gefen", "muon"])
+def test_undeclared_tensor_state_disables_atomic_state_movement(implementation):
+    shape = (4,) if implementation == "gefen" else (2, 2)
+    parameter = torch.nn.Parameter(torch.ones(shape))
+    optimizer_type = Gefen if implementation == "gefen" else GefenMuon
+    optimizer = optimizer_type([("parameter", parameter)], fused=False)
+    assert optimizer.optimizer_contract().capabilities.atomic_state_movement
+
+    optimizer.state[parameter]["undeclared_tensor"] = torch.ones(1)
+    capabilities = optimizer.optimizer_contract().capabilities
+    assert not capabilities.atomic_state_movement
+    assert not capabilities.state_offload
+
+
+@pytest.mark.parametrize("implementation", ["gefen", "muon"])
+@pytest.mark.parametrize("contains_tensor", [False, True])
+def test_opaque_extension_state_disables_atomic_state_movement(
+    implementation, contains_tensor
+):
+    @dataclass
+    class ExtensionState:
+        payload: object
+
+    shape = (4,) if implementation == "gefen" else (2, 2)
+    parameter = torch.nn.Parameter(torch.ones(shape))
+    optimizer_type = Gefen if implementation == "gefen" else GefenMuon
+    optimizer = optimizer_type([("parameter", parameter)], fused=False)
+    payload = torch.ones(1) if contains_tensor else "tensor-free"
+    optimizer.state[parameter]["extension"] = ExtensionState(payload)
+
+    capabilities = optimizer.optimizer_contract().capabilities
+    assert not capabilities.atomic_state_movement
+    assert not capabilities.state_offload
+
+
+@pytest.mark.parametrize("implementation", ["gefen", "muon"])
+@pytest.mark.parametrize("container_type", ["defaultdict", "ordered_dict"])
+def test_extension_mapping_with_hidden_tensor_disables_atomic_state_movement(
+    implementation, container_type
+):
+    class TensorFactory:
+        def __init__(self, tensor):
+            self.tensor = tensor
+
+        def __call__(self):
+            return self.tensor
+
+    shape = (4,) if implementation == "gefen" else (2, 2)
+    parameter = torch.nn.Parameter(torch.ones(shape))
+    optimizer_type = Gefen if implementation == "gefen" else GefenMuon
+    optimizer = optimizer_type([("parameter", parameter)], fused=False)
+    hidden_tensor = torch.ones(1)
+    if container_type == "defaultdict":
+        extension = defaultdict(TensorFactory(hidden_tensor))
+    else:
+        extension = OrderedDict()
+        extension.hidden_tensor = hidden_tensor
+    optimizer.state[parameter]["extension"] = extension
+
+    capabilities = optimizer.optimizer_contract().capabilities
+    assert not capabilities.atomic_state_movement
+    assert not capabilities.state_offload
 
 
 def test_muon_mixed_approx_distributed_checkpoint_is_same_topology_only():
@@ -657,3 +746,4 @@ def test_all_public_contract_exports_resolve():
     from gefen import contracts
 
     assert all(getattr(gefen, name) is not None for name in contracts.__all__)
+    assert gefen.StateMovementProvider is StateMovementProvider
