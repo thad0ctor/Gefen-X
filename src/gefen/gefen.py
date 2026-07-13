@@ -1052,6 +1052,19 @@ class Gefen(torch.optim.Optimizer):
             learning and period prediction.
     """
 
+    # Pure rebuildable memoization for the layout-forensics guards. These live
+    # in ``__slots__`` rather than the instance ``__dict__`` so that staged
+    # ``__dict__`` copies, staged commits, and fail-before-mutation attribute
+    # snapshots treat them as what they are — caches, never optimizer state.
+    # Every accessor reads them through ``getattr`` with a cold default, so an
+    # object whose slots were never populated simply revalidates fully.
+    __slots__ = (
+        "_gefen_layout_version",
+        "_gefen_layout_forensics_verdict",
+        "_gefen_manifest_forensics_cache",
+        "_gefen_state_offload_step_verdict",
+    )
+
     def __init__(
         self,
         params: Iterable[Union[nn.Parameter, Tuple[str, nn.Parameter]]],
@@ -1221,6 +1234,21 @@ class Gefen(torch.optim.Optimizer):
         self._gefen_post_sharding_finalized = False
         self._gefen_finalized_slots = ()
         self._gefen_logical_slots = ()
+        # Layout-forensics fast path. After one full structural pass succeeds,
+        # the exact container identities it validated are remembered together
+        # with a version counter that every legitimate mutating API bumps
+        # (post_sharding, staged checkpoint load commits, state movement and
+        # offload). Per-step guards accept only that unchanged token set;
+        # boundary operations (checkpoint prepare/commit, rebinding, movement
+        # and offload, collective codebook initialize/refresh, contract
+        # readiness) always rerun the complete forensic rebuild.
+        self._gefen_layout_version = 0
+        self._gefen_layout_forensics_verdict = None
+        # (manifest, frozenset(manifest.shards), sha256 digest) computed once
+        # per finalized manifest object instead of rehashing every identity on
+        # every scoped step header.
+        self._gefen_manifest_forensics_cache = None
+        self._gefen_state_offload_step_verdict = None
         # ``set_optimizer_state_dict(flatten_optimizer_state_dict=True)`` uses
         # the *live* optimizer state/group keys as its unflattening schema before
         # it calls our loader. Publish the private rank-local transport keys only
@@ -1412,9 +1440,117 @@ class Gefen(torch.optim.Optimizer):
             or self._gefen_sharding_manifest is None
         ):
             return False
-        return self._finalized_binding_layout_matches()
+        # Contract readiness is an honest external claim, so it never trusts
+        # the per-step fast-path verdict.
+        return self._finalized_binding_layout_matches(full=True)
 
-    def _finalized_binding_layout_matches(self) -> bool:
+    def _invalidate_layout_forensics_caches(self) -> None:
+        self._gefen_layout_version = getattr(self, "_gefen_layout_version", 0) + 1
+        self._gefen_layout_forensics_verdict = None
+        self._gefen_state_offload_step_verdict = None
+
+    @staticmethod
+    def _forensics_tokens_match(cached, live) -> bool:
+        # Containers, tensors, and strings compare by object identity — the
+        # cached tuple holds strong references, so an unchanged attribute is
+        # the same object. Plain ints (version counter, lengths) compare by
+        # value because CPython interns only small integers.
+        return len(cached) == len(live) and all(
+            cached_item is live_item
+            or (
+                type(cached_item) is int
+                and type(live_item) is int
+                and cached_item == live_item
+            )
+            for cached_item, live_item in zip(cached, live)
+        )
+
+    def _layout_forensics_fast_tokens(self):
+        # O(local params) identity snapshot of everything user code can reach
+        # between two guard calls: the finalized registries by object identity
+        # (they are replaced, never mutated, by legitimate APIs) plus every
+        # live group container, parameter, and compatibility name element, so
+        # in-place mutation of the public groups — e.g. a closure swapping one
+        # ``group["params"]`` slot — still falls back to the full forensic
+        # pass before any state mutation.
+        live = [
+            getattr(self, "_gefen_layout_version", 0),
+            self._gefen_post_sharding_finalized,
+            self._gefen_sharding_manifest,
+            self._gefen_logical_slots,
+            self._gefen_finalized_slots,
+            self._gefen_local_shard_bindings,
+            self._gefen_shard_bindings,
+            len(self._gefen_shard_bindings),
+            self._param_names,
+            len(self._param_names),
+            self.param_groups,
+            len(self.param_groups),
+            self.state,
+        ]
+        live.extend(self._param_names.keys())
+        live.extend(self._param_names.values())
+        for group in self.param_groups:
+            params = group.get("params") if type(group) is dict else None
+            names = group.get("param_names") if type(group) is dict else None
+            live.append(group)
+            live.append(params)
+            live.append(names)
+            if isinstance(params, (list, tuple)):
+                live.append(len(params))
+                live.extend(params)
+                for parameter in params:
+                    parameter_state = self.state.get(parameter)
+                    live.append(type(parameter_state))
+                    live.append(
+                        parameter_state.get("name")
+                        if type(parameter_state) is dict
+                        else None
+                    )
+            if isinstance(names, (list, tuple)):
+                live.append(len(names))
+                live.extend(names)
+        return tuple(live)
+
+    def _manifest_layout_forensics(self, *, refresh: bool = False):
+        """Return the cached ``(shard set, digest)`` for the live manifest.
+
+        Both values are pure functions of one immutable ``ShardingManifest``,
+        so they are computed once per manifest object (at post_sharding
+        finalization) instead of rehashing every ``ShardIdentity`` — including
+        its world-size ``ordered_members`` tuple — on every step. Full
+        forensic passes recompute with ``refresh=True`` so boundary checks
+        never trust a stale cache.
+        """
+
+        manifest = self._gefen_sharding_manifest
+        cache = getattr(self, "_gefen_manifest_forensics_cache", None)
+        if not refresh and cache is not None and cache[0] is manifest:
+            return cache[1], cache[2]
+        shards = frozenset(manifest.shards)
+        digest = self._compute_codebook_manifest_fingerprint(manifest)
+        self._gefen_manifest_forensics_cache = (manifest, shards, digest)
+        return shards, digest
+
+    def _finalized_binding_layout_matches(self, *, full: bool = False) -> bool:
+        try:
+            verdict = getattr(self, "_gefen_layout_forensics_verdict", None)
+            if not full and verdict is not None:
+                if self._forensics_tokens_match(
+                    verdict, self._layout_forensics_fast_tokens()
+                ):
+                    return True
+            self._gefen_layout_forensics_verdict = None
+            matches = self._finalized_binding_layout_matches_full()
+            if matches:
+                self._gefen_layout_forensics_verdict = (
+                    self._layout_forensics_fast_tokens()
+                )
+            return matches
+        except AttributeError:
+            return False
+
+    def _finalized_binding_layout_matches_full(self) -> bool:
         try:
             if (
                 type(self._gefen_logical_slots) is not tuple
@@ -1471,7 +1607,7 @@ class Gefen(torch.optim.Optimizer):
             if any(not group for group in logical_groups):
                 return False
 
-            manifest_shards = frozenset(self._gefen_sharding_manifest.shards)
+            manifest_shards = self._manifest_layout_forensics(refresh=True)[0]
             if {
                 shard.parameter.fqn for shard in manifest_shards
             } != logical_fqns or any(
@@ -1590,10 +1726,10 @@ class Gefen(torch.optim.Optimizer):
         ):
             return False
 
-    def _assert_finalized_binding_layout(self) -> None:
+    def _assert_finalized_binding_layout(self, *, full: bool = False) -> None:
         if (
             self._gefen_post_sharding_finalized
-            and not self._finalized_binding_layout_matches()
+            and not self._finalized_binding_layout_matches(full=full)
         ):
             raise RuntimeError(
                 "Gefen finalized parameter layout changed outside post_sharding"
@@ -2420,11 +2556,11 @@ class Gefen(torch.optim.Optimizer):
                 raise ValueError("codebook collective CUDA device is unavailable")
 
     @torch._dynamo.disable
-    def _assert_runtime_codebook_process_group(self) -> None:
+    def _assert_runtime_codebook_process_group(self, *, full: bool = False) -> None:
         binding = self._gefen_codebook_process_group
         if binding is None:
             return
-        self._assert_finalized_binding_layout()
+        self._assert_finalized_binding_layout(full=full)
         self._validate_codebook_runtime_binding(binding)
 
     def _codebook_parameter_contributes(self, parameter) -> bool:
@@ -2690,6 +2826,11 @@ class Gefen(torch.optim.Optimizer):
             sources.append(rebinding.old_parameter)
         staged = self._stage_post_sharding(rebindings, manifest, codebook_process_group)
         self.__dict__.update(staged.__dict__)
+        self._invalidate_layout_forensics_caches()
+        # Compute the manifest shard set and digest exactly once at
+        # finalization; every later step guard and scoped operation header
+        # reuses this cache instead of rehashing every shard identity.
+        self._manifest_layout_forensics(refresh=True)
 
     def rebind_shard(
         self,
@@ -3144,6 +3285,18 @@ class Gefen(torch.optim.Optimizer):
             ) from exc
         self.state[parameter] = cpu_state
 
+    def _state_offload_step_tokens(self):
+        return (
+            getattr(self, "_gefen_layout_version", 0),
+            self.state,
+            self.param_groups,
+            len(self.param_groups),
+            self._gefen_state_offload_device,
+            self._gefen_codebook,
+            self._gefen_codebook_process_group,
+            self.capturable,
+        )
+
     def _assert_state_offload_step_ready(self) -> None:
         if self.state_offload_poisoned:
             raise RuntimeError(
@@ -3152,16 +3305,30 @@ class Gefen(torch.optim.Optimizer):
             )
         if not self.state_offload_active:
             return
+        # The complete offload scan (per-tensor storage checks, pairwise
+        # disjointness, native-schema validation) runs once after activation
+        # or any mutating API bumps the layout version; unchanged token
+        # identities reuse that verdict on the step hot path. Every boundary
+        # (activation, movement, staged checkpoint load) still runs the full
+        # scan directly through _state_offload_rejection_reason.
+        verdict = getattr(self, "_gefen_state_offload_step_verdict", None)
+        if verdict is not None:
+            if self._forensics_tokens_match(
+                verdict, self._state_offload_step_tokens()
+            ):
+                return
+            self._gefen_state_offload_step_verdict = None
         reason = self._state_offload_rejection_reason(require_cpu_state=True)
         if reason is not None:
             raise RuntimeError("Gefen state offload cannot step: {}".format(reason))
+        self._gefen_state_offload_step_verdict = self._state_offload_step_tokens()
 
     @torch.no_grad()
     def offload_state_(self, device="cpu") -> None:
         """Atomically enable synchronous CPU-authoritative parameter state."""
 
         target = self._normalize_state_offload_target(device)
-        self._assert_finalized_binding_layout()
+        self._assert_finalized_binding_layout(full=True)
         reason = self._state_offload_rejection_reason(require_cpu_state=False)
         if reason is not None:
             raise RuntimeError("Gefen state offload is unavailable: {}".format(reason))
@@ -3183,6 +3350,7 @@ class Gefen(torch.optim.Optimizer):
                 }
             )
         self.__dict__.update(updates)
+        self._invalidate_layout_forensics_caches()
 
     @torch.no_grad()
     def restore_state_(self) -> None:
@@ -3211,7 +3379,7 @@ class Gefen(torch.optim.Optimizer):
     def _state_movement_rejection_reason(self):
         if (
             self._gefen_post_sharding_finalized
-            and not self._finalized_binding_layout_matches()
+            and not self._finalized_binding_layout_matches(full=True)
         ):
             return "the finalized parameter binding no longer matches live groups"
         if self.capturable:
@@ -3474,7 +3642,7 @@ class Gefen(torch.optim.Optimizer):
     def move_state_(self, device=None) -> None:
         """Atomically co-locate authoritative optimizer state with live parameters."""
 
-        self._assert_finalized_binding_layout()
+        self._assert_finalized_binding_layout(full=True)
         try:
             reason = self._state_movement_rejection_reason()
         except Exception as exc:
@@ -3519,6 +3687,7 @@ class Gefen(torch.optim.Optimizer):
                 "_gefen_state_offload_device": None,
             }
         )
+        self._invalidate_layout_forensics_caches()
 
     @staticmethod
     def _normalize_param_groups(params):
@@ -5069,16 +5238,30 @@ class Gefen(torch.optim.Optimizer):
         return reduced.cpu()
 
     def _codebook_manifest_fingerprint(self):
-        manifest = self._gefen_sharding_manifest
+        return self._manifest_layout_forensics()[1]
+
+    def _compute_codebook_manifest_fingerprint(self, manifest):
+        # Scoped manifests always carry contiguous slices and one process-group
+        # identity, so their payload (and digest) is unchanged; the ungrouped
+        # and logical-region forms only appear for unscoped finalized layouts,
+        # whose digest is cached but never exchanged in a scope header.
         payload = tuple(
             (
                 shard.parameter.fqn,
                 shard.parameter.global_shape,
                 shard.layout.value,
-                shard.logical_slice.flat_offset,
-                shard.logical_slice.length,
-                shard.process_group.semantic_name,
-                shard.process_group.ordered_members,
+                shard.logical_slice.flat_offset
+                if isinstance(shard.logical_slice, LogicalSlice)
+                else tuple(shard.logical_slice.offsets),
+                shard.logical_slice.length
+                if isinstance(shard.logical_slice, LogicalSlice)
+                else tuple(shard.logical_slice.lengths),
+                None
+                if shard.process_group is None
+                else shard.process_group.semantic_name,
+                None
+                if shard.process_group is None
+                else shard.process_group.ordered_members,
                 shard.local_member,
                 shard.owner,
                 tuple(
@@ -5274,7 +5457,9 @@ class Gefen(torch.optim.Optimizer):
         binding = self._gefen_codebook_process_group
         if binding is None or self._gefen_codebook_scope_validated:
             return
-        self._assert_runtime_codebook_process_group()
+        # Scope re-validation runs only after a mutating API reset the flag,
+        # so its collectives already amortize one full forensic rebuild.
+        self._assert_runtime_codebook_process_group(full=True)
         if len(binding.identity.ordered_members) == 1:
             self._gefen_codebook_scope_validated = self._gefen_codebook is not None
             return
@@ -5779,7 +5964,7 @@ class Gefen(torch.optim.Optimizer):
     def initialize_codebook(self) -> bool:
         """Collectively initialize the learned codebook without taking a step."""
 
-        self._assert_finalized_binding_layout()
+        self._assert_finalized_binding_layout(full=True)
         self._assert_runtime_codebook_process_group()
         self._assert_codebook_capture_ready()
         self._validate_codebook_scope_operation_header("initialize")
@@ -5806,7 +5991,7 @@ class Gefen(torch.optim.Optimizer):
     def refresh_codebook(self) -> bool:
         """Collectively relearn and atomically requantize the current codebook."""
 
-        self._assert_finalized_binding_layout()
+        self._assert_finalized_binding_layout(full=True)
         self._assert_runtime_codebook_process_group()
         if torch.cuda.is_available() and torch.cuda.is_current_stream_capturing():
             raise RuntimeError(
@@ -7047,7 +7232,7 @@ class Gefen(torch.optim.Optimizer):
     def export_canonical_state(self):
         """Export an exact-binding, device-neutral local state fragment."""
 
-        self._assert_finalized_binding_layout()
+        self._assert_finalized_binding_layout(full=True)
         self._assert_state_export_safe()
         self._assert_canonical_state_outside_cuda_capture("export")
         if not self._canonical_state_layouts():
@@ -7296,7 +7481,7 @@ class Gefen(torch.optim.Optimizer):
     def prepare_canonical_state_import(self, state):
         """Validate and stage a canonical local import without live mutation."""
 
-        self._assert_finalized_binding_layout()
+        self._assert_finalized_binding_layout(full=True)
         self._assert_canonical_state_outside_cuda_capture("import preparation")
         self._assert_canonical_import_target_safe()
         if not self._canonical_state_layouts():
@@ -7322,7 +7507,7 @@ class Gefen(torch.optim.Optimizer):
             raise ValueError("prepared canonical state belongs to another optimizer")
         if prepared._consumed:
             raise RuntimeError("prepared canonical state import was already consumed")
-        self._assert_finalized_binding_layout()
+        self._assert_finalized_binding_layout(full=True)
         self._assert_canonical_state_outside_cuda_capture("import commit")
         self._assert_canonical_import_target_safe()
         if prepared._live_token != self._canonical_import_live_token():
@@ -7381,11 +7566,11 @@ class Gefen(torch.optim.Optimizer):
     def state_dict(self):
         """Run optimizer state-dict hooks around Gefen's complete schema."""
 
-        self._assert_finalized_binding_layout()
+        self._assert_finalized_binding_layout(full=True)
         self._assert_state_export_safe()
         for pre_hook in self._optimizer_state_dict_pre_hooks.values():
             pre_hook(self)
-        self._assert_finalized_binding_layout()
+        self._assert_finalized_binding_layout(full=True)
         self._assert_state_export_safe()
         state_dict = self._state_dict_impl()
         for post_hook in self._optimizer_state_dict_post_hooks.values():
@@ -8150,13 +8335,13 @@ class Gefen(torch.optim.Optimizer):
     def load_state_dict(self, state_dict):
         """Atomically restore Gefen state between the public load hooks."""
 
-        self._assert_finalized_binding_layout()
+        self._assert_finalized_binding_layout(full=True)
         state_dict = state_dict.copy()
         for pre_hook in self._optimizer_load_state_dict_pre_hooks.values():
             hook_result = pre_hook(self, state_dict)
             if hook_result is not None:
                 state_dict = hook_result
-        self._assert_finalized_binding_layout()
+        self._assert_finalized_binding_layout(full=True)
         staged = self._stage_load_state_dict(state_dict)
         self._commit_staged_load_state_dict(staged)
         for post_hook in self._optimizer_load_state_dict_post_hooks.values():
@@ -8217,6 +8402,7 @@ class Gefen(torch.optim.Optimizer):
         dict.update(live_defaults, staged.defaults)
         staged.defaults = live_defaults
         dict.update(self.__dict__, staged.__dict__)
+        self._invalidate_layout_forensics_caches()
 
     def _validate_loaded_native_state(self) -> None:
         """Validate the complete prepared native state before publication."""
