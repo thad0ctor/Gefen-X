@@ -5708,6 +5708,28 @@ class Gefen(torch.optim.Optimizer):
             for p in group["params"]
         )
 
+    def _scope_agreed_resuming_from_checkpoint(self) -> bool:
+        # Per-parameter state presence is legitimately rank-asymmetric under an
+        # explicit scope (empty non-owner slots and zero-length shards never
+        # create state), so the rank-local _resuming_from_checkpoint() predicate
+        # must not gate collectives directly: resolve one group-wide decision
+        # before any member branches on it. Any member that restored periods
+        # makes the whole scope reuse them.
+        resuming = self._resuming_from_checkpoint()
+        binding = self._gefen_codebook_process_group
+        if binding is None or len(binding.identity.ordered_members) == 1:
+            return resuming
+        self._assert_runtime_codebook_process_group()
+        import torch.distributed as dist
+
+        control = torch.tensor(
+            int(resuming),
+            dtype=torch.int32,
+            device=binding.collective_device,
+        )
+        dist.all_reduce(control, op=dist.ReduceOp.MAX, group=binding.process_group)
+        return bool(int(control.item()))
+
     def _maybe_refresh_gefen_codebook(self) -> None:
         if self._gefen_codebook is not None:
             # A codebook restored from a checkpoint may land on CPU (depending on
@@ -5739,7 +5761,7 @@ class Gefen(torch.optim.Optimizer):
         # the refreshed periods desync from the restored vmean/m_codebook block
         # geometry and the vmean kernel aborts on a block-count mismatch.
         self._ensure_gefen_codebook(
-            reuse_existing_periods=self._resuming_from_checkpoint()
+            reuse_existing_periods=self._scope_agreed_resuming_from_checkpoint()
         )
 
     @torch.no_grad()
@@ -5765,7 +5787,7 @@ class Gefen(torch.optim.Optimizer):
         if self._gefen_codebook is not None:
             return False
         self._ensure_gefen_codebook(
-            reuse_existing_periods=self._resuming_from_checkpoint()
+            reuse_existing_periods=self._scope_agreed_resuming_from_checkpoint()
         )
         return self._gefen_codebook is not None
 
