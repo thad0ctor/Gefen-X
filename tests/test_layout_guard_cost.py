@@ -176,13 +176,24 @@ def test_manifest_digest_is_computed_once_at_finalization(monkeypatch):
     assert first == second == optimizer._compute_codebook_manifest_fingerprint(
         optimizer._gefen_sharding_manifest
     )
+    # The deliberate recompute above must not mask a per-step regression, so
+    # anchor the count separately from it.
+    after_deliberate_compute = calls["count"]
+    assert after_deliberate_compute > finalize_computes
 
+    # The first step after finalization validates the layout fully exactly once
+    # (see test_first_step_after_finalization_validates_fully_once), which
+    # recomputes the digest a single time. Warm past it, then require that every
+    # subsequent steady-state step recomputes nothing -- a per-step recompute
+    # regression would keep growing the count here.
+    _step_with_grads(optimizer, parameters)
+    warm = calls["count"]
+    assert warm == after_deliberate_compute + 1
     _step_with_grads(optimizer, parameters)
     _step_with_grads(optimizer, parameters)
-    assert calls["count"] > finalize_computes  # the deliberate compare above
-    steady = calls["count"]
+    assert calls["count"] == warm
     optimizer._codebook_manifest_fingerprint()
-    assert calls["count"] == steady
+    assert calls["count"] == warm
 
 
 def test_closure_layout_mutation_is_detected_with_a_warm_verdict():
