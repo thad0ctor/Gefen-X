@@ -74,7 +74,6 @@ from gefen.contracts import (
 from gefen.gefen import (
     Gefen,
     _amp_native_scaling_required,
-    _amp_prepare_optimizer_step,
     _assert_optimizer_gradients_structurally_valid,
 )
 from gefen.gefen_muon import GefenMuon
@@ -1091,6 +1090,40 @@ class GefenMuonHybrid(torch.optim.Optimizer):
         self._assert_finalized_binding_layout()
         return self._hybrid_codebook_process_group
 
+    @property
+    def _gefen_codebook_process_group(self):
+        # Read-only alias: the scoped-step protocol borrowed from Gefen
+        # (_prepare_scoped_amp_optimizer_step and the failure synchronization
+        # it drives) looks the binding up under the child attribute name. The
+        # composite's one shared binding lives in
+        # _hybrid_codebook_process_group; nothing may store under this name.
+        return self._hybrid_codebook_process_group
+
+    def _synchronize_codebook_scope_failure(self, error, phase: str) -> None:
+        # Composite-level preflight/AMP failures synchronize on the one
+        # binding shared by every child, so every scope member raises
+        # together instead of stranding peers inside a child's scoped step
+        # collectives. The finalized layout guarantees the first child holds
+        # the identical binding; without a binding, the local error is raised
+        # unchanged, exactly as the children do.
+        binding = self._hybrid_codebook_process_group
+        if binding is None:
+            if error is not None:
+                raise error
+            return
+        self._subopts[0]._synchronize_codebook_scope_failure(error, phase)
+
+    def _prepare_scoped_amp_optimizer_step(self) -> bool:
+        # GradScaler attaches found_inf/grad_scale to the composite, never to
+        # the children, so the children's own scoped AMP gates cannot see an
+        # overflow. Run the base scoped protocol once with the composite as
+        # the optimizer: under a multi-member codebook binding it validates
+        # found_inf/grad_scale agreement collectively and makes an overflow
+        # skip a group-wide decision, and on a finite step it unscales the
+        # union of both children's gradients exactly once. Without a binding
+        # this is exactly _amp_prepare_optimizer_step(self).
+        return Gefen._prepare_scoped_amp_optimizer_step(self)
+
     def zero_grad(self, set_to_none: bool = True):
         self._assert_finalized_binding_layout()
         for o in self._subopts:
@@ -1148,13 +1181,34 @@ class GefenMuonHybrid(torch.optim.Optimizer):
             with torch.enable_grad():
                 loss = closure()
         self._assert_finalized_binding_layout()
-        for child in self._subopts:
-            _assert_optimizer_gradients_structurally_valid(child, require_2d_params=child is self.muon)
+        # Composite structural preflight, atomically over BOTH children before
+        # either child steps. Under a shared codebook scope the failure is
+        # synchronized on the binding first (mirroring Gefen.step and
+        # GefenMuon.step), so a rank-local structural error raises on every
+        # scope member together instead of stranding peers inside a child's
+        # scoped step collectives.
+        try:
+            for child in self._subopts:
+                _assert_optimizer_gradients_structurally_valid(child, require_2d_params=child is self.muon)
+            local_preflight_error = None
+        except Exception as exc:
+            local_preflight_error = exc
+        if self._hybrid_codebook_process_group is not None:
+            self._synchronize_codebook_scope_failure(
+                local_preflight_error, "gradient preflight"
+            )
+        elif local_preflight_error is not None:
+            raise local_preflight_error
         # A non-finite gradient in either half skips BOTH children before their
-        # codebooks, states, counters, or parameters can move. Explicit
-        # scaler.unscale_(hybrid) is detected by grad_scale=None and is not
-        # repeated; automatic unscale covers every child parameter exactly once.
-        if (hasattr(self, "found_inf") or hasattr(self, "grad_scale")) and not _amp_prepare_optimizer_step(self):
+        # codebooks, states, counters, or parameters can move. GradScaler
+        # attaches found_inf/grad_scale to the composite, so under a shared
+        # multi-member codebook scope the overflow skip is the children's
+        # scoped AMP protocol run here -- collective found_inf/grad_scale
+        # agreement, then a group-wide skip -- before any child enters its
+        # scoped step collectives. Explicit scaler.unscale_(hybrid) is
+        # detected by grad_scale=None and is not repeated; automatic unscale
+        # covers every child parameter exactly once.
+        if (hasattr(self, "found_inf") or hasattr(self, "grad_scale")) and not self._prepare_scoped_amp_optimizer_step():
             for post_hook in self._optimizer_step_post_hooks.values():
                 post_hook(self, args, kwargs)
             return loss
