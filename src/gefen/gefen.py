@@ -8315,6 +8315,20 @@ class Gefen(torch.optim.Optimizer):
     def load_state_dict(self, state_dict):
         """Atomically restore Gefen state between the public load hooks."""
 
+        staged = self._prepare_load_state_dict(state_dict)
+        self._publish_load_state_dict(staged)
+
+    def _prepare_load_state_dict(self, state_dict):
+        """Validate and stage a restore without mutating live state (phase one).
+
+        Runs the load pre-hooks and stages the complete restore, returning an
+        isolated shadow. Nothing on the live optimizer is mutated, so a rejection
+        here (schema/layout mismatch, foreign backend, corrupted state) is a true
+        no-op. Composite owners (GefenMuonHybrid) call this to validate every
+        child before publishing any of them; ``load_state_dict`` pairs it with
+        ``_publish_load_state_dict`` for the standalone atomic load.
+        """
+
         self._assert_finalized_binding_layout(full=True)
         state_dict = state_dict.copy()
         for pre_hook in self._optimizer_load_state_dict_pre_hooks.values():
@@ -8322,7 +8336,11 @@ class Gefen(torch.optim.Optimizer):
             if hook_result is not None:
                 state_dict = hook_result
         self._assert_finalized_binding_layout(full=True)
-        staged = self._stage_load_state_dict(state_dict)
+        return self._stage_load_state_dict(state_dict)
+
+    def _publish_load_state_dict(self, staged):
+        """Commit a prepared restore through non-throwing swaps (phase two)."""
+
         self._commit_staged_load_state_dict(staged)
         for post_hook in self._optimizer_load_state_dict_post_hooks.values():
             post_hook(self)

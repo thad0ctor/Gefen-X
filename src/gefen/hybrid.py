@@ -54,7 +54,6 @@ period-one off, stochastic rounding off), with ``ns_schedule="tuned3"`` and
 ``normuon=True`` as the hybrid-specific defaults.
 """
 
-import copy
 import logging
 from collections import OrderedDict
 
@@ -1487,23 +1486,52 @@ class GefenMuonHybrid(torch.optim.Optimizer):
                         checkpoint_backup_optimizer, self.backup_optimizer
                     )
                 )
-        # Load the two children atomically: torch's optimizer loader can still
-        # reject a child on its internal layout (e.g. a different param count),
-        # and a backup failure after the muon child loaded would leave the
-        # hybrid half-loaded (new muon, old backup). Snapshot the muon child's
-        # state first and roll it back if the backup load raises.
-        muon_snapshot = None
+        # Load the two children with two-phase composite semantics: validate and
+        # stage BOTH halves before publishing EITHER, so a rejection on either
+        # half (a different param count, a foreign layout, a corrupted/truncated
+        # child state) leaves both live children byte-for-byte untouched. The
+        # previous code committed the muon child first and only then loaded the
+        # backup, recovering via a second full ``muon.load_state_dict(snapshot)``
+        # reload -- a rollback that could itself raise (e.g. CUDA OOM re-staging
+        # every muon tensor), masking the real backup error and leaving a
+        # half-loaded hybrid (new muon, old backup).
+        #
+        # Each Gefen child already loads atomically via a stage-then-swap
+        # primitive (``_prepare_load_state_dict`` returns an isolated shadow;
+        # ``_publish_load_state_dict`` publishes it through non-throwing dict
+        # swaps). Staging is process-group-safe: ``_stage_load_state_dict``
+        # shallow-copies the child's ``__dict__`` and swaps in fresh state
+        # containers -- it never deepcopies the live optimizer, so a codebook
+        # process-group handle (or any live ProcessGroup) is shared by reference,
+        # never duplicated. We deliberately avoid ``copy.deepcopy`` of a child or
+        # its process groups for exactly that reason.
+        muon_staged = None
         if self.muon is not None:
-            if self.backup is not None:
-                muon_snapshot = copy.deepcopy(self.muon.state_dict())
-            self.muon.load_state_dict(state_dict["muon"])
-        if self.backup is not None:
-            try:
-                self.backup.load_state_dict(state_dict["backup"])
-            except Exception:
-                if muon_snapshot is not None:
-                    self.muon.load_state_dict(muon_snapshot)
-                raise
+            muon_staged = self.muon._prepare_load_state_dict(state_dict["muon"])
+
+        if self.backup is None:
+            # muon-only hybrid: publish the single staged child.
+            if muon_staged is not None:
+                self.muon._publish_load_state_dict(muon_staged)
+        elif isinstance(self.backup, Gefen):
+            # Both halves expose the Gefen staging primitive: stage both (all
+            # validation and rejection happens here, before any mutation), then
+            # publish through non-throwing swaps so neither can fail mid-commit.
+            backup_staged = self.backup._prepare_load_state_dict(state_dict["backup"])
+            if muon_staged is not None:
+                self.muon._publish_load_state_dict(muon_staged)
+            self.backup._publish_load_state_dict(backup_staged)
+        else:
+            # Foreign backup (torch ``AdamW``): no non-throwing staging
+            # primitive, but ``torch.optim.Optimizer.load_state_dict`` validates
+            # the group structure and casts every state tensor before its single
+            # ``__setstate__``, so it is itself fail-before-mutation. Commit it
+            # first, while the muon child is only staged (never published); if it
+            # raises, the muon child is untouched. The muon child was already
+            # validated above, so publishing its swap afterwards cannot fail.
+            self.backup.load_state_dict(state_dict["backup"])
+            if muon_staged is not None:
+                self.muon._publish_load_state_dict(muon_staged)
 
         for post_hook in self._optimizer_load_state_dict_post_hooks.values():
             post_hook(self)
