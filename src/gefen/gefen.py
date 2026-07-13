@@ -5144,17 +5144,28 @@ class Gefen(torch.optim.Optimizer):
                 *self._codebook_scope_fingerprint(),
                 *self._codebook_manifest_fingerprint(),
                 *self._codebook_value_fingerprint(),
+                # Trailing decision bit, deliberately excluded from the equality
+                # check below: collective-free rank-local operations
+                # (move_state_, offload_state_, staged/native checkpoint loads)
+                # legitimately reset _gefen_codebook_scope_validated on a subset
+                # of members without changing any fingerprinted value. The group
+                # resolves "does any member need re-validation" here so
+                # _ensure_codebook_scope_agreement re-validates on every member
+                # together instead of diverging in front of its collectives.
+                int(self._gefen_codebook_scope_validated),
             ],
             dtype=torch.int64,
             device=binding.collective_device,
         )
         headers = [torch.empty_like(header) for _ in binding.identity.ordered_members]
         dist.all_gather(headers, header, group=binding.process_group)
-        if any(not torch.equal(item, headers[0]) for item in headers[1:]):
+        if any(not torch.equal(item[:-1], headers[0][:-1]) for item in headers[1:]):
             raise RuntimeError(
                 "scoped Gefen codebook operation, step, scope, manifest, policy, "
                 "or old codebook differs across process-group members"
             )
+        if any(int(item[-1].item()) == 0 for item in headers):
+            self._gefen_codebook_scope_validated = False
         if operation != "step" and self._gefen_codebook is not None:
             self._verify_codebook_scope_agreement(self._gefen_codebook)
 
