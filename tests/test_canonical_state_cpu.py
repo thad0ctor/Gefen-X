@@ -24,6 +24,8 @@ from gefen import (
 )
 from gefen.rebinding import LogicalSlotBinding
 
+from _state_snapshot import assert_deep_state_snapshot, deep_state_snapshot
+
 
 def _replicated(identity, group=None, member=None):
     placements = ()
@@ -74,23 +76,20 @@ def _finalize(optimizer, bindings, manifest):
 
 
 def _snapshot(optimizer):
+    # Deep snapshot: container identities plus bitwise clones of every state
+    # tensor, codebook tensor, counter, and param-group entry, so a rejected
+    # import that mutated live containers in place cannot pass unnoticed.
     return {
-        "dict": optimizer.__dict__.copy(),
-        "groups": optimizer.param_groups,
-        "state": optimizer.state,
+        "deep": deep_state_snapshot(optimizer),
         "codebook": optimizer._gefen_codebook,
         "global_step": optimizer._gefen_global_step,
     }
 
 
 def _assert_snapshot_identity(optimizer, snapshot):
-    assert optimizer.param_groups is snapshot["groups"]
-    assert optimizer.state is snapshot["state"]
     assert optimizer._gefen_codebook is snapshot["codebook"]
     assert optimizer._gefen_global_step is snapshot["global_step"]
-    assert optimizer.__dict__.keys() == snapshot["dict"].keys()
-    for key, value in snapshot["dict"].items():
-        assert optimizer.__dict__[key] is value
+    assert_deep_state_snapshot(optimizer, snapshot["deep"])
 
 
 def _two_parameter_source():

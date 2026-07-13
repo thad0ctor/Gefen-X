@@ -17,6 +17,8 @@ from gefen.contracts import (
 )
 from gefen.rebinding import ParameterRebinding
 
+from _state_snapshot import assert_deep_state_snapshot, deep_state_snapshot
+
 
 _MEMBER = "rank:0"
 
@@ -116,8 +118,12 @@ def _owner_shards(fqn, shape, group, owner):
 
 
 def _snapshot(optimizer):
+    # Each child is snapshotted deeply (container identities plus bitwise
+    # clones of per-parameter state, group['params'] entries, and options)
+    # so a failed composite transaction that partially rebound a child in
+    # place cannot pass on top-level identity alone.
     return {
-        "children": tuple((child, child.__dict__.copy()) for child in optimizer._subopts),
+        "children": tuple((child, deep_state_snapshot(child)) for child in optimizer._subopts),
         "owner": optimizer._state_param_owner,
         "finalized": optimizer._hybrid_post_sharding_finalized,
         "manifest": optimizer._hybrid_sharding_manifest,
@@ -137,11 +143,9 @@ def _assert_snapshot(optimizer, snapshot):
     assert optimizer._hybrid_codebook_process_group is snapshot["binding"]
     assert optimizer._hybrid_finalized_slots is snapshot["slots"]
     assert len(optimizer._subopts) == len(snapshot["children"])
-    for live, (expected_child, expected_attributes) in zip(optimizer._subopts, snapshot["children"]):
+    for live, (expected_child, expected_snapshot) in zip(optimizer._subopts, snapshot["children"]):
         assert live is expected_child
-        assert set(live.__dict__) == set(expected_attributes)
-        for name, expected in expected_attributes.items():
-            assert live.__dict__[name] is expected
+        assert_deep_state_snapshot(live, expected_snapshot)
 
 
 def test_composite_post_sharding_publishes_children_and_rebuilds_routing():
