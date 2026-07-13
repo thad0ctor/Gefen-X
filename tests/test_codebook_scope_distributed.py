@@ -935,6 +935,207 @@ def test_explicit_gloo_subgroups_are_isolated_from_default_world():
     assert first[0] != second[0]
 
 
+def _zero_length_flat_worker(rank, world, init_file, queue):
+    try:
+        dist.init_process_group(
+            "gloo",
+            init_method="file://{}".format(init_file),
+            rank=rank,
+            world_size=world,
+            timeout=timedelta(seconds=45),
+        )
+        members = tuple("rank:{}".format(index) for index in range(world))
+        group = ProcessGroupIdentity("data_parallel", members)
+        runtime_group = dist.group.WORLD
+
+        # Uneven sharding of a small parameter: member one holds a legal
+        # zero-length flattened slice bound to a live numel-0 tensor. The
+        # empty member creates no per-parameter state and its gradient
+        # presence is excluded from the nonempty-shard consensus, but it must
+        # still join every scoped collective symmetrically.
+        identity = ParameterIdentity("ZeroFlat", (4,))
+        records = (
+            _flat(identity, group, "rank:0", 0, 4),
+            _flat(identity, group, "rank:1", 4, 0),
+        )
+        parameter = torch.nn.Parameter(torch.zeros(4 if rank == 0 else 0))
+        optimizer = Gefen([("zero_flat", parameter)], fused=False, factored_v_2d=False)
+        _finalize(
+            optimizer,
+            parameter,
+            records[rank],
+            ShardingManifest(records),
+            _binding(group, rank, runtime_group),
+        )
+        optimizer._resolve_automatic_period = lambda *args: 4
+        nonempty_grad = torch.tensor([-4.0, -1.0, 2.0, 8.0])
+        if rank == 0:
+            parameter.grad = nonempty_grad.clone()
+        initialized = optimizer.initialize_codebook()
+        init_oracle = learn_gefen_exact_codebook_from_grad_periods(
+            grad_periods=(("ZeroFlat", nonempty_grad, 4, nonempty_grad),),
+            codebook_device=torch.device("cpu"),
+            num_codebooks=256,
+            force_endpoints=True,
+            verbose=False,
+            compute_mse_logging=False,
+            use_fused_histogram=False,
+        )
+        init_matches_oracle = torch.equal(optimizer._gefen_codebook, init_oracle)
+        init_codebooks = [torch.empty_like(optimizer._gefen_codebook) for _ in range(world)]
+        dist.all_gather(init_codebooks, optimizer._gefen_codebook)
+        init_agreement = all(torch.equal(item, init_codebooks[0]) for item in init_codebooks[1:])
+
+        optimizer.step()
+        step_valid = optimizer._gefen_global_step == 1 and (
+            rank == 0 or optimizer.state[parameter] == {"name": "zero_flat"}
+        )
+
+        continuation_grad = nonempty_grad.flip(0)
+        if rank == 0:
+            parameter.grad = continuation_grad.clone()
+        refreshed = optimizer.refresh_codebook()
+        refresh_oracle = learn_gefen_exact_codebook_from_grad_periods(
+            grad_periods=(("ZeroFlat", continuation_grad, 4, continuation_grad),),
+            codebook_device=torch.device("cpu"),
+            num_codebooks=256,
+            force_endpoints=True,
+            verbose=False,
+            compute_mse_logging=False,
+            use_fused_histogram=False,
+        )
+        refresh_matches_oracle = torch.equal(optimizer._gefen_codebook, refresh_oracle)
+        refreshed_codebooks = [torch.empty_like(optimizer._gefen_codebook) for _ in range(world)]
+        dist.all_gather(refreshed_codebooks, optimizer._gefen_codebook)
+        refresh_agreement = all(torch.equal(item, refreshed_codebooks[0]) for item in refreshed_codebooks[1:])
+        empty_state_inert = rank == 0 or optimizer.state[parameter] == {"name": "zero_flat"}
+
+        # A failure on the nonempty member must be observed by the empty
+        # member through the failure-sync collective, leave both members
+        # unchanged, and keep the pair retryable.
+        failure_param = torch.nn.Parameter(torch.zeros(4 if rank == 0 else 0))
+        failure_optimizer = Gefen(
+            [("zero_failure", failure_param)],
+            fused=False,
+            factored_v_2d=False,
+        )
+        failure_identity = ParameterIdentity("ZeroFailure", (4,))
+        failure_records = (
+            _flat(failure_identity, group, "rank:0", 0, 4),
+            _flat(failure_identity, group, "rank:1", 4, 0),
+        )
+        _finalize(
+            failure_optimizer,
+            failure_param,
+            failure_records[rank],
+            ShardingManifest(failure_records),
+            _binding(group, rank, runtime_group),
+        )
+        failure_optimizer._resolve_automatic_period = lambda *args: 4
+        if rank == 0:
+            failure_param.grad = nonempty_grad.clone()
+        original_exact_dp = gefen_module.quantization_module.exact_dp
+        if rank == 0:
+
+            def fail_exact_dp(*args, **kwargs):
+                raise RuntimeError("rank-local exact-DP failure")
+
+            gefen_module.quantization_module.exact_dp = fail_exact_dp
+        try:
+            failure_optimizer.initialize_codebook()
+            failure_seen = False
+        except RuntimeError as exc:
+            failure_seen = "exact-DP" in str(exc)
+        finally:
+            gefen_module.quantization_module.exact_dp = original_exact_dp
+        failure_atomic = (
+            failure_optimizer._gefen_codebook is None
+            and failure_optimizer._gefen_global_step == 0
+            and failure_optimizer.state[failure_param] == {"name": "zero_failure"}
+        )
+        retry_succeeded = failure_optimizer.initialize_codebook()
+        retry_codebooks = [torch.empty_like(failure_optimizer._gefen_codebook) for _ in range(world)]
+        dist.all_gather(retry_codebooks, failure_optimizer._gefen_codebook)
+        retry_agreement = all(torch.equal(item, retry_codebooks[0]) for item in retry_codebooks[1:])
+
+        queue.put(
+            {
+                "rank": rank,
+                "initialized": initialized,
+                "init_matches_oracle": init_matches_oracle,
+                "init_agreement": init_agreement,
+                "step_valid": step_valid,
+                "refreshed": refreshed,
+                "refresh_matches_oracle": refresh_matches_oracle,
+                "refresh_agreement": refresh_agreement,
+                "empty_state_inert": empty_state_inert,
+                "failure_seen": failure_seen,
+                "failure_atomic": failure_atomic,
+                "retry_succeeded": retry_succeeded,
+                "retry_agreement": retry_agreement,
+            }
+        )
+    except Exception as exc:
+        queue.put({"rank": rank, "error": repr(exc)})
+    finally:
+        if dist.is_available() and dist.is_initialized():
+            dist.destroy_process_group()
+
+
+def _run_zero_length_flat_workers(world=2):
+    context = mp.get_context("spawn")
+    queue = context.Queue()
+    fd, init_file = tempfile.mkstemp(prefix="gefen-codebook-zero-flat-")
+    os.close(fd)
+    os.unlink(init_file)
+    processes = [
+        context.Process(
+            target=_zero_length_flat_worker,
+            args=(rank, world, init_file, queue),
+        )
+        for rank in range(world)
+    ]
+    try:
+        for process in processes:
+            process.start()
+        results = [queue.get(timeout=60) for _ in processes]
+        for process in processes:
+            process.join(timeout=10)
+        for process in processes:
+            if process.is_alive():
+                process.terminate()
+                process.join(timeout=5)
+                pytest.fail("zero-length flattened shard worker hung")
+            assert process.exitcode == 0
+        return sorted(results, key=lambda item: item["rank"])
+    finally:
+        for process in processes:
+            if process.is_alive():
+                process.terminate()
+                process.join(timeout=5)
+        if os.path.exists(init_file):
+            os.unlink(init_file)
+
+
+def test_zero_length_flattened_shard_member_joins_every_scoped_collective():
+    results = _run_zero_length_flat_workers()
+
+    assert all("error" not in item for item in results), results
+    for item in results:
+        assert item["initialized"], item
+        assert item["init_matches_oracle"], item
+        assert item["init_agreement"], item
+        assert item["step_valid"], item
+        assert item["refreshed"], item
+        assert item["refresh_matches_oracle"], item
+        assert item["refresh_agreement"], item
+        assert item["empty_state_inert"], item
+        assert item["failure_seen"], item
+        assert item["failure_atomic"], item
+        assert item["retry_succeeded"], item
+        assert item["retry_agreement"], item
+
+
 def _nccl_empty_owner_worker(rank, world, init_file, queue):
     try:
         torch.cuda.set_device(rank)
