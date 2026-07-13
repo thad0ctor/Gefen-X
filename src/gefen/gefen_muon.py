@@ -1,4 +1,5 @@
 import math
+import re
 import warnings
 from collections import OrderedDict
 from typing import Iterable, Optional, Tuple, Union
@@ -26,6 +27,12 @@ def _stable_distributed_owner(stable_index: int, world: int) -> int:
     if stable_index < 0:
         raise ValueError("stable_index must be non-negative, got {}".format(stable_index))
     return stable_index % world
+
+# Auto-generated names for bare (unnamed) parameters, as assigned during group
+# registration in gefen.py: "param_{i}", "group_{g}_param_{i}", plus the
+# "_{n}" uniquing suffix. These names follow registration position, so they
+# carry no cross-rank identity of their own.
+_AUTO_PARAM_NAME = re.compile(r"^(?:param|group_\d+_param)_\d+(?:_\d+)?$")
 
 # Tuned per-iteration Newton-Schulz coefficient schedules. Each entry is a list
 # of (a, b, c) quintic coefficients applied one per iteration. Unlike the fixed
@@ -1297,15 +1304,18 @@ class GefenMuon(Gefen):
 
     @torch._dynamo.disable
     def _assert_sharded_grad_presence_consistent(self) -> None:
-        """Fail before collectives when mesh ranks disagree on ``grad is None``.
+        """Fail before collectives when mesh ranks disagree on the step inputs.
 
         Exact and distributed Muon reconstruct full DTensor gradients with
-        collectives. If one mesh rank skips a parameter while another enters its
-        ``full_tensor()``/broadcast path, the latter waits forever. Pack every
-        relevant parameter's activity bit by DeviceMesh and sum it across each
-        mesh dimension in sequence; the final count is global to that mesh, so
-        every participating rank sees and raises on the same disagreement before
-        codebook learning or optimizer state/parameter mutation begins.
+        collectives entered in parameter-group insertion order, and
+        ``_step_distributed_pg`` assigns momentum owners by that same insertion
+        index. Two rank-local properties therefore must agree mesh-wide before
+        any of those collectives start: which parameters have gradients, and
+        the order the parameters were registered in. Pack both per DeviceMesh
+        — an activity bit summed across every mesh dimension, and an insertion
+        position reduced to its mesh-wide max and min — so every participating
+        rank sees the same global result and raises on the same disagreement
+        before codebook learning or optimizer state/parameter mutation begins.
 
         Plain tensors/DDP and local-shard ``approx`` mode take no Muon gradient
         collectives and therefore pay no preflight collective. Manual CUDA graph
@@ -1330,6 +1340,11 @@ class GefenMuon(Gefen):
         import torch.distributed as dist
 
         by_mesh = OrderedDict()
+        # Optimizer-wide insertion positions: step() walks parameters and
+        # first-seen process groups in this order, so cross-mesh order
+        # divergence is just as collective-fatal as divergence inside one
+        # mesh. Per-mesh enumeration would hide it.
+        global_position = {}
         for group in self.param_groups:
             if group["sharded_mode"] == "approx":
                 continue
@@ -1339,12 +1354,13 @@ class GefenMuon(Gefen):
                 mesh = p.device_mesh
                 if mesh.get_coordinate() is None or mesh.size() < 2:
                     continue
-                # Parameter-group order may legitimately differ between ranks
-                # while two equivalent DeviceMesh objects still refer to
-                # distinct c10d groups. Key each mesh by content instead of
-                # object identity, and sort meshes and items below, so every
-                # rank compares the same positional activity vector and enters
-                # the per-mesh collectives in the same order.
+                # Two equivalent DeviceMesh objects can still refer to distinct
+                # c10d groups, and a mis-built training script can register the
+                # same parameters in a different order per rank. Key each mesh
+                # by content instead of object identity, and sort meshes and
+                # items below, so this preflight's own collectives stay matched
+                # under both — and rank-divergent registration order is then
+                # detected positionally rather than corrupting the comparison.
                 process_groups = tuple(mesh.get_all_groups())
                 key = (
                     str(mesh.device_type),
@@ -1364,8 +1380,12 @@ class GefenMuon(Gefen):
                     }
                     by_mesh[key] = entry
                 entry["items"].append((str(name), p, p.grad is not None))
+                global_position[id(p)] = len(global_position)
 
         mismatches = []
+        order_mismatches = []
+        duplicate_labels = []
+        duplicates_anywhere = False
         for mesh_key in sorted(by_mesh):
             entry = by_mesh[mesh_key]
             mesh = entry["mesh"]
@@ -1377,21 +1397,110 @@ class GefenMuon(Gefen):
                     str(item[1].dtype),
                 ),
             )
+            # Two parameters carrying the same explicit name, shape, and dtype
+            # are indistinguishable across ranks, so neither this order probe
+            # nor the presence vector below can align them; construction
+            # accepts duplicate explicit names, so fail closed on them. The
+            # flag rides the reduced probe below rather than raising here:
+            # a rank whose own labels are clean must learn about duplicates on
+            # its peers and take the same error path, not enter a collective
+            # its peer already abandoned.
+            duplicate_keys = sorted(
+                {
+                    items[index][0]
+                    for index in range(1, len(items))
+                    if items[index][0] == items[index - 1][0]
+                    and tuple(items[index][1].shape)
+                    == tuple(items[index - 1][1].shape)
+                    and str(items[index][1].dtype)
+                    == str(items[index - 1][1].dtype)
+                }
+            )
+            # Bare parameters receive positional auto-names, so two of them
+            # with the same shape and dtype have no rank-invariant identity at
+            # all: the probes below would align labels that themselves follow
+            # position, and no rank-local property can do better. Ranks built
+            # by the same construction code (the normal case) remain correct;
+            # warn once that divergence between such parameters is invisible
+            # to this preflight, and recommend named construction.
+            if not getattr(self, "_gefen_warned_unverifiable_order", False):
+                collisions = {}
+                for name, p, _ in items:
+                    if _AUTO_PARAM_NAME.match(str(name)):
+                        key = (tuple(p.shape), str(p.dtype))
+                        collisions.setdefault(key, []).append(str(name))
+                ambiguous = sorted(
+                    name
+                    for names in collisions.values()
+                    if len(names) > 1
+                    for name in names
+                )
+                if ambiguous:
+                    warnings.warn(
+                        "GefenMuon cannot verify cross-rank parameter order "
+                        "for unnamed parameters that share a shape and dtype "
+                        "({}): their auto-generated names follow registration "
+                        "position, so rank-divergent registration order "
+                        "between them is undetectable. Construct the "
+                        "optimizer from model.named_parameters() to make "
+                        "this check complete.".format(", ".join(ambiguous)),
+                        RuntimeWarning,
+                        stacklevel=3,
+                    )
+                    self._gefen_warned_unverifiable_order = True
             device = self._state_tensor_device(items[0][1])
             active_counts = torch.tensor(
                 [int(active) for _, _, active in items],
                 dtype=torch.int32,
                 device=device,
             )
-            # Reducing the same vector once along every Cartesian mesh
-            # dimension propagates a global activity count to every mesh rank.
-            # This is one collective per mesh dimension, independent of the
-            # number of optimizer parameters.
+            # Each sorted slot is the same parameter identity on every rank, so
+            # reducing its optimizer-wide insertion position to the mesh-wide
+            # max and min (one MAX all_reduce over [position, -position])
+            # exposes any rank whose registration order differs — including
+            # order swaps between parameters on different meshes. The final
+            # slot carries this rank's duplicate-label count so the reduction
+            # also propagates duplicates to every rank of the mesh.
+            order_probe = torch.tensor(
+                [
+                    signed
+                    for _, p, _ in items
+                    for signed in (
+                        global_position[id(p)],
+                        -global_position[id(p)],
+                    )
+                ]
+                + [len(duplicate_keys)],
+                dtype=torch.int32,
+                device=device,
+            )
+            # Reducing the same vectors once along every Cartesian mesh
+            # dimension propagates mesh-global results to every rank. This is
+            # two collectives per mesh dimension, independent of the number of
+            # optimizer parameters.
             for process_group in entry["process_groups"]:
                 if dist.get_world_size(process_group) > 1:
                     dist.all_reduce(
                         active_counts, op=dist.ReduceOp.SUM, group=process_group
                     )
+                    dist.all_reduce(
+                        order_probe, op=dist.ReduceOp.MAX, group=process_group
+                    )
+
+            # Do not raise inside this loop: with DTensors on overlapping but
+            # non-identical meshes, a rank exiting early would strand peers
+            # that only share a later mesh inside that mesh's all_reduce.
+            # Accumulate every violation and raise after all local meshes
+            # have completed their probe collectives, like the presence path.
+            order_flat = order_probe.cpu().tolist()
+            if order_flat[-1] > 0:
+                duplicates_anywhere = True
+                duplicate_labels.extend(duplicate_keys)
+            order_mismatches.extend(
+                items[index][0]
+                for index in range(len(items))
+                if order_flat[2 * index] != -order_flat[2 * index + 1]
+            )
 
             mesh_size = mesh.size()
             inconsistent = torch.nonzero(
@@ -1408,6 +1517,29 @@ class GefenMuon(Gefen):
                     )
                 )
 
+        if duplicates_anywhere:
+            raise RuntimeError(
+                "GefenMuon cannot verify cross-rank parameter order or "
+                "gradient presence when parameters in one "
+                "sharded_mode='exact' or 'distributed' DTensor mesh share "
+                "a name, shape, and dtype{}: the shared label makes them "
+                "indistinguishable across ranks. Give every parameter a "
+                "unique name.".format(
+                    " ({})".format(", ".join(sorted(set(duplicate_labels))))
+                    if duplicate_labels
+                    else " on at least one mesh rank"
+                )
+            )
+        if order_mismatches:
+            raise RuntimeError(
+                "GefenMuon requires identical parameter-group order on "
+                "every rank of a DTensor/FSDP mesh before "
+                "sharded_mode='exact' or 'distributed' stepping: gradient "
+                "collectives and momentum-owner assignment follow that "
+                "order. Parameters at rank-divergent positions: {}. "
+                "Construct parameter groups in the same order on every "
+                "rank.".format(", ".join(order_mismatches))
+            )
         if mismatches:
             raise RuntimeError(
                 "GefenMuon requires identical gradient presence on every rank "
