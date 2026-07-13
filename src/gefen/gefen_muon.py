@@ -1,4 +1,5 @@
 import math
+import re
 import warnings
 from collections import OrderedDict
 from typing import Iterable, Optional, Tuple, Union
@@ -26,6 +27,12 @@ def _stable_distributed_owner(stable_index: int, world: int) -> int:
     if stable_index < 0:
         raise ValueError("stable_index must be non-negative, got {}".format(stable_index))
     return stable_index % world
+
+# Auto-generated names for bare (unnamed) parameters, as assigned during group
+# registration in gefen.py: "param_{i}", "group_{g}_param_{i}", plus the
+# "_{n}" uniquing suffix. These names follow registration position, so they
+# carry no cross-rank identity of their own.
+_AUTO_PARAM_NAME = re.compile(r"^(?:param|group_\d+_param)_\d+(?:_\d+)?$")
 
 # Tuned per-iteration Newton-Schulz coefficient schedules. Each entry is a list
 # of (a, b, c) quintic coefficients applied one per iteration. Unlike the fixed
@@ -1333,6 +1340,11 @@ class GefenMuon(Gefen):
         import torch.distributed as dist
 
         by_mesh = OrderedDict()
+        # Optimizer-wide insertion positions: step() walks parameters and
+        # first-seen process groups in this order, so cross-mesh order
+        # divergence is just as collective-fatal as divergence inside one
+        # mesh. Per-mesh enumeration would hide it.
+        global_position = {}
         for group in self.param_groups:
             if group["sharded_mode"] == "approx":
                 continue
@@ -1368,15 +1380,12 @@ class GefenMuon(Gefen):
                     }
                     by_mesh[key] = entry
                 entry["items"].append((str(name), p, p.grad is not None))
+                global_position[id(p)] = len(global_position)
 
         mismatches = []
         for mesh_key in sorted(by_mesh):
             entry = by_mesh[mesh_key]
             mesh = entry["mesh"]
-            local_position = {
-                id(item[1]): position
-                for position, item in enumerate(entry["items"])
-            }
             items = sorted(
                 entry["items"],
                 key=lambda item: (
@@ -1385,6 +1394,63 @@ class GefenMuon(Gefen):
                     str(item[1].dtype),
                 ),
             )
+            # Two parameters carrying the same explicit name, shape, and dtype
+            # are indistinguishable across ranks, so neither this order probe
+            # nor the presence vector below can align them; construction
+            # accepts duplicate explicit names, so fail closed here before any
+            # collective rather than verify against ambiguous labels.
+            duplicate_keys = sorted(
+                {
+                    items[index][0]
+                    for index in range(1, len(items))
+                    if items[index][0] == items[index - 1][0]
+                    and tuple(items[index][1].shape)
+                    == tuple(items[index - 1][1].shape)
+                    and str(items[index][1].dtype)
+                    == str(items[index - 1][1].dtype)
+                }
+            )
+            if duplicate_keys:
+                raise RuntimeError(
+                    "GefenMuon cannot verify cross-rank parameter order or "
+                    "gradient presence when parameters in one "
+                    "sharded_mode='exact' or 'distributed' DTensor mesh share "
+                    "a name, shape, and dtype ({}): the shared label makes "
+                    "them indistinguishable across ranks. Give every "
+                    "parameter a unique name.".format(", ".join(duplicate_keys))
+                )
+            # Bare parameters receive positional auto-names, so two of them
+            # with the same shape and dtype have no rank-invariant identity at
+            # all: the probes below would align labels that themselves follow
+            # position, and no rank-local property can do better. Ranks built
+            # by the same construction code (the normal case) remain correct;
+            # warn once that divergence between such parameters is invisible
+            # to this preflight, and recommend named construction.
+            if not getattr(self, "_gefen_warned_unverifiable_order", False):
+                collisions = {}
+                for name, p, _ in items:
+                    if _AUTO_PARAM_NAME.match(str(name)):
+                        key = (tuple(p.shape), str(p.dtype))
+                        collisions.setdefault(key, []).append(str(name))
+                ambiguous = sorted(
+                    name
+                    for names in collisions.values()
+                    if len(names) > 1
+                    for name in names
+                )
+                if ambiguous:
+                    warnings.warn(
+                        "GefenMuon cannot verify cross-rank parameter order "
+                        "for unnamed parameters that share a shape and dtype "
+                        "({}): their auto-generated names follow registration "
+                        "position, so rank-divergent registration order "
+                        "between them is undetectable. Construct the "
+                        "optimizer from model.named_parameters() to make "
+                        "this check complete.".format(", ".join(ambiguous)),
+                        RuntimeWarning,
+                        stacklevel=3,
+                    )
+                    self._gefen_warned_unverifiable_order = True
             device = self._state_tensor_device(items[0][1])
             active_counts = torch.tensor(
                 [int(active) for _, _, active in items],
@@ -1392,16 +1458,17 @@ class GefenMuon(Gefen):
                 device=device,
             )
             # Each sorted slot is the same parameter identity on every rank, so
-            # reducing its local insertion position to the mesh-wide max and
-            # min (one MAX all_reduce over [position, -position]) exposes any
-            # rank whose parameter-group order differs.
+            # reducing its optimizer-wide insertion position to the mesh-wide
+            # max and min (one MAX all_reduce over [position, -position])
+            # exposes any rank whose registration order differs — including
+            # order swaps between parameters on different meshes.
             order_probe = torch.tensor(
                 [
                     signed
                     for _, p, _ in items
                     for signed in (
-                        local_position[id(p)],
-                        -local_position[id(p)],
+                        global_position[id(p)],
+                        -global_position[id(p)],
                     )
                 ],
                 dtype=torch.int32,

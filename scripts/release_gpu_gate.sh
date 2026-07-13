@@ -52,6 +52,9 @@ while [ $# -gt 0 ]; do
   case "$1" in
     --wheel)
       [ $# -ge 2 ] || { echo "error: --wheel requires a path" >&2; exit 2; }
+      case "$2" in
+        -*) echo "error: --wheel requires a path, got option-like '$2'" >&2; exit 2 ;;
+      esac
       # Resolve now: the script cd's to the repo root later, which would break
       # a relative path given from another directory.
       WHEEL="$(realpath -m -- "$2")"
