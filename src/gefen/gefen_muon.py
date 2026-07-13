@@ -6,7 +6,7 @@ from typing import Iterable, Optional, Tuple, Union
 import torch
 import torch.nn as nn
 
-from gefen.contracts import OptimizerContract, _gefen_muon_contract
+from gefen.contracts import OptimizerContract, ParameterLayout, _gefen_muon_contract
 from gefen.gefen import (
     Gefen,
     _amp_prepare_optimizer_step,
@@ -766,6 +766,48 @@ class GefenMuon(Gefen):
             sharded_modes=sharded_modes,
             normuon_modes=normuon_modes,
             non_normuon_modes=non_normuon_modes,
+            canonical_parameter_fqns=self._canonical_identity_ready(),
+            stable_shard_identity=self._canonical_identity_ready(),
+        )
+
+    def _validate_rebinding_layout(self, rebinding) -> None:
+        shard = rebinding.shard
+        target = rebinding.new_parameter
+        if len(shard.parameter.global_shape) != 2:
+            raise ValueError("GefenMuon canonical parameters must be logical matrices")
+        if shard.layout is ParameterLayout.REPLICATED:
+            if target is None or tuple(target.shape) != shard.parameter.global_shape:
+                raise ValueError(
+                    "replicated GefenMuon rebinding requires one complete 2-D matrix"
+                )
+        elif shard.layout is ParameterLayout.WHOLE_PARAMETER_OWNER:
+            local_owns = shard.local_member == shard.owner
+            if local_owns and (
+                target is None
+                or target.ndim != 2
+                or tuple(target.shape) != shard.parameter.global_shape
+            ):
+                raise ValueError(
+                    "a GefenMuon whole-parameter owner requires one complete 2-D matrix"
+                )
+            if not local_owns and target is not None:
+                raise ValueError(
+                    "a GefenMuon whole-parameter non-owner must not retain storage"
+                )
+        else:
+            raise ValueError(
+                "GefenMuon rebinding supports replicated complete matrices or "
+                "whole-parameter ownership only"
+            )
+        if target is not None and target.numel() != shard.logical_slice.length:
+            raise ValueError(
+                "GefenMuon rebound tensor numel does not match its logical slice"
+            )
+
+    def _has_unscoped_whole_owner_bindings(self) -> bool:
+        return any(
+            shard.layout is ParameterLayout.WHOLE_PARAMETER_OWNER
+            for _, shard in self._gefen_local_shard_bindings
         )
 
     def add_param_group(self, param_group):
@@ -2619,12 +2661,19 @@ class GefenMuon(Gefen):
 
     @torch.no_grad()
     def step(self, closure=None):
+        self._assert_finalized_binding_layout()
+        if self._has_unscoped_whole_owner_bindings():
+            raise RuntimeError(
+                "GefenMuon whole-parameter owner stepping requires the separate "
+                "explicit process-group codebook scope, which is not implemented"
+            )
         self._assert_capturable_if_capturing()
         loss = None
         if closure is not None:
             with torch.enable_grad():
                 loss = closure()
 
+        self._assert_finalized_binding_layout()
         _assert_optimizer_gradients_structurally_valid(
             self, require_2d_params=True
         )

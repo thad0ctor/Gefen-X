@@ -470,3 +470,5 @@ def test_identity_contracts_are_public_lazy_exports():
     ):
         assert name in gefen.__all__
         assert getattr(gefen, name).__module__ == "gefen.contracts"
+    assert "ParameterRebinding" in gefen.__all__
+    assert gefen.ParameterRebinding.__module__ == "gefen.rebinding"

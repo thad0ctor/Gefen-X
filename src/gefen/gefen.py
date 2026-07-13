@@ -15,15 +15,24 @@ import logging
 import math
 import os
 import warnings
-from collections import OrderedDict
+from collections import defaultdict, OrderedDict
 from itertools import chain
 from typing import Iterable, Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
 
-from gefen.contracts import OptimizerContract, _gefen_contract
+from gefen.contracts import (
+    LogicalSlice,
+    OptimizerContract,
+    ParameterIdentity,
+    ParameterLayout,
+    ShardIdentity,
+    ShardingManifest,
+    _gefen_contract,
+)
 from gefen.partitioning import find_period_by_block_variance
+from gefen.rebinding import ParameterRebinding
 import gefen.quantization as quantization_module
 from gefen.kernels.automatic_vmean import (
     automatic_vmean_update_cuda as _automatic_vmean_update_cuda,
@@ -1052,6 +1061,14 @@ class Gefen(torch.optim.Optimizer):
             weight_decay=weight_decay,
         )
         self._param_names = {}
+        # Exact canonical identity remains separate from compatibility
+        # ``param_names``. A full post_sharding transaction publishes these
+        # registries only after validating every optimizer slot and manifest.
+        self._gefen_shard_bindings = {}
+        self._gefen_local_shard_bindings = ()
+        self._gefen_sharding_manifest = None
+        self._gefen_post_sharding_finalized = False
+        self._gefen_finalized_slots = ()
         # ``set_optimizer_state_dict(flatten_optimizer_state_dict=True)`` uses
         # the *live* optimizer state/group keys as its unflattening schema before
         # it calls our loader. Publish the private rank-local transport keys only
@@ -1072,7 +1089,519 @@ class Gefen(torch.optim.Optimizer):
     def optimizer_contract(self) -> OptimizerContract:
         """Return the immutable state-layout and integration capability contract."""
 
-        return _gefen_contract(factored_v_2d=self._factored_v_2d)
+        identity_ready = self._canonical_identity_ready()
+        return _gefen_contract(
+            factored_v_2d=self._factored_v_2d,
+            canonical_parameter_fqns=identity_ready,
+            stable_shard_identity=identity_ready,
+        )
+
+    def _canonical_identity_ready(self) -> bool:
+        if (
+            not self._gefen_post_sharding_finalized
+            or self._gefen_sharding_manifest is None
+        ):
+            return False
+        return self._finalized_binding_layout_matches()
+
+    def _finalized_binding_layout_matches(self) -> bool:
+        if len(self.param_groups) != len(self._gefen_finalized_slots):
+            return False
+        for group, expected in zip(self.param_groups, self._gefen_finalized_slots):
+            params = group.get("params")
+            if not isinstance(params, (list, tuple)) or len(params) != len(expected):
+                return False
+            if any(live is not bound for live, bound in zip(params, expected)):
+                return False
+        live_params = [
+            param for group in self.param_groups for param in group["params"]
+        ]
+        bound = [
+            (parameter, shard)
+            for parameter, shard in self._gefen_local_shard_bindings
+            if parameter is not None
+        ]
+        if len(live_params) != len(bound) or len(self._gefen_shard_bindings) != len(
+            bound
+        ):
+            return False
+        for parameter, shard in bound:
+            if not self._parameter_in(live_params, parameter):
+                return False
+            if self._gefen_shard_bindings.get(parameter) != shard:
+                return False
+        return True
+
+    def _assert_finalized_binding_layout(self) -> None:
+        if self._gefen_post_sharding_finalized and not self._finalized_binding_layout_matches():
+            raise RuntimeError(
+                "Gefen finalized parameter layout changed outside post_sharding"
+            )
+
+    def parameter_identity(self, parameter) -> ParameterIdentity:
+        """Return the exact canonical identity bound to one live parameter."""
+
+        return self.shard_identity(parameter).parameter
+
+    def shard_identity(self, parameter) -> ShardIdentity:
+        """Return the stable shard identity bound to one live parameter."""
+
+        self._assert_finalized_binding_layout()
+        try:
+            return self._gefen_shard_bindings[parameter]
+        except KeyError:
+            raise KeyError("parameter has no finalized Gefen shard identity") from None
+
+    def shard_bindings(self):
+        """Return local tensor/identity pairs in canonical structural order."""
+
+        self._assert_finalized_binding_layout()
+        return self._gefen_local_shard_bindings
+
+    def sharding_manifest(self):
+        """Return the finalized global identity manifest, or ``None``."""
+
+        self._assert_finalized_binding_layout()
+        return self._gefen_sharding_manifest
+
+    @staticmethod
+    def _parameter_in(parameters, candidate) -> bool:
+        return any(item is candidate for item in parameters)
+
+    @staticmethod
+    def _assert_rebound_storage_disjoint(parameters) -> None:
+        storage_ranges = []
+        for parameter in parameters:
+            if parameter.numel() == 0:
+                continue
+            storage = parameter.untyped_storage()
+            storage_id = (str(parameter.device), storage.data_ptr())
+            if not parameter.is_contiguous():
+                for other_id, _, _ in storage_ranges:
+                    if other_id == storage_id:
+                        raise ValueError(
+                            "rebound target tensors must not share noncontiguous storage"
+                        )
+                storage_ranges.append((storage_id, None, None))
+                continue
+            start = parameter.storage_offset() * parameter.element_size()
+            end = start + parameter.numel() * parameter.element_size()
+            for other_id, other_start, other_end in storage_ranges:
+                if other_id != storage_id:
+                    continue
+                if other_start is None or max(start, other_start) < min(end, other_end):
+                    raise ValueError(
+                        "rebound target tensor storage ranges must not overlap"
+                    )
+            storage_ranges.append((storage_id, start, end))
+
+    @staticmethod
+    def _target_may_have_internal_storage_overlap(parameter) -> bool:
+        """Conservatively prove disjoint positive-stride tensor elements."""
+
+        required_span = 1
+        dimensions = sorted(
+            (stride, size)
+            for size, stride in zip(parameter.shape, parameter.stride())
+            if size > 1
+        )
+        for stride, size in dimensions:
+            if stride < required_span:
+                return True
+            required_span += (size - 1) * stride
+        return False
+
+    def _assert_rebinding_pristine(self, rebindings) -> None:
+        if self._gefen_post_sharding_finalized:
+            raise RuntimeError("Gefen post-sharding identity is already finalized")
+        if (
+            self._gefen_shard_bindings
+            or self._gefen_local_shard_bindings
+            or self._gefen_sharding_manifest is not None
+            or self._gefen_finalized_slots
+        ):
+            raise RuntimeError(
+                "Gefen parameter rebinding found an incomplete prior identity plan"
+            )
+        global_step = self._validate_rank_local_counter(
+            "gefen_global_step", self._gefen_global_step
+        )
+        if global_step != 0 or self._gefen_codebook is not None:
+            raise RuntimeError(
+                "Gefen parameter rebinding is allowed only before optimizer mutation"
+            )
+        if self._capt_stacks is not None:
+            raise RuntimeError(
+                "Gefen parameter rebinding cannot discard active capturable stacks"
+            )
+        if self._gefen_codebook_by_device or self._gefen_codebook_lut_by_device:
+            raise RuntimeError(
+                "Gefen parameter rebinding cannot discard initialized codebook caches"
+            )
+        for cache_name in (
+            "_gefen_global_step_by_device",
+            "_sr_seed_by_device",
+        ):
+            cache = getattr(self, cache_name)
+            for value in cache.values():
+                if (
+                    not torch.is_tensor(value)
+                    or value.numel() != 1
+                    or value.dtype == torch.bool
+                    or not bool(torch.isfinite(value.detach()).all())
+                    or float(value.detach().cpu().item()) != 0.0
+                ):
+                    raise RuntimeError(
+                        "Gefen parameter rebinding found non-pristine device counters"
+                    )
+
+        live = [param for group in self.param_groups for param in group["params"]]
+        sources = [item.old_parameter for item in rebindings]
+        allowed_state_keys = tuple(live) + tuple(sources)
+        for parameter in self._param_names:
+            if not self._parameter_in(allowed_state_keys, parameter):
+                raise RuntimeError(
+                    "Gefen parameter rebinding found orphan parameter-name state"
+                )
+            compatibility_name = self._param_names[parameter]
+            if (
+                not isinstance(compatibility_name, str)
+                or compatibility_name != compatibility_name.lower()
+            ):
+                raise RuntimeError(
+                    "Gefen parameter rebinding found an invalid compatibility name"
+                )
+        allowed_names = {"name", _RANK_LOCAL_MEMBER_KEY}
+        for parameter, pstate in self.state.items():
+            if not self._parameter_in(allowed_state_keys, parameter):
+                raise RuntimeError(
+                    "Gefen parameter rebinding found orphan optimizer state"
+                )
+            if not isinstance(pstate, dict):
+                raise RuntimeError(
+                    "Gefen parameter rebinding found invalid constructor state"
+                )
+            for key in pstate:
+                if key in allowed_names:
+                    continue
+                if isinstance(key, str) and key.startswith(
+                    _RANK_LOCAL_PAYLOAD_KEY_PREFIX
+                ):
+                    continue
+                raise RuntimeError(
+                    "Gefen parameter rebinding found initialized optimizer state"
+                )
+            state_name = pstate.get("name")
+            if state_name is not None and (
+                not isinstance(state_name, str) or state_name != state_name.lower()
+            ):
+                raise RuntimeError(
+                    "Gefen parameter rebinding found an invalid state name"
+                )
+
+    def _validate_rebinding_layout(self, rebinding: ParameterRebinding) -> None:
+        shard = rebinding.shard
+        target = rebinding.new_parameter
+        if shard.layout is ParameterLayout.REPLICATED:
+            if target is None or tuple(target.shape) != shard.parameter.global_shape:
+                raise ValueError(
+                    "replicated Gefen rebinding requires complete parameter storage"
+                )
+        elif shard.layout is ParameterLayout.FLATTENED_ELEMENT_SHARD:
+            if target is None or target.ndim != 1:
+                raise ValueError(
+                    "flattened Gefen rebinding requires a live 1-D tensor shard"
+                )
+            if not target.is_contiguous():
+                raise ValueError(
+                    "flattened Gefen rebinding requires contiguous physical storage"
+                )
+            if self._factored_v_2d and len(shard.parameter.global_shape) == 2:
+                raise ValueError(
+                    "flattened logical matrices require factored_v_2d=False until "
+                    "matrix-aware factored-state projection is implemented"
+                )
+        else:
+            raise ValueError(
+                "plain Gefen rebinding supports replicated or flattened element "
+                "shards only"
+            )
+        if target.numel() != shard.logical_slice.length:
+            raise ValueError(
+                "Gefen rebound tensor numel does not match its logical slice"
+            )
+
+    def _stage_post_sharding(self, rebindings, manifest):
+        self._assert_rebinding_pristine(rebindings)
+        live_slots = []
+        for group_index, group in enumerate(self.param_groups):
+            params = list(group["params"])
+            names = list(group.get("param_names", ()))
+            if len(names) != len(params):
+                names = [self._param_name(param) for param in params]
+            for parameter_index, (parameter, name) in enumerate(zip(params, names)):
+                live_slots.append(
+                    (group_index, parameter_index, parameter, str(name))
+                )
+        if len(rebindings) != len(live_slots):
+            raise ValueError(
+                "post_sharding requires exactly one rebinding for every optimizer slot"
+            )
+
+        manifest_fqns = {
+            shard.parameter.fqn for shard in manifest.shards
+        }
+        local_fqns = [item.shard.parameter.fqn for item in rebindings]
+        if len(set(local_fqns)) != len(local_fqns):
+            raise ValueError("local canonical parameter FQNs must be unique")
+        if set(local_fqns) != manifest_fqns:
+            raise ValueError(
+                "post_sharding manifest FQNs must exactly match optimizer slots"
+            )
+
+        assigned_positions = {}
+        binding_names = {}
+        final_targets = []
+        seen_sources = []
+        local_member_by_group = {}
+        for binding_index, rebinding in enumerate(rebindings):
+            if not isinstance(rebinding.old_parameter, torch.Tensor):
+                raise TypeError("rebinding source must be a Tensor")
+            if self._parameter_in(seen_sources, rebinding.old_parameter):
+                raise ValueError("rebinding source tensors must be unique")
+            seen_sources.append(rebinding.old_parameter)
+            process_group = rebinding.shard.process_group
+            if process_group is not None:
+                previous_member = local_member_by_group.setdefault(
+                    process_group, rebinding.shard.local_member
+                )
+                if previous_member != rebinding.shard.local_member:
+                    raise ValueError(
+                        "local shard bindings must use one member per process group"
+                    )
+            target = rebinding.new_parameter
+            if target is not None:
+                if not isinstance(target, torch.Tensor):
+                    raise TypeError("rebinding target must be a Tensor or None")
+                if self._is_dtensor_parameter(target):
+                    raise ValueError(
+                        "stable DTensor rebinding requires the deferred logical-region "
+                        "identity schema"
+                    )
+                if torch.is_complex(target):
+                    raise ValueError("Gefen does not support complex rebound parameters")
+                if target.layout is not torch.strided or target.dtype not in (
+                    torch.float16,
+                    torch.bfloat16,
+                    torch.float32,
+                    torch.float64,
+                ):
+                    raise ValueError(
+                        "rebound parameters require strided floating-point storage"
+                    )
+                if target.is_meta:
+                    raise ValueError("rebound parameters require materialized storage")
+                if (
+                    rebinding.shard.layout
+                    is ParameterLayout.FLATTENED_ELEMENT_SHARD
+                    and not target.is_contiguous()
+                ):
+                    raise ValueError(
+                        "flattened Gefen rebinding requires contiguous physical storage"
+                    )
+                if self._target_may_have_internal_storage_overlap(target):
+                    raise ValueError(
+                        "rebound target storage must be provably free of internal "
+                        "storage overlap"
+                    )
+                if not target.is_leaf and not target.retains_grad:
+                    raise ValueError("can't optimize a non-leaf rebound Tensor")
+            if rebinding.old_parameter.grad is not None or (
+                target is not None and target.grad is not None
+            ):
+                raise RuntimeError(
+                    "post_sharding must run before source or target gradients exist"
+                )
+            if rebinding.shard not in manifest.shards:
+                raise ValueError("local shard identity is absent from the manifest")
+            whole_owner = (
+                rebinding.shard.layout is ParameterLayout.WHOLE_PARAMETER_OWNER
+            )
+            local_owns = rebinding.shard.local_member == rebinding.shard.owner
+            if whole_owner and local_owns != (target is not None):
+                raise ValueError(
+                    "whole-parameter owner bindings require storage only on the owner"
+                )
+            if not whole_owner and target is None:
+                raise ValueError("only a whole-parameter non-owner may bind None")
+
+            source_positions = [
+                index
+                for index, slot in enumerate(live_slots)
+                if slot[2] is rebinding.old_parameter
+            ]
+            target_positions = []
+            if target is not None:
+                target_positions = [
+                    index
+                    for index, slot in enumerate(live_slots)
+                    if slot[2] is target
+                ]
+            if len(source_positions) == 1:
+                position = source_positions[0]
+                if target_positions and target_positions != [position]:
+                    raise ValueError(
+                        "rebinding target already occupies another optimizer slot"
+                    )
+            elif len(source_positions) == 0 and len(target_positions) == 1:
+                position = target_positions[0]
+                source_known = (
+                    rebinding.old_parameter in self.state
+                    or rebinding.old_parameter in self._param_names
+                )
+                if not source_known:
+                    raise ValueError("rebinding source is not registered with Gefen")
+            else:
+                raise ValueError(
+                    "rebinding source must identify exactly one optimizer slot"
+                )
+            if position in assigned_positions:
+                raise ValueError("multiple rebindings target one optimizer slot")
+            assigned_positions[position] = binding_index
+            compatibility_name = self._param_names.get(rebinding.old_parameter)
+            source_state = self.state.get(rebinding.old_parameter)
+            if compatibility_name is None and isinstance(source_state, dict):
+                compatibility_name = source_state.get("name")
+            if compatibility_name is None:
+                compatibility_name = live_slots[position][3]
+            if (
+                not isinstance(compatibility_name, str)
+                or compatibility_name != compatibility_name.lower()
+            ):
+                raise ValueError(
+                    "rebinding source compatibility name must be a lowercase string"
+                )
+            binding_names[binding_index] = compatibility_name
+            if target is not None:
+                if self._parameter_in(final_targets, target):
+                    raise ValueError("rebound target tensors must be unique")
+                final_targets.append(target)
+            self._validate_rebinding_layout(rebinding)
+
+        if len(assigned_positions) != len(live_slots):
+            raise ValueError("post_sharding did not bind every optimizer slot")
+        self._assert_rebound_storage_disjoint(final_targets)
+
+        staged = object.__new__(type(self))
+        staged.__dict__ = self.__dict__.copy()
+        staged.param_groups = []
+        staged.state = defaultdict(dict)
+        staged._param_names = {}
+        staged._gefen_shard_bindings = {}
+        local_bindings = []
+        slot_cursor = 0
+        for group in self.param_groups:
+            staged_group = dict(group)
+            staged_group.pop("_gefen_checkpoint_metadata", None)
+            staged_params = []
+            staged_names = []
+            names = list(group.get("param_names", ()))
+            if len(names) != len(group["params"]):
+                names = [self._param_name(param) for param in group["params"]]
+            for _ in names:
+                binding_index = assigned_positions[slot_cursor]
+                rebinding = rebindings[binding_index]
+                compatibility_name = binding_names[binding_index]
+                slot_cursor += 1
+                target = rebinding.new_parameter
+                local_bindings.append((target, rebinding.shard))
+                if target is None:
+                    continue
+                staged_params.append(target)
+                staged_names.append(compatibility_name)
+                staged._param_names[target] = compatibility_name
+                staged.state[target]["name"] = compatibility_name
+                staged._gefen_shard_bindings[target] = rebinding.shard
+            staged_group["params"] = staged_params
+            staged_group["param_names"] = staged_names
+            staged.param_groups.append(staged_group)
+
+        staged._gefen_local_shard_bindings = tuple(
+            sorted(local_bindings, key=lambda item: item[1].sort_key)
+        )
+        staged._gefen_sharding_manifest = manifest
+        staged._gefen_post_sharding_finalized = True
+        staged._gefen_codebook_by_device = {}
+        staged._gefen_codebook_lut_by_device = {}
+        staged._sr_seed_by_device = {}
+        staged._gefen_global_step_by_device = {}
+        staged._capt_stacks = None
+        staged._static_mark_sig = None
+        staged._lr_scalar_cache = None
+        staged._ensure_gefen_global_step_devices()
+        staged._install_rank_local_checkpoint_schema()
+        staged._gefen_finalized_slots = tuple(
+            tuple(group["params"]) for group in staged.param_groups
+        )
+        return staged
+
+    def post_sharding(self, rebindings, *, manifest: ShardingManifest) -> None:
+        """Atomically finalize every local optimizer slot after sharding."""
+
+        if not isinstance(manifest, ShardingManifest):
+            raise TypeError("manifest must be a ShardingManifest")
+        if isinstance(rebindings, (str, bytes)):
+            raise TypeError("rebindings must be a sequence")
+        rebindings = tuple(rebindings)
+        if not rebindings or any(
+            not isinstance(item, ParameterRebinding) for item in rebindings
+        ):
+            raise TypeError(
+                "rebindings must contain one or more ParameterRebinding values"
+            )
+        sources = []
+        for rebinding in rebindings:
+            if self._parameter_in(sources, rebinding.old_parameter):
+                raise ValueError("rebinding source tensors must be unique")
+            sources.append(rebinding.old_parameter)
+        staged = self._stage_post_sharding(rebindings, manifest)
+        self.__dict__.update(staged.__dict__)
+
+    def rebind_shard(
+        self,
+        old_parameter,
+        new_parameter,
+        *,
+        shard: ShardIdentity,
+        manifest: ShardingManifest,
+    ) -> None:
+        """Apply a complete one-slot shard plan through ``post_sharding``."""
+
+        self.post_sharding(
+            (ParameterRebinding(old_parameter, new_parameter, shard),),
+            manifest=manifest,
+        )
+
+    def rebind_parameter(
+        self,
+        old_parameter,
+        new_parameter,
+        *,
+        identity: ParameterIdentity,
+    ) -> None:
+        """Bind one complete replicated parameter with a canonical identity."""
+
+        shard = ShardIdentity(
+            identity,
+            ParameterLayout.REPLICATED,
+            LogicalSlice.full(identity),
+        )
+        self.rebind_shard(
+            old_parameter,
+            new_parameter,
+            shard=shard,
+            manifest=ShardingManifest((shard,)),
+        )
 
     @staticmethod
     def _normalize_param_groups(params):
@@ -1181,6 +1710,10 @@ class Gefen(torch.optim.Optimizer):
         stable lowercase name is stored in its per-param state and in the
         group's ``param_names`` list for introspection.
         """
+        if getattr(self, "_gefen_post_sharding_finalized", False):
+            raise RuntimeError(
+                "Gefen cannot add parameter groups after post_sharding finalization"
+            )
         if not isinstance(param_group, dict):
             raise TypeError(
                 "param_group must be a dict, got {}".format(
@@ -3710,8 +4243,10 @@ class Gefen(torch.optim.Optimizer):
     def state_dict(self):
         """Run optimizer state-dict hooks around Gefen's complete schema."""
 
+        self._assert_finalized_binding_layout()
         for pre_hook in self._optimizer_state_dict_pre_hooks.values():
             pre_hook(self)
+        self._assert_finalized_binding_layout()
         state_dict = self._state_dict_impl()
         for post_hook in self._optimizer_state_dict_post_hooks.values():
             hook_result = post_hook(self, state_dict)
@@ -4466,11 +5001,13 @@ class Gefen(torch.optim.Optimizer):
     def load_state_dict(self, state_dict):
         """Atomically restore Gefen state between the public load hooks."""
 
+        self._assert_finalized_binding_layout()
         state_dict = state_dict.copy()
         for pre_hook in self._optimizer_load_state_dict_pre_hooks.values():
             hook_result = pre_hook(self, state_dict)
             if hook_result is not None:
                 state_dict = hook_result
+        self._assert_finalized_binding_layout()
         staged = self._stage_load_state_dict(state_dict)
         self._commit_staged_load_state_dict(staged)
         for post_hook in self._optimizer_load_state_dict_post_hooks.values():
@@ -5370,6 +5907,7 @@ class Gefen(torch.optim.Optimizer):
                 closure feed the first step's codebook learning correctly. The
                 returned loss is passed through.
         """
+        self._assert_finalized_binding_layout()
         self._assert_capturable_if_capturing()
 
         loss = None
@@ -5377,6 +5915,7 @@ class Gefen(torch.optim.Optimizer):
             with torch.enable_grad():
                 loss = closure()
 
+        self._assert_finalized_binding_layout()
         _assert_optimizer_gradients_structurally_valid(self)
 
         # GradScaler invokes native-AMP optimizers even on overflow. Decide

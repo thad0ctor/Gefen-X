@@ -24,6 +24,7 @@ __all__ = [
     "ParameterLayout",
     "ParameterIdentity",
     "ParameterStateRole",
+    "ParameterRebinding",
     "PlacementKind",
     "Precision",
     "ProcessGroupScope",
@@ -63,6 +64,10 @@ def __getattr__(name):
         from . import params
 
         return getattr(params, name)
+    if name == "ParameterRebinding":
+        from .rebinding import ParameterRebinding
+
+        return ParameterRebinding
     if name in (
         "CONTRACT_SCHEMA_VERSION",
         "IDENTITY_SCHEMA_VERSION",

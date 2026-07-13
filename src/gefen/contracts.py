@@ -877,6 +877,10 @@ def _negative_capabilities(
     training: Tuple[TrainingSupport, ...],
     checkpoints: Tuple[CheckpointSupport, ...],
     supported_parameter_ranks: Optional[Tuple[int, ...]],
+    canonical_parameter_fqns: bool = False,
+    stable_shard_identity: bool = False,
+    shard_rebinding: bool = False,
+    post_sharding: bool = False,
 ) -> OptimizerCapabilities:
     return OptimizerCapabilities(
         training=training,
@@ -884,18 +888,23 @@ def _negative_capabilities(
         precisions=_ALL_PRECISIONS,
         supported_parameter_ranks=supported_parameter_ranks,
         accepts_semantic_parameter_names=True,
-        canonical_parameter_fqns=False,
-        stable_shard_identity=False,
+        canonical_parameter_fqns=canonical_parameter_fqns,
+        stable_shard_identity=stable_shard_identity,
         explicit_process_group_codebook_scope=False,
-        shard_rebinding=False,
-        post_sharding=False,
+        shard_rebinding=shard_rebinding,
+        post_sharding=post_sharding,
         canonical_state_io=False,
         atomic_state_movement=False,
         state_offload=False,
     )
 
 
-def _gefen_contract(*, factored_v_2d: bool) -> OptimizerContract:
+def _gefen_contract(
+    *,
+    factored_v_2d: bool,
+    canonical_parameter_fqns: bool = False,
+    stable_shard_identity: bool = False,
+) -> OptimizerContract:
     block_fields = (
         StateField("vmean", StateScope.PARAMETER, StateGeometry.BLOCK, True),
         StateField("vmean_step", StateScope.PARAMETER, StateGeometry.SCALAR, True),
@@ -1070,6 +1079,10 @@ def _gefen_contract(*, factored_v_2d: bool) -> OptimizerContract:
             training=training,
             checkpoints=checkpoints,
             supported_parameter_ranks=None,
+            canonical_parameter_fqns=canonical_parameter_fqns,
+            stable_shard_identity=stable_shard_identity,
+            shard_rebinding=True,
+            post_sharding=True,
         ),
     )
 
@@ -1099,6 +1112,8 @@ def _gefen_muon_contract(
     sharded_modes: FrozenSet[str],
     normuon_modes: FrozenSet[str],
     non_normuon_modes: FrozenSet[str],
+    canonical_parameter_fqns: bool = False,
+    stable_shard_identity: bool = False,
 ) -> OptimizerContract:
     sharded_modes = _frozenset(sharded_modes)
     normuon_modes = _frozenset(normuon_modes)
@@ -1304,6 +1319,10 @@ def _gefen_muon_contract(
             training=training,
             checkpoints=tuple(checkpoints),
             supported_parameter_ranks=(2,),
+            canonical_parameter_fqns=canonical_parameter_fqns,
+            stable_shard_identity=stable_shard_identity,
+            shard_rebinding=True,
+            post_sharding=True,
         ),
     )
 

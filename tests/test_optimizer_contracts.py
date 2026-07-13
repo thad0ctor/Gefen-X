@@ -162,8 +162,8 @@ def test_plain_contract_matches_live_persistent_state(factored_v_2d):
     assert not contract.capabilities.canonical_parameter_fqns
     assert not contract.capabilities.stable_shard_identity
     assert not contract.capabilities.explicit_process_group_codebook_scope
-    assert not contract.capabilities.shard_rebinding
-    assert not contract.capabilities.post_sharding
+    assert contract.capabilities.shard_rebinding
+    assert contract.capabilities.post_sharding
     assert not contract.capabilities.canonical_state_io
     assert not contract.capabilities.atomic_state_movement
     assert not contract.capabilities.state_offload
