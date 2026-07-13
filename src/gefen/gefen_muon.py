@@ -9,7 +9,6 @@ import torch.nn as nn
 from gefen.contracts import OptimizerContract, ParameterLayout, _gefen_muon_contract
 from gefen.gefen import (
     Gefen,
-    _amp_prepare_optimizer_step,
     _assert_optimizer_gradients_structurally_valid,
 )
 
@@ -768,6 +767,14 @@ class GefenMuon(Gefen):
             non_normuon_modes=non_normuon_modes,
             canonical_parameter_fqns=self._canonical_identity_ready(),
             stable_shard_identity=self._canonical_identity_ready(),
+            explicit_process_group_codebook_scope=True,
+            whole_parameter_owner=(
+                self._codebook_scope_ready()
+                and any(
+                    shard.layout is ParameterLayout.WHOLE_PARAMETER_OWNER
+                    for _, shard in self._gefen_local_shard_bindings
+                )
+            ),
         )
 
     def _validate_rebinding_layout(self, rebinding) -> None:
@@ -805,7 +812,7 @@ class GefenMuon(Gefen):
             )
 
     def _has_unscoped_whole_owner_bindings(self) -> bool:
-        return any(
+        return self._gefen_codebook_process_group is None and any(
             shard.layout is ParameterLayout.WHOLE_PARAMETER_OWNER
             for _, shard in self._gefen_local_shard_bindings
         )
@@ -940,7 +947,12 @@ class GefenMuon(Gefen):
     def _init_gefen_muon_state(self, state, grad_view: torch.Tensor) -> None:
         self._init_gefen_state(state, grad_view)
 
-    def _iter_gefen_grad_periods(self, reuse_existing_periods: bool = False):
+    def _codebook_requires_2d_parameters(self) -> bool:
+        return True
+
+    def _iter_gefen_grad_periods(
+        self, reuse_existing_periods: bool = False, staged_periods=None
+    ):
         # Same as Gefen._iter_gefen_grad_periods, but for sharded (DTensor)
         # gradients gather the FULL matrix (full_tensor) instead of taking the
         # local shard. The exact-DP codebook and the per-param block period are
@@ -949,56 +961,58 @@ class GefenMuon(Gefen):
         # matches). With full grads, flat.numel() is the global numel and is
         # never 0, so every rank iterates every parameter in the same order and
         # the full_tensor() collective is matched across ranks.
-        for group in self.param_groups:
-            for param_name, p in self._iter_group_params_with_names(group):
-                if p.grad is None:
-                    continue
-                grad = p.grad
-                # approx mode learns the codebook/period from the LOCAL shard
-                # (no all-gather) so periods divide the local numel that the
-                # approximate step operates on; exact mode gathers the full matrix.
-                if group["sharded_mode"] == "approx" and hasattr(
-                    grad, "to_local"
-                ):
-                    grad = grad.to_local()
-                elif hasattr(grad, "full_tensor"):
-                    grad = grad.full_tensor()
-                elif hasattr(grad, "to_local"):
-                    grad = grad.to_local()
-                if hasattr(grad, "wait"):
-                    grad = grad.wait()
-                grad = grad.detach()
-                flat = grad.reshape(-1)
-                if flat.numel() == 0:
-                    continue
+        for group, param_name, p in self._iter_codebook_params_with_names():
+            if p.grad is None:
+                continue
+            grad = p.grad
+            # approx mode learns the codebook/period from the LOCAL shard
+            # (no all-gather) so periods divide the local numel that the
+            # approximate step operates on; exact mode gathers the full matrix.
+            if group["sharded_mode"] == "approx" and hasattr(grad, "to_local"):
+                grad = grad.to_local()
+            elif hasattr(grad, "full_tensor"):
+                grad = grad.full_tensor()
+            elif hasattr(grad, "to_local"):
+                grad = grad.to_local()
+            if hasattr(grad, "wait"):
+                grad = grad.wait()
+            grad = grad.detach()
+            flat = grad.reshape(-1)
+            if flat.numel() == 0:
+                continue
 
-                if reuse_existing_periods:
-                    state = self.state[p]
-                    if "automatic_period" not in state:
-                        raise ValueError(
-                            "Expected automatic_period to exist for {} before refreshing Gefen codebook at optimizer step {}".format(
-                                param_name,
-                                self._gefen_global_step,
-                            )
-                        )
-                    period = state["automatic_period"]
-                elif flat.numel() == 1:
-                    period = 1
-                else:
-                    period = self._predict_period_from_grad_sq(param_name, p, grad)
-
-                self.state[p]["automatic_period"] = period
-
-                if flat.numel() % period != 0:
+            if reuse_existing_periods:
+                state = self.state[p]
+                if "automatic_period" not in state:
                     raise ValueError(
-                        "Automatic partition period {} does not divide parameter {} with numel {} while learning Gefen codebook".format(
-                            period,
+                        "Expected automatic_period to exist for {} before refreshing Gefen codebook at optimizer step {}".format(
                             param_name,
-                            flat.numel(),
+                            self._gefen_global_step,
                         )
                     )
+                period = state["automatic_period"]
+            elif flat.numel() == 1:
+                period = 1
+            else:
+                period = self._predict_period_from_grad_sq(param_name, p, grad)
 
-                yield param_name, flat, period, grad
+            if flat.numel() % period != 0:
+                raise ValueError(
+                    "Automatic partition period {} does not divide parameter {} with numel {} while learning Gefen codebook".format(
+                        period,
+                        param_name,
+                        flat.numel(),
+                    )
+                )
+
+            if staged_periods is None:
+                self.state[p]["automatic_period"] = period
+            elif not reuse_existing_periods:
+                staged_periods.append((p, period))
+            if not self._codebook_parameter_contributes(p):
+                continue
+
+            yield param_name, flat, period, grad
 
     def _quantize_momentum_(self, state, momentum_view: torch.Tensor) -> None:
         period = state["automatic_period"]
@@ -2662,21 +2676,36 @@ class GefenMuon(Gefen):
     @torch.no_grad()
     def step(self, closure=None):
         self._assert_finalized_binding_layout()
+        self._assert_runtime_codebook_process_group()
         if self._has_unscoped_whole_owner_bindings():
             raise RuntimeError(
                 "GefenMuon whole-parameter owner stepping requires the separate "
-                "explicit process-group codebook scope, which is not implemented"
+                "explicit process-group codebook scope"
             )
         self._assert_capturable_if_capturing()
+        self._assert_codebook_capture_ready()
         loss = None
         if closure is not None:
             with torch.enable_grad():
                 loss = closure()
 
         self._assert_finalized_binding_layout()
-        _assert_optimizer_gradients_structurally_valid(
-            self, require_2d_params=True
-        )
+        self._assert_runtime_codebook_process_group()
+        try:
+            _assert_optimizer_gradients_structurally_valid(
+                self, require_2d_params=True
+            )
+            local_preflight_error = None
+        except Exception as exc:
+            local_preflight_error = exc
+        self._validate_codebook_scope_operation_header("step")
+        if self._gefen_codebook_process_group is not None:
+            self._synchronize_codebook_scope_failure(
+                local_preflight_error, "gradient preflight"
+            )
+        elif local_preflight_error is not None:
+            raise local_preflight_error
+        self._ensure_codebook_scope_agreement()
 
         # Native GradScaler calls AMP-aware optimizers even when its non-finite
         # scan found an overflow. Skip before the sharded preflight, first-step
@@ -2684,7 +2713,7 @@ class GefenMuon(Gefen):
         # gradients are unscaled once here for every existing Muon path.
         if (
             hasattr(self, "found_inf") or hasattr(self, "grad_scale")
-        ) and not _amp_prepare_optimizer_step(self):
+        ) and not self._prepare_scoped_amp_optimizer_step():
             return loss
 
         # Partition the work once so distributed-mode sharded params can take the

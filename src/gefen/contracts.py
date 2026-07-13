@@ -468,6 +468,7 @@ class StateField:
     key_match: StateKeyMatch = StateKeyMatch.EXACT
     applicable_sharded_modes: AbstractSet[str] = frozenset()
     description: str = ""
+    optional: bool = False
 
     def __post_init__(self) -> None:
         object.__setattr__(
@@ -483,6 +484,8 @@ class StateField:
             raise TypeError("StateField.geometry must be a StateGeometry")
         if not isinstance(self.key_match, StateKeyMatch):
             raise TypeError("StateField.key_match must be a StateKeyMatch")
+        if type(self.optional) is not bool:
+            raise TypeError("StateField.optional must be a bool")
 
     @property
     def authoritative(self) -> bool:
@@ -607,6 +610,7 @@ class TrainingSupport:
     sharded_mode: Optional[str] = None
     requires_complete_parameter_storage: bool = False
     requires_complete_logical_matrix: bool = False
+    requires_post_step_parameter_sync: bool = False
 
     def __post_init__(self) -> None:
         if self.mesh_dimensions is not None:
@@ -620,6 +624,13 @@ class TrainingSupport:
             raise TypeError(
                 "TrainingSupport.process_group_scope must be a ProcessGroupScope"
             )
+        for name in (
+            "requires_complete_parameter_storage",
+            "requires_complete_logical_matrix",
+            "requires_post_step_parameter_sync",
+        ):
+            if type(getattr(self, name)) is not bool:
+                raise TypeError("TrainingSupport.{} must be a bool".format(name))
 
 
 @dataclass(frozen=True)
@@ -783,6 +794,14 @@ def _common_fields() -> Tuple[StateField, ...]:
             True,
             description="Checkpoint-bound deterministic execution policy.",
         ),
+        StateField(
+            "gefen_codebook_scope",
+            StateScope.OPTIMIZER_COMMON,
+            StateGeometry.OPAQUE,
+            True,
+            description="Stable adapter-defined learned-codebook process-group scope.",
+            optional=True,
+        ),
     )
 
 
@@ -828,6 +847,20 @@ def _derived_fields() -> Tuple[StateField, ...]:
             StateGeometry.OPAQUE,
             False,
         ),
+        StateField(
+            "_gefen_codebook_process_group",
+            StateScope.DERIVED,
+            StateGeometry.OPAQUE,
+            False,
+            description="Live runtime handle for the adapter-defined codebook scope.",
+        ),
+        StateField(
+            "_gefen_codebook_scope_validated",
+            StateScope.DERIVED,
+            StateGeometry.SCALAR,
+            False,
+            description="Rebuildable cross-member scope-agreement cache.",
+        ),
         StateField("_sr_seed_by_device", StateScope.DERIVED, StateGeometry.SCALAR, False),
         StateField(
             "_gefen_global_step_by_device",
@@ -858,6 +891,13 @@ def _derived_fields() -> Tuple[StateField, ...]:
             True,
             description="PyTorch transport mirror of optimizer-common state.",
         ),
+        StateField(
+            "gefen_native_local_shards",
+            StateScope.DERIVED,
+            StateGeometry.OPAQUE,
+            True,
+            description="Native rank-local identity guard for scoped physical shards.",
+        ),
     )
 
 
@@ -879,6 +919,7 @@ def _negative_capabilities(
     supported_parameter_ranks: Optional[Tuple[int, ...]],
     canonical_parameter_fqns: bool = False,
     stable_shard_identity: bool = False,
+    explicit_process_group_codebook_scope: bool = False,
     shard_rebinding: bool = False,
     post_sharding: bool = False,
 ) -> OptimizerCapabilities:
@@ -890,7 +931,7 @@ def _negative_capabilities(
         accepts_semantic_parameter_names=True,
         canonical_parameter_fqns=canonical_parameter_fqns,
         stable_shard_identity=stable_shard_identity,
-        explicit_process_group_codebook_scope=False,
+        explicit_process_group_codebook_scope=explicit_process_group_codebook_scope,
         shard_rebinding=shard_rebinding,
         post_sharding=post_sharding,
         canonical_state_io=False,
@@ -904,6 +945,8 @@ def _gefen_contract(
     factored_v_2d: bool,
     canonical_parameter_fqns: bool = False,
     stable_shard_identity: bool = False,
+    explicit_process_group_codebook_scope: bool = False,
+    native_flattened_checkpoint: bool = False,
 ) -> OptimizerContract:
     block_fields = (
         StateField("vmean", StateScope.PARAMETER, StateGeometry.BLOCK, True),
@@ -1052,11 +1095,11 @@ def _gefen_contract(
     checkpoints = (
         CheckpointSupport(
             CheckpointTransport.NATIVE_OPTIMIZER,
-            frozenset(
-                {
-                    ParameterLayout.REPLICATED,
-                    ParameterLayout.FLATTENED_ELEMENT_SHARD,
-                }
+            frozenset({ParameterLayout.REPLICATED})
+            | (
+                frozenset({ParameterLayout.FLATTENED_ELEMENT_SHARD})
+                if native_flattened_checkpoint
+                else frozenset()
             ),
             frozenset(),
             ProcessGroupScope.NONE,
@@ -1081,6 +1124,7 @@ def _gefen_contract(
             supported_parameter_ranks=None,
             canonical_parameter_fqns=canonical_parameter_fqns,
             stable_shard_identity=stable_shard_identity,
+            explicit_process_group_codebook_scope=explicit_process_group_codebook_scope,
             shard_rebinding=True,
             post_sharding=True,
         ),
@@ -1114,6 +1158,8 @@ def _gefen_muon_contract(
     non_normuon_modes: FrozenSet[str],
     canonical_parameter_fqns: bool = False,
     stable_shard_identity: bool = False,
+    explicit_process_group_codebook_scope: bool = False,
+    whole_parameter_owner: bool = False,
 ) -> OptimizerContract:
     sharded_modes = _frozenset(sharded_modes)
     normuon_modes = _frozenset(normuon_modes)
@@ -1178,6 +1224,19 @@ def _gefen_muon_contract(
                     sharded_mode=mode,
                 )
             )
+        if whole_parameter_owner:
+            variants.append(
+                StateVariant(
+                    "name_only_whole_owner_" + mode,
+                    ("name",),
+                    frozenset({ParameterLayout.WHOLE_PARAMETER_OWNER}),
+                    StateExtent.METADATA_ONLY,
+                    role=ParameterStateRole.OWNER,
+                    initialized=False,
+                    parameter_ranks=(2,),
+                    sharded_mode=mode,
+                )
+            )
     for mode_set, field_names, prefix in (
         (non_normuon_modes, base_names, "quantized_muon"),
         (normuon_modes, normuon_names, "quantized_normuon"),
@@ -1194,6 +1253,17 @@ def _gefen_muon_contract(
                     mode=mode,
                 )
             )
+            if whole_parameter_owner:
+                variants.append(
+                    _muon_initialized_variant(
+                        name=prefix + "_whole_owner_" + mode,
+                        field_names=field_names,
+                        layout=ParameterLayout.WHOLE_PARAMETER_OWNER,
+                        extent=StateExtent.OWNER_PARAMETER,
+                        mode=mode,
+                        role=ParameterStateRole.OWNER,
+                    )
+                )
         if "approx" in mode_set:
             variants.append(
                 _muon_initialized_variant(
@@ -1270,6 +1340,18 @@ def _gefen_muon_contract(
             ),
         )
     )
+    if whole_parameter_owner:
+        training += tuple(
+            TrainingSupport(
+                ParameterLayout.WHOLE_PARAMETER_OWNER,
+                ProcessGroupScope.ADAPTER_DEFINED,
+                sharded_mode=mode,
+                requires_complete_parameter_storage=True,
+                requires_complete_logical_matrix=True,
+                requires_post_step_parameter_sync=True,
+            )
+            for mode in sorted(sharded_modes)
+        )
     checkpoints = [
         CheckpointSupport(
             CheckpointTransport.NATIVE_OPTIMIZER,
@@ -1321,6 +1403,7 @@ def _gefen_muon_contract(
             supported_parameter_ranks=(2,),
             canonical_parameter_fqns=canonical_parameter_fqns,
             stable_shard_identity=stable_shard_identity,
+            explicit_process_group_codebook_scope=explicit_process_group_codebook_scope,
             shard_rebinding=True,
             post_sharding=True,
         ),

@@ -15,6 +15,7 @@ __all__ = [
     "IDENTITY_SCHEMA_VERSION",
     "CheckpointSupport",
     "CheckpointTransport",
+    "CodebookProcessGroupBinding",
     "OptimizerCapabilities",
     "OptimizerChildContract",
     "OptimizerContract",
@@ -68,6 +69,10 @@ def __getattr__(name):
         from .rebinding import ParameterRebinding
 
         return ParameterRebinding
+    if name == "CodebookProcessGroupBinding":
+        from .codebook import CodebookProcessGroupBinding
+
+        return CodebookProcessGroupBinding
     if name in (
         "CONTRACT_SCHEMA_VERSION",
         "IDENTITY_SCHEMA_VERSION",

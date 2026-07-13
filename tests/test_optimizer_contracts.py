@@ -158,10 +158,11 @@ def test_plain_contract_matches_live_persistent_state(factored_v_2d):
         if item.transport is CheckpointTransport.NATIVE_OPTIMIZER
     )
     assert native.atomic_load
+    assert ParameterLayout.FLATTENED_ELEMENT_SHARD not in native.same_topology
     assert contract.capabilities.accepts_semantic_parameter_names
     assert not contract.capabilities.canonical_parameter_fqns
     assert not contract.capabilities.stable_shard_identity
-    assert not contract.capabilities.explicit_process_group_codebook_scope
+    assert contract.capabilities.explicit_process_group_codebook_scope
     assert contract.capabilities.shard_rebinding
     assert contract.capabilities.post_sharding
     assert not contract.capabilities.canonical_state_io
@@ -208,8 +209,22 @@ def test_plain_contract_matches_live_persistent_state(factored_v_2d):
             StateScope.OPTIMIZER_COMMON
         )
     }
-    assert common == {"gefen_global_step", "gefen_codebook", "gefen_deterministic"}
-    assert common.issubset(state_dict)
+    assert common == {
+        "gefen_global_step",
+        "gefen_codebook",
+        "gefen_deterministic",
+        "gefen_codebook_scope",
+    }
+    required_common = {
+        field.name
+        for field in contract.state_layout.fields_for_scope(
+            StateScope.OPTIMIZER_COMMON
+        )
+        if not field.optional
+    }
+    assert required_common.issubset(state_dict)
+    assert contract.state_layout.field("gefen_codebook_scope").optional
+    assert "gefen_codebook_scope" not in state_dict
 
 
 @pytest.mark.parametrize(
@@ -337,6 +352,7 @@ def test_muon_contract_separates_mode_topology_and_state_extent(
 
     assert contract.implementation == "gefen.GefenMuon"
     assert contract.capabilities.supported_parameter_ranks == (2,)
+    assert contract.capabilities.explicit_process_group_codebook_scope
     native = next(
         item
         for item in contract.capabilities.checkpoints
@@ -468,6 +484,10 @@ def test_hybrid_contract_preserves_child_namespaces(backup_optimizer):
         assert contract.children[1].implementation == "torch.optim.adamw.AdamW"
         assert contract.children[1].contract is None
     assert contract.state_layout.composite_namespaces == ("muon", "backup")
+    assert not contract.capabilities.explicit_process_group_codebook_scope
+    assert contract.children[0].contract.capabilities.explicit_process_group_codebook_scope
+    if backup_optimizer == "gefen":
+        assert contract.children[1].contract.capabilities.explicit_process_group_codebook_scope
     assert {field.name for field in contract.state_layout.fields} == {
         "backup_optimizer"
     }
@@ -625,6 +645,7 @@ def test_derived_fields_are_explicitly_non_authoritative():
         "_gefen_rank_local_payload_",
         "_gefen_rank_local_member",
         "_gefen_checkpoint_metadata",
+        "gefen_native_local_shards",
     }
     payload_field = optimizer.optimizer_contract().state_layout.field(
         "_gefen_rank_local_payload_3"

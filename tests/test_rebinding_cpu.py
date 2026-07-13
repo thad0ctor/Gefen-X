@@ -188,7 +188,7 @@ def test_replicated_rebind_preserves_legacy_name_and_enables_identity_contract()
     assert contract.capabilities.shard_rebinding
     assert contract.capabilities.post_sharding
     assert not contract.capabilities.canonical_state_io
-    assert not contract.capabilities.explicit_process_group_codebook_scope
+    assert contract.capabilities.explicit_process_group_codebook_scope
     with pytest.raises(RuntimeError, match="already finalized"):
         optimizer.rebind_parameter(new, new, identity=identity)
     with pytest.raises(RuntimeError, match="cannot add"):
@@ -749,7 +749,7 @@ def test_muon_whole_owner_post_sharding_prunes_nonowner_and_blocks_training():
     contract = optimizer.optimizer_contract()
     assert contract.capabilities.canonical_parameter_fqns
     assert contract.capabilities.stable_shard_identity
-    assert not contract.capabilities.explicit_process_group_codebook_scope
+    assert contract.capabilities.explicit_process_group_codebook_scope
     assert all(
         support.layout is not ParameterLayout.WHOLE_PARAMETER_OWNER for support in contract.capabilities.training
     )
