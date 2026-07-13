@@ -747,3 +747,13 @@ def test_all_public_contract_exports_resolve():
 
     assert all(getattr(gefen, name) is not None for name in contracts.__all__)
     assert gefen.StateMovementProvider is StateMovementProvider
+
+
+def test_portable_global_transport_is_defined_but_not_claimed_before_integration():
+    parameter = torch.nn.Parameter(torch.ones(4))
+    optimizer = Gefen([("parameter", parameter)], fused=False)
+
+    assert all(
+        support.transport is not CheckpointTransport.CANONICAL_GLOBAL
+        for support in optimizer.optimizer_contract().capabilities.checkpoints
+    )

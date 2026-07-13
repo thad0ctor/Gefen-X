@@ -15,6 +15,7 @@ from typing import (
     Protocol,
     Sequence,
     Tuple,
+    Union,
     runtime_checkable,
 )
 
@@ -101,6 +102,7 @@ class CheckpointTransport(str, Enum):
     PYTORCH_RANK_LOCAL = "pytorch_rank_local"
     COMPOSITE_NATIVE = "composite_native"
     CANONICAL_LOCAL = "canonical_local"
+    CANONICAL_GLOBAL = "canonical_global"
 
 
 class TopologyChange(str, Enum):
@@ -244,12 +246,138 @@ class LogicalSlice:
 
 
 @dataclass(frozen=True)
+class LogicalRegion:
+    """One axis-aligned region in canonical logical parameter coordinates."""
+
+    offsets: Sequence[int]
+    lengths: Sequence[int]
+
+    def __post_init__(self) -> None:
+        for name, values in (
+            ("LogicalRegion.offsets", self.offsets),
+            ("LogicalRegion.lengths", self.lengths),
+        ):
+            if isinstance(values, (str, bytes, bytearray)):
+                raise TypeError("{} must be a sequence of dimensions".format(name))
+            try:
+                normalized = tuple(values)
+            except TypeError as exc:
+                raise TypeError(
+                    "{} must be a sequence of dimensions".format(name)
+                ) from exc
+            if any(type(value) is not int or value < 0 for value in normalized):
+                raise ValueError(
+                    "{} must contain nonnegative integers".format(name)
+                )
+            object.__setattr__(self, name.rsplit(".", 1)[1], normalized)
+        if len(self.offsets) != len(self.lengths):
+            raise ValueError(
+                "LogicalRegion offsets and lengths must have the same rank"
+            )
+
+    @property
+    def rank(self) -> int:
+        """Return the logical tensor rank described by this region."""
+
+        return len(self.offsets)
+
+    @property
+    def numel(self) -> int:
+        """Return the number of logical elements in this region."""
+
+        return math.prod(self.lengths)
+
+    @classmethod
+    def full(cls, parameter: ParameterIdentity) -> "LogicalRegion":
+        """Return the complete axis-aligned region for ``parameter``."""
+
+        if not isinstance(parameter, ParameterIdentity):
+            raise TypeError("parameter must be a ParameterIdentity")
+        return cls((0,) * len(parameter.global_shape), parameter.global_shape)
+
+    def validate_bounds(self, parameter: ParameterIdentity) -> None:
+        """Raise when this region is not contained by ``parameter``."""
+
+        if not isinstance(parameter, ParameterIdentity):
+            raise TypeError("parameter must be a ParameterIdentity")
+        if self.rank != len(parameter.global_shape):
+            raise ValueError(
+                "LogicalRegion rank must match the global parameter rank"
+            )
+        if any(
+            offset + length > dimension
+            for offset, length, dimension in zip(
+                self.offsets, self.lengths, parameter.global_shape
+            )
+        ):
+            raise ValueError("LogicalRegion exceeds the global parameter")
+
+    def intersection(self, other: "LogicalRegion") -> "LogicalRegion":
+        """Return the axis-aligned intersection with another same-rank region."""
+
+        if not isinstance(other, LogicalRegion):
+            raise TypeError("other must be a LogicalRegion")
+        if self.rank != other.rank:
+            raise ValueError("LogicalRegion intersection requires equal ranks")
+        offsets = tuple(
+            max(left, right)
+            for left, right in zip(self.offsets, other.offsets)
+        )
+        ends = tuple(
+            min(left_offset + left_length, right_offset + right_length)
+            for left_offset, left_length, right_offset, right_length in zip(
+                self.offsets,
+                self.lengths,
+                other.offsets,
+                other.lengths,
+            )
+        )
+        return LogicalRegion(
+            offsets,
+            tuple(max(0, end - offset) for offset, end in zip(offsets, ends)),
+        )
+
+    def overlaps(self, other: "LogicalRegion") -> bool:
+        """Return whether two regions share at least one logical element."""
+
+        return self.intersection(other).numel > 0
+
+    @staticmethod
+    def validate_exact_coverage(
+        parameter: ParameterIdentity, regions: Sequence["LogicalRegion"]
+    ) -> None:
+        """Validate that bounded regions cover a parameter exactly once."""
+
+        if not isinstance(parameter, ParameterIdentity):
+            raise TypeError("parameter must be a ParameterIdentity")
+        if isinstance(regions, (str, bytes, bytearray)):
+            raise TypeError("regions must be a sequence of LogicalRegion values")
+        try:
+            regions = tuple(regions)
+        except TypeError as exc:
+            raise TypeError(
+                "regions must be a sequence of LogicalRegion values"
+            ) from exc
+        if any(not isinstance(region, LogicalRegion) for region in regions):
+            raise TypeError("regions must contain LogicalRegion values")
+        for region in regions:
+            region.validate_bounds(parameter)
+        for index, region in enumerate(regions):
+            if any(region.overlaps(other) for other in regions[index + 1 :]):
+                raise ValueError("LogicalRegions must not overlap")
+        if sum(region.numel for region in regions) != parameter.numel:
+            raise ValueError(
+                "LogicalRegions must exactly cover the global parameter"
+            )
+
+
+@dataclass(frozen=True)
 class ShardIdentity:
     """Stable identity of one process-group member's logical parameter shard."""
 
     parameter: ParameterIdentity
     layout: ParameterLayout
-    logical_slice: LogicalSlice
+    logical_slice: Union[LogicalSlice, LogicalRegion]
     placements: Sequence[ShardPlacement] = ()
     process_group: Optional[ProcessGroupIdentity] = None
     local_member: Optional[str] = None
@@ -261,8 +389,18 @@ class ShardIdentity:
             raise TypeError("ShardIdentity.parameter must be a ParameterIdentity")
         if not isinstance(self.layout, ParameterLayout):
             raise TypeError("ShardIdentity.layout must be a ParameterLayout")
-        if not isinstance(self.logical_slice, LogicalSlice):
-            raise TypeError("ShardIdentity.logical_slice must be a LogicalSlice")
+        uses_logical_region = isinstance(self.logical_slice, LogicalRegion)
+        if self.layout is ParameterLayout.DTENSOR_1D_DEFAULT_WORLD:
+            if not uses_logical_region:
+                raise ValueError(
+                    "stable DTensor identity requires a logical-region descriptor "
+                    "(LogicalRegion)"
+                )
+            self.logical_slice.validate_bounds(self.parameter)
+        elif not isinstance(self.logical_slice, LogicalSlice):
+            raise TypeError(
+                "non-DTensor ShardIdentity.logical_slice must be a LogicalSlice"
+            )
         placements = _tuple(self.placements)
         if any(not isinstance(item, ShardPlacement) for item in placements):
             raise TypeError("ShardIdentity.placements must contain ShardPlacement values")
@@ -274,7 +412,11 @@ class ShardIdentity:
             "placements",
             tuple(sorted(placements, key=lambda item: item.mesh_axis)),
         )
-        if self.logical_slice.flat_offset + self.logical_slice.length > self.parameter.numel:
+        if (
+            not uses_logical_region
+            and self.logical_slice.flat_offset + self.logical_slice.length
+            > self.parameter.numel
+        ):
             raise ValueError("ShardIdentity.logical_slice exceeds the global parameter")
         if self.process_group is None:
             if self.local_member is not None or self.owner is not None:
@@ -289,7 +431,11 @@ class ShardIdentity:
         if self.layout is not ParameterLayout.WHOLE_PARAMETER_OWNER and self.owner is not None:
             raise ValueError("ShardIdentity.owner is valid only for whole-parameter ownership")
 
-        full = self.logical_slice == LogicalSlice.full(self.parameter)
+        full = (
+            self.logical_slice == LogicalRegion.full(self.parameter)
+            if uses_logical_region
+            else self.logical_slice == LogicalSlice.full(self.parameter)
+        )
         kinds = tuple(item.kind for item in self.placements)
         if self.process_group is not None:
             member_index = self.process_group.ordered_members.index(self.local_member)
@@ -326,11 +472,49 @@ class ShardIdentity:
             if len(kinds) != 1 or kinds[0] is not PlacementKind.WHOLE_PARAMETER_OWNER:
                 raise ValueError("whole-parameter ownership requires one owner placement")
         elif self.layout is ParameterLayout.DTENSOR_1D_DEFAULT_WORLD:
-            raise ValueError(
-                "stable DTensor identity requires a logical-region descriptor and is "
-                "not implemented by the contiguous-slice identity schema"
-            )
+            if self.process_group is None or self.owner is not None:
+                raise ValueError(
+                    "DTensor identities require a process group and no owner"
+                )
+            if len(self.placements) != 1 or kinds[0] not in {
+                PlacementKind.DIMENSION_SHARD,
+                PlacementKind.REPLICATE,
+            }:
+                raise ValueError(
+                    "one-dimensional DTensor identities require one dimension-shard "
+                    "or replicate placement"
+                )
+            placement = self.placements[0]
+            if placement.kind is PlacementKind.REPLICATE:
+                if not full:
+                    raise ValueError(
+                        "replicated DTensor identities must cover the full parameter"
+                    )
+            else:
+                shard_dimension = placement.parameter_dimension
+                for dimension, (offset, length, global_length) in enumerate(
+                    zip(
+                        self.logical_slice.offsets,
+                        self.logical_slice.lengths,
+                        self.parameter.global_shape,
+                    )
+                ):
+                    if dimension != shard_dimension and (
+                        offset != 0 or length != global_length
+                    ):
+                        raise ValueError(
+                            "a dimension-sharded DTensor region must cover every "
+                            "unsharded parameter dimension"
+                        )
         _validate_identity_schema_version("shard identity", self.schema_version)
+
+    @property
+    def logical_region(self) -> Optional[LogicalRegion]:
+        """Return the axis-aligned logical region, when this identity has one."""
+
+        if isinstance(self.logical_slice, LogicalRegion):
+            return self.logical_slice
+        return None
 
     @property
     def sort_key(self):
@@ -354,15 +538,39 @@ class ShardIdentity:
             )
             for item in self.placements
         )
+        if isinstance(self.logical_slice, LogicalSlice):
+            # Preserve the released contiguous-slice key exactly. Besides
+            # retaining its public structural shape, this leaves all existing
+            # manifest ordering and freshness tokens byte-for-byte stable.
+            return (
+                self.parameter.fqn,
+                self.logical_slice.flat_offset,
+                self.logical_slice.length,
+                self.layout.value,
+                group_name,
+                member_index,
+                owner_index,
+                placement_key,
+            )
+
+        flat_offset = 0
+        stride = 1
+        for offset, dimension in reversed(
+            tuple(zip(self.logical_slice.offsets, self.parameter.global_shape))
+        ):
+            flat_offset += offset * stride
+            stride *= dimension
         return (
             self.parameter.fqn,
-            self.logical_slice.flat_offset,
-            self.logical_slice.length,
+            flat_offset,
+            self.logical_slice.numel,
             self.layout.value,
             group_name,
             member_index,
             owner_index,
             placement_key,
+            self.logical_slice.offsets,
+            self.logical_slice.lengths,
         )
 
 
@@ -451,6 +659,38 @@ class ShardingManifest:
                 owners = {item.owner for item in parameter_shards}
                 if len(owners) != 1:
                     raise ValueError("whole-parameter manifest shards must agree on one owner")
+            elif layout is ParameterLayout.DTENSOR_1D_DEFAULT_WORLD:
+                placements = tuple(item.placements[0] for item in parameter_shards)
+                placement_kind = placements[0].kind
+                if placement_kind is PlacementKind.REPLICATE:
+                    if any(
+                        item.logical_region != LogicalRegion.full(parameter)
+                        for item in parameter_shards
+                    ):
+                        raise ValueError(
+                            "replicated DTensor manifest regions must all be complete"
+                        )
+                    continue
+
+                shard_dimension = placements[0].parameter_dimension
+                by_coordinate = sorted(
+                    parameter_shards,
+                    key=lambda item: item.placements[0].coordinate,
+                )
+                cursor = 0
+                for item in by_coordinate:
+                    region = item.logical_region
+                    if region.offsets[shard_dimension] != cursor:
+                        raise ValueError(
+                            "dimension-sharded DTensor manifest regions must be "
+                            "gapless and non-overlapping in coordinate order"
+                        )
+                    cursor += region.lengths[shard_dimension]
+                if cursor != parameter.global_shape[shard_dimension]:
+                    raise ValueError(
+                        "dimension-sharded DTensor manifest regions must cover "
+                        "the global parameter"
+                    )
 
     def for_parameter(self, fqn: str) -> Tuple[ShardIdentity, ...]:
         """Return one canonical parameter's shards in deterministic order."""
@@ -1582,6 +1822,7 @@ __all__ = [
     "OptimizerContract",
     "OptimizerContractProvider",
     "OptimizerStateLayout",
+    "LogicalRegion",
     "LogicalSlice",
     "ParameterLayout",
     "ParameterIdentity",

@@ -5,6 +5,7 @@ from dataclasses import FrozenInstanceError
 import pytest
 
 import gefen
+import gefen.contracts as contracts_module
 from gefen import (
     IDENTITY_SCHEMA_VERSION,
     LogicalSlice,
@@ -16,6 +17,7 @@ from gefen import (
     ShardPlacement,
     ShardingManifest,
 )
+from gefen.contracts import LogicalRegion
 
 
 def _group():
@@ -59,6 +61,37 @@ def _owner_shard(parameter, group, member, owner):
         process_group=group,
         local_member=member,
         owner=owner,
+    )
+
+
+def _dtensor_shard(
+    parameter,
+    group,
+    member,
+    offsets,
+    lengths,
+    *,
+    dimension=0,
+    replicate=False,
+):
+    coordinate = group.ordered_members.index(member)
+    return ShardIdentity(
+        parameter,
+        ParameterLayout.DTENSOR_1D_DEFAULT_WORLD,
+        LogicalRegion(offsets, lengths),
+        placements=(
+            ShardPlacement(
+                "dp",
+                PlacementKind.REPLICATE
+                if replicate
+                else PlacementKind.DIMENSION_SHARD,
+                coordinate,
+                len(group.ordered_members),
+                None if replicate else dimension,
+            ),
+        ),
+        process_group=group,
+        local_member=member,
     )
 
 
@@ -123,6 +156,73 @@ def test_placement_and_logical_slice_validation():
         LogicalSlice(0, -1)
 
 
+def test_released_logical_slice_sort_key_shape_has_a_golden_value():
+    parameter = ParameterIdentity("layer.weight", (8,))
+    group = ProcessGroupIdentity("dp", ("rank:0", "rank:1"))
+    shard = _flat_shard(parameter, group, "rank:1", 4, 4)
+
+    assert shard.sort_key == (
+        "layer.weight",
+        4,
+        4,
+        "flattened_element_shard",
+        "dp",
+        1,
+        -1,
+        (("data_parallel", "flat_shard", 1, 2, -1),),
+    )
+
+
+def test_logical_region_is_immutable_and_validates_rank_bounds_and_values():
+    offsets = [1, 0]
+    lengths = [2, 4]
+    region = LogicalRegion(offsets, lengths)
+    offsets[0] = 0
+    lengths[0] = 3
+
+    assert region.offsets == (1, 0)
+    assert region.lengths == (2, 4)
+    assert region.rank == 2
+    assert region.numel == 8
+    with pytest.raises(FrozenInstanceError):
+        region.offsets = (0, 0)
+
+    parameter = ParameterIdentity("layer.weight", (4, 4))
+    assert LogicalRegion.full(parameter) == LogicalRegion((0, 0), (4, 4))
+    region.validate_bounds(parameter)
+    with pytest.raises(ValueError, match="same rank"):
+        LogicalRegion((0,), (1, 1))
+    with pytest.raises(ValueError, match="nonnegative"):
+        LogicalRegion((-1, 0), (1, 1))
+    with pytest.raises(ValueError, match="nonnegative"):
+        LogicalRegion((False, 0), (1, 1))
+    with pytest.raises(TypeError, match="sequence"):
+        LogicalRegion("00", (1, 1))
+    with pytest.raises(ValueError, match="rank"):
+        LogicalRegion((0,), (4,)).validate_bounds(parameter)
+    with pytest.raises(ValueError, match="exceeds"):
+        LogicalRegion((3, 0), (2, 4)).validate_bounds(parameter)
+
+
+def test_logical_region_intersection_overlap_and_exact_coverage_utilities():
+    parameter = ParameterIdentity("layer.weight", (4, 4))
+    first = LogicalRegion((0, 0), (2, 4))
+    second = LogicalRegion((2, 0), (2, 4))
+    overlapping = LogicalRegion((1, 0), (2, 4))
+
+    assert first.intersection(second) == LogicalRegion((2, 0), (0, 4))
+    assert not first.overlaps(second)
+    assert first.intersection(overlapping) == LogicalRegion((1, 0), (1, 4))
+    assert first.overlaps(overlapping)
+    LogicalRegion.validate_exact_coverage(parameter, (second, first))
+    with pytest.raises(ValueError, match="overlap"):
+        LogicalRegion.validate_exact_coverage(parameter, (first, overlapping))
+    with pytest.raises(ValueError, match="exactly cover"):
+        LogicalRegion.validate_exact_coverage(parameter, (first,))
+    with pytest.raises(ValueError, match="equal ranks"):
+        first.intersection(LogicalRegion((0,), (1,)))
+
+
 def test_replicated_identity_can_be_local_or_process_group_scoped():
     parameter = ParameterIdentity("layer.weight", (4, 4))
     local = ShardIdentity(
@@ -164,6 +264,177 @@ def test_contiguous_slice_schema_rejects_dtensor_identity_until_regions_exist():
             ParameterLayout.DTENSOR_1D_DEFAULT_WORLD,
             LogicalSlice(0, 8),
             placements=(ShardPlacement("dp", PlacementKind.DIMENSION_SHARD, 0, 2, 0),),
+            process_group=group,
+            local_member="rank:0",
+        )
+
+
+def test_dtensor_row_shard_manifest_accepts_uneven_regions_and_sorts_them():
+    parameter = ParameterIdentity("layer.weight", (5, 4))
+    group = ProcessGroupIdentity("dp", ("rank:0", "rank:1", "rank:2"))
+    shards = (
+        _dtensor_shard(parameter, group, "rank:2", (4, 0), (1, 4)),
+        _dtensor_shard(parameter, group, "rank:0", (0, 0), (2, 4)),
+        _dtensor_shard(parameter, group, "rank:1", (2, 0), (2, 4)),
+    )
+
+    manifest = ShardingManifest(shards)
+
+    assert tuple(item.local_member for item in manifest.shards) == (
+        "rank:0",
+        "rank:1",
+        "rank:2",
+    )
+    assert tuple(item.logical_region for item in manifest.shards) == (
+        LogicalRegion((0, 0), (2, 4)),
+        LogicalRegion((2, 0), (2, 4)),
+        LogicalRegion((4, 0), (1, 4)),
+    )
+
+
+def test_dtensor_column_shard_and_replicate_manifests_are_complete():
+    parameter = ParameterIdentity("layer.weight", (3, 5))
+    group = ProcessGroupIdentity("dp", ("rank:0", "rank:1"))
+    column_manifest = ShardingManifest(
+        (
+            _dtensor_shard(
+                parameter,
+                group,
+                "rank:1",
+                (0, 3),
+                (3, 2),
+                dimension=1,
+            ),
+            _dtensor_shard(
+                parameter,
+                group,
+                "rank:0",
+                (0, 0),
+                (3, 3),
+                dimension=1,
+            ),
+        )
+    )
+    assert tuple(item.logical_region.offsets for item in column_manifest.shards) == (
+        (0, 0),
+        (0, 3),
+    )
+
+    replicated = ShardingManifest(
+        tuple(
+            _dtensor_shard(
+                parameter,
+                group,
+                member,
+                (0, 0),
+                parameter.global_shape,
+                replicate=True,
+            )
+            for member in reversed(group.ordered_members)
+        )
+    )
+    assert all(
+        item.logical_region == LogicalRegion.full(parameter)
+        for item in replicated.shards
+    )
+
+
+def test_dtensor_manifest_retains_explicit_empty_member_regions():
+    parameter = ParameterIdentity("small.weight", (2, 4))
+    group = ProcessGroupIdentity(
+        "dp", ("rank:0", "rank:1", "rank:2", "rank:3")
+    )
+    shards = tuple(
+        _dtensor_shard(parameter, group, member, offsets, lengths)
+        for member, offsets, lengths in (
+            ("rank:0", (0, 0), (1, 4)),
+            ("rank:1", (1, 0), (1, 4)),
+            ("rank:2", (2, 0), (0, 4)),
+            ("rank:3", (2, 0), (0, 4)),
+        )
+    )
+
+    manifest = ShardingManifest(tuple(reversed(shards)))
+
+    assert tuple(item.local_member for item in manifest.shards) == (
+        "rank:0",
+        "rank:1",
+        "rank:2",
+        "rank:3",
+    )
+    assert tuple(item.logical_region.numel for item in manifest.shards) == (
+        4,
+        4,
+        0,
+        0,
+    )
+
+
+def test_dtensor_manifest_rejects_gap_overlap_and_missing_member():
+    parameter = ParameterIdentity("layer.weight", (4, 4))
+    group = ProcessGroupIdentity("dp", ("rank:0", "rank:1"))
+    with pytest.raises(ValueError, match="gapless"):
+        ShardingManifest(
+            (
+                _dtensor_shard(parameter, group, "rank:0", (0, 0), (1, 4)),
+                _dtensor_shard(parameter, group, "rank:1", (2, 0), (2, 4)),
+            )
+        )
+    with pytest.raises(ValueError, match="gapless"):
+        ShardingManifest(
+            (
+                _dtensor_shard(parameter, group, "rank:0", (0, 0), (3, 4)),
+                _dtensor_shard(parameter, group, "rank:1", (2, 0), (2, 4)),
+            )
+        )
+    with pytest.raises(ValueError, match="each process-group member"):
+        ShardingManifest(
+            (_dtensor_shard(parameter, group, "rank:0", (0, 0), (4, 4)),)
+        )
+
+
+def test_dtensor_identity_rejects_invalid_region_and_placement_geometry():
+    parameter = ParameterIdentity("layer.weight", (4, 4))
+    group = ProcessGroupIdentity("dp", ("rank:0", "rank:1"))
+    with pytest.raises(ValueError, match="LogicalRegion"):
+        ShardIdentity(
+            parameter,
+            ParameterLayout.DTENSOR_1D_DEFAULT_WORLD,
+            LogicalSlice(0, 8),
+            placements=(
+                ShardPlacement("dp", PlacementKind.DIMENSION_SHARD, 0, 2, 0),
+            ),
+            process_group=group,
+            local_member="rank:0",
+        )
+    with pytest.raises(ValueError, match="unsharded"):
+        _dtensor_shard(parameter, group, "rank:0", (0, 1), (2, 3))
+    with pytest.raises(ValueError, match="replicated"):
+        _dtensor_shard(
+            parameter,
+            group,
+            "rank:0",
+            (0, 0),
+            (2, 4),
+            replicate=True,
+        )
+    with pytest.raises(ValueError, match="one dimension-shard"):
+        ShardIdentity(
+            parameter,
+            ParameterLayout.DTENSOR_1D_DEFAULT_WORLD,
+            LogicalRegion((0, 0), (2, 4)),
+            placements=(ShardPlacement("dp", PlacementKind.FLAT_SHARD, 0, 2),),
+            process_group=group,
+            local_member="rank:0",
+        )
+    with pytest.raises(ValueError, match="coordinates"):
+        ShardIdentity(
+            parameter,
+            ParameterLayout.DTENSOR_1D_DEFAULT_WORLD,
+            LogicalRegion((0, 0), (2, 4)),
+            placements=(
+                ShardPlacement("dp", PlacementKind.DIMENSION_SHARD, 1, 2, 0),
+            ),
             process_group=group,
             local_member="rank:0",
         )
@@ -472,3 +743,4 @@ def test_identity_contracts_are_public_lazy_exports():
         assert getattr(gefen, name).__module__ == "gefen.contracts"
     assert "ParameterRebinding" in gefen.__all__
     assert gefen.ParameterRebinding.__module__ == "gefen.rebinding"
+    assert "LogicalRegion" in contracts_module.__all__

@@ -13,10 +13,12 @@ __all__ = [
     "GefenMuonHybrid",
     "CONTRACT_SCHEMA_VERSION",
     "CANONICAL_STATE_FORMAT_VERSION",
+    "PORTABLE_STATE_FORMAT_VERSION",
     "IDENTITY_SCHEMA_VERSION",
     "CheckpointSupport",
     "CheckpointTransport",
     "CanonicalStateProvider",
+    "CheckpointProcessGroupBinding",
     "CodebookProcessGroupBinding",
     "PreparedCanonicalStateImport",
     "OptimizerCapabilities",
@@ -24,6 +26,7 @@ __all__ = [
     "OptimizerContract",
     "OptimizerContractProvider",
     "OptimizerStateLayout",
+    "LogicalRegion",
     "LogicalSlice",
     "ParameterLayout",
     "ParameterIdentity",
@@ -45,6 +48,9 @@ __all__ = [
     "StateVariant",
     "TopologyChange",
     "TrainingSupport",
+    "build_portable_state_document",
+    "normalize_portable_state_document",
+    "portable_state_digest",
     "split_params_for_muon",
     "validate_split",
     "kernels",
@@ -77,6 +83,10 @@ def __getattr__(name):
         from .codebook import CodebookProcessGroupBinding
 
         return CodebookProcessGroupBinding
+    if name == "CheckpointProcessGroupBinding":
+        from .checkpoint import CheckpointProcessGroupBinding
+
+        return CheckpointProcessGroupBinding
     if name in (
         "CANONICAL_STATE_FORMAT_VERSION",
         "PreparedCanonicalStateImport",
@@ -84,6 +94,15 @@ def __getattr__(name):
         from . import canonical
 
         return getattr(canonical, name)
+    if name in (
+        "PORTABLE_STATE_FORMAT_VERSION",
+        "build_portable_state_document",
+        "normalize_portable_state_document",
+        "portable_state_digest",
+    ):
+        from . import portable_schema
+
+        return getattr(portable_schema, name)
     if name in (
         "CONTRACT_SCHEMA_VERSION",
         "IDENTITY_SCHEMA_VERSION",
@@ -95,6 +114,7 @@ def __getattr__(name):
         "OptimizerContract",
         "OptimizerContractProvider",
         "OptimizerStateLayout",
+        "LogicalRegion",
         "LogicalSlice",
         "ParameterLayout",
         "ParameterIdentity",
