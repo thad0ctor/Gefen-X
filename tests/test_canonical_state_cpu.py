@@ -22,6 +22,7 @@ from gefen import (
     ShardPlacement,
     ShardingManifest,
 )
+from gefen.rebinding import LogicalSlotBinding
 
 
 def _replicated(identity, group=None, member=None):
@@ -277,6 +278,7 @@ def test_initialized_import_maps_by_fqn_across_order_and_group_boundaries():
     input_magnitude_value = input_magnitude.clone()
 
     prepared = target.prepare_canonical_state_import(exported)
+    logical_slots = target._gefen_logical_slots
     assert isinstance(prepared, PreparedCanonicalStateImport)
     assert target._gefen_codebook is None
     assert exported["common"]["gefen_codebook"] is input_codebook
@@ -286,6 +288,7 @@ def test_initialized_import_maps_by_fqn_across_order_and_group_boundaries():
     target.commit_canonical_state_import(prepared)
 
     assert not load_hooks
+    assert target._gefen_logical_slots is logical_slots
     assert torch.equal(
         target.state[target_first]["m_magnitude"],
         source.state[source_first]["m_magnitude"],
@@ -308,6 +311,10 @@ def test_initialized_import_maps_by_fqn_across_order_and_group_boundaries():
     assert torch.equal(target_first, source_first)
     assert torch.equal(target_second, source_second)
     assert torch.equal(target._gefen_codebook, source._gefen_codebook)
+
+    target.move_state_("cpu")
+    assert target._gefen_logical_slots is logical_slots
+    assert target.optimizer_contract().capabilities.canonical_state_io
 
     with pytest.raises(RuntimeError, match="already consumed"):
         target.commit_canonical_state_import(prepared)
@@ -342,6 +349,44 @@ def test_prepared_import_rejects_wrong_optimizer_and_stale_live_state():
     with pytest.raises(RuntimeError, match="changed after"):
         target.commit_canonical_state_import(prepared)
     _assert_snapshot_identity(target, target_before)
+
+
+@pytest.mark.parametrize("mutation", ["registry_identity", "registry_structure"])
+def test_prepared_import_freshness_covers_logical_slot_registry(mutation):
+    parameter = torch.nn.Parameter(torch.ones(4))
+    optimizer = Gefen(
+        [("p", parameter)],
+        fused=False,
+        factored_v_2d=False,
+    )
+    identity = ParameterIdentity("Model.P", (4,))
+    shard = _replicated(identity)
+    _finalize(optimizer, ((parameter, shard),), ShardingManifest((shard,)))
+    prepared = optimizer.prepare_canonical_state_import(
+        optimizer.export_canonical_state()
+    )
+    slot = optimizer._gefen_logical_slots[0]
+    if mutation == "registry_identity":
+        optimizer._gefen_logical_slots = (
+            LogicalSlotBinding(
+                slot.group_index,
+                slot.original_slot_index,
+                slot.compatibility_name,
+                slot.shard,
+            ),
+        )
+    else:
+        object.__setattr__(
+            slot.shard,
+            "parameter",
+            ParameterIdentity("Model.Changed", (4,)),
+        )
+    assert optimizer._finalized_binding_layout_matches()
+    before = _snapshot(optimizer)
+
+    with pytest.raises(RuntimeError, match="changed after"):
+        optimizer.commit_canonical_state_import(prepared)
+    _assert_snapshot_identity(optimizer, before)
 
 
 @pytest.mark.parametrize(

@@ -1,6 +1,9 @@
 """CPU coverage for atomic pre-initialization parameter rebinding."""
 
 import copy
+from dataclasses import FrozenInstanceError, fields, is_dataclass, replace
+import gc
+import weakref
 
 import pytest
 import torch
@@ -19,6 +22,7 @@ from gefen import (
     ShardPlacement,
     ShardingManifest,
 )
+from gefen.rebinding import LogicalSlotBinding
 
 
 def _replicated(parameter, fqn, shape=None):
@@ -97,6 +101,23 @@ def _nested_equal(left, right):
         assert left == right
 
 
+def _contains_tensor(value):
+    if torch.is_tensor(value):
+        return True
+    if is_dataclass(value) and not isinstance(value, type):
+        return any(
+            _contains_tensor(getattr(value, field.name)) for field in fields(value)
+        )
+    if isinstance(value, dict):
+        return any(
+            _contains_tensor(key) or _contains_tensor(item)
+            for key, item in value.items()
+        )
+    if isinstance(value, (list, tuple, set, frozenset)):
+        return any(_contains_tensor(item) for item in value)
+    return False
+
+
 def _snapshot(optimizer):
     return {
         "state": optimizer.state,
@@ -120,6 +141,7 @@ def _snapshot(optimizer):
         "manifest": optimizer._gefen_sharding_manifest,
         "finalized": optimizer._gefen_post_sharding_finalized,
         "finalized_slots": optimizer._gefen_finalized_slots,
+        "logical_slots": optimizer._gefen_logical_slots,
         "caches": tuple(
             (name, getattr(optimizer, name))
             for name in (
@@ -146,6 +168,7 @@ def _assert_snapshot(optimizer, snapshot):
     assert optimizer._gefen_sharding_manifest is snapshot["manifest"]
     assert optimizer._gefen_post_sharding_finalized is snapshot["finalized"]
     assert optimizer._gefen_finalized_slots is snapshot["finalized_slots"]
+    assert optimizer._gefen_logical_slots is snapshot["logical_slots"]
     assert optimizer._capt_stacks is snapshot["capt_stacks"]
     assert optimizer._static_mark_sig is snapshot["static_mark_sig"]
     assert optimizer._gefen_global_step is snapshot["global_step"]
@@ -163,6 +186,200 @@ def _assert_snapshot(optimizer, snapshot):
         )
     for name, cache_ref in snapshot["caches"]:
         assert getattr(optimizer, name) is cache_ref
+
+
+@pytest.mark.parametrize(
+    ("changes", "error", "match"),
+    [
+        ({"group_index": True}, TypeError, "group_index must be an integer"),
+        ({"group_index": -1}, ValueError, "group_index must be nonnegative"),
+        (
+            {"original_slot_index": 1.0},
+            TypeError,
+            "original_slot_index must be an integer",
+        ),
+        (
+            {"original_slot_index": -1},
+            ValueError,
+            "original_slot_index must be nonnegative",
+        ),
+        (
+            {"compatibility_name": object()},
+            TypeError,
+            "compatibility_name must be a string",
+        ),
+        (
+            {"compatibility_name": "MixedCase"},
+            ValueError,
+            "compatibility_name must be lowercase",
+        ),
+        ({"shard": object()}, TypeError, "shard must be a ShardIdentity"),
+    ],
+)
+def test_logical_slot_binding_strict_validation(changes, error, match):
+    parameter = torch.nn.Parameter(torch.ones(4))
+    values = {
+        "group_index": 0,
+        "original_slot_index": 0,
+        "compatibility_name": "",
+        "shard": _replicated(parameter, "Weight"),
+    }
+    values.update(changes)
+
+    with pytest.raises(error, match=match):
+        LogicalSlotBinding(**values)
+
+
+def _interleaved_logical_slot_optimizer():
+    sources = [
+        torch.nn.Parameter(torch.full((2, 2), float(index + 1)))
+        for index in range(5)
+    ]
+    source_refs = tuple(weakref.ref(parameter) for parameter in sources)
+    names = (
+        "group0.live0",
+        "group0.remote",
+        "group0.live2",
+        "group1.remote",
+        "group1.live1",
+    )
+    optimizer = GefenMuon(
+        [
+            {"params": list(zip(names[:3], sources[:3]))},
+            {"params": list(zip(names[3:], sources[3:]))},
+        ],
+        fused=False,
+    )
+    process_group = ProcessGroupIdentity("data_parallel", ("rank:0", "rank:1"))
+    owners = ("rank:0", "rank:1", "rank:0", "rank:1", "rank:0")
+    records = []
+    local_shards = []
+    for index, owner in enumerate(owners):
+        identity = ParameterIdentity("Model.Parameter{}".format(index), (2, 2))
+        parameter_records = tuple(
+            _owner_shard(identity, process_group, member, owner)
+            for member in process_group.ordered_members
+        )
+        records.extend(parameter_records)
+        local_shards.append(
+            next(
+                shard
+                for shard in parameter_records
+                if shard.local_member == "rank:0"
+            )
+        )
+    targets = {
+        index: torch.nn.Parameter(sources[index].detach().clone())
+        for index in (0, 2, 4)
+    }
+    rebindings = [
+        ParameterRebinding(
+            sources[index],
+            targets.get(index),
+            local_shards[index],
+        )
+        for index in (4, 1, 3, 0, 2)
+    ]
+    optimizer.post_sharding(
+        rebindings,
+        manifest=ShardingManifest(tuple(records)),
+    )
+    return optimizer, source_refs, targets, tuple(local_shards), names
+
+
+def test_logical_slot_registry_preserves_original_interleaved_structure_without_tensors():
+    optimizer, source_refs, targets, local_shards, names = (
+        _interleaved_logical_slot_optimizer()
+    )
+    gc.collect()
+
+    assert all(reference() is None for reference in source_refs)
+    assert optimizer.param_groups[0]["params"] == [targets[0], targets[2]]
+    assert optimizer.param_groups[1]["params"] == [targets[4]]
+    assert optimizer.param_groups[0]["param_names"] == [names[0], names[2]]
+    assert optimizer.param_groups[1]["param_names"] == [names[4]]
+    assert tuple(
+        (slot.group_index, slot.original_slot_index)
+        for slot in optimizer._gefen_logical_slots
+    ) == ((0, 0), (0, 1), (0, 2), (1, 0), (1, 1))
+    assert tuple(
+        slot.compatibility_name for slot in optimizer._gefen_logical_slots
+    ) == names
+    assert tuple(
+        slot.shard for slot in optimizer._gefen_logical_slots
+    ) == local_shards
+    assert not _contains_tensor(optimizer._gefen_logical_slots)
+    assert all(
+        not hasattr(slot, "__dict__") for slot in optimizer._gefen_logical_slots
+    )
+    with pytest.raises(FrozenInstanceError):
+        optimizer._gefen_logical_slots[0].compatibility_name = "changed"
+    assert optimizer.optimizer_contract().capabilities.stable_shard_identity
+
+
+@pytest.mark.parametrize(
+    "corruption",
+    [
+        "logical_slots",
+        "manifest",
+        "finalized_slots",
+        "local_bindings",
+        "group_names",
+        "name_cache",
+        "state_name",
+    ],
+)
+def test_finalized_layout_guard_checks_logical_slot_caches_and_names(corruption):
+    parameters = [
+        torch.nn.Parameter(torch.full((4,), float(index + 1)))
+        for index in range(2)
+    ]
+    optimizer = Gefen(
+        [("first", parameters[0]), ("second", parameters[1])],
+        fused=False,
+        factored_v_2d=False,
+    )
+    shards = tuple(
+        _replicated(parameter, "Model.Parameter{}".format(index))
+        for index, parameter in enumerate(parameters)
+    )
+    optimizer.post_sharding(
+        tuple(
+            ParameterRebinding(parameter, parameter, shard)
+            for parameter, shard in zip(parameters, shards)
+        ),
+        manifest=ShardingManifest(shards),
+    )
+
+    if corruption == "logical_slots":
+        slots = optimizer._gefen_logical_slots
+        optimizer._gefen_logical_slots = (
+            replace(slots[0], compatibility_name="changed"),
+            slots[1],
+        )
+    elif corruption == "manifest":
+        optimizer._gefen_sharding_manifest = ShardingManifest(
+            (
+                _replicated(parameters[0], "Model.Parameter0", shape=(5,)),
+                shards[1],
+            )
+        )
+    elif corruption == "finalized_slots":
+        optimizer._gefen_finalized_slots = (tuple(reversed(parameters)),)
+    elif corruption == "local_bindings":
+        optimizer._gefen_local_shard_bindings = tuple(
+            reversed(optimizer._gefen_local_shard_bindings)
+        )
+    elif corruption == "group_names":
+        optimizer.param_groups[0]["param_names"].reverse()
+    elif corruption == "name_cache":
+        optimizer._param_names[parameters[0]] = "changed"
+    else:
+        optimizer.state[parameters[0]]["name"] = "changed"
+
+    assert not optimizer.optimizer_contract().capabilities.stable_shard_identity
+    with pytest.raises(RuntimeError, match="changed outside post_sharding"):
+        optimizer.state_dict()
 
 
 def test_replicated_rebind_preserves_legacy_name_and_enables_identity_contract():

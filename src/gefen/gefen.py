@@ -46,7 +46,7 @@ from gefen.contracts import (
     _gefen_contract,
 )
 from gefen.partitioning import find_period_by_block_variance
-from gefen.rebinding import ParameterRebinding
+from gefen.rebinding import LogicalSlotBinding, ParameterRebinding
 import gefen.quantization as quantization_module
 from gefen.kernels.automatic_vmean import (
     automatic_vmean_update_cuda as _automatic_vmean_update_cuda,
@@ -1212,6 +1212,7 @@ class Gefen(torch.optim.Optimizer):
         self._gefen_sharding_manifest = None
         self._gefen_post_sharding_finalized = False
         self._gefen_finalized_slots = ()
+        self._gefen_logical_slots = ()
         # ``set_optimizer_state_dict(flatten_optimizer_state_dict=True)`` uses
         # the *live* optimizer state/group keys as its unflattening schema before
         # it calls our loader. Publish the private rank-local transport keys only
@@ -1375,32 +1376,184 @@ class Gefen(torch.optim.Optimizer):
         return self._finalized_binding_layout_matches()
 
     def _finalized_binding_layout_matches(self) -> bool:
-        if len(self.param_groups) != len(self._gefen_finalized_slots):
-            return False
-        for group, expected in zip(self.param_groups, self._gefen_finalized_slots):
-            params = group.get("params")
-            if not isinstance(params, (list, tuple)) or len(params) != len(expected):
+        try:
+            if (
+                type(self._gefen_logical_slots) is not tuple
+                or not self._gefen_logical_slots
+                or type(self._gefen_finalized_slots) is not tuple
+                or type(self._gefen_local_shard_bindings) is not tuple
+                or type(self._gefen_shard_bindings) is not dict
+                or type(self._param_names) is not dict
+                or not isinstance(self._gefen_sharding_manifest, ShardingManifest)
+                or len(self.param_groups) != len(self._gefen_finalized_slots)
+            ):
                 return False
-            if any(live is not bound for live, bound in zip(params, expected)):
+
+            logical_groups = [[] for _ in self.param_groups]
+            logical_fqns = set()
+            previous_position = None
+            for logical_slot in self._gefen_logical_slots:
+                if (
+                    type(logical_slot) is not LogicalSlotBinding
+                    or type(logical_slot.group_index) is not int
+                    or type(logical_slot.original_slot_index) is not int
+                    or type(logical_slot.compatibility_name) is not str
+                    or logical_slot.compatibility_name
+                    != logical_slot.compatibility_name.lower()
+                    or not isinstance(logical_slot.shard, ShardIdentity)
+                ):
+                    return False
+                position = (
+                    logical_slot.group_index,
+                    logical_slot.original_slot_index,
+                )
+                if (
+                    logical_slot.group_index < 0
+                    or logical_slot.group_index >= len(logical_groups)
+                    or logical_slot.original_slot_index
+                    != len(logical_groups[logical_slot.group_index])
+                ):
+                    return False
+                if previous_position is None:
+                    if position != (0, 0):
+                        return False
+                elif logical_slot.group_index == previous_position[0]:
+                    if logical_slot.original_slot_index != previous_position[1] + 1:
+                        return False
+                elif position != (previous_position[0] + 1, 0):
+                    return False
+                fqn = logical_slot.shard.parameter.fqn
+                if fqn in logical_fqns:
+                    return False
+                logical_fqns.add(fqn)
+                logical_groups[logical_slot.group_index].append(logical_slot)
+                previous_position = position
+
+            if any(not group for group in logical_groups):
                 return False
-        live_params = [
-            param for group in self.param_groups for param in group["params"]
-        ]
-        bound = [
-            (parameter, shard)
-            for parameter, shard in self._gefen_local_shard_bindings
-            if parameter is not None
-        ]
-        if len(live_params) != len(bound) or len(self._gefen_shard_bindings) != len(
-            bound
+
+            manifest_shards = frozenset(self._gefen_sharding_manifest.shards)
+            if {
+                shard.parameter.fqn for shard in manifest_shards
+            } != logical_fqns or any(
+                logical_slot.shard not in manifest_shards
+                for logical_slot in self._gefen_logical_slots
+            ):
+                return False
+
+            local_bindings = {}
+            previous_sort_key = None
+            for item in self._gefen_local_shard_bindings:
+                if type(item) is not tuple or len(item) != 2:
+                    return False
+                parameter, shard = item
+                if parameter is not None and not isinstance(parameter, torch.Tensor):
+                    return False
+                if not isinstance(shard, ShardIdentity):
+                    return False
+                if previous_sort_key is not None and shard.sort_key < previous_sort_key:
+                    return False
+                previous_sort_key = shard.sort_key
+                fqn = shard.parameter.fqn
+                if fqn in local_bindings:
+                    return False
+                local_bindings[fqn] = (parameter, shard)
+            if set(local_bindings) != logical_fqns:
+                return False
+
+            expected_live_groups = []
+            expected_name_groups = []
+            expected_live_bindings = []
+            for logical_group in logical_groups:
+                live_group = []
+                name_group = []
+                for logical_slot in logical_group:
+                    parameter, shard = local_bindings[
+                        logical_slot.shard.parameter.fqn
+                    ]
+                    if shard != logical_slot.shard:
+                        return False
+                    pruned = (
+                        shard.layout is ParameterLayout.WHOLE_PARAMETER_OWNER
+                        and shard.local_member != shard.owner
+                    )
+                    if pruned:
+                        if parameter is not None:
+                            return False
+                        continue
+                    if parameter is None:
+                        return False
+                    live_group.append(parameter)
+                    name_group.append(logical_slot.compatibility_name)
+                    expected_live_bindings.append((parameter, shard))
+                expected_live_groups.append(tuple(live_group))
+                expected_name_groups.append(tuple(name_group))
+
+            if len(self._gefen_shard_bindings) != len(expected_live_bindings):
+                return False
+            expected_live_ids = {
+                id(parameter) for parameter, _ in expected_live_bindings
+            }
+            if len(expected_live_ids) != len(expected_live_bindings):
+                return False
+            if {
+                id(parameter) for parameter in self._gefen_shard_bindings
+            } != expected_live_ids:
+                return False
+            for parameter, shard in expected_live_bindings:
+                if self._gefen_shard_bindings.get(parameter) != shard:
+                    return False
+
+            if len(self._param_names) != len(expected_live_bindings):
+                return False
+            if {
+                id(parameter) for parameter in self._param_names
+            } != expected_live_ids:
+                return False
+            for group_index, (group, expected_params, expected_names) in enumerate(
+                zip(self.param_groups, expected_live_groups, expected_name_groups)
+            ):
+                params = group.get("params")
+                names = group.get("param_names")
+                finalized = self._gefen_finalized_slots[group_index]
+                if (
+                    not isinstance(params, (list, tuple))
+                    or not isinstance(names, (list, tuple))
+                    or type(finalized) is not tuple
+                    or len(params) != len(expected_params)
+                    or len(names) != len(expected_names)
+                    or len(finalized) != len(expected_params)
+                ):
+                    return False
+                if any(
+                    live is not expected
+                    for live, expected in zip(params, expected_params)
+                ) or any(
+                    bound is not expected
+                    for bound, expected in zip(finalized, expected_params)
+                ):
+                    return False
+                if tuple(names) != expected_names:
+                    return False
+                for parameter, expected_name in zip(expected_params, expected_names):
+                    if self._param_names.get(parameter) != expected_name:
+                        return False
+                    parameter_state = self.state.get(parameter)
+                    if (
+                        type(parameter_state) is not dict
+                        or parameter_state.get("name") != expected_name
+                    ):
+                        return False
+            return True
+        except (
+            AttributeError,
+            IndexError,
+            KeyError,
+            RuntimeError,
+            TypeError,
+            ValueError,
         ):
             return False
-        for parameter, shard in bound:
-            if not self._parameter_in(live_params, parameter):
-                return False
-            if self._gefen_shard_bindings.get(parameter) != shard:
-                return False
-        return True
 
     def _assert_finalized_binding_layout(self) -> None:
         if self._gefen_post_sharding_finalized and not self._finalized_binding_layout_matches():
@@ -1880,6 +2033,7 @@ class Gefen(torch.optim.Optimizer):
             or self._gefen_local_shard_bindings
             or self._gefen_sharding_manifest is not None
             or self._gefen_finalized_slots
+            or self._gefen_logical_slots
         ):
             raise RuntimeError(
                 "Gefen parameter rebinding found an incomplete prior identity plan"
@@ -2284,8 +2438,9 @@ class Gefen(torch.optim.Optimizer):
         staged._param_names = {}
         staged._gefen_shard_bindings = {}
         local_bindings = []
+        logical_slots = []
         slot_cursor = 0
-        for group in self.param_groups:
+        for group_index, group in enumerate(self.param_groups):
             staged_group = dict(group)
             staged_group.pop("_gefen_checkpoint_metadata", None)
             staged_params = []
@@ -2293,13 +2448,21 @@ class Gefen(torch.optim.Optimizer):
             names = list(group.get("param_names", ()))
             if len(names) != len(group["params"]):
                 names = [self._param_name(param) for param in group["params"]]
-            for _ in names:
+            for original_slot_index, _ in enumerate(names):
                 binding_index = assigned_positions[slot_cursor]
                 rebinding = rebindings[binding_index]
                 compatibility_name = binding_names[binding_index]
                 slot_cursor += 1
                 target = rebinding.new_parameter
                 local_bindings.append((target, rebinding.shard))
+                logical_slots.append(
+                    LogicalSlotBinding(
+                        group_index,
+                        original_slot_index,
+                        compatibility_name,
+                        rebinding.shard,
+                    )
+                )
                 if target is None:
                     continue
                 staged_params.append(target)
@@ -2314,6 +2477,7 @@ class Gefen(torch.optim.Optimizer):
         staged._gefen_local_shard_bindings = tuple(
             sorted(local_bindings, key=lambda item: item[1].sort_key)
         )
+        staged._gefen_logical_slots = tuple(logical_slots)
         staged._gefen_sharding_manifest = manifest
         staged._gefen_post_sharding_finalized = True
         staged._gefen_codebook_process_group = codebook_process_group
@@ -2828,11 +2992,32 @@ class Gefen(torch.optim.Optimizer):
 
     def _sync_param_names_to_state(self) -> None:
         self._param_names = {}
-        for group in self.param_groups:
+        logical_groups = None
+        if self._gefen_post_sharding_finalized:
+            logical_groups = [[] for _ in self.param_groups]
+            for logical_slot in self._gefen_logical_slots:
+                if (
+                    logical_slot.shard.layout
+                    is ParameterLayout.WHOLE_PARAMETER_OWNER
+                    and logical_slot.shard.local_member != logical_slot.shard.owner
+                ):
+                    continue
+                logical_groups[logical_slot.group_index].append(
+                    logical_slot.compatibility_name
+                )
+        for group_index, group in enumerate(self.param_groups):
             params = group["params"]
-            names = list(group.get("param_names", ()))
-            if len(names) != len(params):
-                names = [self._param_name(p) for p in params]
+            if logical_groups is None:
+                names = list(group.get("param_names", ()))
+                if len(names) != len(params):
+                    names = [self._param_name(p) for p in params]
+            else:
+                names = logical_groups[group_index]
+                if len(names) != len(params):
+                    raise RuntimeError(
+                        "Gefen finalized logical-slot registry does not match the "
+                        "loaded layout"
+                    )
             normalized_names = []
             for param, name in zip(params, names):
                 name = str(name).lower()
@@ -6052,6 +6237,19 @@ class Gefen(torch.optim.Optimizer):
             id(self._gefen_codebook_process_group),
             self._canonical_value_token(self._serialized_codebook_scope()),
             id(self._gefen_sharding_manifest),
+            id(self._gefen_logical_slots),
+            tuple(
+                (
+                    id(logical_slot),
+                    logical_slot.group_index,
+                    logical_slot.original_slot_index,
+                    logical_slot.compatibility_name,
+                    self._canonical_value_token(
+                        self._serialized_canonical_shard(logical_slot.shard)
+                    ),
+                )
+                for logical_slot in self._gefen_logical_slots
+            ),
             tuple(
                 (id(parameter), shard.sort_key)
                 for parameter, shard in self._gefen_local_shard_bindings
