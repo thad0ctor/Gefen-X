@@ -3019,8 +3019,20 @@ class Gefen(torch.optim.Optimizer):
         return False
 
     def _state_offload_rejection_reason(
-        self, *, require_cpu_state: bool, allow_poisoned: bool = False
+        self,
+        *,
+        require_cpu_state: bool,
+        allow_poisoned: bool = False,
+        require_full_layout: bool = False,
     ):
+        # ``require_full_layout`` controls only the immutable finalized-LAYOUT
+        # forensics reached through ``_state_movement_rejection_reason``. It
+        # defaults to False so the per-step offload-readiness caller reuses the
+        # memoized layout verdict; boundary callers (activation, load, contract
+        # readiness) pass True for a full rebuild. Every per-tensor offload
+        # check below still runs on each call regardless of this flag, because
+        # offloaded per-parameter state tensors are legitimately replaced each
+        # step and a cached verdict there would miss corruption.
         if type(self) is not Gefen:
             return "native state offload is implemented only by plain Gefen"
         if self.state_offload_active and self.state_offload_device != torch.device(
@@ -3054,7 +3066,9 @@ class Gefen(torch.optim.Optimizer):
             except RuntimeError:
                 return "the CUDA graph-capture state could not be inspected"
 
-        movement_reason = self._state_movement_rejection_reason()
+        movement_reason = self._state_movement_rejection_reason(
+            require_full_layout=require_full_layout
+        )
         if movement_reason is not None:
             return movement_reason
 
@@ -3142,7 +3156,8 @@ class Gefen(torch.optim.Optimizer):
 
         try:
             reason = self._state_offload_rejection_reason(
-                require_cpu_state=self.state_offload_active
+                require_cpu_state=self.state_offload_active,
+                require_full_layout=True,
             )
         except Exception:
             return False
@@ -3309,7 +3324,9 @@ class Gefen(torch.optim.Optimizer):
 
         target = self._normalize_state_offload_target(device)
         self._assert_finalized_binding_layout(full=True)
-        reason = self._state_offload_rejection_reason(require_cpu_state=False)
+        reason = self._state_offload_rejection_reason(
+            require_cpu_state=False, require_full_layout=True
+        )
         if reason is not None:
             raise RuntimeError("Gefen state offload is unavailable: {}".format(reason))
         staged_state = self._stage_all_parameter_state_to_cpu()
@@ -3356,10 +3373,17 @@ class Gefen(torch.optim.Optimizer):
                 )
         self.move_state_()
 
-    def _state_movement_rejection_reason(self):
+    def _state_movement_rejection_reason(self, *, require_full_layout: bool = True):
+        # The finalized layout is immutable across steps, so the per-step
+        # offload-readiness caller passes ``require_full_layout=False`` to reuse
+        # the memoized layout-forensics verdict (an O(local params) identity
+        # token check) instead of forcing an uncached full rebuild + manifest
+        # digest recompute every step. Boundary callers (``move_state_``,
+        # ``_atomic_state_movement_supported``) keep the default full rebuild.
+        # The per-tensor state checks below always run regardless.
         if (
             self._gefen_post_sharding_finalized
-            and not self._finalized_binding_layout_matches(full=True)
+            and not self._finalized_binding_layout_matches(full=require_full_layout)
         ):
             return "the finalized parameter binding no longer matches live groups"
         if self.capturable:
@@ -8375,6 +8399,7 @@ class Gefen(torch.optim.Optimizer):
             reason = staged._state_offload_rejection_reason(
                 require_cpu_state=False,
                 allow_poisoned=True,
+                require_full_layout=True,
             )
             if reason is not None:
                 raise RuntimeError(

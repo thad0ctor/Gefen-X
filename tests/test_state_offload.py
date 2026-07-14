@@ -653,3 +653,122 @@ def test_capturable_compile_and_capture_states_fail_closed(monkeypatch):
     monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
     with pytest.raises(RuntimeError, match="CUDA graph capture"):
         optimizer.offload_state_()
+
+
+def _replicated_shard(fqn, shape):
+    identity = ParameterIdentity(fqn, shape)
+    return ShardIdentity(
+        identity,
+        ParameterLayout.REPLICATED,
+        LogicalSlice.full(identity),
+    )
+
+
+def _finalized_replicated_cuda_optimizer(count=3):
+    parameters = [
+        torch.nn.Parameter(torch.full((4,), float(index + 1), device="cuda"))
+        for index in range(count)
+    ]
+    optimizer = Gefen(
+        [
+            ("weight{}".format(index), parameter)
+            for index, parameter in enumerate(parameters)
+        ],
+        fused=False,
+        factored_v_2d=False,
+    )
+    optimizer._resolve_automatic_period = lambda *args, **kwargs: 4
+    shards = tuple(
+        _replicated_shard("Model.Weight{}".format(index), (4,))
+        for index in range(count)
+    )
+    optimizer.post_sharding(
+        tuple(
+            ParameterRebinding(parameter, parameter, shard)
+            for parameter, shard in zip(parameters, shards)
+        ),
+        manifest=ShardingManifest(shards),
+    )
+    return optimizer, parameters
+
+
+def _step_offload(optimizer, parameters):
+    for parameter in parameters:
+        parameter.grad = torch.full_like(parameter, 0.5)
+    optimizer.step()
+
+
+def _count_full_layout_passes(monkeypatch):
+    calls = {"count": 0}
+    original = Gefen._finalized_binding_layout_matches_full
+
+    def counted(self):
+        calls["count"] += 1
+        return original(self)
+
+    monkeypatch.setattr(Gefen, "_finalized_binding_layout_matches_full", counted)
+    return calls
+
+
+def _count_manifest_digest_computes(monkeypatch):
+    calls = {"count": 0}
+    original = Gefen._compute_codebook_manifest_fingerprint
+
+    def counted(self, manifest):
+        calls["count"] += 1
+        return original(self, manifest)
+
+    monkeypatch.setattr(Gefen, "_compute_codebook_manifest_fingerprint", counted)
+    return calls
+
+
+@_CUDA_REQUIRED
+def test_offload_steady_state_reuses_cached_layout_forensics(monkeypatch):
+    # The finalized layout is immutable across steps, so the per-step offload
+    # readiness path (called ~2x/step) must reuse the memoized layout-forensics
+    # verdict instead of rebuilding the full layout + recomputing the manifest
+    # digest on every step. The per-tensor offload scan still runs every step;
+    # only the immutable layout forensics is cached.
+    optimizer, parameters = _finalized_replicated_cuda_optimizer()
+    optimizer.offload_state_()
+
+    layout = _count_full_layout_passes(monkeypatch)
+    digest = _count_manifest_digest_computes(monkeypatch)
+
+    # The first offloaded step still fully validates the layout once, because
+    # offload_state_ invalidated the cached verdict; that single full pass
+    # recomputes the manifest digest once.
+    _step_offload(optimizer, parameters)
+    first_layout = layout["count"]
+    first_digest = digest["count"]
+    assert first_layout >= 1
+    assert first_digest >= 1
+
+    # Steady state: neither the full layout rebuild nor the manifest digest is
+    # recomputed again. On the pre-fix code each of the two per-step readiness
+    # calls forced a full rebuild + digest recompute, so these counts grew by
+    # four per step.
+    for _ in range(3):
+        _step_offload(optimizer, parameters)
+    assert layout["count"] == first_layout
+    assert digest["count"] == first_digest
+
+
+@_CUDA_REQUIRED
+def test_offload_layout_change_is_still_caught_with_a_warm_verdict():
+    optimizer, parameters = _finalized_replicated_cuda_optimizer()
+    optimizer.offload_state_()
+    _step_offload(optimizer, parameters)  # warm the cached layout verdict
+
+    # Replace a finalized registry container so the fast-path tokens diverge:
+    # the offload readiness path must fall back to the full forensic rebuild and
+    # reject the step before any parameter is staged or mutated.
+    first_before = parameters[0].detach().clone()
+    optimizer._gefen_local_shard_bindings = tuple(
+        reversed(optimizer._gefen_local_shard_bindings)
+    )
+    for parameter in parameters:
+        parameter.grad = torch.full_like(parameter, 0.5)
+    with pytest.raises(RuntimeError, match="cannot step"):
+        optimizer.step()
+    assert torch.equal(parameters[0].detach(), first_before)
