@@ -569,8 +569,12 @@ def _reversed_order_worker(rank, world, port, result_queue):
             world_size=world,
             timeout=timedelta(seconds=12),
         )
-        mesh = init_device_mesh("cpu", (world,))
-        second_mesh = init_device_mesh("cpu", (world,))
+        mesh = init_device_mesh(
+            "cpu", (world,), mesh_dim_names=("primary",)
+        )
+        second_mesh = init_device_mesh(
+            "cpu", (world,), mesh_dim_names=("secondary",)
+        )
         results = []
 
         import warnings
@@ -583,7 +587,7 @@ def _reversed_order_worker(rank, world, port, result_queue):
             "bare_ambiguous",
             "duplicate_names",
             "duplicate_one_rank",
-            "cross_mesh_reversed",
+            "asymmetric_second_mesh",
         ):
             generator = torch.Generator(device="cpu").manual_seed(
                 6100 + len(results)
@@ -597,7 +601,7 @@ def _reversed_order_worker(rank, world, port, result_queue):
                 in ("bare_ambiguous", "duplicate_names", "duplicate_one_rank")
                 else (6, 10)
             )
-            b_mesh = second_mesh if case == "cross_mesh_reversed" else mesh
+            b_mesh = second_mesh if case == "asymmetric_second_mesh" else mesh
             full_a = torch.randn(8, 8, generator=generator)
             full_a_grad = torch.randn(8, 8, generator=generator) * 0.01
             full_b = torch.randn(*b_shape, generator=generator)
@@ -618,11 +622,15 @@ def _reversed_order_worker(rank, world, port, result_queue):
                 params = (
                     [("w", a), ("w", b)] if rank == 1 else [("a", a), ("b", b)]
                 )
+            elif case == "asymmetric_second_mesh":
+                # Both ranks retain A as the common first consensus anchor, but
+                # only rank 0 registers B on a second mesh. The fixed header
+                # must reject this globally and stop; rank 0 must never enter an
+                # unmatched second anchor after rank 1 has returned.
+                params = [("a", a), ("b", b)] if rank == 0 else [("a", a)]
             else:
                 params = [("a", a), ("b", b)]
-                if (
-                    case.startswith("reversed") or case == "cross_mesh_reversed"
-                ) and rank == 1:
+                if case.startswith("reversed") and rank == 1:
                     params = list(reversed(params))
             optimizer = GefenMuon(
                 params,
@@ -740,32 +748,44 @@ def test_sharded_grad_presence_check_rejects_rank_divergent_order():
             "bare_ambiguous",
             "duplicate_names",
             "duplicate_one_rank",
-            "cross_mesh_reversed",
+            "asymmetric_second_mesh",
         }, (rank, cases)
         # Duplicate explicit labels defeat cross-rank identification, so they
         # fail closed even with aligned order and full gradient presence —
         # and the rank whose own labels are clean must raise too, via the
         # reduced flag, instead of blocking in an abandoned collective.
-        for case in ("duplicate_names", "duplicate_one_rank"):
-            message = cases[case]["message"]
-            assert message is not None, (rank, case)
-            assert "unique name" in message, (rank, case, message)
-        # Order swaps between parameters on different meshes are step-fatal
-        # too; the optimizer-wide position probe must catch them.
-        message = cases["cross_mesh_reversed"]["message"]
-        assert message is not None, (rank, "cross_mesh_reversed")
-        assert "identical parameter-group order" in message, (rank, message)
+        message = cases["duplicate_names"]["message"]
+        assert message is not None, (rank, "duplicate_names")
+        assert "unique name" in message, (rank, "duplicate_names", message)
+        # A duplicate introduced on only one rank now fails one layer earlier:
+        # the constant-size intent header detects the asymmetric identity stream
+        # before the detailed name validator. Both diagnostics are fail-closed;
+        # this one is what guarantees the clean-label peer rejects too.
+        message = cases["duplicate_one_rank"]["message"]
+        assert message is not None, (rank, "duplicate_one_rank")
+        assert "identical DTensor parameter membership" in message, (
+            rank,
+            "duplicate_one_rank",
+            message,
+        )
+        # A secondary mesh present on only one rank must stop after the one
+        # common fixed header; no rank may enter a variable second anchor.
+        message = cases["asymmetric_second_mesh"]["message"]
+        assert message is not None, (rank, "asymmetric_second_mesh")
+        assert "identical DTensor parameter membership" in message, (
+            rank,
+            message,
+        )
         # Rank-divergent order is rejected up front, with or without a
         # gradient-presence mismatch layered on top.
         for case in ("reversed_mismatch", "reversed_consistent"):
             message = cases[case]["message"]
             assert message is not None, (rank, case)
-            assert "identical parameter-group order" in message, (
+            assert "identical DTensor parameter membership" in message, (
                 rank,
                 case,
                 message,
             )
-            assert "a" in message and "b" in message, (rank, case, message)
         message = cases["aligned_mismatch"]["message"]
         assert message is not None, (rank, "aligned_mismatch")
         assert "identical gradient presence" in message, (rank, message)
@@ -790,7 +810,7 @@ def test_sharded_grad_presence_check_rejects_rank_divergent_order():
             "aligned_consistent",
             "duplicate_names",
             "duplicate_one_rank",
-            "cross_mesh_reversed",
+            "asymmetric_second_mesh",
         ):
             assert not cases[case]["warned"], (rank, case)
 
@@ -801,7 +821,7 @@ def test_sharded_grad_presence_check_rejects_rank_divergent_order():
         "reversed_consistent",
         "aligned_mismatch",
         "duplicate_names",
-        "cross_mesh_reversed",
+        "asymmetric_second_mesh",
     ):
         assert (
             rank_results[0][case]["message"] == rank_results[1][case]["message"]
@@ -938,3 +958,402 @@ def test_cpu_mesh_preflights_never_query_cuda_capture_state():
     # protocol; skipping the CUDA query must not change the decision.
     for rank, payload in rank_results.items():
         assert payload["native_amp"] is True, (rank, payload)
+
+
+def _two_dimensional_mesh_rejection_worker(rank, world, port, result_queue):
+    import torch.distributed as dist
+    from torch.distributed.tensor import (
+        Replicate,
+        Shard,
+        distribute_tensor,
+        init_device_mesh,
+    )
+
+    try:
+        os.environ["MASTER_ADDR"] = "127.0.0.1"
+        os.environ["MASTER_PORT"] = port
+        os.environ["RANK"] = str(rank)
+        os.environ["WORLD_SIZE"] = str(world)
+        dist.init_process_group(
+            "gloo",
+            rank=rank,
+            world_size=world,
+            timeout=timedelta(seconds=30),
+        )
+        mesh = init_device_mesh(
+            "cpu",
+            (2, 2),
+            mesh_dim_names=("shard", "replicate"),
+        )
+        placements = [Shard(0), Replicate()]
+        full = torch.arange(64, dtype=torch.float32).reshape(8, 8).div_(64)
+        full_grad = torch.arange(64, dtype=torch.float32).reshape(8, 8).sin()
+        parameter = nn.Parameter(
+            distribute_tensor(full.clone(), mesh, placements)
+        )
+        parameter.grad = distribute_tensor(full_grad.clone(), mesh, placements)
+        before = parameter.to_local().detach().clone()
+        message = None
+        try:
+            GefenMuon(
+                [("weight", parameter)],
+                lr=5e-2,
+                weight_decay=0.0,
+                fused=False,
+                ns_steps=1,
+                sharded_mode="exact",
+            )
+        except RuntimeError as exc:
+            message = str(exc)
+        result_queue.put(
+            (
+                "result",
+                rank,
+                {
+                    "message": message,
+                    "unchanged": torch.equal(
+                        before, parameter.to_local().detach()
+                    ),
+                },
+            )
+        )
+    except Exception:
+        result_queue.put(("error", rank, traceback.format_exc()))
+    finally:
+        if dist.is_initialized():
+            dist.destroy_process_group()
+
+
+@pytest.mark.skipif(
+    not torch.distributed.is_available() or not torch.distributed.is_gloo_available(),
+    reason="2-D DeviceMesh intent regression needs Gloo",
+)
+def test_muon_rejects_multidimensional_mesh_before_optimizer_collectives():
+    import torch.multiprocessing as mp
+
+    world = 4
+    context = mp.get_context("spawn")
+    result_queue = context.Queue()
+    port = _free_port()
+    processes = [
+        context.Process(
+            target=_two_dimensional_mesh_rejection_worker,
+            args=(rank, world, port, result_queue),
+        )
+        for rank in range(world)
+    ]
+    for process in processes:
+        process.start()
+
+    messages = []
+    try:
+        for _ in range(world):
+            messages.append(result_queue.get(timeout=90))
+    except queue.Empty:
+        pass
+    finally:
+        for process in processes:
+            process.join(timeout=10)
+        for process in processes:
+            if process.is_alive():
+                process.terminate()
+                process.join(timeout=5)
+
+    assert all(process.exitcode == 0 for process in processes), [
+        process.exitcode for process in processes
+    ]
+    errors = [payload for kind, _, payload in messages if kind == "error"]
+    assert not errors, "\n".join(errors)
+    results = {
+        rank: payload for kind, rank, payload in messages if kind == "result"
+    }
+    assert set(results) == set(range(world)), messages
+    for rank, payload in results.items():
+        assert "one-dimensional DeviceMesh" in payload["message"], (
+            rank,
+            payload,
+        )
+        assert payload["unchanged"], (rank, payload)
+
+
+def _subgroup_nonmember_late_add_worker(rank, world, port, result_queue):
+    import torch.distributed as dist
+    from torch.distributed.tensor import Shard, distribute_tensor, init_device_mesh
+
+    try:
+        os.environ["MASTER_ADDR"] = "127.0.0.1"
+        os.environ["MASTER_PORT"] = port
+        os.environ["RANK"] = str(rank)
+        os.environ["WORLD_SIZE"] = str(world)
+        dist.init_process_group(
+            "gloo",
+            rank=rank,
+            world_size=world,
+            timeout=timedelta(seconds=20),
+        )
+        full_mesh = init_device_mesh("cpu", (world,))
+        subgroup_mesh = init_device_mesh("cpu", (world - 1,))
+        full = torch.arange(16, dtype=torch.float32).reshape(4, 4)
+        full_parameter = nn.Parameter(
+            distribute_tensor(full.clone(), full_mesh, [Shard(0)])
+        )
+        subgroup_parameter = nn.Parameter(
+            distribute_tensor(full, subgroup_mesh, [Shard(0)])
+        )
+        base_parameter = nn.Parameter(torch.ones(4, 4))
+        plain_optimizer = GefenMuon(
+            [("base", base_parameter)],
+            lr=1e-3,
+            fused=False,
+            ns_steps=1,
+            sharded_mode="exact",
+        )
+        anchored_optimizer = GefenMuon(
+            [("full", full_parameter)],
+            lr=1e-3,
+            fused=False,
+            ns_steps=1,
+            sharded_mode="exact",
+        )
+
+        plain_message = None
+        try:
+            plain_optimizer.add_param_group(
+                {"params": [("subgroup", subgroup_parameter)]}
+            )
+        except RuntimeError as exc:
+            plain_message = str(exc)
+        anchored_message = None
+        try:
+            anchored_optimizer.add_param_group(
+                {"params": [("subgroup", subgroup_parameter)]}
+            )
+        except RuntimeError as exc:
+            anchored_message = str(exc)
+        result_queue.put(
+            (
+                "result",
+                rank,
+                {
+                    "coordinate": subgroup_mesh.get_coordinate(),
+                    "plain_message": plain_message,
+                    "plain_group_count": len(plain_optimizer.param_groups),
+                    "anchored_message": anchored_message,
+                    "anchored_group_count": len(anchored_optimizer.param_groups),
+                },
+            )
+        )
+    except Exception:
+        result_queue.put(("error", rank, traceback.format_exc()))
+    finally:
+        if dist.is_initialized():
+            dist.destroy_process_group()
+
+
+@pytest.mark.skipif(
+    not torch.distributed.is_available() or not torch.distributed.is_gloo_available(),
+    reason="subgroup nonmember late-add regression needs Gloo",
+)
+def test_subgroup_dtensor_add_rejects_before_registration_on_all_world_ranks():
+    import torch.multiprocessing as mp
+
+    world = 3
+    context = mp.get_context("spawn")
+    result_queue = context.Queue()
+    port = _free_port()
+    processes = [
+        context.Process(
+            target=_subgroup_nonmember_late_add_worker,
+            args=(rank, world, port, result_queue),
+        )
+        for rank in range(world)
+    ]
+    for process in processes:
+        process.start()
+
+    messages = []
+    try:
+        for _ in range(world):
+            messages.append(result_queue.get(timeout=60))
+    except queue.Empty:
+        pass
+    finally:
+        for process in processes:
+            process.join(timeout=10)
+        for process in processes:
+            if process.is_alive():
+                process.terminate()
+                process.join(timeout=5)
+
+    assert all(process.exitcode == 0 for process in processes), [
+        process.exitcode for process in processes
+    ]
+    errors = [payload for kind, _, payload in messages if kind == "error"]
+    assert not errors, "\n".join(errors)
+    results = {
+        rank: payload for kind, rank, payload in messages if kind == "result"
+    }
+    assert set(results) == set(range(world)), messages
+    assert results[world - 1]["coordinate"] is None
+    for rank, payload in results.items():
+        for key in ("plain_message", "anchored_message"):
+            assert "span the initialized default process group" in payload[key], (
+                rank,
+                payload,
+            )
+        assert payload["plain_group_count"] == 1, (rank, payload)
+        assert payload["anchored_group_count"] == 1, (rank, payload)
+
+
+def _distinct_mesh_route_worker(rank, world, port, result_queue):
+    import torch.distributed as dist
+    from torch.distributed.tensor import Shard, distribute_tensor, init_device_mesh
+
+    try:
+        os.environ["MASTER_ADDR"] = "127.0.0.1"
+        os.environ["MASTER_PORT"] = port
+        os.environ["RANK"] = str(rank)
+        os.environ["WORLD_SIZE"] = str(world)
+        dist.init_process_group(
+            "gloo",
+            rank=rank,
+            world_size=world,
+            timeout=timedelta(seconds=20),
+        )
+        mesh_a = init_device_mesh(
+            "cpu", (world,), mesh_dim_names=("dp",)
+        )
+        mesh_b = init_device_mesh(
+            "cpu", (world,), mesh_dim_names=("dp",)
+        )
+        full = torch.arange(64, dtype=torch.float32).reshape(8, 8).div_(64)
+        # Wrapping an equal-topology DTensor in nn.Parameter canonicalizes its
+        # DeviceMesh on recent PyTorch. Raw detached leaf DTensors preserve the
+        # distinct live c10d routes that the optimizer must distinguish.
+        parameter_a = distribute_tensor(
+            full.clone(), mesh_a, [Shard(0)]
+        ).requires_grad_()
+        parameter_b = distribute_tensor(
+            full.clone(), mesh_b, [Shard(0)]
+        ).requires_grad_()
+        parameter = parameter_a if rank == 0 else parameter_b
+        before = parameter.to_local().detach().clone()
+        optimizer = GefenMuon(
+            [("weight", parameter)],
+            lr=1e-3,
+            fused=False,
+            ns_steps=1,
+            sharded_mode="exact",
+        )
+        message = None
+        try:
+            optimizer._assert_sharded_mode_collective_intent_consistent()
+        except RuntimeError as exc:
+            message = str(exc)
+        result_queue.put(
+            (
+                "result",
+                rank,
+                {
+                    "message": message,
+                    "group_a": str(mesh_a.get_group().group_name),
+                    "group_b": str(mesh_b.get_group().group_name),
+                    "parameter_a_group": str(
+                        parameter_a.device_mesh.get_group().group_name
+                    ),
+                    "parameter_b_group": str(
+                        parameter_b.device_mesh.get_group().group_name
+                    ),
+                    "selected_group": str(
+                        parameter.device_mesh.get_group().group_name
+                    ),
+                    "is_leaf": parameter.is_leaf,
+                    "portable": optimizer._gradient_preflight_portable_mesh_key(
+                        parameter.device_mesh
+                    ),
+                    "unchanged": torch.equal(
+                        before, parameter.to_local().detach()
+                    ),
+                    "baseline": (
+                        getattr(
+                            optimizer,
+                            "_gefen_muon_collective_intent_baseline",
+                            None,
+                        )
+                        is None
+                    ),
+                },
+            )
+        )
+    except Exception:
+        result_queue.put(("error", rank, traceback.format_exc()))
+    finally:
+        if dist.is_initialized():
+            dist.destroy_process_group()
+
+
+@pytest.mark.skipif(
+    not torch.distributed.is_available() or not torch.distributed.is_gloo_available(),
+    reason="distinct DeviceMesh routing regression needs Gloo",
+)
+def test_intent_distinguishes_distinct_mesh_routes_or_accepts_shared_group():
+    import torch.multiprocessing as mp
+
+    world = 2
+    context = mp.get_context("spawn")
+    result_queue = context.Queue()
+    port = _free_port()
+    processes = [
+        context.Process(
+            target=_distinct_mesh_route_worker,
+            args=(rank, world, port, result_queue),
+        )
+        for rank in range(world)
+    ]
+    for process in processes:
+        process.start()
+
+    messages = []
+    try:
+        for _ in range(world):
+            messages.append(result_queue.get(timeout=60))
+    except queue.Empty:
+        pass
+    finally:
+        for process in processes:
+            process.join(timeout=10)
+        for process in processes:
+            if process.is_alive():
+                process.terminate()
+                process.join(timeout=5)
+
+    assert all(process.exitcode == 0 for process in processes), [
+        process.exitcode for process in processes
+    ]
+    errors = [payload for kind, _, payload in messages if kind == "error"]
+    assert not errors, "\n".join(errors)
+    results = {
+        rank: payload for kind, rank, payload in messages if kind == "result"
+    }
+    assert set(results) == set(range(world)), messages
+    assert results[0]["group_a"] == results[1]["group_a"]
+    assert results[0]["group_b"] == results[1]["group_b"]
+    for payload in results.values():
+        assert payload["parameter_a_group"] == payload["group_a"]
+        assert payload["parameter_b_group"] == payload["group_b"]
+    assert results[0]["selected_group"] == results[0]["group_a"]
+    assert results[1]["selected_group"] == results[1]["group_b"]
+    for rank, payload in results.items():
+        assert payload["is_leaf"], (rank, payload)
+        assert payload["unchanged"], (rank, payload)
+        if payload["group_a"] != payload["group_b"]:
+            assert payload["message"] is not None, (rank, payload)
+            assert (
+                "identical DTensor parameter membership" in payload["message"]
+            ), (rank, payload)
+            assert payload["baseline"], (rank, payload)
+        else:
+            # PyTorch 2.5 reuses the default-world group for equivalent 1-D
+            # DeviceMeshes. There is no distinct live route to reject.
+            assert payload["message"] is None, (rank, payload)
+            assert not payload["baseline"], (rank, payload)

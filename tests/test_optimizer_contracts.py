@@ -124,6 +124,27 @@ def _checkpoint_support(contract, transport, layout):
     ]
 
 
+def _adamw_adapter_training():
+    return (
+        TrainingSupport(ParameterLayout.REPLICATED, ProcessGroupScope.NONE),
+        TrainingSupport(
+            ParameterLayout.FLATTENED_ELEMENT_SHARD,
+            ProcessGroupScope.NONE,
+        ),
+        TrainingSupport(
+            ParameterLayout.WHOLE_PARAMETER_OWNER,
+            ProcessGroupScope.ADAPTER_DEFINED,
+            requires_complete_parameter_storage=True,
+            requires_post_step_parameter_sync=True,
+        ),
+        TrainingSupport(
+            _DTENSOR,
+            ProcessGroupScope.INFERRED_DEVICE_MESH,
+            mesh_dimensions=(1,),
+        ),
+    )
+
+
 @pytest.mark.parametrize("factored_v_2d", [False, True])
 def test_plain_contract_matches_live_persistent_state(factored_v_2d):
     param = torch.nn.Parameter(torch.arange(16, dtype=torch.float32).reshape(4, 4))
@@ -486,10 +507,9 @@ def test_hybrid_contract_preserves_child_namespaces(backup_optimizer):
         assert contract.children[1].implementation == "torch.optim.adamw.AdamW"
         assert contract.children[1].contract is None
     assert contract.state_layout.composite_namespaces == ("muon", "backup")
-    gefen_backed = backup_optimizer == "gefen"
-    assert contract.capabilities.explicit_process_group_codebook_scope is gefen_backed
-    assert contract.capabilities.shard_rebinding is gefen_backed
-    assert contract.capabilities.post_sharding is gefen_backed
+    assert contract.capabilities.explicit_process_group_codebook_scope
+    assert contract.capabilities.shard_rebinding
+    assert contract.capabilities.post_sharding
     assert not contract.capabilities.canonical_state_io
     assert not contract.capabilities.atomic_state_movement
     assert not contract.capabilities.state_offload
@@ -501,14 +521,15 @@ def test_hybrid_contract_preserves_child_namespaces(backup_optimizer):
             1
         ].contract.capabilities.explicit_process_group_codebook_scope
     assert {field.name for field in contract.state_layout.fields} == {
-        "backup_optimizer"
+        "backup_optimizer",
+        "finalized_binding",
     }
     checkpoint = contract.capabilities.checkpoints
     assert len(checkpoint) == 1
     assert checkpoint[0].transport is CheckpointTransport.COMPOSITE_NATIVE
     assert checkpoint[0].same_topology == frozenset({ParameterLayout.REPLICATED})
     assert not checkpoint[0].topology_changing
-    assert not checkpoint[0].atomic_load
+    assert checkpoint[0].atomic_load
 
 
 def test_muon_contract_keeps_mixed_normuon_variants_in_one_mode():
@@ -528,6 +549,22 @@ def test_muon_contract_keeps_mixed_normuon_variants_in_one_mode():
     }
     assert "quantized_muon_replicated_exact" in variants
     assert "quantized_normuon_replicated_exact" in variants
+
+
+def test_muon_contract_rejects_invalid_live_mode_without_normalizing_it():
+    parameter = torch.nn.Parameter(torch.ones(4, 4))
+    optimizer = GefenMuon(
+        [("weight", parameter)],
+        fused=False,
+        sharded_mode="approx",
+    )
+    optimizer.param_groups[0]["sharded_mode"] = "invalid"
+
+    with pytest.raises(RuntimeError, match="invalid sharded_mode"):
+        optimizer.optimizer_contract()
+    with pytest.raises(RuntimeError, match="invalid sharded_mode"):
+        optimizer._canonical_state_variant_layout()
+    assert optimizer.param_groups[0]["sharded_mode"] == "invalid"
 
 
 @pytest.mark.parametrize("implementation", ["gefen", "muon"])
@@ -783,13 +820,18 @@ def test_backup_only_hybrid_training_claims_come_from_backup_child(backup_optimi
             for item in contract.capabilities.training
         )
     else:
-        # AdamW publishes no contract, so the composite keeps only the plain
-        # replicated layout the hybrid actually exercises for that child; a
-        # DTensor claim no code validated would be an over-claim.
+        # The Hybrid adapter owns and validates exact AdamW DTensor rebinding,
+        # so the backup-only composite can make this narrowly scoped claim even
+        # though AdamW does not publish a child contract of its own.
         assert contract.children[0].contract is None
-        assert contract.capabilities.training == (
-            TrainingSupport(ParameterLayout.REPLICATED, ProcessGroupScope.NONE),
+        assert contract.capabilities.training == _adamw_adapter_training()
+        checkpoints = contract.capabilities.checkpoints
+        assert len(checkpoints) == 1
+        assert all(
+            item.transport is not CheckpointTransport.CANONICAL_GLOBAL
+            for item in checkpoints
         )
+        assert not contract.capabilities.explicit_process_group_codebook_scope
 
 
 @pytest.mark.parametrize("backup_optimizer", ["gefen", "adamw"])
@@ -809,9 +851,7 @@ def test_hybrid_training_claims_are_the_union_of_routed_children(backup_optimize
     if backup_optimizer == "gefen":
         backup_training = contract.children[1].contract.capabilities.training
     else:
-        backup_training = (
-            TrainingSupport(ParameterLayout.REPLICATED, ProcessGroupScope.NONE),
-        )
+        backup_training = _adamw_adapter_training()
     assert set(training) == set(muon_training) | set(backup_training)
     assert len(set(training)) == len(training)
 

@@ -378,6 +378,33 @@ def _closure_divergent_result(rank, group):
     }
 
 
+def _checkpoint_parent_failure_result(rank, group):
+    optimizer, muon_parameter, backup_parameter, backup_shard = _make_scoped_hybrid(
+        rank, group
+    )
+    _seed_hybrid_state(
+        optimizer,
+        muon_parameter,
+        backup_parameter,
+        backup_shard,
+    )
+    hook_handle = None
+    if rank == 0:
+        def reject_save(_optimizer):
+            raise RuntimeError("checkpoint pre-hook boom on rank:0")
+
+        hook_handle = optimizer.register_state_dict_pre_hook(reject_save)
+    try:
+        optimizer.state_dict()
+        message = None
+    except RuntimeError as exc:
+        message = str(exc)
+    finally:
+        if hook_handle is not None:
+            hook_handle.remove()
+    return {"message": message}
+
+
 def _distributed_worker(rank, init_file, result_queue):
     try:
         dist.init_process_group(
@@ -398,6 +425,8 @@ def _distributed_worker(rank, init_file, result_queue):
         dist.barrier()
         closure_divergent = _closure_divergent_result(rank, group)
         dist.barrier()
+        checkpoint_parent = _checkpoint_parent_failure_result(rank, group)
+        dist.barrier()
         result_queue.put(
             {
                 "rank": rank,
@@ -406,6 +435,7 @@ def _distributed_worker(rank, init_file, result_queue):
                 "amp_finite": amp_finite,
                 "preflight": preflight,
                 "closure_divergent": closure_divergent,
+                "checkpoint_parent": checkpoint_parent,
             }
         )
     except BaseException:
@@ -514,6 +544,15 @@ def test_hybrid_step_synchronizes_amp_and_preflight_across_the_scope():
     assert "closure boom on rank:0" in closure_divergent[0]["message"]
     assert "step preamble failed on another process-group member" in closure_divergent[1]["message"]
     assert all(item["untouched"] for item in closure_divergent), closure_divergent
+
+    # Hybrid parent checkpoint phases vote through the installed scope before
+    # the distributed-Muon child enters owner-state consolidation. A one-rank
+    # pre-hook failure therefore raises on both members instead of hanging the
+    # peer in the child's first broadcast.
+    checkpoint_parent = [result["checkpoint_parent"] for result in results]
+    assert all(item["message"] is not None for item in checkpoint_parent), checkpoint_parent
+    assert "checkpoint pre-hook boom on rank:0" in checkpoint_parent[0]["message"]
+    assert "state-dict pre-hook failed on another process-group member" in checkpoint_parent[1]["message"]
 
 
 def _make_plain_hybrid():

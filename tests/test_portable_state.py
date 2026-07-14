@@ -26,6 +26,8 @@ from gefen.portable_identity import (
 from gefen.portable_schema import build_portable_state_document
 from gefen.portable_state import (
     PortableStateLimits,
+    _SECOND_MOMENT_PROJECTION_EXACT,
+    _SECOND_MOMENT_PROJECTION_FACTORED_TO_BLOCK,
     _assemble_portable_state_fragments,
     _build_portable_state_fragment,
     _normalize_gefen_portable_state_document,
@@ -57,7 +59,9 @@ def _policy(*, factored=False):
         "stochastic_round": False,
         "codebook_refresh_every": 0,
         "momentum_projection": "dense_fp32_target_period_one_v1",
-        "second_moment_projection": "exact_representation_target_period_one_v1",
+        "second_moment_projection": (
+            _SECOND_MOMENT_PROJECTION_FACTORED_TO_BLOCK if factored else _SECOND_MOMENT_PROJECTION_EXACT
+        ),
     }
 
 
@@ -294,6 +298,7 @@ def test_plain_initialized_block_assembles_and_projects_exact_period_one(layout)
             implementation="gefen.Gefen",
             global_step=4,
             codebook=document["common"]["gefen_codebook"],
+            source_second_moment_projection=document["policy"]["second_moment_projection"],
             target_algorithm_options=_plain_options(),
             target_second_moment="block",
         )
@@ -333,7 +338,7 @@ def test_empty_flat_fragment_is_pristine_and_ownership_is_enforced():
         _normalize_portable_state_fragment(corrupted, limits=_limits())
 
 
-def test_factored_replicas_preserve_authoritative_factor_bytes_and_reject_migration():
+def test_factored_replicas_preserve_factor_bytes_and_define_live_fp32_block_projection():
     parameter = ParameterIdentity("matrix.weight", (2, 3))
     group = _group()
     shards = _replicas(parameter, group)
@@ -360,23 +365,91 @@ def test_factored_replicas_preserve_authoritative_factor_bytes_and_reject_migrat
         implementation="gefen.Gefen",
         global_step=4,
         codebook=_codebook(),
+        source_second_moment_projection=document["policy"]["second_moment_projection"],
         target_algorithm_options=_plain_options(second="factored"),
         target_second_moment="factored",
     )
     assert torch.equal(projected["v_row"].view(torch.int32), v_row.view(torch.int32))
-    with pytest.raises(ValueError, match="target"):
-        _project_portable_parameter_state(
-            record,
-            shards[0],
-            implementation="gefen.Gefen",
-            global_step=4,
-            codebook=_codebook(),
-            target_algorithm_options=_plain_options(second="factored"),
-            target_second_moment="block",
-        )
+    assert torch.equal(projected["v_col"].view(torch.int32), v_col.view(torch.int32))
+    block = _project_portable_parameter_state(
+        record,
+        shards[0],
+        implementation="gefen.Gefen",
+        global_step=4,
+        codebook=_codebook(),
+        source_second_moment_projection=document["policy"]["second_moment_projection"],
+        target_algorithm_options=_plain_options(second="block"),
+        target_second_moment="block",
+    )
+    denominator = v_row.mean().clamp_(min=torch.finfo(torch.float32).tiny)
+    expected = torch.outer(v_row, v_col).div_(denominator)
+    assert torch.equal(block["vmean"].reshape(2, 3).view(torch.int32), expected.view(torch.int32))
+    assert block["vmean_step"] == 3
+    assert block["step"] == 4
+    assert block["automatic_period"] == 1
     fragments[1]["logical_slots"][0]["state"]["v_row"][0] = 0.0
     with pytest.raises(ValueError, match="v_row disagree"):
         _assemble_portable_state_fragments(fragments, process_group_identity=group, limits=_limits())
+
+
+def test_second_moment_projection_rejects_reverse_and_exact_only_factored_migration():
+    parameter = ParameterIdentity("matrix.weight", (2, 3))
+    group = _group()
+    shards = _replicas(parameter, group)
+    block_document = _assemble_portable_state_fragments(
+        _fragments(
+            "gefen.Gefen",
+            parameter,
+            shards,
+            options=_plain_options(second="block"),
+            policy=_policy(),
+            variant="initialized_dense",
+            momentum=torch.arange(6, dtype=torch.float32).reshape(2, 3),
+            second=torch.arange(1, 7, dtype=torch.float32).reshape(2, 3),
+        ),
+        process_group_identity=group,
+        limits=_limits(),
+    )
+    with pytest.raises(ValueError, match="block-to-factored"):
+        _project_portable_parameter_state(
+            block_document["parameters"][parameter.fqn],
+            shards[0],
+            implementation="gefen.Gefen",
+            global_step=4,
+            codebook=block_document["common"]["gefen_codebook"],
+            source_second_moment_projection=block_document["policy"]["second_moment_projection"],
+            target_algorithm_options=_plain_options(second="factored"),
+            target_second_moment="factored",
+        )
+
+    exact_policy = _policy(factored=True)
+    exact_policy["second_moment_projection"] = _SECOND_MOMENT_PROJECTION_EXACT
+    exact_factored_document = _assemble_portable_state_fragments(
+        _fragments(
+            "gefen.Gefen",
+            parameter,
+            shards,
+            options=_plain_options(second="factored"),
+            policy=exact_policy,
+            variant="initialized_factored",
+            momentum=torch.arange(6, dtype=torch.float32).reshape(2, 3),
+            v_row=torch.tensor([2.0, 3.0]),
+            v_col=torch.tensor([5.0, 7.0, 11.0]),
+        ),
+        process_group_identity=group,
+        limits=_limits(),
+    )
+    with pytest.raises(ValueError, match="does not authorize"):
+        _project_portable_parameter_state(
+            exact_factored_document["parameters"][parameter.fqn],
+            shards[0],
+            implementation="gefen.Gefen",
+            global_step=4,
+            codebook=exact_factored_document["common"]["gefen_codebook"],
+            source_second_moment_projection=exact_factored_document["policy"]["second_moment_projection"],
+            target_algorithm_options=_plain_options(second="block"),
+            target_second_moment="block",
+        )
 
 
 def test_period_selected_projection_binds_target_second_moment_policy():
@@ -395,6 +468,17 @@ def test_period_selected_projection_binds_target_second_moment_policy():
         process_group_identity=group,
         limits=_limits(),
     )
+    projected = _project_portable_parameter_state(
+        document["parameters"][parameter.fqn],
+        shards[0],
+        implementation="gefen.Gefen",
+        global_step=0,
+        codebook=document["common"]["gefen_codebook"],
+        source_second_moment_projection=document["policy"]["second_moment_projection"],
+        target_algorithm_options=_plain_options(second="block"),
+        target_second_moment="block",
+    )
+    assert projected == {"automatic_period": 1}
     with pytest.raises(ValueError, match="conflicts with target algorithm options"):
         _project_portable_parameter_state(
             document["parameters"][parameter.fqn],
@@ -402,6 +486,7 @@ def test_period_selected_projection_binds_target_second_moment_policy():
             implementation="gefen.Gefen",
             global_step=0,
             codebook=document["common"]["gefen_codebook"],
+            source_second_moment_projection=document["policy"]["second_moment_projection"],
             target_algorithm_options=_plain_options(second="factored"),
             target_second_moment="block",
         )
@@ -438,6 +523,7 @@ def test_factored_matrix_rejects_flat_fragments_before_initialization():
             implementation="gefen.Gefen",
             global_step=document["common"]["gefen_global_step"],
             codebook=document["common"]["gefen_codebook"],
+            source_second_moment_projection=document["policy"]["second_moment_projection"],
             target_algorithm_options=_plain_options(second="factored"),
             target_second_moment="factored",
         )
@@ -469,6 +555,7 @@ def test_muon_whole_owner_assembles_and_projects_after_owner_move(normuon):
         implementation="gefen.GefenMuon",
         global_step=4,
         codebook=_codebook(),
+        source_second_moment_projection=document["policy"]["second_moment_projection"],
         target_algorithm_options=_muon_options(normuon=normuon),
     )
     owner = _project_portable_parameter_state(
@@ -477,6 +564,7 @@ def test_muon_whole_owner_assembles_and_projects_after_owner_move(normuon):
         implementation="gefen.GefenMuon",
         global_step=4,
         codebook=_codebook(),
+        source_second_moment_projection=document["policy"]["second_moment_projection"],
         target_algorithm_options=_muon_options(normuon=normuon),
     )
     assert nonowner == {}
@@ -508,6 +596,7 @@ def test_muon_whole_owner_projection_requires_distributed_mode():
             implementation="gefen.GefenMuon",
             global_step=document["common"]["gefen_global_step"],
             codebook=document["common"]["gefen_codebook"],
+            source_second_moment_projection=document["policy"]["second_moment_projection"],
             target_algorithm_options=_muon_options(mode="exact"),
         )
 
@@ -667,6 +756,7 @@ def test_fragment_rejects_ungrouped_shards_and_empty_period_projection_stays_emp
             implementation="gefen.Gefen",
             global_step=4,
             codebook=document["common"]["gefen_codebook"],
+            source_second_moment_projection=document["policy"]["second_moment_projection"],
             target_algorithm_options=_plain_options(),
             target_second_moment="block",
         )

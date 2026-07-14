@@ -131,6 +131,8 @@ def _snapshot(optimizer):
         "finalized": optimizer._hybrid_post_sharding_finalized,
         "manifest": optimizer._hybrid_sharding_manifest,
         "local": optimizer._hybrid_local_shard_bindings,
+        "shards": optimizer._hybrid_shard_bindings,
+        "shard_contents": tuple(optimizer._hybrid_shard_bindings.items()),
         "roles": optimizer._hybrid_fqn_roles,
         "binding": optimizer._hybrid_codebook_process_group,
         "slots": optimizer._hybrid_finalized_slots,
@@ -148,6 +150,13 @@ def _assert_snapshot(optimizer, snapshot):
     assert optimizer._hybrid_post_sharding_finalized is snapshot["finalized"]
     assert optimizer._hybrid_sharding_manifest is snapshot["manifest"]
     assert optimizer._hybrid_local_shard_bindings is snapshot["local"]
+    assert optimizer._hybrid_shard_bindings is snapshot["shards"]
+    assert len(optimizer._hybrid_shard_bindings) == len(snapshot["shard_contents"])
+    for (live_parameter, live_shard), (expected_parameter, expected_shard) in zip(
+        optimizer._hybrid_shard_bindings.items(), snapshot["shard_contents"]
+    ):
+        assert live_parameter is expected_parameter
+        assert live_shard == expected_shard
     assert optimizer._hybrid_fqn_roles is snapshot["roles"]
     assert optimizer._hybrid_codebook_process_group is snapshot["binding"]
     assert optimizer._hybrid_finalized_slots is snapshot["slots"]
@@ -498,31 +507,47 @@ def test_one_child_hybrids_support_convenience_rebinding(role):
     assert set(optimizer._state_param_owner) == {id(new)}
 
 
-def test_adamw_backup_rejects_before_any_child_or_hybrid_mutation():
+def test_adamw_backup_rebinds_with_parent_owned_identity_and_muon_only_codebook_scope():
     optimizer, old_matrix, old_bias = _optimizer(backup_optimizer="adamw")
-    matrix_shard = _ungrouped_replicated("Model.Layer.Weight", (2, 2))
+    group = ProcessGroupIdentity("checkpoint", (_MEMBER,))
+    binding = CodebookProcessGroupBinding(
+        group,
+        _MEMBER,
+        None,
+        torch.device("cpu"),
+    )
+    matrix_shard = _grouped_replicated(
+        "Model.Layer.Weight",
+        (2, 2),
+        group,
+        _MEMBER,
+    )
     bias_shard = _ungrouped_replicated("Model.Layer.Bias", (4,))
-    snapshot = _snapshot(optimizer)
+    matrix = torch.nn.Parameter(torch.full((2, 2), 3.0))
+    bias = torch.nn.Parameter(torch.full((4,), 5.0))
 
-    with pytest.raises(NotImplementedError, match="AdamW"):
-        optimizer.post_sharding(
-            (
-                ParameterRebinding(
-                    old_matrix,
-                    torch.nn.Parameter(torch.ones(2, 2)),
-                    matrix_shard,
-                ),
-                ParameterRebinding(
-                    old_bias,
-                    torch.nn.Parameter(torch.ones(4)),
-                    bias_shard,
-                ),
-            ),
-            manifest=ShardingManifest((matrix_shard, bias_shard)),
-        )
+    optimizer.post_sharding(
+        (
+            ParameterRebinding(old_matrix, matrix, matrix_shard),
+            ParameterRebinding(old_bias, bias, bias_shard),
+        ),
+        manifest=ShardingManifest((matrix_shard, bias_shard)),
+        codebook_process_group=binding,
+    )
 
-    _assert_snapshot(optimizer, snapshot)
-    assert not optimizer._canonical_identity_ready()
+    assert optimizer._canonical_identity_ready()
+    assert optimizer.shard_identity(matrix) == matrix_shard
+    assert optimizer.shard_identity(bias) == bias_shard
+    assert optimizer._hybrid_shard_bindings == {
+        matrix: matrix_shard,
+        bias: bias_shard,
+    }
+    assert optimizer.muon.codebook_process_group_binding() is binding
+    assert not hasattr(optimizer.backup, "_gefen_codebook_process_group")
+    assert optimizer.backup.param_groups[0]["params"] == [bias]
+    assert optimizer.backup.param_groups[0]["param_names"] == ["layer.bias"]
+    assert optimizer.state[bias] is optimizer.backup.state[bias]
+    assert "finalized_binding" in optimizer.state_dict()
 
 
 def test_composite_guard_fails_closed_after_owner_metadata_corruption():

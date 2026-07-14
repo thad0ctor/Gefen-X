@@ -8,6 +8,7 @@ from gefen.portable import (
     _decode_quantized_momentum,
     _expand_block_second_moment,
     _expand_factored_second_moment,
+    _expand_factored_second_moment_live_fp32_v1,
     _project_factored_second_moment,
     _recompress_dense_momentum,
     _reduce_block_second_moment,
@@ -480,6 +481,54 @@ def test_factored_expansion_and_projection_follow_adafactor_geometry():
     assert torch.equal(projected_column, torch.tensor([3.0, 4.0]))
     _assert_tight(projected_row, shape=(3,))
     _assert_tight(projected_column, shape=(2,))
+
+
+def test_live_fp32_factored_expansion_matches_optimizer_operator_bits():
+    row = torch.tensor([0.10000000149011612, 3.75, 19.125], dtype=torch.float32)
+    column = torch.tensor([0.30000001192092896, 7.25, 23.5, 101.0], dtype=torch.float32)
+    expected = torch.outer(row, column).div_(
+        row.mean().clamp_(min=torch.finfo(torch.float32).tiny)
+    )
+
+    actual = _expand_factored_second_moment_live_fp32_v1(
+        row,
+        column,
+        logical_shape=(3, 4),
+        step=7,
+    )
+
+    _assert_tight(actual, shape=(3, 4))
+    assert torch.equal(actual.view(torch.int32), expected.view(torch.int32))
+
+
+def test_live_fp32_factored_expansion_defines_zero_and_subnormal_clamp_edges():
+    subnormal = torch.nextafter(torch.tensor(0.0), torch.tensor(1.0))
+    subnormal_result = _expand_factored_second_moment_live_fp32_v1(
+        torch.stack((subnormal, subnormal)),
+        torch.stack((subnormal, subnormal)),
+        logical_shape=(2, 2),
+        step=1,
+    )
+    assert torch.equal(subnormal_result, torch.zeros((2, 2)))
+
+    zero_row_result = _expand_factored_second_moment_live_fp32_v1(
+        torch.zeros(2),
+        torch.tensor([1.0, torch.finfo(torch.float32).max]),
+        logical_shape=(2, 2),
+        step=1,
+    )
+    assert torch.equal(zero_row_result, torch.zeros((2, 2)))
+
+
+def test_live_fp32_factored_expansion_rejects_operator_overflow():
+    maximum = torch.finfo(torch.float32).max
+    with pytest.raises(ValueError, match="cannot be represented"):
+        _expand_factored_second_moment_live_fp32_v1(
+            torch.full((2,), maximum),
+            torch.full((2,), maximum),
+            logical_shape=(2, 2),
+            step=1,
+        )
 
 
 def test_factored_projection_is_overflow_safe_and_roundtrips_consistent_rank_one_state():

@@ -523,10 +523,12 @@ def _mixed_cpu_checkpoint_worker(rank, world, port, result_queue):
         rejection_message = None
         try:
             rejected.load_state_dict(corrupted)
-        except ValueError as exc:
+        except RuntimeError as exc:
             rejection_message = str(exc)
         fallback_atomic = (
             rejection_message is not None
+            and "unscoped DTensor checkpoint local load staging failed on this rank"
+            in rejection_message
             and "ordered eligible" in rejection_message
             and snapshot_equal(rejected, rejected_params, before)
         )
@@ -767,10 +769,12 @@ def _checkpoint_worker(rank, world, port, result_queue):
         error = None
         try:
             invalid_target.load_state_dict(invalid_checkpoint)
-        except ValueError as exc:
+        except RuntimeError as exc:
             error = str(exc)
         rejection_ok = (
             error is not None
+            and "unscoped DTensor checkpoint local load staging failed on this rank"
+            in error
             and "refused populated" in error
             and invalid_target._gefen_global_step == step_before
             and torch.equal(invalid_target._gefen_codebook, codebook_before)

@@ -480,6 +480,21 @@ def test_native_v2_guard_retains_pruned_logical_positions_and_rejects_corruption
         "_validate_codebook_runtime_binding",
         lambda self, binding: None,
     )
+    monkeypatch.setattr(
+        GefenMuon,
+        "_preflight_muon_checkpoint_routing",
+        lambda self: None,
+    )
+
+    def synchronize_checkpoint_failure_locally(_self, error, _phase):
+        if error is not None:
+            raise error
+
+    monkeypatch.setattr(
+        GefenMuon,
+        "_synchronize_muon_checkpoint_failure",
+        synchronize_checkpoint_failure_locally,
+    )
     group = ProcessGroupIdentity("data_parallel", ("rank:0", "rank:1"))
 
     def build():
