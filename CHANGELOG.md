@@ -2,6 +2,15 @@
 
 All notable changes to this project are documented here. This project adheres to [Semantic Versioning](https://semver.org/).
 
+## Unreleased
+
+- Add stable post-sharding rebinding, local training, and exact same-topology native checkpoint continuation for narrow one-dimensional default-world DTensors, including uneven and empty shards.
+- Freeze GefenMuon's DTensor parameter membership, order, rebinding, mesh route, and `sharded_mode` after the first collective routing validation; later edits fail before optimizer or parameter mutation because initialized state has no mode-migration rule.
+- Extend `GefenMuonHybrid` atomic rebinding and native load staging to exact AdamW backups and mixed DTensor layouts while preserving nested child state and fail-before-mutation semantics.
+- Bind finalized scoped native checkpoints to their exact process-group identity and local layout, including direct distributed Muon; unscoped distributed Muon retains its complete cross-world-size native checkpoint path.
+- Add representation-qualified checkpoint transitions, including the directional `defined_projection_factored_to_block_live_fp32_target_period_one_v1` portable projection; reverse block-to-factored conversion remains unsupported.
+- Replace the dense-everywhere portable DCP save format with a load-compatible sharded version that stores multi-member canonical fields as DCP DTensors and singleton fields as ordinary full tensors, supports plain-Gefen DTensor resharding and Gefen-backed Hybrid child namespaces, and bounds metadata, chunks, and aggregate payloads.
+
 ## [0.4.0] - 2026-07-12
 
 Correctness and compatibility:
