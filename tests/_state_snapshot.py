@@ -9,11 +9,29 @@ in-place ``group['params']`` element swap, or an in-place option edit —
 preserves every top-level object identity and is only caught by comparing the
 live values against these clones. ``assert_deep_state_snapshot`` therefore
 checks identity AND bitwise value equality together.
+
+The staged post_sharding transaction also publishes two per-parameter registry
+dicts on each child — ``_param_names`` (parameter -> compatibility FQN string)
+and ``_gefen_shard_bindings`` (parameter -> ``ShardIdentity``) — by rebuilding
+them on a staged shadow and swapping the shadow in wholesale. Those dicts keep
+their live object identity across a transaction, so a regression that wrote
+``self._param_names[target] = ...`` on the LIVE child before a later child
+raised would leave a half-populated registry that top-level identity checks
+miss. ``deep_state_snapshot`` therefore also records the key set (by parameter
+identity) and cloned values of these registries, and
+``assert_deep_state_snapshot`` value-compares them after the transaction.
 """
 
 import copy
 
 import torch
+
+
+# Per-parameter registry dicts each Gefen/GefenMuon child rebuilds on a staged
+# shadow during a post_sharding transaction. Keys are live parameters (compared
+# by identity); values are FQN strings / ``ShardIdentity`` objects (compared by
+# value). Absent on optimizer types that do not stage these (handled below).
+_CHILD_REGISTRY_ATTRS = ("_param_names", "_gefen_shard_bindings")
 
 
 def _cloned(value):
@@ -90,9 +108,31 @@ def _tensor_value_pairs(optimizer):
     return tuple(pairs)
 
 
+def _registry_snapshot(optimizer):
+    """Cloned contents of each per-parameter registry dict that staging swaps.
+
+    Returns ``name -> ((param, cloned_value), ...)`` for every registry that is
+    present as a ``dict`` on ``optimizer``; registries absent on this optimizer
+    type are skipped so the helper stays usable across optimizer kinds. Keys are
+    kept by reference for identity comparison; values are cloned so a later
+    in-place value mutation cannot alias the snapshot.
+    """
+
+    registries = {}
+    for name in _CHILD_REGISTRY_ATTRS:
+        registry = getattr(optimizer, name, None)
+        if type(registry) is not dict:
+            continue
+        registries[name] = tuple(
+            (key, _cloned(value)) for key, value in registry.items()
+        )
+    return registries
+
+
 def deep_state_snapshot(optimizer):
     return {
         "attributes": optimizer.__dict__.copy(),
+        "registries": _registry_snapshot(optimizer),
         "state": optimizer.state,
         "state_items": tuple(
             (parameter, state, _cloned(dict(state)))
@@ -140,3 +180,13 @@ def assert_deep_state_snapshot(optimizer, snapshot):
         )
     for tensor, expected in snapshot["tensors"]:
         assert _tensors_bitwise_equal(tensor, expected)
+    for name, expected_entries in snapshot["registries"].items():
+        live = getattr(optimizer, name, None)
+        assert type(live) is dict
+        live_entries = tuple(live.items())
+        assert len(live_entries) == len(expected_entries)
+        for (live_key, live_value), (expected_key, expected_value) in zip(
+            live_entries, expected_entries
+        ):
+            assert live_key is expected_key
+            _nested_equal(live_value, expected_value)

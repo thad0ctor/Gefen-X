@@ -157,6 +157,55 @@ def _assert_snapshot(optimizer, snapshot):
         assert_deep_state_snapshot(live, expected_snapshot)
 
 
+@pytest.mark.parametrize("registry", ["_param_names", "_gefen_shard_bindings"])
+def test_deep_snapshot_catches_inplace_child_registry_addition(registry):
+    # The staged post_sharding transaction rebuilds each child's per-parameter
+    # registries (``_param_names`` / ``_gefen_shard_bindings``) on a shadow and
+    # swaps it in, so a regression that instead wrote onto the LIVE registry
+    # before a later child raised would leave a half-populated dict. The dict
+    # keeps its object identity, so only value comparison of its contents
+    # catches the partial publication.
+    optimizer, matrix, bias = _optimizer()
+    for child in optimizer._subopts:
+        live = getattr(child, registry)
+        snapshot = deep_state_snapshot(child)
+        # The live registry object identity is preserved by an in-place add, so
+        # the top-level identity checks stay green; only content comparison sees
+        # the injected key.
+        assert getattr(child, registry) is live
+        injected = torch.nn.Parameter(torch.zeros(1))
+        if registry == "_param_names":
+            live[injected] = "injected"
+        else:
+            live[injected] = _ungrouped_replicated("Injected.Param", (1,))
+        with pytest.raises(AssertionError):
+            assert_deep_state_snapshot(child, snapshot)
+        del live[injected]
+        # With the injection undone the child is byte-for-byte its snapshot.
+        assert_deep_state_snapshot(child, snapshot)
+
+
+def test_deep_snapshot_catches_inplace_child_registry_value_change():
+    # A value edit that keeps the key set intact (e.g. rebinding a child's shard
+    # in place onto the live registry) must also be caught by content
+    # comparison, not just added/removed keys.
+    optimizer, matrix, bias = _optimizer()
+    child = optimizer._subopts[0]
+    (param,) = child._param_names
+    child._gefen_shard_bindings[param] = _ungrouped_replicated("Seed.Param", (2, 2))
+    snapshot = deep_state_snapshot(child)
+
+    child._param_names[param] = "mutated-name"
+    with pytest.raises(AssertionError):
+        assert_deep_state_snapshot(child, snapshot)
+    child._param_names[param] = snapshot["registries"]["_param_names"][0][1]
+    assert_deep_state_snapshot(child, snapshot)
+
+    child._gefen_shard_bindings[param] = _ungrouped_replicated("Other.Param", (4,))
+    with pytest.raises(AssertionError):
+        assert_deep_state_snapshot(child, snapshot)
+
+
 def test_composite_post_sharding_publishes_children_and_rebuilds_routing():
     optimizer, old_matrix, old_bias = _optimizer()
     matrix = torch.nn.Parameter(torch.full((2, 2), 7.0))
