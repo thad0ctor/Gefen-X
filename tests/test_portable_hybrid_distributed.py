@@ -17,6 +17,7 @@ from gefen import GefenMuonHybrid, load_portable_dcp, save_portable_dcp
 from gefen.checkpoint import CheckpointProcessGroupBinding
 from gefen.codebook import CodebookProcessGroupBinding
 from gefen.contracts import (
+    CheckpointTransport,
     LogicalSlice,
     ParameterIdentity,
     ParameterLayout,
@@ -25,6 +26,7 @@ from gefen.contracts import (
     ShardIdentity,
     ShardPlacement,
     ShardingManifest,
+    TopologyChange,
 )
 from gefen.portable_hybrid import _hybrid_portable_live_token
 from gefen.portable_state import PortableStateLimits
@@ -98,6 +100,27 @@ def _owner_shards(identity, group, owner):
             process_group=group,
             local_member=member,
             owner=owner,
+        )
+        for coordinate, member in enumerate(group.ordered_members)
+    )
+
+
+def _replicated_shards(identity, group):
+    return tuple(
+        ShardIdentity(
+            identity,
+            ParameterLayout.REPLICATED,
+            LogicalSlice.full(identity),
+            placements=(
+                ShardPlacement(
+                    "checkpoint",
+                    PlacementKind.REPLICATE,
+                    coordinate,
+                    len(group.ordered_members),
+                ),
+            ),
+            process_group=group,
+            local_member=member,
         )
         for coordinate, member in enumerate(group.ordered_members)
     )
@@ -641,6 +664,348 @@ def _run_distributed_workers(checkpoint_dir):
     return sorted(results, key=lambda item: item["rank"])
 
 
+def _make_singleton_hybrid(*, deterministic=True, replicated=False):
+    member = "load:0" if replicated else "save:0"
+    group = ProcessGroupIdentity(
+        (
+            "hybrid_portable_reverse_singleton"
+            if replicated
+            else "hybrid_portable_singleton"
+        ),
+        (member,),
+    )
+    muon_identity = ParameterIdentity(_MUON_FQN, (3, 2))
+    backup_identity = ParameterIdentity(_BACKUP_FQN, (8,))
+    muon_parameter = torch.nn.Parameter(_muon_initial().clone())
+    backup_parameter = torch.nn.Parameter(_backup_initial().clone())
+    optimizer = GefenMuonHybrid(
+        [("matrix", muon_parameter)],
+        [("vector", backup_parameter)],
+        lr=2.5e-3,
+        muon_lr=3.0e-3,
+        backup_lr=2.5e-3,
+        weight_decay=0.03,
+        muon_weight_decay=0.02,
+        backup_weight_decay=0.03,
+        backup_optimizer="gefen",
+        backup_1d_period_one=True,
+        betas=(0.8, 0.97),
+        eps=2.0e-8,
+        fused=False,
+        momentum=0.85,
+        nesterov=False,
+        ns_steps=2,
+        sharded_mode="distributed",
+        deterministic=deterministic,
+        normuon=True,
+        normuon_beta2=0.9,
+        normuon_eps=3.0e-8,
+    )
+    muon_shard = (
+        _replicated_shards(muon_identity, group)[0]
+        if replicated
+        else _owner_shards(muon_identity, group, member)[0]
+    )
+    backup_shard = (
+        _replicated_shards(backup_identity, group)[0]
+        if replicated
+        else _flat_shards(backup_identity, group, (8,))[0]
+    )
+    optimizer.post_sharding(
+        (
+            ParameterRebinding(muon_parameter, muon_parameter, muon_shard),
+            ParameterRebinding(backup_parameter, backup_parameter, backup_shard),
+        ),
+        manifest=ShardingManifest((muon_shard, backup_shard)),
+        codebook_process_group=CodebookProcessGroupBinding(
+            group,
+            member,
+            None,
+            torch.device("cpu"),
+        ),
+    )
+    return (
+        optimizer,
+        muon_parameter,
+        backup_parameter,
+        backup_shard,
+        CheckpointProcessGroupBinding(
+            group,
+            member,
+            None,
+            torch.device("cpu"),
+        ),
+    )
+
+
+def _has_replicated_portable_intersection(optimizer, *, same_topology):
+    supports = tuple(
+        support
+        for support in optimizer.optimizer_contract().capabilities.checkpoints
+        if support.transport is CheckpointTransport.CANONICAL_GLOBAL
+    )
+    return (
+        len(supports) == 1
+        and supports[0].same_topology
+        == (
+            frozenset({ParameterLayout.REPLICATED})
+            if same_topology
+            else frozenset()
+        )
+        and supports[0].topology_changing
+        == frozenset({ParameterLayout.REPLICATED})
+        and supports[0].topology_change_kinds
+        == frozenset({TopologyChange.PLACEMENT_RESHARD})
+        and supports[0].requires_collective
+        and supports[0].atomic_load
+    )
+
+
+def _singleton_save_worker(_rank, init_file, checkpoint_dir, result_queue):
+    _strict_worker_warnings()
+    try:
+        dist.init_process_group(
+            "gloo",
+            init_method="file://{}".format(init_file),
+            rank=0,
+            world_size=1,
+            timeout=timedelta(seconds=120),
+        )
+        source = _make_singleton_hybrid()
+        _seed_hybrid_state(source[0], source[1], source[2], source[3])
+        save_portable_dcp(
+            source[0],
+            checkpoint_process_group=source[4],
+            storage_writer=FileSystemWriter(checkpoint_dir),
+            transaction_id="hybrid-world-change-save",
+            limits=_limits(),
+        )
+        keys = FileSystemReader(checkpoint_dir).read_metadata().state_dict_metadata
+        result_queue.put(
+            {
+                "rank": 0,
+                "v2": (
+                    "optimizer.__gefen_portable_composite_metadata_v2__" in keys
+                    and "optimizer.__gefen_portable_metadata_v1__" not in keys
+                ),
+            }
+        )
+    except BaseException:
+        result_queue.put({"rank": 0, "fatal_error": traceback.format_exc()})
+    finally:
+        if dist.is_available() and dist.is_initialized():
+            dist.destroy_process_group()
+
+
+def _world_change_load_worker(rank, init_file, checkpoint_dir, result_queue):
+    _strict_worker_warnings()
+    try:
+        dist.init_process_group(
+            "gloo",
+            init_method="file://{}".format(init_file),
+            rank=rank,
+            world_size=_WORLD,
+            timeout=timedelta(seconds=120),
+        )
+        group = ProcessGroupIdentity(
+            "hybrid_portable_world_change_target",
+            _members(),
+        )
+        target, reference = _fresh_target_and_reference(rank, group)
+        load_portable_dcp(
+            target[0],
+            checkpoint_process_group=target[4],
+            storage_reader=FileSystemReader(checkpoint_dir),
+            transaction_id="hybrid-world-change-load",
+            limits=_limits(),
+        )
+        restored_exact = _hybrids_exact(
+            target[0],
+            target[1],
+            target[2],
+            reference[0],
+            reference[1],
+            reference[2],
+        )
+        next_step_exact = _step_against_reference(
+            target[0],
+            target[1],
+            target[2],
+            target[3],
+            reference[0],
+            reference[1],
+            reference[2],
+        )
+        result_queue.put(
+            {
+                "rank": rank,
+                "restored_exact": restored_exact,
+                "next_step_exact": next_step_exact,
+            }
+        )
+    except BaseException:
+        result_queue.put({"rank": rank, "fatal_error": traceback.format_exc()})
+    finally:
+        if dist.is_available() and dist.is_initialized():
+            dist.destroy_process_group()
+
+
+def _reverse_world_change_save_worker(rank, init_file, checkpoint_dir, result_queue):
+    _strict_worker_warnings()
+    try:
+        dist.init_process_group(
+            "gloo",
+            init_method="file://{}".format(init_file),
+            rank=rank,
+            world_size=_WORLD,
+            timeout=timedelta(seconds=120),
+        )
+        group = ProcessGroupIdentity(
+            "hybrid_portable_reverse_source",
+            _members(),
+        )
+        source = _make_hybrid(
+            rank,
+            group,
+            owner=_SOURCE_OWNER,
+            lengths=_SOURCE_LENGTHS,
+            deterministic=True,
+        )
+        _seed_hybrid_state(source[0], source[1], source[2], source[3])
+        intersection_exact = _has_replicated_portable_intersection(
+            source[0],
+            same_topology=False,
+        )
+        save_portable_dcp(
+            source[0],
+            checkpoint_process_group=source[4],
+            storage_writer=FileSystemWriter(checkpoint_dir),
+            transaction_id="hybrid-reverse-world-change-save",
+            limits=_limits(),
+        )
+        keys = FileSystemReader(checkpoint_dir).read_metadata().state_dict_metadata
+        result_queue.put(
+            {
+                "rank": rank,
+                "intersection_exact": intersection_exact,
+                "v2": (
+                    "optimizer.__gefen_portable_composite_metadata_v2__" in keys
+                    and "optimizer.__gefen_portable_metadata_v1__" not in keys
+                ),
+            }
+        )
+    except BaseException:
+        result_queue.put({"rank": rank, "fatal_error": traceback.format_exc()})
+    finally:
+        if dist.is_available() and dist.is_initialized():
+            dist.destroy_process_group()
+
+
+def _reverse_world_change_load_worker(_rank, init_file, checkpoint_dir, result_queue):
+    _strict_worker_warnings()
+    try:
+        dist.init_process_group(
+            "gloo",
+            init_method="file://{}".format(init_file),
+            rank=0,
+            world_size=1,
+            timeout=timedelta(seconds=120),
+        )
+        target = _make_singleton_hybrid(deterministic=False, replicated=True)
+        reference = _make_singleton_hybrid(deterministic=True, replicated=True)
+        _seed_hybrid_state(
+            reference[0],
+            reference[1],
+            reference[2],
+            reference[3],
+        )
+        intersection_exact = _has_replicated_portable_intersection(
+            target[0],
+            same_topology=True,
+        )
+        load_portable_dcp(
+            target[0],
+            checkpoint_process_group=target[4],
+            storage_reader=FileSystemReader(checkpoint_dir),
+            transaction_id="hybrid-reverse-world-change-load",
+            limits=_limits(),
+        )
+        restored_exact = _hybrids_exact(
+            target[0],
+            target[1],
+            target[2],
+            reference[0],
+            reference[1],
+            reference[2],
+        )
+        next_step_exact = _step_against_reference(
+            target[0],
+            target[1],
+            target[2],
+            target[3],
+            reference[0],
+            reference[1],
+            reference[2],
+        )
+        result_queue.put(
+            {
+                "rank": 0,
+                "intersection_exact": intersection_exact,
+                "restored_exact": restored_exact,
+                "next_step_exact": next_step_exact,
+            }
+        )
+    except BaseException:
+        result_queue.put({"rank": 0, "fatal_error": traceback.format_exc()})
+    finally:
+        if dist.is_available() and dist.is_initialized():
+            dist.destroy_process_group()
+
+
+def _run_phase(worker, world_size, checkpoint_dir):
+    context = mp.get_context("spawn")
+    result_queue = context.Queue()
+    descriptor, init_file = tempfile.mkstemp(prefix="gefen-portable-hybrid-phase-")
+    os.close(descriptor)
+    os.unlink(init_file)
+    processes = [
+        context.Process(
+            target=worker,
+            args=(rank, init_file, checkpoint_dir, result_queue),
+        )
+        for rank in range(world_size)
+    ]
+    results = []
+    try:
+        for process in processes:
+            process.start()
+        try:
+            for _ in processes:
+                results.append(result_queue.get(timeout=180))
+        except queue_module.Empty:
+            pass
+        for process in processes:
+            process.join(timeout=10)
+        for process in processes:
+            if process.is_alive():
+                process.terminate()
+                process.join(timeout=5)
+    finally:
+        for process in processes:
+            if process.is_alive():
+                process.terminate()
+                process.join(timeout=5)
+        result_queue.close()
+        result_queue.join_thread()
+        if os.path.exists(init_file):
+            os.unlink(init_file)
+    assert len(results) == world_size, (results, [process.exitcode for process in processes])
+    assert all(process.exitcode == 0 for process in processes)
+    results = sorted(results, key=lambda item: item["rank"])
+    assert all("fatal_error" not in result for result in results), results
+    return results
+
+
 @pytest.mark.skipif(
     not dist.is_available() or not dist.is_gloo_available(),
     reason="portable Hybrid topology coverage requires Gloo",
@@ -666,7 +1031,6 @@ def test_two_process_portable_hybrid_topology_change_and_dcp(tmp_path):
         and result["dcp"]["next_step_exact"]
         for result in results
     ), results
-
     messages = [result["asymmetric"]["message"] for result in results]
     assert messages[0] == messages[1]
     assert messages[0] is not None and "unknown keys" in messages[0]
@@ -677,3 +1041,48 @@ def test_two_process_portable_hybrid_topology_change_and_dcp(tmp_path):
         and result["asymmetric"]["common_unchanged"]
         for result in results
     ), results
+
+
+@pytest.mark.skipif(
+    not dist.is_available() or not dist.is_gloo_available(),
+    reason="portable Hybrid world-size coverage requires Gloo",
+)
+def test_sharded_hybrid_dcp_changes_world_size_and_continues_exactly(tmp_path):
+    checkpoint_dir = str(tmp_path / "hybrid-world-change")
+    saved = _run_phase(_singleton_save_worker, 1, checkpoint_dir)
+    assert saved == [{"rank": 0, "v2": True}]
+    loaded = _run_phase(_world_change_load_worker, _WORLD, checkpoint_dir)
+    assert all(
+        result["restored_exact"] and result["next_step_exact"]
+        for result in loaded
+    ), loaded
+
+
+@pytest.mark.skipif(
+    not dist.is_available() or not dist.is_gloo_available(),
+    reason="portable Hybrid reverse world-size coverage requires Gloo",
+)
+def test_sharded_hybrid_dcp_collapses_to_singleton_and_continues_exactly(tmp_path):
+    checkpoint_dir = str(tmp_path / "hybrid-reverse-world-change")
+    saved = _run_phase(
+        _reverse_world_change_save_worker,
+        _WORLD,
+        checkpoint_dir,
+    )
+    assert all(
+        result["intersection_exact"] and result["v2"]
+        for result in saved
+    ), saved
+    loaded = _run_phase(
+        _reverse_world_change_load_worker,
+        1,
+        checkpoint_dir,
+    )
+    assert loaded == [
+        {
+            "rank": 0,
+            "intersection_exact": True,
+            "restored_exact": True,
+            "next_step_exact": True,
+        }
+    ]

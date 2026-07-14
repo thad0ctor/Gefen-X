@@ -329,6 +329,104 @@ def test_filesystem_dcp_round_trip_is_tensor_only(tmp_path, variant):
     )
 
 
+def test_public_loader_accepts_legacy_v1_plain_checkpoint(tmp_path):
+    (
+        source,
+        source_parameter,
+        source_binding,
+        target,
+        target_parameter,
+        target_binding,
+    ) = _optimizer_pair("plain-block")
+    _initialize(source, source_parameter, variant="plain-block")
+    limits = _limits()
+    document = source.export_portable_state(
+        checkpoint_process_group=source_binding,
+        transaction_id="legacy-v1-plain-export",
+        limits=limits,
+    )
+    wire_limits = limits._wire_limits(collective=True)
+    plan = portable_dcp._prepare_canonical_wire_value(document, wire_limits)
+    state = portable_dcp._state_from_plan("optimizer", plan, wire_limits)
+    checkpoint = tmp_path / "legacy-v1-plain"
+    dcp.save(state, storage_writer=dcp.FileSystemWriter(checkpoint))
+    keys = dcp.FileSystemReader(checkpoint).read_metadata().state_dict_metadata
+    assert "optimizer.__gefen_portable_metadata_v1__" in keys
+    assert "optimizer.__gefen_portable_metadata_v2__" not in keys
+    load_portable_dcp(
+        target,
+        checkpoint_process_group=target_binding,
+        storage_reader=dcp.FileSystemReader(checkpoint),
+        transaction_id="legacy-v1-plain-load",
+        limits=limits,
+    )
+    _assert_loaded_state(
+        target,
+        target_parameter,
+        document,
+        variant="plain-block",
+    )
+
+
+def test_sharded_dcp_round_trips_initialized_scalar_state(tmp_path):
+    def scalar_optimizer(*, deterministic):
+        parameter = torch.nn.Parameter(torch.tensor(2.0))
+        optimizer = Gefen(
+            [("scalar", parameter)],
+            fused=False,
+            factored_v_2d=False,
+            period_one_substrings=("scalar",),
+            deterministic=deterministic,
+        )
+        return optimizer, parameter, _finalize(
+            optimizer,
+            parameter,
+            layout=ParameterLayout.REPLICATED,
+        )
+
+    source, source_parameter, source_binding = scalar_optimizer(
+        deterministic=True
+    )
+    source._gefen_global_step = 4
+    source._gefen_codebook = torch.linspace(-1.0, 1.0, 256)
+    source.state[source_parameter].update(
+        {
+            "automatic_period": 1,
+            "step": 4,
+            "m_codebook": torch.tensor([[255]], dtype=torch.uint8),
+            "m_magnitude": torch.tensor([[2.0]]),
+            "vmean": torch.tensor([[3.0]]),
+            "vmean_step": 3,
+        }
+    )
+    target, target_parameter, target_binding = scalar_optimizer(
+        deterministic=False
+    )
+    checkpoint = tmp_path / "scalar-v2"
+    save_portable_dcp(
+        source,
+        checkpoint_process_group=source_binding,
+        storage_writer=dcp.FileSystemWriter(checkpoint),
+        transaction_id="scalar-v2-save",
+        limits=_limits(),
+    )
+    load_portable_dcp(
+        target,
+        checkpoint_process_group=target_binding,
+        storage_reader=dcp.FileSystemReader(checkpoint),
+        transaction_id="scalar-v2-load",
+        limits=_limits(),
+    )
+    assert target._gefen_global_step == 4
+    assert target._deterministic is True
+    assert target.state[target_parameter]["step"] == 4
+    assert target.state[target_parameter]["vmean_step"] == 3
+    assert torch.equal(
+        target.state[target_parameter]["vmean"].reshape(()),
+        torch.tensor(3.0),
+    )
+
+
 @pytest.mark.parametrize(
     "namespace",
     ["", " optimizer", "optimizer.", "optim\x00izer", "optim/izer", "optimé"],
@@ -592,15 +690,44 @@ def test_corrupted_tensor_payload_leaves_target_unchanged(tmp_path):
         limits=limits,
     )
 
-    wire_limits = limits._wire_limits(collective=True)
-    state = {"optimizer": {}}
+    from gefen.portable_dcp_sharded import (
+        _DCP_SHARDED_METADATA_KEY,
+        _allocate_sharded_load_state,
+        _metadata_storage_spec,
+        _read_sharded_metadata,
+    )
+
+    reader = dcp.FileSystemReader(original)
+    checkpoint_metadata = reader.read_metadata()
+    metadata = _read_sharded_metadata(
+        storage_reader=reader,
+        checkpoint_metadata=checkpoint_metadata,
+        binding=source_binding,
+        namespace="optimizer",
+        limits=limits,
+        transaction_id="dcp-read-corruption-source-metadata",
+    )
+    metadata_shape = _metadata_storage_spec(
+        checkpoint_metadata,
+        namespace="optimizer",
+        limits=limits,
+    )
+    state = _allocate_sharded_load_state(
+        metadata,
+        metadata_tensor=torch.empty(metadata_shape, dtype=torch.uint8),
+        namespace="optimizer",
+        binding=source_binding,
+    )
     dcp.load(
         state,
-        storage_reader=dcp.FileSystemReader(original),
-        planner=portable_dcp._load_planner("optimizer", wire_limits),
+        storage_reader=reader,
         process_group=None,
     )
-    payload_keys = sorted(key for key in state["optimizer"] if key.startswith(portable_dcp._DCP_PAYLOAD_PREFIX))
+    payload_keys = sorted(
+        key
+        for key in state["optimizer"]
+        if key != _DCP_SHARDED_METADATA_KEY
+    )
     assert payload_keys
     payload = next(state["optimizer"][key] for key in payload_keys if state["optimizer"][key].numel())
     raw = payload.view(torch.uint8).reshape(-1)
@@ -612,7 +739,7 @@ def test_corrupted_tensor_payload_leaves_target_unchanged(tmp_path):
     )
     before = target._canonical_import_live_token()
 
-    with pytest.raises(RuntimeError, match="invalid digest"):
+    with pytest.raises(RuntimeError, match="integrity digest mismatch"):
         load_portable_dcp(
             target,
             checkpoint_process_group=target_binding,
