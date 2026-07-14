@@ -55,8 +55,12 @@ def _tensors_bitwise_equal(live, expected):
         or tuple(live.shape) != tuple(expected.shape)
     ):
         return False
-    live_bytes = live.detach().contiguous().view(torch.uint8)
-    expected_bytes = expected.detach().contiguous().view(torch.uint8)
+    # ``view(torch.uint8)`` rejects a 0-dim tensor (a scalar cannot hold the
+    # several uint8 elements one value reinterprets to), which capturable
+    # device-resident scalar counters hit. Flatten to 1-D first; shapes were
+    # already checked equal above, so both sides flatten identically.
+    live_bytes = live.detach().contiguous().reshape(-1).view(torch.uint8)
+    expected_bytes = expected.detach().contiguous().reshape(-1).view(torch.uint8)
     return bool(torch.equal(live_bytes, expected_bytes))
 
 
