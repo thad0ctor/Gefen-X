@@ -656,7 +656,11 @@ class GefenMuonHybrid(torch.optim.Optimizer):
             )
 
     def step(self, closure=None):
-        self._assert_capturable_devices_if_capturing()
+        process_groups = (
+            self.muon._step_failure_process_groups()
+            if self.muon is not None
+            else ()
+        )
         # Dispatch the INSTANCE step hooks around the composite step, mirroring
         # torch.optim.Optimizer.profile_hook_step exactly: hooks receive
         # (optimizer, args, kwargs) where args are the raw step() call args
@@ -667,41 +671,74 @@ class GefenMuonHybrid(torch.optim.Optimizer):
         # each child sub-optimizer's (wrapped) step; see the class docstring.
         args = (self, closure) if closure is not None else (self,)
         kwargs = {}
-        for pre_hook in self._optimizer_step_pre_hooks.values():
-            result = pre_hook(self, args, kwargs)
-            if result is not None:
-                if isinstance(result, tuple) and len(result) == 2:
-                    args, kwargs = result
-                else:
-                    raise RuntimeError(
-                        f"{self.__class__.__name__}.step pre hook must return None "
-                        f"or a tuple of (new_args, new_kwargs), but got {result}."
-                    )
-        # Re-read the closure from the (possibly hook-rewritten) call args, as
-        # torch's wrapper would by calling step(*args, **kwargs).
-        closure = args[1] if len(args) > 1 else kwargs.get("closure")
-
         loss = None
-        if closure is not None:
-            with torch.enable_grad():
-                loss = closure()
-        for child in self._subopts:
-            _assert_optimizer_gradients_structurally_valid(
-                child, require_2d_params=child is self.muon
+        try:
+            self._assert_capturable_devices_if_capturing()
+            for pre_hook in self._optimizer_step_pre_hooks.values():
+                result = pre_hook(self, args, kwargs)
+                if result is not None:
+                    if isinstance(result, tuple) and len(result) == 2:
+                        args, kwargs = result
+                    else:
+                        raise RuntimeError(
+                            f"{self.__class__.__name__}.step pre hook must return None "
+                            f"or a tuple of (new_args, new_kwargs), but got {result}."
+                        )
+            # Re-read the closure from the (possibly hook-rewritten) call args,
+            # as torch's wrapper would by calling step(*args, **kwargs).
+            closure = args[1] if len(args) > 1 else kwargs.get("closure")
+            if closure is not None:
+                with torch.enable_grad():
+                    loss = closure()
+            for child in self._subopts:
+                _assert_optimizer_gradients_structurally_valid(
+                    child, require_2d_params=child is self.muon
+                )
+            local_preflight_error = None
+        except Exception as exc:
+            loss = None
+            local_preflight_error = exc
+        if self.muon is not None:
+            self.muon._synchronize_sharded_step_error(
+                local_preflight_error, "hybrid step preflight", process_groups
             )
+        elif local_preflight_error is not None:
+            raise local_preflight_error
+
         # A non-finite gradient in either half skips BOTH children before their
         # codebooks, states, counters, or parameters can move. Explicit
         # scaler.unscale_(hybrid) is detected by grad_scale=None and is not
         # repeated; automatic unscale covers every child parameter exactly once.
-        if (
-            hasattr(self, "found_inf") or hasattr(self, "grad_scale")
-        ) and not _amp_prepare_optimizer_step(self):
+        if self.muon is not None:
+            should_step = self.muon._prepare_synchronized_amp_step(
+                self, process_groups
+            )
+        elif hasattr(self, "found_inf") or hasattr(self, "grad_scale"):
+            should_step = _amp_prepare_optimizer_step(self)
+        else:
+            should_step = True
+        if not should_step:
             for post_hook in self._optimizer_step_post_hooks.values():
                 post_hook(self, args, kwargs)
             return loss
+
         with torch.no_grad():
             for o in self._subopts:
-                o.step()
+                if o is not self.muon:
+                    o.step()
+                    continue
+                marker = object()
+                previous = getattr(
+                    o, "_gefen_hybrid_precollective_preflight", marker
+                )
+                o._gefen_hybrid_precollective_preflight = True
+                try:
+                    o.step()
+                finally:
+                    if previous is marker:
+                        del o._gefen_hybrid_precollective_preflight
+                    else:
+                        o._gefen_hybrid_precollective_preflight = previous
 
         for post_hook in self._optimizer_step_post_hooks.values():
             post_hook(self, args, kwargs)
