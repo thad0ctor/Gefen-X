@@ -655,12 +655,44 @@ class GefenMuonHybrid(torch.optim.Optimizer):
                 )
             )
 
+    @torch._dynamo.disable
+    def _step_failure_process_groups(self):
+        """Failure-sync scope for the composite preflight: the UNION of both
+        children's sharded-mesh (process_group, device) pairs.
+
+        The composite preflight (closure + structural gradient validation + AMP
+        controls) covers BOTH children, so the pre-collective failure sync must
+        span every sharded mesh EITHER child owns -- not only the Muon child's.
+        Deriving the scope from the Muon child alone missed any mesh owned only
+        by the backup child (a sharded backup weight whose Muon half is
+        non-sharded or absent): a one-rank preflight failure on that backup-only
+        mesh then raised on the failing rank while its mesh peers proceeded to
+        step and mutate their shard, diverging cross-rank state. Both children's
+        param_groups are folded through ONE deduped, sorted scan
+        (``GefenMuon._collect_sharded_failure_groups``), so the standard
+        fully_shard case -- both halves sharded on the SAME mesh -- collapses to
+        exactly the Muon-only scope with no extra collective, while a
+        backup-only mesh is included in one deterministic cross-rank order.
+        """
+        if not GefenMuon._dist_available():
+            return ()
+        param_groups = [
+            group
+            for optimizer in self._subopts
+            for group in optimizer.param_groups
+        ]
+        params = [param for group in param_groups for param in group["params"]]
+        # The protocol returns host-readable flags and cannot be captured; a
+        # captured step already requires an eager warmup with fixed control flow
+        # (mirrors GefenMuon._step_failure_process_groups).
+        if any(param.device.type == "cuda" for param in params) and (
+            torch.cuda.is_current_stream_capturing()
+        ):
+            return ()
+        return GefenMuon._collect_sharded_failure_groups(param_groups)
+
     def step(self, closure=None):
-        process_groups = (
-            self.muon._step_failure_process_groups()
-            if self.muon is not None
-            else ()
-        )
+        process_groups = self._step_failure_process_groups()
         # Dispatch the INSTANCE step hooks around the composite step, mirroring
         # torch.optim.Optimizer.profile_hook_step exactly: hooks receive
         # (optimizer, args, kwargs) where args are the raw step() call args

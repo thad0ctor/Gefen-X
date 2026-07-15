@@ -136,7 +136,33 @@ def _make_optimizer(mesh, case: str):
     full_weight_grad = torch.linspace(0.6, -0.7, 64, dtype=torch.float32).reshape(8, 8)
     weight = nn.Parameter(distribute_tensor(full_weight.clone(), mesh, [Shard(0)]))
 
-    if case == "hybrid_exact":
+    if case == "hybrid_backup_sharded":
+        # Invert the ownership of hybrid_exact: the Muon half holds a REPLICATED
+        # (non-sharded) 2D weight while the BACKUP half owns the sharded mesh.
+        # Deriving the failure-sync scope from the Muon child alone would then
+        # miss that backup-only mesh, so a one-rank preflight failure would raise
+        # on the failing rank while its mesh peers stepped and mutated their
+        # backup shard (cross-rank divergence). The hybrid's union scope must
+        # fold the backup mesh in so every rank fails fast instead.
+        muon_weight = nn.Parameter(
+            torch.linspace(-0.5, 0.6, 64, dtype=torch.float32).reshape(8, 8)
+        )
+        optimizer = GefenMuonHybrid(
+            [("muon.weight", muon_weight)],
+            [("backup.weight", weight)],
+            lr=1e-3,
+            fused=False,
+            ns_steps=1,
+            ns_schedule="standard",
+            sharded_mode="exact",
+            backup_optimizer="gefen",
+            normuon=False,
+        )
+        parameters = (muon_weight, weight)
+        muon_weight.grad = torch.linspace(
+            0.6, -0.7, 64, dtype=torch.float32
+        ).reshape(8, 8)
+    elif case == "hybrid_exact":
         bias = nn.Parameter(torch.linspace(-0.4, 0.3, 8, dtype=torch.float32))
         optimizer = GefenMuonHybrid(
             [("weight", weight)],
@@ -292,7 +318,37 @@ def _distributed_worker(rank: int, init_method: str, case: str, result_queue) ->
             dist.destroy_process_group()
 
 
-def _run_distributed_case(case: str):
+def _backup_sharded_worker(rank: int, init_method: str, case: str, result_queue) -> None:
+    """Worker for the backup-only-mesh case: only the closure-failure scenario.
+
+    Constructs the hybrid where the BACKUP half owns the sharded mesh and the
+    Muon half is non-sharded, induces a rank-0 closure failure, and reports
+    whether the failure fanned out to every mesh rank (fail-fast) with no
+    parameter/state mutation and no hang.
+    """
+    try:
+        torch.set_num_threads(1)
+        dist.init_process_group(
+            "gloo",
+            init_method=init_method,
+            rank=rank,
+            world_size=_WORLD_SIZE,
+            timeout=timedelta(seconds=_PROCESS_GROUP_TIMEOUT_SECONDS),
+        )
+        from torch.distributed.tensor import init_device_mesh
+
+        mesh = init_device_mesh("cpu", (_WORLD_SIZE,), mesh_dim_names=("dp",))
+        closure_failure = _closure_failure_result(rank, mesh, case)
+        dist.barrier()
+        result_queue.put({"rank": rank, "closure_failure": closure_failure})
+    except BaseException:
+        result_queue.put({"rank": rank, "fatal_error": traceback.format_exc()})
+    finally:
+        if dist.is_available() and dist.is_initialized():
+            dist.destroy_process_group()
+
+
+def _run_distributed_case(case: str, worker_target=_distributed_worker):
     context = torch.multiprocessing.get_context("spawn")
     result_queue = context.Queue()
     descriptor, rendezvous_path = tempfile.mkstemp(prefix="gefen-precollective-sync-")
@@ -301,7 +357,7 @@ def _run_distributed_case(case: str):
     init_method = Path(rendezvous_path).resolve().as_uri()
     processes = [
         context.Process(
-            target=_distributed_worker,
+            target=worker_target,
             args=(rank, init_method, case, result_queue),
         )
         for rank in range(_WORLD_SIZE)
@@ -400,3 +456,44 @@ def test_rank_local_closure_and_amp_controls_are_synchronized(case):
         assert [item["post_hook_calls"] for item in skip_results] == [1, 1]
     else:
         assert [item["post_hook_calls"] for item in skip_results] == [None, None]
+
+
+@pytest.mark.skipif(
+    not dist.is_available() or not dist.is_gloo_available(),
+    reason="pre-collective failure synchronization coverage requires Gloo",
+)
+def test_backup_only_mesh_preflight_failure_is_synchronized():
+    """A backup-owned sharded mesh the Muon half does not touch is in scope.
+
+    Regression for the composite failure-sync deriving its process-group scope
+    from the Muon child only: when the BACKUP half owns the sharded mesh (and
+    the Muon half is non-sharded), a rank-0 preflight failure must fan out to
+    every mesh rank so ALL ranks fail fast with no mutation -- rather than
+    rank 0 raising while its mesh peer silently steps and mutates its backup
+    shard. Also guards against a hang (bounded worker/step deadlines).
+    """
+    results = _run_distributed_case(
+        "hybrid_backup_sharded", worker_target=_backup_sharded_worker
+    )
+    assert all("fatal_error" not in result for result in results), results
+
+    closure_results = [result["closure_failure"] for result in results]
+    # Both ranks fail fast (the failure was synchronized across the backup mesh).
+    assert all(item["message"] is not None for item in closure_results), closure_results
+    assert (
+        "GefenMuon hybrid step preflight failed on local rank 0"
+        in closure_results[0]["message"]
+    ), closure_results
+    assert "rank-zero closure failure" in closure_results[0]["message"], closure_results
+    assert (
+        "GefenMuon hybrid step preflight failed on another process-group member"
+        in closure_results[1]["message"]
+    ), closure_results
+    # Liveness: neither rank hung, and no parameter/state/gradient moved on
+    # either rank (the failing rank AND its mesh peer both roll back).
+    assert all(
+        item["elapsed"] < _STEP_DEADLINE_SECONDS for item in closure_results
+    ), closure_results
+    assert all(
+        all(item["unchanged"].values()) for item in closure_results
+    ), closure_results

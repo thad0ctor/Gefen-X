@@ -1305,6 +1305,57 @@ class GefenMuon(Gefen):
             return False
         return torch.distributed.is_initialized()
 
+    @staticmethod
+    @torch._dynamo.disable
+    def _collect_sharded_failure_groups(param_groups):
+        """Deduped, deterministically-ordered (process_group, device) pairs.
+
+        Shared by the raw ``GefenMuon`` step scope and ``GefenMuonHybrid``'s
+        union scope. Scans every sharded (non-``approx``) mesh represented in
+        ``param_groups``, keyed and deduplicated by mesh content and iterated in
+        sorted-key order, and within each mesh in its ``get_all_groups()``
+        dimension order. Folding several optimizers' groups through ONE dict
+        keeps a single deterministic order across ranks: an identical mesh owned
+        by more than one child (the standard fully_shard case) collapses to a
+        single collective, and a child-only mesh is still folded in -- never a
+        per-child concatenation that could interleave one rank's row all-reduce
+        against a peer's column all-reduce. Groups with no ``sharded_mode`` key
+        (a foreign backup's conventional torch groups) count as non-approx.
+        """
+        import torch.distributed as dist
+
+        by_mesh = {}
+        for group in param_groups:
+            if group.get("sharded_mode") == "approx":
+                continue
+            for param in group["params"]:
+                if not GefenMuon._is_sharded(param):
+                    continue
+                mesh = param.device_mesh
+                if mesh.get_coordinate() is None or mesh.size() < 2:
+                    continue
+                process_groups = tuple(mesh.get_all_groups())
+                members = tuple(
+                    int(item)
+                    for item in mesh.mesh.detach().cpu().reshape(-1).tolist()
+                )
+                key = (
+                    str(mesh.device_type),
+                    tuple(int(item) for item in mesh.shape),
+                    members,
+                    tuple(str(pg.group_name) for pg in process_groups),
+                )
+                by_mesh.setdefault(
+                    key, (GefenMuon._state_tensor_device(param), process_groups)
+                )
+        result = []
+        for key in sorted(by_mesh):
+            device, process_groups = by_mesh[key]
+            for process_group in process_groups:
+                if dist.get_world_size(process_group) > 1:
+                    result.append((process_group, device))
+        return tuple(result)
+
     @torch._dynamo.disable
     def _step_failure_process_groups(self):
         """Return the control scope for eager exact/distributed Muon steps.
@@ -1337,39 +1388,7 @@ class GefenMuon(Gefen):
         ):
             return ()
 
-        import torch.distributed as dist
-
-        by_mesh = {}
-        for group in self.param_groups:
-            if group["sharded_mode"] == "approx":
-                continue
-            for param in group["params"]:
-                if not self._is_sharded(param):
-                    continue
-                mesh = param.device_mesh
-                if mesh.get_coordinate() is None or mesh.size() < 2:
-                    continue
-                process_groups = tuple(mesh.get_all_groups())
-                members = tuple(
-                    int(item)
-                    for item in mesh.mesh.detach().cpu().reshape(-1).tolist()
-                )
-                key = (
-                    str(mesh.device_type),
-                    tuple(int(item) for item in mesh.shape),
-                    members,
-                    tuple(str(pg.group_name) for pg in process_groups),
-                )
-                by_mesh.setdefault(
-                    key, (self._state_tensor_device(param), process_groups)
-                )
-        result = []
-        for key in sorted(by_mesh):
-            device, process_groups = by_mesh[key]
-            for process_group in process_groups:
-                if dist.get_world_size(process_group) > 1:
-                    result.append((process_group, device))
-        return tuple(result)
+        return self._collect_sharded_failure_groups(self.param_groups)
 
     @staticmethod
     @torch._dynamo.disable
