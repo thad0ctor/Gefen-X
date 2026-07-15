@@ -1213,6 +1213,15 @@ class GefenMuonHybrid(torch.optim.Optimizer):
             return
         self._subopts[0]._synchronize_codebook_scope_failure(error, phase)
 
+    def _synchronize_prevalidated_codebook_scope_failure(
+        self, error, phase: str, binding
+    ) -> None:
+        """Synchronize through the shared binding validated at step entry."""
+
+        self._subopts[0]._synchronize_prevalidated_codebook_scope_failure(
+            error, phase, binding
+        )
+
     def _prepare_scoped_amp_optimizer_step(self) -> bool:
         # GradScaler attaches found_inf/grad_scale to the composite, never to
         # the children, so the children's own scoped AMP gates cannot see an
@@ -1250,8 +1259,13 @@ class GefenMuonHybrid(torch.optim.Optimizer):
             )
 
     def step(self, closure=None):
-        self._assert_finalized_binding_layout()
         binding = self._hybrid_codebook_process_group
+        if binding is None:
+            self._assert_finalized_binding_layout()
+        else:
+            if not isinstance(binding, CodebookProcessGroupBinding):
+                raise TypeError("the runtime codebook process-group binding is invalid")
+            self._subopts[0]._validate_codebook_runtime_binding(binding)
         process_groups = (
             self.muon._step_failure_process_groups()
             if self.muon is not None and binding is None
@@ -1271,12 +1285,14 @@ class GefenMuonHybrid(torch.optim.Optimizer):
         # and synchronize it on the one shared codebook binding BEFORE any member
         # enters the composite preflight synchronize or a child's scoped step
         # collectives, so it raises on every member together instead of stranding
-        # peers. The finalized-layout guard above stays local: it establishes the
-        # binding used to synchronize.
+        # peers. A present runtime binding is validated independently first, so
+        # the finalized-layout entry guard can join this synchronized phase.
         args = (self, closure) if closure is not None else (self,)
         kwargs = {}
         loss = None
         try:
+            if binding is not None:
+                self._assert_finalized_binding_layout()
             self._assert_capturable_devices_if_capturing()
             for pre_hook in self._optimizer_step_pre_hooks.values():
                 result = pre_hook(self, args, kwargs)
@@ -1300,11 +1316,11 @@ class GefenMuonHybrid(torch.optim.Optimizer):
             local_preamble_error = exc
 
         if binding is not None:
-            self._synchronize_codebook_scope_failure(
-                local_preamble_error, "step preamble"
+            self._synchronize_prevalidated_codebook_scope_failure(
+                local_preamble_error, "step preamble", binding
             )
-            self._assert_finalized_binding_layout()
             try:
+                self._assert_finalized_binding_layout()
                 for child in self._subopts:
                     _assert_optimizer_gradients_structurally_valid(
                         child, require_2d_params=child is self.muon
@@ -1312,8 +1328,8 @@ class GefenMuonHybrid(torch.optim.Optimizer):
                 local_preflight_error = None
             except Exception as exc:
                 local_preflight_error = exc
-            self._synchronize_codebook_scope_failure(
-                local_preflight_error, "gradient preflight"
+            self._synchronize_prevalidated_codebook_scope_failure(
+                local_preflight_error, "gradient preflight", binding
             )
             should_step = self._prepare_scoped_amp_optimizer_step()
         else:

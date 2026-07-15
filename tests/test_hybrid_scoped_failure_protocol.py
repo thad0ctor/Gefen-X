@@ -378,6 +378,58 @@ def _closure_divergent_result(rank, group):
     }
 
 
+def _closure_layout_divergent_result(rank, group):
+    optimizer, muon_parameter, backup_parameter, backup_shard = _make_scoped_hybrid(
+        rank, group
+    )
+    _set_local_gradients(muon_parameter, backup_parameter, backup_shard)
+    rogue = torch.nn.Parameter(torch.ones_like(backup_parameter))
+    rogue_before = rogue.detach().clone()
+
+    def closure():
+        if rank == 0:
+            optimizer.backup.param_groups[0]["params"][0] = rogue
+            rogue.grad = torch.ones_like(rogue)
+        return torch.tensor(1.0)
+
+    try:
+        optimizer.step(closure)
+        message = None
+    except RuntimeError as exc:
+        message = str(exc)
+    return {
+        "message": message,
+        "untouched": (
+            _untouched(optimizer, muon_parameter, backup_parameter)
+            and torch.equal(rogue, rogue_before)
+        ),
+    }
+
+
+def _step_entry_layout_divergent_result(rank, group):
+    optimizer, muon_parameter, backup_parameter, backup_shard = _make_scoped_hybrid(
+        rank, group
+    )
+    _set_local_gradients(muon_parameter, backup_parameter, backup_shard)
+    rogue = torch.nn.Parameter(torch.ones_like(backup_parameter))
+    rogue_before = rogue.detach().clone()
+    if rank == 0:
+        optimizer.backup.param_groups[0]["params"][0] = rogue
+        rogue.grad = torch.ones_like(rogue)
+    try:
+        optimizer.step()
+        message = None
+    except RuntimeError as exc:
+        message = str(exc)
+    return {
+        "message": message,
+        "untouched": (
+            _untouched(optimizer, muon_parameter, backup_parameter)
+            and torch.equal(rogue, rogue_before)
+        ),
+    }
+
+
 def _distributed_worker(rank, init_file, result_queue):
     try:
         dist.init_process_group(
@@ -398,6 +450,10 @@ def _distributed_worker(rank, init_file, result_queue):
         dist.barrier()
         closure_divergent = _closure_divergent_result(rank, group)
         dist.barrier()
+        closure_layout_divergent = _closure_layout_divergent_result(rank, group)
+        dist.barrier()
+        step_entry_layout_divergent = _step_entry_layout_divergent_result(rank, group)
+        dist.barrier()
         result_queue.put(
             {
                 "rank": rank,
@@ -406,6 +462,8 @@ def _distributed_worker(rank, init_file, result_queue):
                 "amp_finite": amp_finite,
                 "preflight": preflight,
                 "closure_divergent": closure_divergent,
+                "closure_layout_divergent": closure_layout_divergent,
+                "step_entry_layout_divergent": step_entry_layout_divergent,
             }
         )
     except BaseException:
@@ -514,6 +572,28 @@ def test_hybrid_step_synchronizes_amp_and_preflight_across_the_scope():
     assert "closure boom on rank:0" in closure_divergent[0]["message"]
     assert "step preamble failed on another process-group member" in closure_divergent[1]["message"]
     assert all(item["untouched"] for item in closure_divergent), closure_divergent
+
+    # A closure can silently replace one finalized child parameter. Synchronize
+    # that post-closure layout failure through the binding captured at step entry,
+    # before either member revalidates the now rank-divergent live binding.
+    closure_layout_divergent = [
+        result["closure_layout_divergent"] for result in results
+    ]
+    assert closure_layout_divergent[0]["message"] is not None and closure_layout_divergent[1]["message"] is not None, closure_layout_divergent
+    assert "changed outside post_sharding" in closure_layout_divergent[0]["message"]
+    assert "gradient preflight failed on another process-group member" in closure_layout_divergent[1]["message"]
+    assert all(item["untouched"] for item in closure_layout_divergent), closure_layout_divergent
+
+    # A mutation made between steps fails the first finalized-layout guard. The
+    # explicit binding is captured independently so that guard joins the same
+    # preamble vote instead of failing on only one member.
+    step_entry_layout_divergent = [
+        result["step_entry_layout_divergent"] for result in results
+    ]
+    assert step_entry_layout_divergent[0]["message"] is not None and step_entry_layout_divergent[1]["message"] is not None, step_entry_layout_divergent
+    assert "changed outside post_sharding" in step_entry_layout_divergent[0]["message"]
+    assert "step preamble failed on another process-group member" in step_entry_layout_divergent[1]["message"]
+    assert all(item["untouched"] for item in step_entry_layout_divergent), step_entry_layout_divergent
 
 
 def _make_plain_hybrid():

@@ -1,11 +1,11 @@
-"""Per-step layout/offload guard cost: fast-path tokens, dedupe, boundaries.
+"""Per-step layout guard cost: fast-path tokens, dedupe, and boundaries.
 
 The finalized-layout guards run on every ``step()``; these tests pin the
 contract that steady-state steps reuse one cached forensic verdict (an
 O(local params) identity token check) while every legitimate mutating API and
-every boundary operation (checkpoint prepare/commit, rebinding, state
-movement/offload, contract readiness) still runs the complete O(params x
-world) forensic rebuild. Detection-before-mutation is preserved: anything a
+every boundary operation (checkpoint prepare/commit, rebinding, and contract
+readiness) still runs the complete O(params x world) forensic rebuild.
+Detection-before-mutation is preserved: anything a
 closure or adapter can corrupt through the public optimizer containers still
 raises at the step guard itself.
 """
@@ -259,7 +259,7 @@ def test_private_registry_inplace_tamper_is_detected_at_the_next_boundary():
         optimizer.state_dict()
 
 
-def test_mutating_apis_bump_the_layout_version_and_force_revalidation(monkeypatch):
+def test_load_state_dict_bumps_the_layout_version_and_forces_revalidation(monkeypatch):
     optimizer, parameters = _finalized_replicated_optimizer()
     _step_with_grads(optimizer, parameters)
     checkpoint = optimizer.state_dict()
@@ -267,75 +267,16 @@ def test_mutating_apis_bump_the_layout_version_and_force_revalidation(monkeypatc
     calls = _count_full_layout_passes(monkeypatch)
 
     version = optimizer._gefen_layout_version
-    optimizer.move_state_()
-    assert optimizer._gefen_layout_version == version + 1
-    assert optimizer._gefen_layout_forensics_verdict is None
-
-    _step_with_grads(optimizer, parameters)
-    after_move = calls["count"]
-    assert after_move >= 1
-    _step_with_grads(optimizer, parameters)
-    assert calls["count"] == after_move  # steady again
-
-    version = optimizer._gefen_layout_version
     optimizer.load_state_dict(checkpoint)
     assert optimizer._gefen_layout_version > version
     assert optimizer._gefen_layout_forensics_verdict is None
 
-
-def test_state_offload_step_scan_runs_on_every_step(monkeypatch):
-    # The offload readiness scan is intentionally NOT cached: the per-parameter
-    # offloaded state tensors are legitimately replaced on every step, so a
-    # cached verdict cannot represent them, and a token-preserving in-place
-    # corruption of a later parameter would otherwise slip past step entry and
-    # only be caught mid-step, after earlier parameters were already mutated.
-    # The scan is O(local params) and must run before any parameter is staged.
-    optimizer, parameters = _finalized_replicated_optimizer()
+    after_load = calls["count"]
     _step_with_grads(optimizer, parameters)
-
-    calls = {"count": 0}
-
-    def counted(self, *, require_cpu_state, allow_poisoned=False):
-        calls["count"] += 1
-        return None
-
-    monkeypatch.setattr(Gefen, "_state_offload_rejection_reason", counted)
-    monkeypatch.setattr(
-        Gefen,
-        "state_offload_active",
-        property(lambda self: True),
-    )
-
-    optimizer._assert_state_offload_step_ready()
-    optimizer._assert_state_offload_step_ready()
-    optimizer._assert_state_offload_step_ready()
-    assert calls["count"] == 3
-
-    optimizer._gefen_state_offload_poisoned = True
-    with pytest.raises(RuntimeError, match="poisoned"):
-        optimizer._assert_state_offload_step_ready()
-
-
-def test_offload_scan_re_rejects_on_every_step(monkeypatch):
-    optimizer, parameters = _finalized_replicated_optimizer()
-
-    calls = {"count": 0}
-
-    def counted(self, *, require_cpu_state, allow_poisoned=False):
-        calls["count"] += 1
-        return "authoritative offloaded tensors must be tight CPU tensors"
-
-    monkeypatch.setattr(Gefen, "_state_offload_rejection_reason", counted)
-    monkeypatch.setattr(
-        Gefen,
-        "state_offload_active",
-        property(lambda self: True),
-    )
-
-    for _ in range(2):
-        with pytest.raises(RuntimeError, match="cannot step"):
-            optimizer._assert_state_offload_step_ready()
-    assert calls["count"] == 2
+    assert calls["count"] > after_load
+    after_revalidation = calls["count"]
+    _step_with_grads(optimizer, parameters)
+    assert calls["count"] == after_revalidation  # steady again
 
 
 def test_forensics_caches_stay_out_of_the_public_attribute_namespace():
@@ -359,10 +300,8 @@ def test_warm_step_guards_are_far_cheaper_than_one_forensic_pass():
     iterations = 50
     start = time.perf_counter()
     for _ in range(iterations):
-        optimizer._assert_state_offload_step_ready()
         optimizer._assert_finalized_binding_layout()
         optimizer._assert_runtime_codebook_process_group()
-        optimizer._assert_state_offload_step_ready()
         optimizer._assert_finalized_binding_layout()
         optimizer._assert_runtime_codebook_process_group()
     warm_guard = (time.perf_counter() - start) / iterations

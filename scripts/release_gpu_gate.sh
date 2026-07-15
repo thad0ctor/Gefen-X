@@ -216,8 +216,6 @@ GEFEN_VERBOSE_BUILD=1 \
   tests/test_gefen_fsdp2_checkpoint.py \
   tests/test_muon_distributed_checkpoint_safety.py \
   tests/test_muon_grad_presence.py \
-  tests/test_state_offload.py \
-  tests/test_state_movement.py \
   tests/test_step_preflight_atomicity.py \
   tests/test_muon_fsdp2_parity.py::test_muon_fsdp2_fused_cuda_parity \
   tests/test_muon_fsdp2_parity.py::test_muon_fsdp2_fused_multirank_parity \

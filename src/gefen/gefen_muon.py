@@ -777,10 +777,7 @@ class GefenMuon(Gefen):
             for group in self.param_groups
             if not group.get("normuon", False)
         )
-        try:
-            canonical_state_layouts = self._canonical_state_layouts()
-        except Exception:
-            canonical_state_layouts = frozenset()
+        canonical_state_layouts = self._canonical_state_layouts()
         try:
             from gefen.portable_runtime import _portable_runtime_layouts
 
@@ -814,7 +811,6 @@ class GefenMuon(Gefen):
             canonical_global_same_topology=canonical_global_same_topology,
             canonical_global_topology_changing=canonical_global_topology_changing,
             canonical_global_topology_change_kinds=canonical_global_topology_change_kinds,
-            atomic_state_movement=self._atomic_state_movement_supported(),
             whole_parameter_owner=(
                 self._codebook_scope_ready()
                 and any(
@@ -2192,6 +2188,15 @@ class GefenMuon(Gefen):
         update = self._compute_muon_update(group, param_name, p, grad, eff_numel)
         self._apply_muon_update(group, p, update, is_sharded, approx)
 
+    @staticmethod
+    def _state_tensor_device(p: torch.Tensor) -> torch.device:
+        if hasattr(p, "to_local"):
+            local = p.to_local()
+            if hasattr(local, "wait"):
+                local = local.wait()
+            return local.device
+        return p.device
+
     def _distributed_state_items(self, state_dict):
         saved_ids = []
         for saved_group in state_dict["param_groups"]:
@@ -3052,24 +3057,31 @@ class GefenMuon(Gefen):
 
     @torch.no_grad()
     def step(self, closure=None):
-        self._assert_finalized_binding_layout()
-        self._assert_runtime_codebook_process_group()
-        if self._has_unscoped_whole_owner_bindings():
-            raise RuntimeError(
-                "GefenMuon whole-parameter owner stepping requires the separate "
-                "explicit process-group codebook scope"
-            )
-        loss = None
+        scope_binding = self._capture_codebook_scope_binding_for_step()
         hybrid_preflight_complete = bool(
             getattr(self, "_gefen_hybrid_precollective_preflight", False)
         )
-        if not hybrid_preflight_complete and (
-            self._gefen_codebook_process_group is not None
-        ):
+        if hybrid_preflight_complete or scope_binding is None:
+            self._assert_finalized_binding_layout()
+            self._assert_runtime_codebook_process_group()
+            if self._has_unscoped_whole_owner_bindings():
+                raise RuntimeError(
+                    "GefenMuon whole-parameter owner stepping requires the separate "
+                    "explicit process-group codebook scope"
+                )
+        loss = None
+        if not hybrid_preflight_complete and scope_binding is not None:
             # The explicit convention binding is the exclusive control scope:
             # synchronize on it before any operation header or mesh collective,
             # never in addition to the mainline DTensor-derived scope.
             try:
+                self._assert_finalized_binding_layout()
+                self._assert_runtime_codebook_process_group()
+                if self._has_unscoped_whole_owner_bindings():
+                    raise RuntimeError(
+                        "GefenMuon whole-parameter owner stepping requires the separate "
+                        "explicit process-group codebook scope"
+                    )
                 self._assert_capturable_if_capturing()
                 self._assert_codebook_capture_ready()
                 if closure is not None:
@@ -3079,23 +3091,23 @@ class GefenMuon(Gefen):
             except Exception as exc:
                 loss = None
                 local_preamble_error = exc
-            self._synchronize_codebook_scope_failure(
-                local_preamble_error, "step preamble"
+            self._synchronize_prevalidated_codebook_scope_failure(
+                local_preamble_error, "step preamble", scope_binding
             )
 
-            self._assert_finalized_binding_layout()
-            self._assert_runtime_codebook_process_group()
             try:
+                self._assert_finalized_binding_layout()
+                self._assert_runtime_codebook_process_group()
                 _assert_optimizer_gradients_structurally_valid(
                     self, require_2d_params=True
                 )
                 local_preflight_error = None
             except Exception as exc:
                 local_preflight_error = exc
-            self._validate_codebook_scope_operation_header("step")
-            self._synchronize_codebook_scope_failure(
-                local_preflight_error, "gradient preflight"
+            self._synchronize_prevalidated_codebook_scope_failure(
+                local_preflight_error, "gradient preflight", scope_binding
             )
+            self._validate_codebook_scope_operation_header("step")
             self._ensure_codebook_scope_agreement()
 
             if not self._prepare_scoped_amp_optimizer_step():

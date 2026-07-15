@@ -205,8 +205,9 @@ def _reuse_decision_worker(rank, init_file, queue):
 def _revalidation_decision_worker(rank, init_file, queue):
     """A rank-local scope-validated reset must re-validate on every member.
 
-    move_state_ is collective-free and resets _gefen_codebook_scope_validated
-    on the member that called it only, while every fingerprint the step
+    A native checkpoint reload is rank-local and resets
+    _gefen_codebook_scope_validated on the member that loaded it only, while
+    every fingerprint the step
     header exchanges stays identical. The next step must make the SAME
     early-return decision inside _ensure_codebook_scope_agreement on every
     member.
@@ -232,11 +233,12 @@ def _revalidation_decision_worker(rank, init_file, queue):
         optimizer.step()
         validated_after_first = bool(optimizer._gefen_codebook_scope_validated)
 
-        # Advertised collective-free state movement on ONE member only; every
-        # state value stays bit-identical, so the step header fingerprints
-        # still agree across members.
+        # Reload native state on ONE member only; every state value stays
+        # bit-identical, so the step header fingerprints still agree across
+        # members.
+        checkpoint = optimizer.state_dict()
         if rank == 0:
-            optimizer.move_state_(torch.device("cpu"))
+            optimizer.load_state_dict(checkpoint)
         reset_asymmetric = (
             not optimizer._gefen_codebook_scope_validated
             if rank == 0

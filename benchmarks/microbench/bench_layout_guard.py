@@ -153,12 +153,10 @@ def main() -> int:
     )
 
     def warm_step_guards():
-        # The complete step() guard sequence (both the pre-closure and the
-        # post-closure blocks), on a warm verdict.
-        optimizer._assert_state_offload_step_ready()
+        # The finalized-layout/process-group step guard sequence (both the
+        # pre-closure and post-closure blocks), on a warm verdict.
         optimizer._assert_finalized_binding_layout()
         optimizer._assert_runtime_codebook_process_group()
-        optimizer._assert_state_offload_step_ready()
         optimizer._assert_finalized_binding_layout()
         optimizer._assert_runtime_codebook_process_group()
 

@@ -311,10 +311,6 @@ def test_initialized_import_maps_by_fqn_across_order_and_group_boundaries():
     assert torch.equal(target_second, source_second)
     assert torch.equal(target._gefen_codebook, source._gefen_codebook)
 
-    target.move_state_("cpu")
-    assert target._gefen_logical_slots is logical_slots
-    assert target.optimizer_contract().capabilities.canonical_state_io
-
     with pytest.raises(RuntimeError, match="already consumed"):
         target.commit_canonical_state_import(prepared)
 

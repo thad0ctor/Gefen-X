@@ -1150,29 +1150,6 @@ class PortableStateProvider(Protocol):
         """Collectively stage and atomically publish portable global state."""
 
 
-@runtime_checkable
-class StateMovementProvider(Protocol):
-    """Structural protocol for quiescent atomic optimizer-state movement."""
-
-    def move_state_(self, device=None) -> None:
-        """Co-locate authoritative state with the optimizer's live parameters."""
-
-
-@runtime_checkable
-class StateOffloadProvider(Protocol):
-    """Structural protocol for persistent live optimizer-state offload."""
-
-    @property
-    def state_offload_device(self):
-        """Return the active offload device, or ``None`` while resident."""
-
-    def offload_state_(self, device="cpu") -> None:
-        """Atomically park supported state and enable transparent step paging."""
-
-    def restore_state_(self) -> None:
-        """Atomically co-locate state with parameters and disable offload."""
-
-
 _ALL_PRECISIONS = frozenset(
     {Precision.FLOAT32, Precision.BFLOAT16, Precision.FLOAT16, Precision.FLOAT64}
 )
@@ -1336,8 +1313,6 @@ def _negative_capabilities(
     shard_rebinding: bool = False,
     post_sharding: bool = False,
     canonical_state_io: bool = False,
-    atomic_state_movement: bool = False,
-    state_offload: bool = False,
 ) -> OptimizerCapabilities:
     return OptimizerCapabilities(
         training=training,
@@ -1351,8 +1326,8 @@ def _negative_capabilities(
         shard_rebinding=shard_rebinding,
         post_sharding=post_sharding,
         canonical_state_io=canonical_state_io,
-        atomic_state_movement=atomic_state_movement,
-        state_offload=state_offload,
+        atomic_state_movement=False,
+        state_offload=False,
     )
 
 
@@ -1367,8 +1342,6 @@ def _gefen_contract(
     canonical_global_same_topology: AbstractSet[ParameterLayout] = frozenset(),
     canonical_global_topology_changing: AbstractSet[ParameterLayout] = frozenset(),
     canonical_global_topology_change_kinds: AbstractSet[TopologyChange] = frozenset(),
-    atomic_state_movement: bool = False,
-    state_offload: bool = False,
 ) -> OptimizerContract:
     canonical_state_layouts = _frozenset(canonical_state_layouts)
     canonical_global_same_topology = _frozenset(canonical_global_same_topology)
@@ -1586,8 +1559,6 @@ def _gefen_contract(
                 or canonical_global_same_topology
                 or canonical_global_topology_changing
             ),
-            atomic_state_movement=atomic_state_movement,
-            state_offload=state_offload,
         ),
     )
 
@@ -1625,7 +1596,6 @@ def _gefen_muon_contract(
     canonical_global_same_topology: AbstractSet[ParameterLayout] = frozenset(),
     canonical_global_topology_changing: AbstractSet[ParameterLayout] = frozenset(),
     canonical_global_topology_change_kinds: AbstractSet[TopologyChange] = frozenset(),
-    atomic_state_movement: bool = False,
 ) -> OptimizerContract:
     canonical_state_layouts = _frozenset(canonical_state_layouts)
     canonical_global_same_topology = _frozenset(canonical_global_same_topology)
@@ -1950,7 +1920,6 @@ def _gefen_muon_contract(
                 or canonical_global_same_topology
                 or canonical_global_topology_changing
             ),
-            atomic_state_movement=atomic_state_movement,
         ),
     )
 
@@ -2093,8 +2062,6 @@ __all__ = [
     "StateField",
     "StateGeometry",
     "StateKeyMatch",
-    "StateMovementProvider",
-    "StateOffloadProvider",
     "StateScope",
     "StateVariant",
     "TrainingSupport",

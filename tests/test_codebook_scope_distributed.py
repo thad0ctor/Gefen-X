@@ -1247,11 +1247,10 @@ def test_nccl_scope_uses_explicit_collective_device_with_empty_nonowner():
             os.unlink(init_file)
 
 
-def _closure_preamble_worker(rank, world, init_file, queue):
-    # GefenMuon.step runs the closure BEFORE any scope synchronization. A
-    # rank-local closure failure must raise on every scope member together
-    # instead of leaving the failing rank to exit step() while the peer enters
-    # the scoped operation-header / synchronization collectives and hangs.
+def _closure_preamble_worker(
+    rank, world, init_file, queue, optimizer_kind, failure_mode
+):
+    # Optimizer.step runs the closure before any later scope collectives. A rank-local closure failure must raise on every scope member together instead of leaving the failing rank to exit step() while the peer enters the scoped operation-header / synchronization collectives and hangs.
     try:
         dist.init_process_group(
             "gloo",
@@ -1265,7 +1264,14 @@ def _closure_preamble_worker(rank, world, init_file, queue):
         runtime_group = dist.group.WORLD
 
         matrix = torch.nn.Parameter(torch.zeros(2, 2))
-        optimizer = GefenMuon([("matrix", matrix)], fused=False)
+        if optimizer_kind == "muon":
+            optimizer = GefenMuon([("matrix", matrix)], fused=False)
+        elif optimizer_kind == "gefen":
+            optimizer = Gefen(
+                [("matrix", matrix)], fused=False, factored_v_2d=False
+            )
+        else:
+            raise AssertionError("unknown closure-preamble optimizer kind")
         identity = ParameterIdentity("Matrix", (2, 2))
         records = tuple(_replicated(identity, group, member) for member in members)
         _finalize(
@@ -1276,10 +1282,18 @@ def _closure_preamble_worker(rank, world, init_file, queue):
             _binding(group, rank, runtime_group),
         )
         matrix.grad = torch.tensor([[1.0, -2.0], [3.0, -4.0]])
+        rogue = torch.nn.Parameter(torch.ones(2, 2))
+        rogue_before = rogue.detach().clone()
+        if rank == 0 and failure_mode == "replace_before":
+            optimizer.param_groups[0]["params"][0] = rogue
+            rogue.grad = torch.ones_like(rogue)
 
         def closure():
-            if rank == 0:
+            if rank == 0 and failure_mode == "raise":
                 raise RuntimeError("closure boom on rank:0")
+            if rank == 0 and failure_mode == "replace":
+                optimizer.param_groups[0]["params"][0] = rogue
+                rogue.grad = torch.ones_like(rogue)
             return torch.tensor(1.0)
 
         try:
@@ -1293,6 +1307,7 @@ def _closure_preamble_worker(rank, world, init_file, queue):
             and optimizer._gefen_codebook is None
             and optimizer.state[matrix] == {"name": "matrix"}
             and torch.equal(matrix, torch.zeros(2, 2))
+            and torch.equal(rogue, rogue_before)
         )
         queue.put({"rank": rank, "message": message, "untouched": untouched})
     except Exception as exc:
@@ -1302,7 +1317,9 @@ def _closure_preamble_worker(rank, world, init_file, queue):
             dist.destroy_process_group()
 
 
-def _run_closure_preamble_workers(world=2):
+def _run_closure_preamble_workers(
+    optimizer_kind="muon", failure_mode="raise", world=2
+):
     context = mp.get_context("spawn")
     queue = context.Queue()
     fd, init_file = tempfile.mkstemp(prefix="gefen-codebook-closure-preamble-")
@@ -1311,7 +1328,7 @@ def _run_closure_preamble_workers(world=2):
     processes = [
         context.Process(
             target=_closure_preamble_worker,
-            args=(rank, world, init_file, queue),
+            args=(rank, world, init_file, queue, optimizer_kind, failure_mode),
         )
         for rank in range(world)
     ]
@@ -1352,5 +1369,53 @@ def test_scoped_step_closure_failure_raises_symmetrically_across_the_scope():
     assert all("error" not in item for item in results), results
     assert results[0]["message"] is not None and results[1]["message"] is not None, results
     assert "closure boom on rank:0" in results[0]["message"]
+    assert "step preamble failed on another process-group member" in results[1]["message"]
+    assert all(item["untouched"] for item in results), results
+
+
+@pytest.mark.skipif(
+    not dist.is_available() or not dist.is_gloo_available(),
+    reason="plain Gefen scoped closure-preamble coverage requires Gloo",
+)
+def test_plain_gefen_scoped_step_closure_failure_raises_symmetrically_across_the_scope():
+    results = _run_closure_preamble_workers("gefen")
+    assert len(results) == 2, results
+    assert all("error" not in item for item in results), results
+    assert results[0]["message"] is not None and results[1]["message"] is not None, results
+    assert "closure boom on rank:0" in results[0]["message"]
+    assert "step preamble failed on another process-group member" in results[1]["message"]
+    assert all(item["untouched"] for item in results), results
+
+
+@pytest.mark.skipif(
+    not dist.is_available() or not dist.is_gloo_available(),
+    reason="scoped closure layout-mutation coverage requires Gloo",
+)
+@pytest.mark.parametrize("optimizer_kind", ["gefen", "muon"])
+def test_scoped_step_closure_layout_mutation_raises_symmetrically_across_the_scope(
+    optimizer_kind,
+):
+    results = _run_closure_preamble_workers(optimizer_kind, "replace")
+    assert len(results) == 2, results
+    assert all("error" not in item for item in results), results
+    assert results[0]["message"] is not None and results[1]["message"] is not None, results
+    assert "changed outside post_sharding" in results[0]["message"]
+    assert "gradient preflight failed on another process-group member" in results[1]["message"]
+    assert all(item["untouched"] for item in results), results
+
+
+@pytest.mark.skipif(
+    not dist.is_available() or not dist.is_gloo_available(),
+    reason="scoped step-entry layout-mutation coverage requires Gloo",
+)
+@pytest.mark.parametrize("optimizer_kind", ["gefen", "muon"])
+def test_scoped_step_entry_layout_mutation_raises_symmetrically_across_the_scope(
+    optimizer_kind,
+):
+    results = _run_closure_preamble_workers(optimizer_kind, "replace_before")
+    assert len(results) == 2, results
+    assert all("error" not in item for item in results), results
+    assert results[0]["message"] is not None and results[1]["message"] is not None, results
+    assert "changed outside post_sharding" in results[0]["message"]
     assert "step preamble failed on another process-group member" in results[1]["message"]
     assert all(item["untouched"] for item in results), results
