@@ -497,9 +497,14 @@ def _resolve_find_period_backend(grad: torch.Tensor) -> str:
     return "cuda_kernel" if grad_work.device.type == "cuda" else "cpu"
 
 
-def _step_failure_collective_device(process_group) -> torch.device:
+def _step_failure_collective_device(
+    process_group, *, collective_device=None
+) -> torch.device:
     """Choose a backend-compatible device for a process-group control flag."""
     import torch.distributed as dist
+
+    if collective_device is not None:
+        return torch.device(collective_device)
 
     group = process_group if process_group is not None else dist.group.WORLD
     bound_device = getattr(group, "bound_device_id", None)
@@ -519,7 +524,9 @@ def _step_failure_collective_device(process_group) -> torch.device:
 
 @torch.no_grad()
 @torch._dynamo.disable
-def _synchronize_step_failure(local_failed, process_group) -> bool:
+def _synchronize_step_failure(
+    local_failed, process_group, *, collective_device=None
+) -> bool:
     """Return whether any process-group member reported a step failure."""
     failed = bool(local_failed)
     if not torch.distributed.is_available() or not torch.distributed.is_initialized():
@@ -532,7 +539,9 @@ def _synchronize_step_failure(local_failed, process_group) -> bool:
     flag = torch.tensor(
         int(failed),
         dtype=torch.int32,
-        device=_step_failure_collective_device(process_group),
+        device=_step_failure_collective_device(
+            process_group, collective_device=collective_device
+        ),
     )
     dist.all_reduce(flag, op=dist.ReduceOp.MAX, group=process_group)
     return bool(flag.item())
@@ -540,7 +549,9 @@ def _synchronize_step_failure(local_failed, process_group) -> bool:
 
 @torch.no_grad()
 @torch._dynamo.disable
-def _synchronize_step_control_range(local_minimum, local_maximum, process_group):
+def _synchronize_step_control_range(
+    local_minimum, local_maximum, process_group, *, collective_device=None
+):
     """Expand control-value bounds across one process group."""
     minimum = tuple(float(item) for item in local_minimum)
     maximum = tuple(float(item) for item in local_maximum)
@@ -556,7 +567,9 @@ def _synchronize_step_control_range(local_minimum, local_maximum, process_group)
     bounds = torch.tensor(
         minimum + tuple(-item for item in maximum),
         dtype=torch.float64,
-        device=_step_failure_collective_device(process_group),
+        device=_step_failure_collective_device(
+            process_group, collective_device=collective_device
+        ),
     )
     dist.all_reduce(bounds, op=dist.ReduceOp.MIN, group=process_group)
     values = bounds.cpu().tolist()
