@@ -62,7 +62,6 @@ import torch.nn as nn
 from gefen.gefen import (
     Gefen,
     _amp_native_scaling_required,
-    _amp_prepare_optimizer_step,
     _assert_optimizer_gradients_structurally_valid,
 )
 from gefen.gefen_muon import GefenMuon
@@ -655,12 +654,44 @@ class GefenMuonHybrid(torch.optim.Optimizer):
                 )
             )
 
+    @torch._dynamo.disable
+    def _step_failure_process_groups(self):
+        """Failure-sync scope for the composite preflight: the UNION of both
+        children's sharded-mesh (process_group, device) pairs.
+
+        The composite preflight (closure + structural gradient validation + AMP
+        controls) covers BOTH children, so the pre-collective failure sync must
+        span every sharded mesh EITHER child owns -- not only the Muon child's.
+        Deriving the scope from the Muon child alone missed any mesh owned only
+        by the backup child (a sharded backup weight whose Muon half is
+        non-sharded or absent): a one-rank preflight failure on that backup-only
+        mesh then raised on the failing rank while its mesh peers proceeded to
+        step and mutate their shard, diverging cross-rank state. Both children's
+        param_groups are folded through ONE deduped, sorted scan
+        (``GefenMuon._collect_sharded_failure_groups``), so the standard
+        fully_shard case -- both halves sharded on the SAME mesh -- collapses to
+        exactly the Muon-only scope with no extra collective, while a
+        backup-only mesh is included in one deterministic cross-rank order.
+        """
+        if not GefenMuon._dist_available():
+            return ()
+        param_groups = [
+            group
+            for optimizer in self._subopts
+            for group in optimizer.param_groups
+        ]
+        params = [param for group in param_groups for param in group["params"]]
+        # The protocol returns host-readable flags and cannot be captured; a
+        # captured step already requires an eager warmup with fixed control flow
+        # (mirrors GefenMuon._step_failure_process_groups).
+        if any(param.device.type == "cuda" for param in params) and (
+            torch.cuda.is_current_stream_capturing()
+        ):
+            return ()
+        return GefenMuon._collect_sharded_failure_groups(param_groups)
+
     def step(self, closure=None):
-        process_groups = (
-            self.muon._step_failure_process_groups()
-            if self.muon is not None
-            else ()
-        )
+        process_groups = self._step_failure_process_groups()
         # Dispatch the INSTANCE step hooks around the composite step, mirroring
         # torch.optim.Optimizer.profile_hook_step exactly: hooks receive
         # (optimizer, args, kwargs) where args are the raw step() call args
@@ -698,25 +729,25 @@ class GefenMuonHybrid(torch.optim.Optimizer):
         except Exception as exc:
             loss = None
             local_preflight_error = exc
-        if self.muon is not None:
-            self.muon._synchronize_sharded_step_error(
-                local_preflight_error, "hybrid step preflight", process_groups
-            )
-        elif local_preflight_error is not None:
-            raise local_preflight_error
+        # Synchronize the preflight failure across the UNION scope
+        # unconditionally -- including a muon-only-None (backup-only) hybrid
+        # whose backup owns a sharded mesh. When process_groups is empty (no
+        # sharded mesh) the static helper just re-raises any local error, which
+        # is the previous rank-local behavior.
+        GefenMuon._synchronize_sharded_step_error(
+            local_preflight_error, "hybrid step preflight", process_groups
+        )
 
         # A non-finite gradient in either half skips BOTH children before their
         # codebooks, states, counters, or parameters can move. Explicit
         # scaler.unscale_(hybrid) is detected by grad_scale=None and is not
         # repeated; automatic unscale covers every child parameter exactly once.
-        if self.muon is not None:
-            should_step = self.muon._prepare_synchronized_amp_step(
-                self, process_groups
-            )
-        elif hasattr(self, "found_inf") or hasattr(self, "grad_scale"):
-            should_step = _amp_prepare_optimizer_step(self)
-        else:
-            should_step = True
+        # The static AMP agreement subsumes the old muon-present/absent split:
+        # with an empty scope and no local controls it returns True, and with
+        # local controls it falls back to plain _amp_prepare_optimizer_step.
+        should_step = GefenMuon._prepare_synchronized_amp_step(
+            self, process_groups
+        )
         if not should_step:
             for post_hook in self._optimizer_step_post_hooks.values():
                 post_hook(self, args, kwargs)
