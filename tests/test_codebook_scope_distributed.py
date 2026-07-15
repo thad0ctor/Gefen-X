@@ -1460,6 +1460,29 @@ def test_plain_gefen_scoped_step_closure_group_swap_raises_symmetrically_across_
     assert all(item["untouched"] for item in results), results
 
 
+@pytest.mark.skipif(
+    not dist.is_available() or not dist.is_gloo_available(),
+    reason="GefenMuon scoped closure group-swap coverage requires Gloo",
+)
+def test_gefen_muon_scoped_step_closure_group_swap_raises_symmetrically_across_the_scope():
+    # GefenMuon twin of the plain-Gefen group-swap coverage. A closure that
+    # clears the captured runtime binding on one rank keeps the rank-local
+    # preamble valid, so without the captured-binding recheck the swapping rank
+    # would skip the scoped step header while its peer entered the all_gather and
+    # hung. The recheck raises on the swapping rank and the failure is
+    # synchronized through the captured scope so BOTH ranks raise fast.
+    results = _run_closure_preamble_workers("muon", "swap_group")
+    assert len(results) == 2, results
+    assert all("error" not in item for item in results), results
+    assert results[0]["message"] is not None and results[1]["message"] is not None, results
+    assert "binding changed during the step preamble" in results[0]["message"]
+    assert (
+        "gradient preflight failed on another process-group member"
+        in results[1]["message"]
+    )
+    assert all(item["untouched"] for item in results), results
+
+
 def _initialize_preamble_worker(rank, world, init_file, queue):
     # initialize_codebook() runs its finalized-layout / runtime-binding /
     # capture-readiness preamble before the scoped operation-header collective.

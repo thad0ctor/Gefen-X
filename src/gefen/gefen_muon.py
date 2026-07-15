@@ -3116,7 +3116,18 @@ class GefenMuon(Gefen):
                 local_preamble_error, "step preamble", scope_binding
             )
 
+            # The closure can replace a finalized parameter or otherwise
+            # invalidate the runtime binding. It can also rebind (or clear) the
+            # runtime process-group between capture and the operation header; a
+            # rank that silently swapped to None or a different binding would
+            # enter a different header collective than its peers and deadlock.
+            # Recheck against the captured binding and synchronize structural
+            # failures before any peer enters a scoped codebook collective.
             try:
+                if self._gefen_codebook_process_group is not scope_binding:
+                    raise RuntimeError(
+                        "GefenMuon codebook process-group binding changed during the step preamble"
+                    )
                 self._assert_finalized_binding_layout()
                 self._assert_runtime_codebook_process_group()
                 _assert_optimizer_gradients_structurally_valid(

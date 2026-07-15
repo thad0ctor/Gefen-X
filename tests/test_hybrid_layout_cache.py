@@ -176,7 +176,10 @@ def test_composite_registry_in_place_entry_swap_is_detected_with_warm_verdict():
     rogue = torch.nn.Parameter(torch.full((2, 2), 5.0))
     rogue_before = rogue.detach().clone()
     optimizer._state_param_owner[key] = (rogue, child)
-    assert optimizer._state_param_owner[key] is not _parameter
+    replaced_parameter, replaced_child = optimizer._state_param_owner[key]
+    assert replaced_parameter is rogue
+    assert replaced_parameter is not _parameter
+    assert replaced_child is child
     assert len(optimizer._state_param_owner) == 2
 
     with pytest.raises(RuntimeError, match="finalized parameter layout changed"):
