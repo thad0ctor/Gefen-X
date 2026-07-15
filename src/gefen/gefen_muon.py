@@ -1309,16 +1309,21 @@ class GefenMuon(Gefen):
     def _step_failure_process_groups(self):
         """Return the control scope for eager exact/distributed Muon steps.
 
-        Every sharded (non-approx) mesh this rank participates in contributes its
-        collective groups, deduplicated by process-group name and returned in a
-        globally consistent (sorted) order -- exactly the meshes
-        ``_assert_sharded_grad_presence_consistent`` enters. Selecting only one
-        mesh, or abstaining when the meshes share no enclosing group, desyncs the
-        control collective: with overlapping meshes (e.g. members {0,1,2} and
-        {2,3}) a rank in both would skip while a rank in only one enters that
-        mesh's all-reduce, deadlocking. Each group carries the local shard device
-        so the control flag lands on the same device as the real collectives
-        rather than the ambient ``current_device``.
+        Enter EXACTLY the collectives ``_assert_sharded_grad_presence_consistent``
+        enters, in the same order: every sharded (non-approx) mesh this rank
+        participates in, keyed and deduplicated by mesh content and iterated in
+        sorted-key order, and within each mesh its ``get_all_groups()`` dimension
+        order. Preserving the per-mesh dimension order matters for multi-dim
+        (HSDP/TP) meshes -- flattening and sorting all groups by name could make
+        one rank enter a row all-reduce while a peer is already blocked in its
+        column all-reduce, deadlocking the preflight itself. Each group carries
+        the local shard device so the control flag lands on the same device as
+        the real collectives rather than the ambient ``current_device``.
+
+        Like the grad-presence preflight, this is a single pass per group; a
+        failure only reaches ranks sharing a mesh with the failing rank. Deeply
+        overlapping non-enclosing meshes therefore keep that preflight's existing
+        cross-mesh limitation.
         """
         if not self._dist_available():
             return ()
@@ -1334,7 +1339,7 @@ class GefenMuon(Gefen):
 
         import torch.distributed as dist
 
-        groups = {}
+        by_mesh = {}
         for group in self.param_groups:
             if group["sharded_mode"] == "approx":
                 continue
@@ -1344,18 +1349,27 @@ class GefenMuon(Gefen):
                 mesh = param.device_mesh
                 if mesh.get_coordinate() is None or mesh.size() < 2:
                     continue
-                device = self._state_tensor_device(param)
                 process_groups = tuple(mesh.get_all_groups())
-                mesh_groups = (
-                    process_groups[:1] if mesh.ndim == 1 else process_groups
+                members = tuple(
+                    int(item)
+                    for item in mesh.mesh.detach().cpu().reshape(-1).tolist()
                 )
-                for process_group in mesh_groups:
-                    if dist.get_world_size(process_group) > 1:
-                        groups.setdefault(
-                            str(process_group.group_name),
-                            (process_group, device),
-                        )
-        return tuple(groups[name] for name in sorted(groups))
+                key = (
+                    str(mesh.device_type),
+                    tuple(int(item) for item in mesh.shape),
+                    members,
+                    tuple(str(pg.group_name) for pg in process_groups),
+                )
+                by_mesh.setdefault(
+                    key, (self._state_tensor_device(param), process_groups)
+                )
+        result = []
+        for key in sorted(by_mesh):
+            device, process_groups = by_mesh[key]
+            for process_group in process_groups:
+                if dist.get_world_size(process_group) > 1:
+                    result.append((process_group, device))
+        return tuple(result)
 
     @staticmethod
     @torch._dynamo.disable
