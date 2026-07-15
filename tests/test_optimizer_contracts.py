@@ -753,6 +753,46 @@ def test_capabilities_reject_untyped_entries_and_flags():
             replace(capabilities, **{name: "yes"})
 
 
+def test_contract_flags_and_schema_version_reject_non_exact_types():
+    # Boolean flags must reject truthy non-bools (e.g. "false" reads truthy and
+    # would falsely advertise a guarantee); schema_version must reject bools and
+    # floats that merely compare equal to the supported integer version.
+    field = StateField("name", StateScope.PARAMETER, StateGeometry.OPAQUE, True)
+    with pytest.raises(TypeError, match="StateField.checkpointed must be a bool"):
+        replace(field, checkpointed="false")
+
+    variant = StateVariant(
+        "name_only",
+        ("name",),
+        frozenset({ParameterLayout.REPLICATED}),
+        StateExtent.METADATA_ONLY,
+        initialized=False,
+    )
+    for name in ("initialized", "migration_only"):
+        with pytest.raises(
+            TypeError, match="StateVariant.{} must be a bool".format(name)
+        ):
+            replace(variant, **{name: 1})
+
+    optimizer = Gefen([("parameter", torch.nn.Parameter(torch.ones(4)))], fused=False)
+    contract = optimizer.optimizer_contract()
+    checkpoint_support = contract.capabilities.checkpoints[0]
+    for name in ("requires_collective", "atomic_load"):
+        with pytest.raises(
+            TypeError, match="CheckpointSupport.{} must be a bool".format(name)
+        ):
+            replace(checkpoint_support, **{name: "false"})
+
+    for bad_version in (True, float(CONTRACT_SCHEMA_VERSION)):
+        with pytest.raises(ValueError, match="schema version"):
+            replace(contract, schema_version=bad_version)
+    # The exact supported integer version still validates.
+    assert (
+        replace(contract, schema_version=CONTRACT_SCHEMA_VERSION).schema_version
+        == CONTRACT_SCHEMA_VERSION
+    )
+
+
 def test_child_contract_rejects_untyped_contract_payload():
     with pytest.raises(
         TypeError, match="contract must be an OptimizerContract or None"

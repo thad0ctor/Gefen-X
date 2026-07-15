@@ -783,6 +783,10 @@ def _run_workers(world=2):
             os.unlink(init_file)
 
 
+@pytest.mark.skipif(
+    not dist.is_available() or not dist.is_gloo_available(),
+    reason="explicit Gloo scope coverage requires Gloo",
+)
 def test_explicit_gloo_scope_aggregates_logical_state_and_fails_atomically():
     results = _run_workers()
 
@@ -924,6 +928,10 @@ def _run_subgroup_workers():
             os.unlink(init_file)
 
 
+@pytest.mark.skipif(
+    not dist.is_available() or not dist.is_gloo_available(),
+    reason="explicit Gloo subgroup coverage requires Gloo",
+)
 def test_explicit_gloo_subgroups_are_isolated_from_default_world():
     results = _run_subgroup_workers()
 
@@ -1117,6 +1125,10 @@ def _run_zero_length_flat_workers(world=2):
             os.unlink(init_file)
 
 
+@pytest.mark.skipif(
+    not dist.is_available() or not dist.is_gloo_available(),
+    reason="zero-length flattened shard coverage requires Gloo",
+)
 def test_zero_length_flattened_shard_member_joins_every_scoped_collective():
     results = _run_zero_length_flat_workers()
 
@@ -1294,6 +1306,12 @@ def _closure_preamble_worker(
             if rank == 0 and failure_mode == "replace":
                 optimizer.param_groups[0]["params"][0] = rogue
                 rogue.grad = torch.ones_like(rogue)
+            if rank == 0 and failure_mode == "swap_group":
+                # Clear the runtime codebook binding after it was captured. The
+                # local preamble still succeeds, so without a captured-binding
+                # recheck this rank would skip the scoped step header while its
+                # peer entered the all_gather and hung.
+                optimizer._gefen_codebook_process_group = None
             return torch.tensor(1.0)
 
         try:
@@ -1418,4 +1436,137 @@ def test_scoped_step_entry_layout_mutation_raises_symmetrically_across_the_scope
     assert results[0]["message"] is not None and results[1]["message"] is not None, results
     assert "changed outside post_sharding" in results[0]["message"]
     assert "step preamble failed on another process-group member" in results[1]["message"]
+    assert all(item["untouched"] for item in results), results
+
+
+@pytest.mark.skipif(
+    not dist.is_available() or not dist.is_gloo_available(),
+    reason="plain Gefen scoped closure group-swap coverage requires Gloo",
+)
+def test_plain_gefen_scoped_step_closure_group_swap_raises_symmetrically_across_the_scope():
+    # A closure that clears the captured runtime binding on one rank must not let
+    # that rank skip the scoped step header while its peer enters the all_gather.
+    # The captured-binding recheck raises on the swapping rank and the failure is
+    # synchronized through the captured scope so BOTH ranks raise fast.
+    results = _run_closure_preamble_workers("gefen", "swap_group")
+    assert len(results) == 2, results
+    assert all("error" not in item for item in results), results
+    assert results[0]["message"] is not None and results[1]["message"] is not None, results
+    assert "binding changed during the step preamble" in results[0]["message"]
+    assert (
+        "gradient preflight failed on another process-group member"
+        in results[1]["message"]
+    )
+    assert all(item["untouched"] for item in results), results
+
+
+def _initialize_preamble_worker(rank, world, init_file, queue):
+    # initialize_codebook() runs its finalized-layout / runtime-binding /
+    # capture-readiness preamble before the scoped operation-header collective.
+    # A rank-local preamble failure must raise on every scope member together
+    # instead of leaving the failing rank to exit while the peer enters the
+    # scoped "initialize" all_gather and hangs.
+    try:
+        dist.init_process_group(
+            "gloo",
+            init_method="file://{}".format(init_file),
+            rank=rank,
+            world_size=world,
+            timeout=timedelta(seconds=45),
+        )
+        members = tuple("rank:{}".format(index) for index in range(world))
+        group = ProcessGroupIdentity("data_parallel", members)
+        runtime_group = dist.group.WORLD
+
+        matrix = torch.nn.Parameter(torch.zeros(2, 2))
+        optimizer = Gefen([("matrix", matrix)], fused=False, factored_v_2d=False)
+        identity = ParameterIdentity("Matrix", (2, 2))
+        records = tuple(_replicated(identity, group, member) for member in members)
+        _finalize(
+            optimizer,
+            matrix,
+            records[rank],
+            ShardingManifest(records),
+            _binding(group, rank, runtime_group),
+        )
+        matrix.grad = torch.tensor([[1.0, -2.0], [3.0, -4.0]])
+        rogue = torch.nn.Parameter(torch.ones(2, 2))
+        rogue_before = rogue.detach().clone()
+        if rank == 0:
+            # Break the finalized layout on one rank before the preamble runs.
+            optimizer.param_groups[0]["params"][0] = rogue
+            rogue.grad = torch.ones_like(rogue)
+
+        try:
+            optimizer.initialize_codebook()
+            message = None
+        except RuntimeError as exc:
+            message = str(exc)
+        untouched = (
+            optimizer._gefen_global_step == 0
+            and optimizer._gefen_codebook is None
+            and torch.equal(rogue, rogue_before)
+        )
+        queue.put({"rank": rank, "message": message, "untouched": untouched})
+    except Exception as exc:
+        queue.put({"rank": rank, "error": repr(exc)})
+    finally:
+        if dist.is_available() and dist.is_initialized():
+            dist.destroy_process_group()
+
+
+def _run_initialize_preamble_workers(world=2):
+    context = mp.get_context("spawn")
+    queue = context.Queue()
+    fd, init_file = tempfile.mkstemp(prefix="gefen-codebook-init-preamble-")
+    os.close(fd)
+    os.unlink(init_file)
+    processes = [
+        context.Process(
+            target=_initialize_preamble_worker,
+            args=(rank, world, init_file, queue),
+        )
+        for rank in range(world)
+    ]
+    try:
+        for process in processes:
+            process.start()
+        results = []
+        try:
+            for _ in processes:
+                results.append(queue.get(timeout=120))
+        except Exception:
+            pass
+        for process in processes:
+            process.join(timeout=10)
+        for process in processes:
+            if process.is_alive():
+                process.terminate()
+                process.join(timeout=5)
+                pytest.fail("initialize-preamble worker hung")
+            assert process.exitcode == 0
+        return sorted(results, key=lambda item: item["rank"])
+    finally:
+        for process in processes:
+            if process.is_alive():
+                process.terminate()
+                process.join(timeout=5)
+        if os.path.exists(init_file):
+            os.unlink(init_file)
+
+
+@pytest.mark.skipif(
+    not dist.is_available() or not dist.is_gloo_available(),
+    reason="scoped initialize-preamble coverage requires Gloo",
+)
+def test_initialize_codebook_preamble_failure_raises_symmetrically_across_the_scope():
+    results = _run_initialize_preamble_workers()
+    assert len(results) == 2, results
+    assert all("error" not in item for item in results), results
+    assert results[0]["message"] is not None and results[1]["message"] is not None, results
+    assert "changed outside post_sharding" in results[0]["message"]
+    assert (
+        "initialize preamble failed on another process-group member"
+        in results[1]["message"]
+    )
     assert all(item["untouched"] for item in results), results

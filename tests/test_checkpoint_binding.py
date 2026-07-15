@@ -46,6 +46,48 @@ def test_checkpoint_binding_validates_descriptor_types_membership_and_device():
         CheckpointProcessGroupBinding(identity, "worker:0", None, torch.device("meta"))
 
 
+def test_validate_collective_device_allows_gloo_cuda_but_requires_available_device():
+    identity = ProcessGroupIdentity("local", ("worker:0",))
+    unavailable_index = (
+        torch.cuda.device_count() if torch.cuda.is_available() else 0
+    )
+    cuda_binding = CheckpointProcessGroupBinding(
+        identity, "worker:0", None, torch.device("cuda", unavailable_index)
+    )
+    # Gloo supports CUDA tensors, so a CUDA collective device is not rejected on
+    # backend grounds; it must instead fail the later availability check when the
+    # configured device does not exist.
+    with pytest.raises(ValueError, match="CUDA device is unavailable"):
+        cuda_binding._validate_collective_device("gloo")
+
+    cpu_binding = CheckpointProcessGroupBinding(
+        identity, "worker:0", None, torch.device("cpu")
+    )
+    # NCCL still requires a CUDA collective device.
+    with pytest.raises(ValueError, match="runtime backend"):
+        cpu_binding._validate_collective_device("nccl")
+    # Gloo with a CPU device remains valid.
+    cpu_binding._validate_collective_device("gloo")
+
+
+def test_validate_collective_device_keeps_mpi_cpu_only():
+    identity = ProcessGroupIdentity("local", ("worker:0",))
+    # MPI moves CUDA tensors only when built CUDA-aware, which PyTorch cannot
+    # reliably detect, so a CUDA collective device must be rejected on backend
+    # grounds rather than deferring a backend error to the later collective.
+    cuda_binding = CheckpointProcessGroupBinding(
+        identity, "worker:0", None, torch.device("cuda", 0)
+    )
+    with pytest.raises(ValueError, match="runtime backend"):
+        cuda_binding._validate_collective_device("mpi")
+
+    # MPI with a CPU device remains valid.
+    cpu_binding = CheckpointProcessGroupBinding(
+        identity, "worker:0", None, torch.device("cpu")
+    )
+    cpu_binding._validate_collective_device("mpi")
+
+
 def test_checkpoint_binding_requires_explicit_multi_member_handle_and_local_singleton():
     singleton = ProcessGroupIdentity("local", ("worker:0",))
     multiple = ProcessGroupIdentity("data", ("worker:0", "worker:1"))
@@ -111,16 +153,23 @@ def _distributed_binding_worker(rank, world_size, init_file, queue):
             "world size",
         )
 
-        wrong_device_binding = CheckpointProcessGroupBinding(
+        # Gloo accepts CUDA tensors, so a CUDA collective device is not rejected
+        # on backend grounds; it must instead fail the later availability check
+        # when the configured device does not exist. An index at or beyond the
+        # visible device count (0 when no CUDA is present) is always unavailable.
+        unavailable_index = (
+            torch.cuda.device_count() if torch.cuda.is_available() else 0
+        )
+        unavailable_device_binding = CheckpointProcessGroupBinding(
             world_identity,
             world_members[rank],
             dist.group.WORLD,
-            torch.device("cuda:0"),
+            torch.device("cuda", unavailable_index),
         )
-        device_mismatch_rejected = _expect_rejection(
-            wrong_device_binding.validate_runtime,
+        cuda_unavailable_rejected = _expect_rejection(
+            unavailable_device_binding.validate_runtime,
             ValueError,
-            "runtime backend",
+            "CUDA device is unavailable",
         )
 
         subgroup_global_ranks = (0, 2)
@@ -162,7 +211,7 @@ def _distributed_binding_worker(rank, world_size, init_file, queue):
                 "world_validated": world_validated,
                 "order_mismatch_rejected": order_mismatch_rejected,
                 "size_mismatch_rejected": size_mismatch_rejected,
-                "device_mismatch_rejected": device_mismatch_rejected,
+                "cuda_unavailable_rejected": cuda_unavailable_rejected,
                 "subgroup_validated": subgroup_validated,
                 "nonmember_rejected": nonmember_rejected,
                 "uninitialized_rejected": uninitialized_rejected,
@@ -221,7 +270,7 @@ def test_checkpoint_binding_validates_real_world_and_subgroup_membership():
     assert all(item["world_validated"] for item in results)
     assert all(item["order_mismatch_rejected"] for item in results)
     assert all(item["size_mismatch_rejected"] for item in results)
-    assert all(item["device_mismatch_rejected"] for item in results)
+    assert all(item["cuda_unavailable_rejected"] for item in results)
     assert all(item["subgroup_validated"] for item in results if item["rank"] in (0, 2))
     assert results[1]["nonmember_rejected"]
     assert all(item["uninitialized_rejected"] for item in results)

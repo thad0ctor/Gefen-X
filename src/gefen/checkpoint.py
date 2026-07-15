@@ -122,11 +122,17 @@ class CheckpointProcessGroupBinding:
                 raise ValueError(
                     "checkpoint collective device is incompatible with the runtime backend"
                 )
-        elif "gloo" in backend_name or "mpi" in backend_name:
+        elif "mpi" in backend_name:
+            # MPI moves GPU tensors only when built CUDA-aware, which PyTorch
+            # cannot reliably detect at runtime. Keep MPI CPU-only so a CUDA
+            # binding is rejected here rather than deferring a backend error to
+            # the later portable-collective all_gather/broadcast.
             if self.collective_device.type != "cpu":
                 raise ValueError(
                     "checkpoint collective device is incompatible with the runtime backend"
                 )
+        # Gloo supports CUDA tensors in addition to CPU, so a CUDA collective
+        # device on Gloo still falls through to the availability check below.
 
         if self.collective_device.type == "cuda":
             index = self.collective_device.index

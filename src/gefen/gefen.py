@@ -5166,9 +5166,25 @@ class Gefen(torch.optim.Optimizer):
     def initialize_codebook(self) -> bool:
         """Collectively initialize the learned codebook without taking a step."""
 
-        self._assert_finalized_binding_layout(full=True)
-        self._assert_runtime_codebook_process_group()
-        self._assert_codebook_capture_ready()
+        # Capture a usable failure-vote binding before inspecting live layout so
+        # a one-sided preamble failure -- for example capture-readiness raising
+        # only on the gradient-owning member while non-owners proceed -- is
+        # reported through the scope instead of stranding peers inside the
+        # scoped operation-header collective below.
+        scope_binding = self._capture_codebook_scope_binding_for_step()
+        try:
+            self._assert_finalized_binding_layout(full=True)
+            self._assert_runtime_codebook_process_group()
+            self._assert_codebook_capture_ready()
+            local_preamble_error = None
+        except Exception as exc:
+            local_preamble_error = exc
+        if scope_binding is not None:
+            self._synchronize_prevalidated_codebook_scope_failure(
+                local_preamble_error, "initialize preamble", scope_binding
+            )
+        elif local_preamble_error is not None:
+            raise local_preamble_error
         self._validate_codebook_scope_operation_header("initialize")
         try:
             _assert_optimizer_gradients_structurally_valid(
@@ -8557,9 +8573,17 @@ class Gefen(torch.optim.Optimizer):
             raise local_preamble_error
 
         # The closure can replace a finalized parameter or otherwise invalidate
-        # the runtime binding. Recheck before the operation header and synchronize
-        # structural failures before any peer enters a scoped codebook collective.
+        # the runtime binding. It can also rebind (or clear) the runtime
+        # process-group between capture and the operation header; a rank that
+        # silently swapped to None or a different binding would enter a
+        # different header collective than its peers and deadlock. Recheck
+        # against the captured binding and synchronize structural failures
+        # before any peer enters a scoped codebook collective.
         try:
+            if self._gefen_codebook_process_group is not scope_binding:
+                raise RuntimeError(
+                    "Gefen codebook process-group binding changed during the step preamble"
+                )
             self._assert_finalized_binding_layout()
             self._assert_runtime_codebook_process_group()
             _assert_optimizer_gradients_structurally_valid(self)
