@@ -122,11 +122,10 @@ class CheckpointProcessGroupBinding:
                 raise ValueError(
                     "checkpoint collective device is incompatible with the runtime backend"
                 )
-        elif "gloo" in backend_name or "mpi" in backend_name:
-            if self.collective_device.type != "cpu":
-                raise ValueError(
-                    "checkpoint collective device is incompatible with the runtime backend"
-                )
+        # Gloo (and MPI) support CUDA tensors in addition to CPU, so no
+        # backend-level device restriction applies here; a CUDA collective
+        # device on those backends still falls through to the availability
+        # check below.
 
         if self.collective_device.type == "cuda":
             index = self.collective_device.index

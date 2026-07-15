@@ -160,3 +160,25 @@ def test_composite_registry_replacement_is_detected_with_warm_verdict():
 
     with pytest.raises(RuntimeError, match="finalized parameter layout changed"):
         _step_with_grads(optimizer, (matrix, bias))
+
+
+def test_composite_registry_in_place_entry_swap_is_detected_with_warm_verdict():
+    optimizer, matrix, bias = _finalized_hybrid()
+    _step_with_grads(optimizer, (matrix, bias))  # warm the cached verdict
+    assert optimizer._hybrid_layout_forensics_verdict is not None
+
+    # Replace ONE ownership entry in place, preserving the dict object identity
+    # and its length. The identity/len tokens cannot see this, so the fast token
+    # must fold in the owner-registry contents; otherwise the stale True verdict
+    # is reused and the mismatched owner routing slips past the guard.
+    key = next(iter(optimizer._state_param_owner))
+    _parameter, child = optimizer._state_param_owner[key]
+    rogue = torch.nn.Parameter(torch.full((2, 2), 5.0))
+    rogue_before = rogue.detach().clone()
+    optimizer._state_param_owner[key] = (rogue, child)
+    assert optimizer._state_param_owner[key] is not _parameter
+    assert len(optimizer._state_param_owner) == 2
+
+    with pytest.raises(RuntimeError, match="finalized parameter layout changed"):
+        _step_with_grads(optimizer, (matrix, bias))
+    assert torch.equal(rogue, rogue_before)

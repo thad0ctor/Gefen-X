@@ -997,6 +997,14 @@ class GefenMuonHybrid(torch.optim.Optimizer):
             self._subopts,
             len(self._subopts),
         ]
+        # Capture the owner registry contents by identity (keys, then the
+        # (parameter, child) values) so an in-place entry replacement that
+        # preserves the dict object and its length -- which the identity/len
+        # tokens above cannot see -- flips a token and forces a full rebuild
+        # instead of reusing the stale verdict. Mirrors the _param_names
+        # snapshot in the base fast-token path.
+        live.extend(self._state_param_owner.keys())
+        live.extend(self._state_param_owner.values())
         for child in self._subopts:
             live.append(child._finalized_binding_layout_matches())
             GefenMuonHybrid._hybrid_child_param_group_tokens(child, live)

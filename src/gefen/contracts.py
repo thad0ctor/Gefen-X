@@ -798,6 +798,8 @@ class StateField:
             raise TypeError("StateField.geometry must be a StateGeometry")
         if not isinstance(self.key_match, StateKeyMatch):
             raise TypeError("StateField.key_match must be a StateKeyMatch")
+        if type(self.checkpointed) is not bool:
+            raise TypeError("StateField.checkpointed must be a bool")
         if type(self.optional) is not bool:
             raise TypeError("StateField.optional must be a bool")
 
@@ -853,6 +855,9 @@ class StateVariant:
             raise TypeError("StateVariant.extent must be a StateExtent")
         if not isinstance(self.role, ParameterStateRole):
             raise TypeError("StateVariant.role must be a ParameterStateRole")
+        for name in ("initialized", "migration_only"):
+            if type(getattr(self, name)) is not bool:
+                raise TypeError("StateVariant.{} must be a bool".format(name))
         if not set(self.inactive_fields).issubset(self.fields):
             raise ValueError("StateVariant.inactive_fields must be present in fields")
         if self.parameter_ranks is not None and set(self.parameter_ranks) & set(
@@ -991,6 +996,9 @@ class CheckpointSupport:
             raise TypeError(
                 "CheckpointSupport.process_group_scope must be a ProcessGroupScope"
             )
+        for name in ("requires_collective", "atomic_load"):
+            if type(getattr(self, name)) is not bool:
+                raise TypeError("CheckpointSupport.{} must be a bool".format(name))
         if bool(self.topology_changing) != bool(self.topology_change_kinds):
             raise ValueError(
                 "topology-changing layouts and change kinds must be declared together"
@@ -1094,7 +1102,10 @@ class OptimizerContract:
         object.__setattr__(self, "children", _tuple(self.children))
         if not self.implementation:
             raise ValueError("OptimizerContract.implementation must be non-empty")
-        if self.schema_version != CONTRACT_SCHEMA_VERSION:
+        if (
+            type(self.schema_version) is not int
+            or self.schema_version != CONTRACT_SCHEMA_VERSION
+        ):
             raise ValueError(
                 "unsupported optimizer contract schema version: {}".format(
                     self.schema_version

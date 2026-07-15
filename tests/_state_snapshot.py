@@ -34,6 +34,21 @@ import torch
 _CHILD_REGISTRY_ATTRS = ("_param_names", "_gefen_shard_bindings")
 
 
+# Per-device cache dicts each Gefen/GefenMuon child keeps live across steps.
+# Their tensors are also reachable from ``__dict__``, but the tensor-value
+# snapshot keeps a strong reference to each tensor, so an in-place ``clear()`` or
+# entry removal leaves every retained tensor still matching its clone while the
+# cache membership silently vanishes. Recording the dict identity plus its keyed
+# contents makes that membership change fail the assertion. Absent on optimizer
+# types that never build these caches (skipped below).
+_CHILD_CACHE_ATTRS = (
+    "_gefen_codebook_by_device",
+    "_gefen_codebook_lut_by_device",
+    "_sr_seed_by_device",
+    "_gefen_global_step_by_device",
+)
+
+
 def _cloned(value):
     if torch.is_tensor(value):
         return value.detach().clone()
@@ -133,10 +148,29 @@ def _registry_snapshot(optimizer):
     return registries
 
 
+def _cache_snapshot(optimizer):
+    """Live dict identity plus cloned contents of each per-device cache.
+
+    Returns ``name -> (live_dict, cloned_contents)`` for every cache present as a
+    ``dict`` on ``optimizer``. The live dict is kept by reference so the assertion
+    can confirm it was not replaced, and its contents are cloned so a later
+    ``clear()`` or entry removal (or an in-place value edit) produces a mismatch.
+    """
+
+    caches = {}
+    for name in _CHILD_CACHE_ATTRS:
+        cache = getattr(optimizer, name, None)
+        if type(cache) is not dict:
+            continue
+        caches[name] = (cache, _cloned(cache))
+    return caches
+
+
 def deep_state_snapshot(optimizer):
     return {
         "attributes": optimizer.__dict__.copy(),
         "registries": _registry_snapshot(optimizer),
+        "caches": _cache_snapshot(optimizer),
         "state": optimizer.state,
         "state_items": tuple(
             (parameter, state, _cloned(dict(state)))
@@ -194,3 +228,7 @@ def assert_deep_state_snapshot(optimizer, snapshot):
         ):
             assert live_key is expected_key
             _nested_equal(live_value, expected_value)
+    for name, (expected_ref, expected_contents) in snapshot["caches"].items():
+        live = getattr(optimizer, name, None)
+        assert live is expected_ref
+        _nested_equal(live, expected_contents)

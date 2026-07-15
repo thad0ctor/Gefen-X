@@ -135,6 +135,23 @@ def _replace_native_guard(checkpoint, guard):
         group["_gefen_checkpoint_metadata"]["native_local_shards"] = copy.deepcopy(guard)
 
 
+def test_deep_snapshot_detects_per_device_cache_membership_clear():
+    # A per-device cache clear preserves the dict attribute identity, and the
+    # retained cache tensors still match their tensor-value clones, so only a
+    # membership-aware snapshot catches the removal.
+    parameter = torch.nn.Parameter(torch.randn(4, 4))
+    optimizer = Gefen([("Layer.Weight", parameter)], fused=False)
+    device = torch.device("cpu")
+    optimizer._gefen_codebook_by_device[device] = torch.randn(8)
+
+    snapshot = deep_state_snapshot(optimizer)
+    assert_deep_state_snapshot(optimizer, snapshot)  # unchanged membership passes
+
+    optimizer._gefen_codebook_by_device.clear()
+    with pytest.raises(AssertionError):
+        assert_deep_state_snapshot(optimizer, snapshot)
+
+
 def test_codebook_process_group_binding_is_public_frozen_and_ordered():
     group = ProcessGroupIdentity("replica", ("worker:b", "worker:a"))
     binding = CodebookProcessGroupBinding(group, "worker:b", object(), torch.device("cpu"))

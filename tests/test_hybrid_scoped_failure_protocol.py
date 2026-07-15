@@ -255,7 +255,9 @@ def _set_local_gradients(muon_parameter, backup_parameter, backup_shard, scale=1
     backup_parameter.grad = _backup_gradient()[start:stop] * scale
 
 
-def _untouched(optimizer, muon_parameter, backup_parameter):
+def _untouched(optimizer, muon_parameter, backup_parameter, backup_shard):
+    start = backup_shard.logical_slice.flat_offset
+    stop = start + backup_shard.logical_slice.length
     return (
         optimizer.muon._gefen_global_step == 0
         and optimizer.backup._gefen_global_step == 0
@@ -266,6 +268,7 @@ def _untouched(optimizer, muon_parameter, backup_parameter):
             muon_parameter is None
             or optimizer.muon.state[muon_parameter] == {"name": "matrix"}
         )
+        and _bits_equal(backup_parameter, _backup_initial()[start:stop])
         and optimizer.backup.state[backup_parameter] == {"name": "vector"}
     )
 
@@ -283,7 +286,7 @@ def _amp_divergent_overflow_result(rank, group):
         message = str(exc)
     return {
         "message": message,
-        "untouched": _untouched(optimizer, muon_parameter, backup_parameter),
+        "untouched": _untouched(optimizer, muon_parameter, backup_parameter, backup_shard),
         "grads_untouched": _bits_equal(backup_parameter.grad, grad_before),
     }
 
@@ -306,7 +309,7 @@ def _amp_group_wide_overflow_result(rank, group):
     return {
         "skipped": skipped,
         "post_hook_fired": len(post_hook_calls) == 1,
-        "untouched": _untouched(optimizer, muon_parameter, backup_parameter),
+        "untouched": _untouched(optimizer, muon_parameter, backup_parameter, backup_shard),
         "grads_untouched": _bits_equal(backup_parameter.grad, grad_before),
     }
 
@@ -350,7 +353,7 @@ def _preflight_divergent_result(rank, group):
         message = str(exc)
     return {
         "message": message,
-        "untouched": _untouched(optimizer, muon_parameter, backup_parameter),
+        "untouched": _untouched(optimizer, muon_parameter, backup_parameter, backup_shard),
     }
 
 
@@ -374,7 +377,7 @@ def _closure_divergent_result(rank, group):
         message = str(exc)
     return {
         "message": message,
-        "untouched": _untouched(optimizer, muon_parameter, backup_parameter),
+        "untouched": _untouched(optimizer, muon_parameter, backup_parameter, backup_shard),
     }
 
 
@@ -400,7 +403,7 @@ def _closure_layout_divergent_result(rank, group):
     return {
         "message": message,
         "untouched": (
-            _untouched(optimizer, muon_parameter, backup_parameter)
+            _untouched(optimizer, muon_parameter, backup_parameter, backup_shard)
             and torch.equal(rogue, rogue_before)
         ),
     }
@@ -424,7 +427,7 @@ def _step_entry_layout_divergent_result(rank, group):
     return {
         "message": message,
         "untouched": (
-            _untouched(optimizer, muon_parameter, backup_parameter)
+            _untouched(optimizer, muon_parameter, backup_parameter, backup_shard)
             and torch.equal(rogue, rogue_before)
         ),
     }
