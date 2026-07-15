@@ -4485,6 +4485,18 @@ class Gefen(torch.optim.Optimizer):
         """Commit a prepared restore through non-throwing swaps (phase two)."""
 
         self._commit_staged_load_state_dict(staged)
+        self._run_load_state_dict_post_hooks()
+
+    def _run_load_state_dict_post_hooks(self) -> None:
+        """Dispatch the load post-hooks (may raise; separate from the commit).
+
+        Kept apart from ``_commit_staged_load_state_dict`` so a composite owner
+        (GefenMuonHybrid) can commit every child's raw state through the
+        non-throwing swaps first and only then run any child's post-hooks -- a
+        throwing post-hook must not fire while a sibling child is still
+        uncommitted, which would strand the hybrid half-loaded.
+        """
+
         for post_hook in self._optimizer_load_state_dict_post_hooks.values():
             post_hook(self)
 
