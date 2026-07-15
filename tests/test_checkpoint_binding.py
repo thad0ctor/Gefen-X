@@ -70,6 +70,24 @@ def test_validate_collective_device_allows_gloo_cuda_but_requires_available_devi
     cpu_binding._validate_collective_device("gloo")
 
 
+def test_validate_collective_device_keeps_mpi_cpu_only():
+    identity = ProcessGroupIdentity("local", ("worker:0",))
+    # MPI moves CUDA tensors only when built CUDA-aware, which PyTorch cannot
+    # reliably detect, so a CUDA collective device must be rejected on backend
+    # grounds rather than deferring a backend error to the later collective.
+    cuda_binding = CheckpointProcessGroupBinding(
+        identity, "worker:0", None, torch.device("cuda", 0)
+    )
+    with pytest.raises(ValueError, match="runtime backend"):
+        cuda_binding._validate_collective_device("mpi")
+
+    # MPI with a CPU device remains valid.
+    cpu_binding = CheckpointProcessGroupBinding(
+        identity, "worker:0", None, torch.device("cpu")
+    )
+    cpu_binding._validate_collective_device("mpi")
+
+
 def test_checkpoint_binding_requires_explicit_multi_member_handle_and_local_singleton():
     singleton = ProcessGroupIdentity("local", ("worker:0",))
     multiple = ProcessGroupIdentity("data", ("worker:0", "worker:1"))
