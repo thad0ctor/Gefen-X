@@ -9,8 +9,11 @@ import torch.nn as nn
 
 from gefen.gefen import (
     Gefen,
+    _amp_optimizer_step_controls,
     _amp_prepare_optimizer_step,
     _assert_optimizer_gradients_structurally_valid,
+    _synchronize_step_control_range,
+    _synchronize_step_failure,
 )
 
 EPS = 1e-7
@@ -1301,6 +1304,197 @@ class GefenMuon(Gefen):
         if not torch.distributed.is_available():
             return False
         return torch.distributed.is_initialized()
+
+    @torch._dynamo.disable
+    def _step_failure_process_groups(self):
+        """Return the control scope for eager exact/distributed Muon steps.
+
+        Enter EXACTLY the collectives ``_assert_sharded_grad_presence_consistent``
+        enters, in the same order: every sharded (non-approx) mesh this rank
+        participates in, keyed and deduplicated by mesh content and iterated in
+        sorted-key order, and within each mesh its ``get_all_groups()`` dimension
+        order. Preserving the per-mesh dimension order matters for multi-dim
+        (HSDP/TP) meshes -- flattening and sorting all groups by name could make
+        one rank enter a row all-reduce while a peer is already blocked in its
+        column all-reduce, deadlocking the preflight itself. Each group carries
+        the local shard device so the control flag lands on the same device as
+        the real collectives rather than the ambient ``current_device``.
+
+        Like the grad-presence preflight, this is a single pass per group; a
+        failure only reaches ranks sharing a mesh with the failing rank. Deeply
+        overlapping non-enclosing meshes therefore keep that preflight's existing
+        cross-mesh limitation.
+        """
+        if not self._dist_available():
+            return ()
+
+        params = [param for group in self.param_groups for param in group["params"]]
+        # The protocol returns host-readable flags and therefore cannot be
+        # captured. Captured steps already require an eager warmup with a fixed
+        # control-flow and gradient-presence pattern.
+        if any(param.device.type == "cuda" for param in params) and (
+            torch.cuda.is_current_stream_capturing()
+        ):
+            return ()
+
+        import torch.distributed as dist
+
+        by_mesh = {}
+        for group in self.param_groups:
+            if group["sharded_mode"] == "approx":
+                continue
+            for param in group["params"]:
+                if not self._is_sharded(param):
+                    continue
+                mesh = param.device_mesh
+                if mesh.get_coordinate() is None or mesh.size() < 2:
+                    continue
+                process_groups = tuple(mesh.get_all_groups())
+                members = tuple(
+                    int(item)
+                    for item in mesh.mesh.detach().cpu().reshape(-1).tolist()
+                )
+                key = (
+                    str(mesh.device_type),
+                    tuple(int(item) for item in mesh.shape),
+                    members,
+                    tuple(str(pg.group_name) for pg in process_groups),
+                )
+                by_mesh.setdefault(
+                    key, (self._state_tensor_device(param), process_groups)
+                )
+        result = []
+        for key in sorted(by_mesh):
+            device, process_groups = by_mesh[key]
+            for process_group in process_groups:
+                if dist.get_world_size(process_group) > 1:
+                    result.append((process_group, device))
+        return tuple(result)
+
+    @staticmethod
+    @torch._dynamo.disable
+    def _synchronize_sharded_step_flag(local_value, process_groups) -> bool:
+        synchronized = bool(local_value)
+        for process_group, collective_device in process_groups:
+            synchronized = _synchronize_step_failure(
+                synchronized, process_group, collective_device=collective_device
+            )
+        return synchronized
+
+    @torch._dynamo.disable
+    def _synchronize_sharded_step_error(
+        self, error, phase: str, process_groups
+    ) -> None:
+        if not process_groups:
+            if error is not None:
+                raise error
+            return
+        failed = self._synchronize_sharded_step_flag(
+            error is not None, process_groups
+        )
+        if not failed:
+            return
+
+        import torch.distributed as dist
+
+        if error is not None:
+            raise RuntimeError(
+                "GefenMuon {} failed on local rank {}: {}".format(
+                    phase, dist.get_rank(), error
+                )
+            ) from error
+        raise RuntimeError(
+            "GefenMuon {} failed on another process-group member".format(
+                phase
+            )
+        )
+
+    @staticmethod
+    @torch._dynamo.disable
+    def _synchronize_sharded_step_control_range(local_control, process_groups):
+        minimum = tuple(float(item) for item in local_control)
+        maximum = minimum
+        for process_group, collective_device in process_groups:
+            minimum, maximum = _synchronize_step_control_range(
+                minimum, maximum, process_group, collective_device=collective_device
+            )
+        return minimum, maximum
+
+    @torch._dynamo.disable
+    def _prepare_synchronized_amp_step(self, optimizer, process_groups) -> bool:
+        """Agree on AMP controls before unscaling or entering Muon collectives."""
+        local_present = hasattr(optimizer, "found_inf") or hasattr(
+            optimizer, "grad_scale"
+        )
+        if not process_groups:
+            if not local_present:
+                return True
+            return _amp_prepare_optimizer_step(optimizer)
+
+        try:
+            if local_present:
+                local_overflow, grad_scale, scale_value = (
+                    _amp_optimizer_step_controls(optimizer)
+                )
+                local_scale_present = grad_scale is not None
+            else:
+                local_overflow = False
+                local_scale_present = False
+                scale_value = 0.0
+            local_amp_error = None
+        except Exception as exc:
+            local_overflow = False
+            local_scale_present = False
+            scale_value = 0.0
+            local_amp_error = exc
+        self._synchronize_sharded_step_error(
+            local_amp_error, "AMP control preflight", process_groups
+        )
+
+        minimum, maximum = self._synchronize_sharded_step_control_range(
+            (
+                int(local_present),
+                int(local_overflow),
+                int(local_scale_present),
+                scale_value,
+            ),
+            process_groups,
+        )
+        if minimum[0] != maximum[0]:
+            raise RuntimeError(
+                "GefenMuon AMP protocol presence differs across process-group "
+                "members; use the same group-aware gradient scaler on every member"
+            )
+        if not bool(maximum[0]):
+            return True
+        if minimum[1] != maximum[1]:
+            raise RuntimeError(
+                "GefenMuon AMP found_inf differs across process-group members; "
+                "use a group-aware gradient scaler"
+            )
+        if minimum[2] != maximum[2]:
+            raise RuntimeError(
+                "GefenMuon AMP grad_scale presence differs across process-group "
+                "members; use the same group-aware gradient scaler on every member"
+            )
+        if bool(maximum[2]) and minimum[3] != maximum[3]:
+            raise RuntimeError(
+                "GefenMuon AMP grad_scale differs across process-group members; "
+                "use a group-aware gradient scaler"
+            )
+        if bool(maximum[1]):
+            return False
+
+        try:
+            should_step = _amp_prepare_optimizer_step(optimizer)
+            local_amp_error = None
+        except Exception as exc:
+            should_step = False
+            local_amp_error = exc
+        self._synchronize_sharded_step_error(
+            local_amp_error, "AMP preparation", process_groups
+        )
+        return should_step
 
     @torch._dynamo.disable
     def _assert_sharded_grad_presence_consistent(self) -> None:
@@ -2728,24 +2922,33 @@ class GefenMuon(Gefen):
 
     @torch.no_grad()
     def step(self, closure=None):
-        self._assert_capturable_if_capturing()
         loss = None
-        if closure is not None:
-            with torch.enable_grad():
-                loss = closure()
-
-        _assert_optimizer_gradients_structurally_valid(
-            self, require_2d_params=True
+        hybrid_preflight_complete = bool(
+            getattr(self, "_gefen_hybrid_precollective_preflight", False)
         )
+        if not hybrid_preflight_complete:
+            process_groups = self._step_failure_process_groups()
+            try:
+                self._assert_capturable_if_capturing()
+                if closure is not None:
+                    with torch.enable_grad():
+                        loss = closure()
+                _assert_optimizer_gradients_structurally_valid(
+                    self, require_2d_params=True
+                )
+                local_preflight_error = None
+            except Exception as exc:
+                loss = None
+                local_preflight_error = exc
+            self._synchronize_sharded_step_error(
+                local_preflight_error, "step preflight", process_groups
+            )
 
-        # Native GradScaler calls AMP-aware optimizers even when its non-finite
-        # scan found an overflow. Skip before the sharded preflight, first-step
-        # codebook learning, or any optimizer/parameter mutation; finite scaled
-        # gradients are unscaled once here for every existing Muon path.
-        if (
-            hasattr(self, "found_inf") or hasattr(self, "grad_scale")
-        ) and not _amp_prepare_optimizer_step(self):
-            return loss
+            # Every mesh member enters the AMP control agreement, including a
+            # member with no local GradScaler attributes. This prevents the
+            # protocol-presence decision itself from becoming rank-divergent.
+            if not self._prepare_synchronized_amp_step(self, process_groups):
+                return loss
 
         # Partition the work once so distributed-mode sharded params can take the
         # stable-owner Parallel-Muon path while every other param keeps the normal

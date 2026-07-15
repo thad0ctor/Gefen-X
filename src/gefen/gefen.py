@@ -497,6 +497,123 @@ def _resolve_find_period_backend(grad: torch.Tensor) -> str:
     return "cuda_kernel" if grad_work.device.type == "cuda" else "cpu"
 
 
+def _step_failure_collective_device(
+    process_group, *, collective_device=None
+) -> torch.device:
+    """Choose a backend-compatible device for a process-group control flag."""
+    import torch.distributed as dist
+
+    if collective_device is not None:
+        return torch.device(collective_device)
+
+    group = process_group if process_group is not None else dist.group.WORLD
+    bound_device = getattr(group, "bound_device_id", None)
+    if bound_device is not None:
+        return torch.device(bound_device)
+
+    backend = str(dist.get_backend(process_group)).lower()
+    if "nccl" in backend:
+        return torch.device("cuda", torch.cuda.current_device())
+    if "xccl" in backend:
+        return torch.device("xpu", torch.xpu.current_device())
+    # Gloo, MPI, UCC, and PyTorch's multi-backend default process group all
+    # accept CPU control tensors. Keeping their flag on CPU also avoids an
+    # unrelated accelerator initialization in spawned Gloo workers.
+    return torch.device("cpu")
+
+
+@torch.no_grad()
+@torch._dynamo.disable
+def _synchronize_step_failure(
+    local_failed, process_group, *, collective_device=None
+) -> bool:
+    """Return whether any process-group member reported a step failure."""
+    failed = bool(local_failed)
+    if not torch.distributed.is_available() or not torch.distributed.is_initialized():
+        return failed
+
+    import torch.distributed as dist
+
+    if dist.get_world_size(process_group) < 2:
+        return failed
+    flag = torch.tensor(
+        int(failed),
+        dtype=torch.int32,
+        device=_step_failure_collective_device(
+            process_group, collective_device=collective_device
+        ),
+    )
+    dist.all_reduce(flag, op=dist.ReduceOp.MAX, group=process_group)
+    return bool(flag.item())
+
+
+@torch.no_grad()
+@torch._dynamo.disable
+def _synchronize_step_control_range(
+    local_minimum, local_maximum, process_group, *, collective_device=None
+):
+    """Expand control-value bounds across one process group."""
+    minimum = tuple(float(item) for item in local_minimum)
+    maximum = tuple(float(item) for item in local_maximum)
+    if len(minimum) != len(maximum):
+        raise ValueError("step-control bounds must have equal lengths")
+    if not torch.distributed.is_available() or not torch.distributed.is_initialized():
+        return minimum, maximum
+
+    import torch.distributed as dist
+
+    if dist.get_world_size(process_group) < 2:
+        return minimum, maximum
+    bounds = torch.tensor(
+        minimum + tuple(-item for item in maximum),
+        dtype=torch.float64,
+        device=_step_failure_collective_device(
+            process_group, collective_device=collective_device
+        ),
+    )
+    dist.all_reduce(bounds, op=dist.ReduceOp.MIN, group=process_group)
+    values = bounds.cpu().tolist()
+    width = len(minimum)
+    return tuple(values[:width]), tuple(-item for item in values[width:])
+
+
+def _amp_optimizer_step_controls(optimizer):
+    """Parse GradScaler's temporary controls without mutating gradients."""
+    found_inf = getattr(optimizer, "found_inf", None)
+    if found_inf is not None:
+        if torch.is_tensor(found_inf):
+            if found_inf.numel() != 1:
+                raise RuntimeError(
+                    "GradScaler supplied a non-scalar found_inf tensor with "
+                    "shape {}".format(tuple(found_inf.shape))
+                )
+            overflow = bool(found_inf.detach().item())
+        else:
+            overflow = bool(found_inf)
+    else:
+        overflow = False
+
+    grad_scale = getattr(optimizer, "grad_scale", None)
+    if torch.is_tensor(grad_scale):
+        if grad_scale.numel() != 1:
+            raise RuntimeError(
+                "GradScaler supplied a non-scalar grad_scale tensor with shape "
+                "{}".format(tuple(grad_scale.shape))
+            )
+        scale_value = float(grad_scale.detach().item())
+    elif grad_scale is not None:
+        scale_value = float(grad_scale)
+    else:
+        scale_value = 0.0
+    if grad_scale is not None and (
+        not math.isfinite(scale_value) or scale_value <= 0.0
+    ):
+        raise RuntimeError(
+            "GradScaler supplied a non-finite or non-positive grad_scale"
+        )
+    return overflow, grad_scale, scale_value
+
+
 @torch.no_grad()
 def _amp_prepare_optimizer_step(optimizer) -> bool:
     """Honor PyTorch's native ``GradScaler`` optimizer-step protocol.
@@ -513,31 +630,14 @@ def _amp_prepare_optimizer_step(optimizer) -> bool:
     keeps every existing fused/unfused update path operating on ordinary
     unscaled gradients and also works for local DTensor shards.
     """
-    found_inf = getattr(optimizer, "found_inf", None)
-    if found_inf is not None:
-        if torch.is_tensor(found_inf):
-            if found_inf.numel() != 1:
-                raise RuntimeError(
-                    "GradScaler supplied a non-scalar found_inf tensor with "
-                    "shape {}".format(tuple(found_inf.shape))
-                )
-            overflow = bool(found_inf.detach().item())
-        else:
-            overflow = bool(found_inf)
-        if overflow:
-            return False
-
-    grad_scale = getattr(optimizer, "grad_scale", None)
+    overflow, grad_scale, _ = _amp_optimizer_step_controls(optimizer)
+    if overflow:
+        return False
     if grad_scale is None:
         # Explicit scaler.unscale_(optimizer), or an ordinary non-AMP step.
         return True
 
     if torch.is_tensor(grad_scale):
-        if grad_scale.numel() != 1:
-            raise RuntimeError(
-                "GradScaler supplied a non-scalar grad_scale tensor with shape "
-                "{}".format(tuple(grad_scale.shape))
-            )
         scale = grad_scale.detach()
         # Match torch.amp.GradScaler.unscale_: computing the reciprocal in
         # fp64 avoids compile-option-dependent fp32 division differences.
