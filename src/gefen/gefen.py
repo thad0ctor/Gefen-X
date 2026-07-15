@@ -5222,6 +5222,7 @@ class Gefen(torch.optim.Optimizer):
 
             yield param_name, flat, period, grad
 
+    @torch._dynamo.disable
     def _synchronize_codebook_scope_failure(self, error, phase: str) -> None:
         binding = self._gefen_codebook_process_group
         if binding is None or len(binding.identity.ordered_members) == 1:
@@ -5248,6 +5249,7 @@ class Gefen(torch.optim.Optimizer):
             )
         )
 
+    @torch._dynamo.disable
     def _prepare_scoped_amp_optimizer_step(self) -> bool:
         binding = self._gefen_codebook_process_group
         if binding is None:

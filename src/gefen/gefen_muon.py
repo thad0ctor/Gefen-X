@@ -1526,6 +1526,7 @@ class GefenMuon(Gefen):
         )
 
     @staticmethod
+    @torch._dynamo.disable
     def _synchronize_sharded_step_flag(local_value, process_groups) -> bool:
         synchronized = bool(local_value)
         for process_group in process_groups:
@@ -1534,6 +1535,7 @@ class GefenMuon(Gefen):
             )
         return synchronized
 
+    @torch._dynamo.disable
     def _synchronize_sharded_step_error(
         self, error, phase: str, process_groups
     ) -> None:
@@ -1562,6 +1564,7 @@ class GefenMuon(Gefen):
         )
 
     @staticmethod
+    @torch._dynamo.disable
     def _synchronize_sharded_step_control_range(local_control, process_groups):
         minimum = tuple(float(item) for item in local_control)
         maximum = minimum
@@ -1571,6 +1574,7 @@ class GefenMuon(Gefen):
             )
         return minimum, maximum
 
+    @torch._dynamo.disable
     def _prepare_synchronized_amp_step(self, optimizer, process_groups) -> bool:
         """Agree on AMP controls before unscaling or entering Muon collectives."""
         local_present = hasattr(optimizer, "found_inf") or hasattr(
