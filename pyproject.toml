@@ -7,7 +7,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "gefen-x"
 # Single-sourced at runtime via importlib.metadata (see __init__.py __version__).
-version = "0.4.0"
+version = "0.4.1"
 description = "Gefen optimizer for memory-efficient PyTorch training"
 readme = "README.md"
 requires-python = ">=3.10"
