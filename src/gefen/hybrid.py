@@ -55,7 +55,7 @@ period-one off, stochastic rounding off), with ``ns_schedule="tuned3"`` and
 """
 
 import logging
-from collections import OrderedDict
+from collections import OrderedDict, defaultdict
 
 import torch
 import torch.nn as nn
@@ -1504,55 +1504,98 @@ class GefenMuonHybrid(torch.optim.Optimizer):
                         checkpoint_backup_optimizer, self.backup_optimizer
                     )
                 )
-        # Load the two children with two-phase composite semantics: validate and
-        # stage BOTH halves before publishing EITHER, so a rejection on either
-        # half (a different param count, a foreign layout, a corrupted/truncated
-        # child state) leaves both live children byte-for-byte untouched. The
-        # previous code committed the muon child first and only then loaded the
-        # backup, recovering via a second full ``muon.load_state_dict(snapshot)``
-        # reload -- a rollback that could itself raise (e.g. CUDA OOM re-staging
-        # every muon tensor), masking the real backup error and leaving a
-        # half-loaded hybrid (new muon, old backup).
-        #
-        # Each Gefen child already loads atomically via a stage-then-swap
-        # primitive (``_prepare_load_state_dict`` returns an isolated shadow;
-        # ``_publish_load_state_dict`` publishes it through non-throwing dict
-        # swaps). Staging is process-group-safe: ``_stage_load_state_dict``
-        # shallow-copies the child's ``__dict__`` and swaps in fresh state
-        # containers -- it never deepcopies the live optimizer, so a codebook
-        # process-group handle (or any live ProcessGroup) is shared by reference,
-        # never duplicated. We deliberately avoid ``copy.deepcopy`` of a child or
-        # its process groups for exactly that reason.
+        # Phase one -- stage every child (validate, mutating nothing live). Phase
+        # two -- commit every child's raw state through non-throwing swaps. Phase
+        # three -- only then dispatch any child's load post-hooks. Separating the
+        # raw commit (phase two) from the post-hooks (phase three) matters: a
+        # post-hook can raise, and if it fired while a sibling child were still
+        # uncommitted it would strand the hybrid half-loaded (e.g. muon step N /
+        # backup step N-1). The foreign backup gets the same isolated staging as
+        # the Gefen children -- torch ``AdamW.load_state_dict`` is NOT itself
+        # fail-before-mutation (``__setstate__`` installs the new state via
+        # ``super().__setstate__`` and only then reads ``state[0]["step"]``, so a
+        # checkpoint whose per-parameter state omits ``step`` raises
+        # ``KeyError("step")`` after the live backup has already been mutated).
         muon_staged = None
         if self.muon is not None:
             muon_staged = self.muon._prepare_load_state_dict(state_dict["muon"])
 
         if self.backup is None:
-            # muon-only hybrid: publish the single staged child.
+            # muon-only hybrid.
             if muon_staged is not None:
-                self.muon._publish_load_state_dict(muon_staged)
+                self.muon._commit_staged_load_state_dict(muon_staged)
+                self.muon._run_load_state_dict_post_hooks()
         elif isinstance(self.backup, Gefen):
-            # Both halves expose the Gefen staging primitive: stage both (all
-            # validation and rejection happens here, before any mutation), then
-            # publish through non-throwing swaps so neither can fail mid-commit.
             backup_staged = self.backup._prepare_load_state_dict(state_dict["backup"])
             if muon_staged is not None:
-                self.muon._publish_load_state_dict(muon_staged)
-            self.backup._publish_load_state_dict(backup_staged)
-        else:
-            # Foreign backup (torch ``AdamW``): no non-throwing staging
-            # primitive, but ``torch.optim.Optimizer.load_state_dict`` validates
-            # the group structure and casts every state tensor before its single
-            # ``__setstate__``, so it is itself fail-before-mutation. Commit it
-            # first, while the muon child is only staged (never published); if it
-            # raises, the muon child is untouched. The muon child was already
-            # validated above, so publishing its swap afterwards cannot fail.
-            self.backup.load_state_dict(state_dict["backup"])
+                self.muon._commit_staged_load_state_dict(muon_staged)
+            self.backup._commit_staged_load_state_dict(backup_staged)
             if muon_staged is not None:
-                self.muon._publish_load_state_dict(muon_staged)
+                self.muon._run_load_state_dict_post_hooks()
+            self.backup._run_load_state_dict_post_hooks()
+        else:
+            # Foreign backup (torch ``AdamW``): stage it on an isolated shadow
+            # too so a mid-load raise leaves the live backup byte-for-byte
+            # untouched, exactly like the Gefen children.
+            backup_shadow = self._stage_foreign_backup_load(
+                self.backup, state_dict["backup"]
+            )
+            if muon_staged is not None:
+                self.muon._commit_staged_load_state_dict(muon_staged)
+            self._commit_foreign_backup_load(self.backup, backup_shadow)
+            if muon_staged is not None:
+                self.muon._run_load_state_dict_post_hooks()
+            self._run_foreign_backup_post_hooks(self.backup)
 
         for post_hook in self._optimizer_load_state_dict_post_hooks.values():
             post_hook(self)
+
+    @staticmethod
+    def _stage_foreign_backup_load(backup, state_dict):
+        """Stage a foreign (non-Gefen) backup load on an isolated shadow.
+
+        ``torch.optim.Optimizer.load_state_dict`` is not fail-before-mutation for
+        every optimizer: torch ``AdamW``'s ``__setstate__`` installs the new
+        state via ``super().__setstate__`` and only then reads
+        ``state_values[0]["step"]``, so a checkpoint whose per-parameter state
+        omits ``step`` raises ``KeyError("step")`` after the live backup has
+        already been mutated. Build the full restore on a shallow shadow first
+        (never a ``copy.deepcopy`` of the live state or any process group), so a
+        rejection leaves the live backup byte-for-byte untouched. Returns the
+        shadow; publish it with ``_commit_foreign_backup_load``.
+        """
+
+        # Mirror Optimizer.load_state_dict's pre-hook + shallow-copy pass, then
+        # run the base load on the shadow with its own hook maps emptied so the
+        # staging build is side-effect free (post-hooks are deferred to the
+        # publish step); the raise, if any, happens here on the shadow.
+        state_dict = state_dict.copy()
+        for pre_hook in backup._optimizer_load_state_dict_pre_hooks.values():
+            hook_result = pre_hook(backup, state_dict)
+            if hook_result is not None:
+                state_dict = hook_result
+        shadow = object.__new__(type(backup))
+        shadow.__dict__ = backup.__dict__.copy()
+        shadow.defaults = backup.defaults.copy()
+        shadow.state = defaultdict(dict)
+        shadow._optimizer_load_state_dict_pre_hooks = OrderedDict()
+        shadow._optimizer_load_state_dict_post_hooks = OrderedDict()
+        torch.optim.Optimizer.load_state_dict(shadow, state_dict)
+        return shadow
+
+    @staticmethod
+    def _commit_foreign_backup_load(backup, shadow):
+        """Publish a staged foreign-backup restore through non-throwing swaps."""
+
+        live_defaults = backup.defaults
+        live_defaults.update(shadow.defaults)
+        backup.state = shadow.state
+        backup.param_groups = shadow.param_groups
+
+    @staticmethod
+    def _run_foreign_backup_post_hooks(backup):
+        for post_hook in backup._optimizer_load_state_dict_post_hooks.values():
+            post_hook(backup)
 
     @staticmethod
     def _auto_split(params_or_model, backup_substrings):
