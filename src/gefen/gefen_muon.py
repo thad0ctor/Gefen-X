@@ -1400,15 +1400,16 @@ class GefenMuon(Gefen):
             )
         return synchronized
 
+    @staticmethod
     @torch._dynamo.disable
     def _synchronize_sharded_step_error(
-        self, error, phase: str, process_groups
+        error, phase: str, process_groups
     ) -> None:
         if not process_groups:
             if error is not None:
                 raise error
             return
-        failed = self._synchronize_sharded_step_flag(
+        failed = GefenMuon._synchronize_sharded_step_flag(
             error is not None, process_groups
         )
         if not failed:
@@ -1439,8 +1440,9 @@ class GefenMuon(Gefen):
             )
         return minimum, maximum
 
+    @staticmethod
     @torch._dynamo.disable
-    def _prepare_synchronized_amp_step(self, optimizer, process_groups) -> bool:
+    def _prepare_synchronized_amp_step(optimizer, process_groups) -> bool:
         """Agree on AMP controls before unscaling or entering Muon collectives."""
         local_present = hasattr(optimizer, "found_inf") or hasattr(
             optimizer, "grad_scale"
@@ -1466,11 +1468,11 @@ class GefenMuon(Gefen):
             local_scale_present = False
             scale_value = 0.0
             local_amp_error = exc
-        self._synchronize_sharded_step_error(
+        GefenMuon._synchronize_sharded_step_error(
             local_amp_error, "AMP control preflight", process_groups
         )
 
-        minimum, maximum = self._synchronize_sharded_step_control_range(
+        minimum, maximum = GefenMuon._synchronize_sharded_step_control_range(
             (
                 int(local_present),
                 int(local_overflow),
@@ -1510,7 +1512,7 @@ class GefenMuon(Gefen):
         except Exception as exc:
             should_step = False
             local_amp_error = exc
-        self._synchronize_sharded_step_error(
+        GefenMuon._synchronize_sharded_step_error(
             local_amp_error, "AMP preparation", process_groups
         )
         return should_step

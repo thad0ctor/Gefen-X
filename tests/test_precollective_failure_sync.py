@@ -136,7 +136,26 @@ def _make_optimizer(mesh, case: str):
     full_weight_grad = torch.linspace(0.6, -0.7, 64, dtype=torch.float32).reshape(8, 8)
     weight = nn.Parameter(distribute_tensor(full_weight.clone(), mesh, [Shard(0)]))
 
-    if case == "hybrid_backup_sharded":
+    if case == "hybrid_backup_only_none":
+        # Degenerate composite: EVERY param routes to the backup, so
+        # ``optimizer.muon is None``. The backup still owns the sharded mesh, so
+        # the hybrid's failure sync must run even with no Muon child -- otherwise
+        # a one-rank preflight failure raises only on the failing rank while its
+        # mesh peer steps and mutates its backup shard.
+        optimizer = GefenMuonHybrid(
+            [],
+            [("backup.weight", weight)],
+            lr=1e-3,
+            fused=False,
+            ns_steps=1,
+            ns_schedule="standard",
+            sharded_mode="exact",
+            backup_optimizer="gefen",
+            normuon=False,
+        )
+        assert optimizer.muon is None
+        parameters = (weight,)
+    elif case == "hybrid_backup_sharded":
         # Invert the ownership of hybrid_exact: the Muon half holds a REPLICATED
         # (non-sharded) 2D weight while the BACKUP half owns the sharded mesh.
         # Deriving the failure-sync scope from the Muon child alone would then
@@ -491,6 +510,44 @@ def test_backup_only_mesh_preflight_failure_is_synchronized():
     ), closure_results
     # Liveness: neither rank hung, and no parameter/state/gradient moved on
     # either rank (the failing rank AND its mesh peer both roll back).
+    assert all(
+        item["elapsed"] < _STEP_DEADLINE_SECONDS for item in closure_results
+    ), closure_results
+    assert all(
+        all(item["unchanged"].values()) for item in closure_results
+    ), closure_results
+
+
+@pytest.mark.skipif(
+    not dist.is_available() or not dist.is_gloo_available(),
+    reason="pre-collective failure synchronization coverage requires Gloo",
+)
+def test_backup_only_hybrid_none_muon_preflight_failure_is_synchronized():
+    """A backup-only hybrid (``muon is None``) still synchronizes preflight.
+
+    Regression for the composite skipping the failure sync entirely when there
+    is no Muon child: when every param routes to a SHARDED backup half, a
+    rank-0 preflight failure must still fan out across the backup mesh so ALL
+    ranks fail fast with no mutation -- rather than rank 0 raising while its mesh
+    peer silently steps and mutates its backup shard. Bounded deadlines guard
+    against a hang.
+    """
+    results = _run_distributed_case(
+        "hybrid_backup_only_none", worker_target=_backup_sharded_worker
+    )
+    assert all("fatal_error" not in result for result in results), results
+
+    closure_results = [result["closure_failure"] for result in results]
+    assert all(item["message"] is not None for item in closure_results), closure_results
+    assert (
+        "GefenMuon hybrid step preflight failed on local rank 0"
+        in closure_results[0]["message"]
+    ), closure_results
+    assert "rank-zero closure failure" in closure_results[0]["message"], closure_results
+    assert (
+        "GefenMuon hybrid step preflight failed on another process-group member"
+        in closure_results[1]["message"]
+    ), closure_results
     assert all(
         item["elapsed"] < _STEP_DEADLINE_SECONDS for item in closure_results
     ), closure_results

@@ -62,7 +62,6 @@ import torch.nn as nn
 from gefen.gefen import (
     Gefen,
     _amp_native_scaling_required,
-    _amp_prepare_optimizer_step,
     _assert_optimizer_gradients_structurally_valid,
 )
 from gefen.gefen_muon import GefenMuon
@@ -730,25 +729,25 @@ class GefenMuonHybrid(torch.optim.Optimizer):
         except Exception as exc:
             loss = None
             local_preflight_error = exc
-        if self.muon is not None:
-            self.muon._synchronize_sharded_step_error(
-                local_preflight_error, "hybrid step preflight", process_groups
-            )
-        elif local_preflight_error is not None:
-            raise local_preflight_error
+        # Synchronize the preflight failure across the UNION scope
+        # unconditionally -- including a muon-only-None (backup-only) hybrid
+        # whose backup owns a sharded mesh. When process_groups is empty (no
+        # sharded mesh) the static helper just re-raises any local error, which
+        # is the previous rank-local behavior.
+        GefenMuon._synchronize_sharded_step_error(
+            local_preflight_error, "hybrid step preflight", process_groups
+        )
 
         # A non-finite gradient in either half skips BOTH children before their
         # codebooks, states, counters, or parameters can move. Explicit
         # scaler.unscale_(hybrid) is detected by grad_scale=None and is not
         # repeated; automatic unscale covers every child parameter exactly once.
-        if self.muon is not None:
-            should_step = self.muon._prepare_synchronized_amp_step(
-                self, process_groups
-            )
-        elif hasattr(self, "found_inf") or hasattr(self, "grad_scale"):
-            should_step = _amp_prepare_optimizer_step(self)
-        else:
-            should_step = True
+        # The static AMP agreement subsumes the old muon-present/absent split:
+        # with an empty scope and no local controls it returns True, and with
+        # local controls it falls back to plain _amp_prepare_optimizer_step.
+        should_step = GefenMuon._prepare_synchronized_amp_step(
+            self, process_groups
+        )
         if not should_step:
             for post_hook in self._optimizer_step_post_hooks.values():
                 post_hook(self, args, kwargs)
