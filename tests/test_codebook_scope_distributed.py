@@ -1175,6 +1175,10 @@ def _nccl_empty_owner_worker(rank, world, init_file, queue):
         gathered = [torch.empty_like(local) for _ in range(world)]
         dist.all_gather(gathered, local)
         agreement = all(torch.equal(item, gathered[0]) for item in gathered[1:])
+        # The codebook binding, not ambient CUDA state, owns the device used by
+        # every scoped control collective. Deliberately make current_device
+        # disagree before the step preamble exercises its shared failure flag.
+        torch.cuda.set_device(1 - rank)
         optimizer.step()
         queue.put(
             {
@@ -1188,6 +1192,7 @@ def _nccl_empty_owner_worker(rank, world, init_file, queue):
                     and optimizer._gefen_codebook.device.type == "cpu"
                 ),
                 "step": optimizer._gefen_global_step,
+                "ambient_device_differed": torch.cuda.current_device() != rank,
             }
         )
     except Exception as exc:
@@ -1232,6 +1237,7 @@ def test_nccl_scope_uses_explicit_collective_device_with_empty_nonowner():
         assert all(item["agreement"] for item in results)
         assert all(item["empty_nonowner"] for item in results)
         assert all(item["step"] == 1 for item in results)
+        assert all(item["ambient_device_differed"] for item in results)
     finally:
         for process in processes:
             if process.is_alive():

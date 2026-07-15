@@ -320,6 +320,47 @@ def test_load_rejects_quantized_momentum_without_codebook():
         fresh_opt.load_state_dict(sd)
 
 
+def test_rank_local_validator_tolerates_legacy_vmean_without_step():
+    # An older rank-local (DTensor/FSDP) checkpoint can carry ``vmean`` without
+    # the separate ``vmean_step`` counter (a pre-counter state, "vmean as old as
+    # step"); the step-time resume path backfills ``vmean_step`` from ``step``.
+    # The native load path accepts these (``allow_legacy_vmean_counter=True``),
+    # and ``_unwrap_rank_local_sharded_checkpoint`` must too -- otherwise the
+    # validator rejects the payload before the backfill can run, breaking an
+    # otherwise valid legacy resume. Pin the validator tolerance both ways.
+    model = _small_model()
+    opt = Gefen(list(model.named_parameters()), lr=1e-3, fused=False)
+    for step_grads in _synthetic_grads(model, 3):
+        _apply_grads(model, step_grads)
+        opt.step()
+
+    signature = opt._rank_local_sharded_signature(context={})
+    states = [opt.state[p] for group in opt.param_groups for p in group["params"]]
+    legacy = [dict(state) for state in states]
+    dropped = 0
+    for state in legacy:
+        if "vmean_step" in state:
+            del state["vmean_step"]
+            dropped += 1
+    assert dropped, "expected the stepped optimizer to carry vmean_step"
+
+    # Strict (the historical rank-local default) rejects the pre-counter payload.
+    with pytest.raises(ValueError, match="block second moment is missing"):
+        opt._validate_rank_local_states(
+            legacy,
+            signature,
+            opt._gefen_codebook,
+            allow_legacy_vmean_counter=False,
+        )
+    # The tolerance the rank-local load path now opts into accepts it (no raise).
+    opt._validate_rank_local_states(
+        legacy,
+        signature,
+        opt._gefen_codebook,
+        allow_legacy_vmean_counter=True,
+    )
+
+
 def test_load_rejects_partial_or_conflicting_group_metadata():
     _, opt = _run_and_save(factored=False)
     sd = copy.deepcopy(opt.state_dict())

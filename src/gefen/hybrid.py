@@ -1251,6 +1251,12 @@ class GefenMuonHybrid(torch.optim.Optimizer):
 
     def step(self, closure=None):
         self._assert_finalized_binding_layout()
+        binding = self._hybrid_codebook_process_group
+        process_groups = (
+            self.muon._step_failure_process_groups()
+            if self.muon is not None and binding is None
+            else ()
+        )
         # Dispatch the INSTANCE step hooks around the composite step, mirroring
         # torch.optim.Optimizer.profile_hook_step exactly: hooks receive
         # (optimizer, args, kwargs) where args are the raw step() call args
@@ -1292,47 +1298,74 @@ class GefenMuonHybrid(torch.optim.Optimizer):
         except Exception as exc:
             loss = None
             local_preamble_error = exc
-        if self._hybrid_codebook_process_group is not None:
+
+        if binding is not None:
             self._synchronize_codebook_scope_failure(
                 local_preamble_error, "step preamble"
             )
-        elif local_preamble_error is not None:
-            raise local_preamble_error
-        self._assert_finalized_binding_layout()
-        # Composite structural preflight, atomically over BOTH children before
-        # either child steps. Under a shared codebook scope the failure is
-        # synchronized on the binding first (mirroring Gefen.step and
-        # GefenMuon.step), so a rank-local structural error raises on every
-        # scope member together instead of stranding peers inside a child's
-        # scoped step collectives.
-        try:
-            for child in self._subopts:
-                _assert_optimizer_gradients_structurally_valid(child, require_2d_params=child is self.muon)
-            local_preflight_error = None
-        except Exception as exc:
-            local_preflight_error = exc
-        if self._hybrid_codebook_process_group is not None:
+            self._assert_finalized_binding_layout()
+            try:
+                for child in self._subopts:
+                    _assert_optimizer_gradients_structurally_valid(
+                        child, require_2d_params=child is self.muon
+                    )
+                local_preflight_error = None
+            except Exception as exc:
+                local_preflight_error = exc
             self._synchronize_codebook_scope_failure(
                 local_preflight_error, "gradient preflight"
             )
-        elif local_preflight_error is not None:
-            raise local_preflight_error
-        # A non-finite gradient in either half skips BOTH children before their
-        # codebooks, states, counters, or parameters can move. GradScaler
-        # attaches found_inf/grad_scale to the composite, so under a shared
-        # multi-member codebook scope the overflow skip is the children's
-        # scoped AMP protocol run here -- collective found_inf/grad_scale
-        # agreement, then a group-wide skip -- before any child enters its
-        # scoped step collectives. Explicit scaler.unscale_(hybrid) is
-        # detected by grad_scale=None and is not repeated; automatic unscale
-        # covers every child parameter exactly once.
-        if (hasattr(self, "found_inf") or hasattr(self, "grad_scale")) and not self._prepare_scoped_amp_optimizer_step():
+            should_step = self._prepare_scoped_amp_optimizer_step()
+        else:
+            if local_preamble_error is None:
+                try:
+                    for child in self._subopts:
+                        _assert_optimizer_gradients_structurally_valid(
+                            child, require_2d_params=child is self.muon
+                        )
+                    local_preflight_error = None
+                except Exception as exc:
+                    local_preflight_error = exc
+            else:
+                local_preflight_error = local_preamble_error
+            if self.muon is not None:
+                self.muon._synchronize_sharded_step_error(
+                    local_preflight_error,
+                    "hybrid step preflight",
+                    process_groups,
+                )
+                should_step = self.muon._prepare_synchronized_amp_step(
+                    self, process_groups
+                )
+            else:
+                if local_preflight_error is not None:
+                    raise local_preflight_error
+                should_step = self._prepare_scoped_amp_optimizer_step()
+        if not should_step:
             for post_hook in self._optimizer_step_post_hooks.values():
                 post_hook(self, args, kwargs)
             return loss
+
         with torch.no_grad():
             for o in self._subopts:
-                o.step()
+                if o is not self.muon:
+                    o.step()
+                    continue
+                if binding is not None:
+                    o.step()
+                    continue
+                marker = object()
+                previous = getattr(
+                    o, "_gefen_hybrid_precollective_preflight", marker
+                )
+                o._gefen_hybrid_precollective_preflight = True
+                try:
+                    o.step()
+                finally:
+                    if previous is marker:
+                        del o._gefen_hybrid_precollective_preflight
+                    else:
+                        o._gefen_hybrid_precollective_preflight = previous
 
         for post_hook in self._optimizer_step_post_hooks.values():
             post_hook(self, args, kwargs)

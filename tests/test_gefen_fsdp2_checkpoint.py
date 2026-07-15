@@ -736,3 +736,85 @@ def test_rank_local_full_dcp_set_optimizer_state_is_exact_under_fully_shard(
     assert checks is not None, "fully_shard checkpoint workers timed out"
     assert all(process.exitcode == 0 for process in processes)
     assert all(all(rank_check) for rank_check in checks), checks
+
+
+@pytest.mark.skipif(
+    not torch.distributed.is_available()
+    or not torch.distributed.is_gloo_available(),
+    reason="rank-local unwrap needs a (gloo) process group and DTensor",
+)
+def test_rank_local_unwrap_tolerates_and_backfills_legacy_vmean():
+    # Exercise the actual load path -- _unwrap_rank_local_sharded_checkpoint --
+    # not just the validator: a pre-counter rank-local checkpoint (vmean without
+    # the separate vmean_step counter) must load, and the first resumed step must
+    # backfill vmean_step from step. A single-rank gloo world drives the same
+    # rank_local_dtensor_v2 format the multi-rank path uses, so it stays a
+    # CPU-only regression guard for the load-path tolerance (rejected pre-fix).
+    import torch.distributed as dist
+    import torch.nn as nn
+    from torch.distributed.device_mesh import init_device_mesh
+    from torch.distributed.tensor import Shard, distribute_tensor
+
+    os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
+    os.environ["MASTER_PORT"] = _free_port()
+    os.environ["RANK"] = "0"
+    os.environ["WORLD_SIZE"] = "1"
+    dist.init_process_group("gloo", rank=0, world_size=1)
+    try:
+        from gefen import Gefen
+
+        mesh = init_device_mesh("cpu", (1,), mesh_dim_names=("dp",))
+
+        def build():
+            model = nn.Module()
+            model.register_parameter(
+                "w",
+                nn.Parameter(
+                    distribute_tensor(
+                        torch.linspace(-1, 1, 64).reshape(8, 8), mesh, [Shard(0)]
+                    )
+                ),
+            )
+            optimizer = Gefen(
+                [{"params": [("w", model.w)]}],
+                lr=1e-3,
+                fused=False,
+                factored_v_2d=False,
+            )
+            return model, optimizer
+
+        def apply_grad(model):
+            model.w.grad = distribute_tensor(
+                torch.arange(64).reshape(8, 8).float().cos(), mesh, [Shard(0)]
+            )
+
+        model, optimizer = build()
+        for _ in range(2):
+            apply_grad(model)
+            optimizer.step()
+
+        # Save a pre-counter rank-local checkpoint: drop the separate vmean_step
+        # counter from the live state before serializing.
+        param = optimizer.param_groups[0]["params"][0]
+        assert "vmean_step" in optimizer.state[param]
+        optimizer.state[param].pop("vmean_step")
+        checkpoint = copy.deepcopy(optimizer.state_dict())
+        assert any(
+            "rank_local_sharded_state" in group.get("_gefen_checkpoint_metadata", {})
+            for group in checkpoint["param_groups"]
+        ), "expected a rank-local sharded checkpoint"
+
+        # Load through the rank-local unwrap path (rejected before the fix). The
+        # pre-counter payload must be accepted with vmean_step still absent...
+        target_model, target_optimizer = build()
+        target_optimizer.load_state_dict(checkpoint)
+        target_param = target_optimizer.param_groups[0]["params"][0]
+        assert "vmean" in target_optimizer.state[target_param]
+        assert "vmean_step" not in target_optimizer.state[target_param]
+
+        # ...and the first resumed step must backfill vmean_step from step.
+        apply_grad(target_model)
+        target_optimizer.step()
+        assert "vmean_step" in target_optimizer.state[target_param]
+    finally:
+        dist.destroy_process_group()
