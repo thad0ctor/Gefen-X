@@ -1446,7 +1446,19 @@ class GefenMuon(Gefen):
 
     @torch._dynamo.disable
     def _step_failure_process_groups(self):
-        """Return the control scope for eager exact/distributed Muon steps."""
+        """Return the control scope for eager exact/distributed Muon steps.
+
+        Every sharded (non-approx) mesh this rank participates in contributes its
+        collective groups, deduplicated by process-group name and returned in a
+        globally consistent (sorted) order -- exactly the meshes
+        ``_assert_sharded_grad_presence_consistent`` enters. Selecting only one
+        mesh, or abstaining when the meshes share no enclosing group, desyncs the
+        control collective: with overlapping meshes (e.g. members {0,1,2} and
+        {2,3}) a rank in both would skip while a rank in only one enters that
+        mesh's all-reduce, deadlocking. Each group carries the local shard device
+        so the control flag lands on the same device as the real collectives
+        rather than the ambient ``current_device``.
+        """
         if not self._dist_available():
             return ()
 
@@ -1461,7 +1473,7 @@ class GefenMuon(Gefen):
 
         import torch.distributed as dist
 
-        meshes = {}
+        groups = {}
         for group in self.param_groups:
             if group["sharded_mode"] == "approx":
                 continue
@@ -1469,69 +1481,28 @@ class GefenMuon(Gefen):
                 if not self._is_sharded(param):
                     continue
                 mesh = param.device_mesh
-                if mesh.get_coordinate() is None:
+                if mesh.get_coordinate() is None or mesh.size() < 2:
                     continue
+                device = self._state_tensor_device(param)
                 process_groups = tuple(mesh.get_all_groups())
-                members = tuple(
-                    int(item)
-                    for item in mesh.mesh.detach().cpu().reshape(-1).tolist()
+                mesh_groups = (
+                    process_groups[:1] if mesh.ndim == 1 else process_groups
                 )
-                key = (
-                    str(mesh.device_type),
-                    tuple(int(item) for item in mesh.shape),
-                    members,
-                    tuple(str(pg.group_name) for pg in process_groups),
-                )
-                meshes.setdefault(key, (mesh, process_groups))
-
-        if not meshes:
-            return ()
-
-        member_sets = {frozenset(key[2]) for key in meshes}
-        world_members = frozenset(range(dist.get_world_size()))
-        participant_union = frozenset().union(*member_sets)
-        if world_members in member_sets:
-            return (dist.group.WORLD,)
-
-        enclosing_sets = [
-            members for members in member_sets if participant_union <= members
-        ]
-        if len(member_sets) > 1 and not enclosing_sets:
-            # No existing group encloses every upcoming collective participant.
-            # Entering only a rank-local subset of those groups could create a
-            # new deadlock before the established mesh/order preflight. Leave
-            # this uncommon topology on its existing behavior until the caller
-            # supplies an explicit enclosing control group.
-            return ()
-
-        selected_members = (
-            min(enclosing_sets, key=lambda item: (len(item), sorted(item)))
-            if enclosing_sets
-            else next(iter(member_sets))
-        )
-        candidates = [
-            (key, entry)
-            for key, entry in meshes.items()
-            if frozenset(key[2]) == selected_members
-        ]
-        _, (mesh, process_groups) = min(candidates, key=lambda item: item[0])
-        if mesh.size() < 2:
-            return ()
-        if mesh.ndim == 1:
-            return (process_groups[0],)
-        return tuple(
-            process_group
-            for process_group in process_groups
-            if dist.get_world_size(process_group) > 1
-        )
+                for process_group in mesh_groups:
+                    if dist.get_world_size(process_group) > 1:
+                        groups.setdefault(
+                            str(process_group.group_name),
+                            (process_group, device),
+                        )
+        return tuple(groups[name] for name in sorted(groups))
 
     @staticmethod
     @torch._dynamo.disable
     def _synchronize_sharded_step_flag(local_value, process_groups) -> bool:
         synchronized = bool(local_value)
-        for process_group in process_groups:
+        for process_group, collective_device in process_groups:
             synchronized = _synchronize_step_failure(
-                synchronized, process_group
+                synchronized, process_group, collective_device=collective_device
             )
         return synchronized
 
@@ -1568,9 +1539,9 @@ class GefenMuon(Gefen):
     def _synchronize_sharded_step_control_range(local_control, process_groups):
         minimum = tuple(float(item) for item in local_control)
         maximum = minimum
-        for process_group in process_groups:
+        for process_group, collective_device in process_groups:
             minimum, maximum = _synchronize_step_control_range(
-                minimum, maximum, process_group
+                minimum, maximum, process_group, collective_device=collective_device
             )
         return minimum, maximum
 
@@ -3123,6 +3094,12 @@ class GefenMuon(Gefen):
                 if closure is not None:
                     with torch.enable_grad():
                         loss = closure()
+                # A closure can rebind param_groups (e.g. swap in a rogue
+                # parameter), so re-assert the finalized binding layout after it
+                # runs -- before any state mutation -- matching the scoped path
+                # and the pre-Tier-2 step. The raise is caught below and
+                # synchronized so every mesh member fails together.
+                self._assert_finalized_binding_layout()
                 _assert_optimizer_gradients_structurally_valid(
                     self, require_2d_params=True
                 )

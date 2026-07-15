@@ -700,7 +700,9 @@ def _synchronize_step_failure(
 
 @torch.no_grad()
 @torch._dynamo.disable
-def _synchronize_step_control_range(local_minimum, local_maximum, process_group):
+def _synchronize_step_control_range(
+    local_minimum, local_maximum, process_group, *, collective_device=None
+):
     """Expand control-value bounds across one process group."""
     minimum = tuple(float(item) for item in local_minimum)
     maximum = tuple(float(item) for item in local_maximum)
@@ -716,7 +718,9 @@ def _synchronize_step_control_range(local_minimum, local_maximum, process_group)
     bounds = torch.tensor(
         minimum + tuple(-item for item in maximum),
         dtype=torch.float64,
-        device=_step_failure_collective_device(process_group),
+        device=_step_failure_collective_device(
+            process_group, collective_device=collective_device
+        ),
     )
     dist.all_reduce(bounds, op=dist.ReduceOp.MIN, group=process_group)
     values = bounds.cpu().tolist()
@@ -9529,11 +9533,21 @@ class Gefen(torch.optim.Optimizer):
 
         # GradScaler invokes native-AMP optimizers even on overflow. Decide
         # before codebook learning, periodic refresh, capturable counters, or
-        # parameter/state mutation. The attribute gate compiles away on the
+        # parameter/state mutation. A multi-member codebook scope must run the
+        # AMP protocol agreement on EVERY member -- including one with no local
+        # GradScaler attributes -- otherwise the presence gather inside
+        # _prepare_scoped_amp_optimizer_step is entered by only some members and
+        # deadlocks (mirrors the unconditional Muon/Hybrid AMP preflight). Off a
+        # multi-member scope the attribute gate still compiles away on the
         # ordinary BF16/FP32 path where GradScaler attaches nothing.
-        if (
-            hasattr(self, "found_inf") or hasattr(self, "grad_scale")
-        ) and not self._prepare_scoped_amp_optimizer_step():
+        scope = self._gefen_codebook_process_group
+        if scope is not None and len(scope.identity.ordered_members) > 1:
+            should_step = self._prepare_scoped_amp_optimizer_step()
+        elif hasattr(self, "found_inf") or hasattr(self, "grad_scale"):
+            should_step = self._prepare_scoped_amp_optimizer_step()
+        else:
+            should_step = True
+        if not should_step:
             return loss
 
         if (
