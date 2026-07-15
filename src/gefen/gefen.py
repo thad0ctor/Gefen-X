@@ -5115,8 +5115,17 @@ class Gefen(torch.optim.Optimizer):
             )
         selected_states = selected_payload["states"]
         selected_codebook = selected_payload["codebook"]
+        # Match the native load path's legacy tolerance: an older rank-local
+        # checkpoint can carry vmean without vmean_step (a pre-counter state, as
+        # old as step), and the step-time resume path backfills vmean_step from
+        # step. Rejecting it here (the default is strict) would block that
+        # backfill and break otherwise valid legacy DTensor/FSDP resumes, while
+        # the native path already accepts them.
         self._validate_rank_local_states(
-            selected_states, current_signature, selected_codebook
+            selected_states,
+            current_signature,
+            selected_codebook,
+            allow_legacy_vmean_counter=True,
         )
         state_dict["state"] = dict(zip(saved_ids, selected_states))
         state_dict["gefen_global_step"] = marker_step
