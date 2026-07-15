@@ -1319,6 +1319,16 @@ class GefenMuonHybrid(torch.optim.Optimizer):
         else:
             if local_preamble_error is None:
                 try:
+                    # A closure/pre-hook can rebind param_groups after the entry
+                    # guard (e.g. swap a same-shaped backup parameter), so
+                    # re-assert the finalized layout before stepping children;
+                    # and the muon child's own capture/codebook readiness guard
+                    # is suppressed below by the preflight marker, so run it here.
+                    # Both raises are caught and synchronized so every mesh member
+                    # fails together.
+                    self._assert_finalized_binding_layout()
+                    if self.muon is not None:
+                        self.muon._assert_codebook_capture_ready()
                     for child in self._subopts:
                         _assert_optimizer_gradients_structurally_valid(
                             child, require_2d_params=child is self.muon
