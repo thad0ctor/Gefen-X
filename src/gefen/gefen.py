@@ -648,6 +648,123 @@ def _resolve_find_period_backend(grad: torch.Tensor) -> str:
     return "cuda_kernel" if grad_work.device.type == "cuda" else "cpu"
 
 
+def _step_failure_collective_device(
+    process_group, *, collective_device=None
+) -> torch.device:
+    """Choose a backend-compatible device for a process-group control flag."""
+    import torch.distributed as dist
+
+    if collective_device is not None:
+        return torch.device(collective_device)
+
+    group = process_group if process_group is not None else dist.group.WORLD
+    bound_device = getattr(group, "bound_device_id", None)
+    if bound_device is not None:
+        return torch.device(bound_device)
+
+    backend = str(dist.get_backend(process_group)).lower()
+    if "nccl" in backend:
+        return torch.device("cuda", torch.cuda.current_device())
+    if "xccl" in backend:
+        return torch.device("xpu", torch.xpu.current_device())
+    # Gloo, MPI, UCC, and PyTorch's multi-backend default process group all
+    # accept CPU control tensors. Keeping their flag on CPU also avoids an
+    # unrelated accelerator initialization in spawned Gloo workers.
+    return torch.device("cpu")
+
+
+@torch.no_grad()
+@torch._dynamo.disable
+def _synchronize_step_failure(
+    local_failed, process_group, *, collective_device=None
+) -> bool:
+    """Return whether any process-group member reported a step failure."""
+    failed = bool(local_failed)
+    if not torch.distributed.is_available() or not torch.distributed.is_initialized():
+        return failed
+
+    import torch.distributed as dist
+
+    if dist.get_world_size(process_group) < 2:
+        return failed
+    flag = torch.tensor(
+        int(failed),
+        dtype=torch.int32,
+        device=_step_failure_collective_device(
+            process_group, collective_device=collective_device
+        ),
+    )
+    dist.all_reduce(flag, op=dist.ReduceOp.MAX, group=process_group)
+    return bool(flag.item())
+
+
+@torch.no_grad()
+@torch._dynamo.disable
+def _synchronize_step_control_range(
+    local_minimum, local_maximum, process_group, *, collective_device=None
+):
+    """Expand control-value bounds across one process group."""
+    minimum = tuple(float(item) for item in local_minimum)
+    maximum = tuple(float(item) for item in local_maximum)
+    if len(minimum) != len(maximum):
+        raise ValueError("step-control bounds must have equal lengths")
+    if not torch.distributed.is_available() or not torch.distributed.is_initialized():
+        return minimum, maximum
+
+    import torch.distributed as dist
+
+    if dist.get_world_size(process_group) < 2:
+        return minimum, maximum
+    bounds = torch.tensor(
+        minimum + tuple(-item for item in maximum),
+        dtype=torch.float64,
+        device=_step_failure_collective_device(
+            process_group, collective_device=collective_device
+        ),
+    )
+    dist.all_reduce(bounds, op=dist.ReduceOp.MIN, group=process_group)
+    values = bounds.cpu().tolist()
+    width = len(minimum)
+    return tuple(values[:width]), tuple(-item for item in values[width:])
+
+
+def _amp_optimizer_step_controls(optimizer):
+    """Parse GradScaler's temporary controls without mutating gradients."""
+    found_inf = getattr(optimizer, "found_inf", None)
+    if found_inf is not None:
+        if torch.is_tensor(found_inf):
+            if found_inf.numel() != 1:
+                raise RuntimeError(
+                    "GradScaler supplied a non-scalar found_inf tensor with "
+                    "shape {}".format(tuple(found_inf.shape))
+                )
+            overflow = bool(found_inf.detach().item())
+        else:
+            overflow = bool(found_inf)
+    else:
+        overflow = False
+
+    grad_scale = getattr(optimizer, "grad_scale", None)
+    if torch.is_tensor(grad_scale):
+        if grad_scale.numel() != 1:
+            raise RuntimeError(
+                "GradScaler supplied a non-scalar grad_scale tensor with shape "
+                "{}".format(tuple(grad_scale.shape))
+            )
+        scale_value = float(grad_scale.detach().item())
+    elif grad_scale is not None:
+        scale_value = float(grad_scale)
+    else:
+        scale_value = 0.0
+    if grad_scale is not None and (
+        not math.isfinite(scale_value) or scale_value <= 0.0
+    ):
+        raise RuntimeError(
+            "GradScaler supplied a non-finite or non-positive grad_scale"
+        )
+    return overflow, grad_scale, scale_value
+
+
 @torch.no_grad()
 def _amp_prepare_optimizer_step(optimizer) -> bool:
     """Honor PyTorch's native ``GradScaler`` optimizer-step protocol.
@@ -664,33 +781,14 @@ def _amp_prepare_optimizer_step(optimizer) -> bool:
     keeps every existing fused/unfused update path operating on ordinary
     unscaled gradients and also works for local DTensor shards.
     """
-    found_inf = getattr(optimizer, "found_inf", None)
-    if found_inf is not None:
-        if torch.is_tensor(found_inf):
-            if found_inf.numel() != 1:
-                raise RuntimeError(
-                    "GradScaler supplied a non-scalar found_inf tensor with shape {}".format(
-                        tuple(found_inf.shape)
-                    )
-                )
-            overflow = bool(found_inf.detach().item())
-        else:
-            overflow = bool(found_inf)
-        if overflow:
-            return False
-
-    grad_scale = getattr(optimizer, "grad_scale", None)
+    overflow, grad_scale, _ = _amp_optimizer_step_controls(optimizer)
+    if overflow:
+        return False
     if grad_scale is None:
         # Explicit scaler.unscale_(optimizer), or an ordinary non-AMP step.
         return True
 
     if torch.is_tensor(grad_scale):
-        if grad_scale.numel() != 1:
-            raise RuntimeError(
-                "GradScaler supplied a non-scalar grad_scale tensor with shape {}".format(
-                    tuple(grad_scale.shape)
-                )
-            )
         scale = grad_scale.detach()
         # Match torch.amp.GradScaler.unscale_: computing the reciprocal in
         # fp64 avoids compile-option-dependent fp32 division differences.
@@ -5128,6 +5226,7 @@ class Gefen(torch.optim.Optimizer):
 
             yield param_name, flat, period, grad
 
+    @torch._dynamo.disable
     def _synchronize_codebook_scope_failure(self, error, phase: str) -> None:
         binding = self._gefen_codebook_process_group
         if binding is None or len(binding.identity.ordered_members) == 1:
@@ -5135,15 +5234,12 @@ class Gefen(torch.optim.Optimizer):
                 raise error
             return
         self._assert_runtime_codebook_process_group()
-        import torch.distributed as dist
-
-        failed = torch.tensor(
-            int(error is not None),
-            dtype=torch.int32,
-            device=binding.collective_device,
+        failed = _synchronize_step_failure(
+            error is not None,
+            binding.process_group,
+            collective_device=binding.collective_device,
         )
-        dist.all_reduce(failed, op=dist.ReduceOp.MAX, group=binding.process_group)
-        if int(failed.item()) == 0:
+        if not failed:
             return
         if error is not None:
             raise RuntimeError(
@@ -5157,49 +5253,29 @@ class Gefen(torch.optim.Optimizer):
             )
         )
 
+    @torch._dynamo.disable
     def _prepare_scoped_amp_optimizer_step(self) -> bool:
         binding = self._gefen_codebook_process_group
         if binding is None:
             return _amp_prepare_optimizer_step(self)
         found_inf = getattr(self, "found_inf", None)
-        grad_scale = getattr(self, "grad_scale", None)
+        local_present = hasattr(self, "found_inf") or hasattr(
+            self, "grad_scale"
+        )
         try:
-            if found_inf is None:
-                local_overflow = False
-            elif torch.is_tensor(found_inf):
-                if found_inf.numel() != 1:
-                    raise RuntimeError(
-                        "GradScaler supplied a non-scalar found_inf tensor with shape {}".format(
-                            tuple(found_inf.shape)
-                        )
-                    )
-                local_overflow = bool(found_inf.detach().item())
-            else:
-                if len(binding.identity.ordered_members) > 1:
-                    raise RuntimeError(
-                        "a multi-member scoped optimizer requires a group-aware "
-                        "gradient scaler to provide tensor found_inf on every member"
-                    )
-                local_overflow = bool(found_inf)
-            if grad_scale is None:
-                scale_present = False
-                local_scale = 0.0
-            elif torch.is_tensor(grad_scale):
-                if grad_scale.numel() != 1:
-                    raise RuntimeError(
-                        "GradScaler supplied a non-scalar grad_scale tensor with shape {}".format(
-                            tuple(grad_scale.shape)
-                        )
-                    )
-                scale_present = True
-                local_scale = float(grad_scale.detach().item())
-            else:
-                scale_present = True
-                local_scale = float(grad_scale)
-            if scale_present and (not math.isfinite(local_scale) or local_scale <= 0.0):
+            local_overflow, grad_scale, local_scale = (
+                _amp_optimizer_step_controls(self)
+            )
+            if (
+                found_inf is not None
+                and not torch.is_tensor(found_inf)
+                and len(binding.identity.ordered_members) > 1
+            ):
                 raise RuntimeError(
-                    "GradScaler supplied a non-finite or non-positive grad_scale"
+                    "a multi-member scoped optimizer requires a group-aware "
+                    "gradient scaler to provide tensor found_inf on every member"
                 )
+            scale_present = grad_scale is not None
             local_error = None
         except Exception as exc:
             local_overflow = False
@@ -5211,7 +5287,12 @@ class Gefen(torch.optim.Optimizer):
             import torch.distributed as dist
 
             amp_control = torch.tensor(
-                [int(local_overflow), int(scale_present), local_scale],
+                [
+                    int(local_present),
+                    int(local_overflow),
+                    int(scale_present),
+                    local_scale,
+                ],
                 dtype=torch.float64,
                 device=binding.collective_device,
             )
@@ -5221,8 +5302,9 @@ class Gefen(torch.optim.Optimizer):
             dist.all_gather(controls, amp_control, group=binding.process_group)
             if any(not torch.equal(item, controls[0]) for item in controls[1:]):
                 raise RuntimeError(
-                    "scoped Gefen AMP requires identical found_inf and grad_scale "
-                    "on every process-group member; use a group-aware gradient scaler"
+                    "scoped Gefen AMP requires identical protocol presence, "
+                    "found_inf, and grad_scale on every process-group member; "
+                    "use a group-aware gradient scaler"
                 )
             if local_overflow:
                 return False
@@ -9058,8 +9140,17 @@ class Gefen(torch.optim.Optimizer):
             )
         selected_states = selected_payload["states"]
         selected_codebook = selected_payload["codebook"]
+        # Match the native load path's legacy tolerance: an older rank-local
+        # checkpoint can carry vmean without vmean_step (a pre-counter state, as
+        # old as step), and the step-time resume path backfills vmean_step from
+        # step. Rejecting it here (the default is strict) would block that
+        # backfill and break otherwise valid legacy DTensor/FSDP resumes, while
+        # the native path already accepts them.
         self._validate_rank_local_states(
-            selected_states, current_signature, selected_codebook
+            selected_states,
+            current_signature,
+            selected_codebook,
+            allow_legacy_vmean_counter=True,
         )
         state_dict["state"] = dict(zip(saved_ids, selected_states))
         state_dict["gefen_global_step"] = marker_step
@@ -9442,11 +9533,21 @@ class Gefen(torch.optim.Optimizer):
 
         # GradScaler invokes native-AMP optimizers even on overflow. Decide
         # before codebook learning, periodic refresh, capturable counters, or
-        # parameter/state mutation. The attribute gate compiles away on the
+        # parameter/state mutation. A multi-member codebook scope must run the
+        # AMP protocol agreement on EVERY member -- including one with no local
+        # GradScaler attributes -- otherwise the presence gather inside
+        # _prepare_scoped_amp_optimizer_step is entered by only some members and
+        # deadlocks (mirrors the unconditional Muon/Hybrid AMP preflight). Off a
+        # multi-member scope the attribute gate still compiles away on the
         # ordinary BF16/FP32 path where GradScaler attaches nothing.
-        if (
-            hasattr(self, "found_inf") or hasattr(self, "grad_scale")
-        ) and not self._prepare_scoped_amp_optimizer_step():
+        scope = self._gefen_codebook_process_group
+        if scope is not None and len(scope.identity.ordered_members) > 1:
+            should_step = self._prepare_scoped_amp_optimizer_step()
+        elif hasattr(self, "found_inf") or hasattr(self, "grad_scale"):
+            should_step = self._prepare_scoped_amp_optimizer_step()
+        else:
+            should_step = True
+        if not should_step:
             return loss
 
         if (
