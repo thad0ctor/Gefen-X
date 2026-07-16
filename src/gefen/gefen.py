@@ -22,6 +22,7 @@ from typing import Iterable, Optional, Tuple, Union
 import torch
 import torch.nn as nn
 
+from gefen.offload import StateOffloadMixin
 from gefen.partitioning import find_period_by_block_variance
 import gefen.quantization as quantization_module
 from gefen.kernels.automatic_vmean import (
@@ -966,7 +967,7 @@ def _assert_optimizer_gradients_structurally_valid(
                 )
 
 
-class Gefen(torch.optim.Optimizer):
+class Gefen(StateOffloadMixin, torch.optim.Optimizer):
     """Adam-family optimizer with 8-bit quantized momentum and block-shared or
     factored second moments, at roughly 1 byte of optimizer state per parameter.
 
@@ -1191,6 +1192,8 @@ class Gefen(torch.optim.Optimizer):
         # one device counter per parameter device and advance it in the captured
         # step tail; state_dict synchronizes the host mirror before serializing.
         self._gefen_global_step_by_device = {}
+        self._gefen_state_offload_device = None
+        self._gefen_state_offload_poisoned = False
 
         defaults = dict(
             lr=lr,
@@ -2687,7 +2690,7 @@ class Gefen(torch.optim.Optimizer):
             self._gefen_codebook_lut_by_device.clear()
 
     def _step_automatic_factored(
-        self, group, param_name: str, p: torch.Tensor, grad: torch.Tensor
+        self, group, param_name: str, p: torch.Tensor, grad: torch.Tensor, *, state=None
     ) -> None:
         # Adafactor-style factored second moment for a 2D param (opt-in via
         # factored_v_2d). The quantized-momentum machinery is byte-identical to
@@ -2702,7 +2705,7 @@ class Gefen(torch.optim.Optimizer):
             grad = grad.to_local()
         if hasattr(grad, "wait"):
             grad = grad.wait()
-        state = self.state[p]
+        state = self.state[p] if state is None else state
         beta1 = group["beta1"]
         beta2 = group["beta2"]
         lr = group["lr"]
@@ -3391,7 +3394,7 @@ class Gefen(torch.optim.Optimizer):
         return quantized_m * state["m_magnitude"]
 
     def _step_automatic(
-        self, group, param_name: str, p: torch.Tensor, grad: torch.Tensor
+        self, group, param_name: str, p: torch.Tensor, grad: torch.Tensor, *, state=None
     ) -> None:
         # Unwrap the gradient to its local shard for both the fused and
         # non-fused paths. Under FSDP2 the gradient arrives as a sharded DTensor;
@@ -3403,7 +3406,7 @@ class Gefen(torch.optim.Optimizer):
         if hasattr(grad, "wait"):
             grad = grad.wait()
 
-        state = self.state[p]
+        state = self.state[p] if state is None else state
         beta1 = group["beta1"]
         beta2 = group["beta2"]
         lr = group["lr"]
@@ -3920,6 +3923,7 @@ class Gefen(torch.optim.Optimizer):
     def state_dict(self):
         """Run optimizer state-dict hooks around Gefen's complete schema."""
 
+        self._assert_state_export_safe()
         for pre_hook in self._optimizer_state_dict_pre_hooks.values():
             pre_hook(self)
         state_dict = self._state_dict_impl()
@@ -4743,6 +4747,7 @@ class Gefen(torch.optim.Optimizer):
 
         staged._load_state_dict_impl(state_dict)
         staged._validate_loaded_native_state()
+        self._stage_loaded_state_for_offload(staged)
         return staged
 
     def _commit_staged_load_state_dict(self, staged) -> None:
@@ -5619,6 +5624,7 @@ class Gefen(torch.optim.Optimizer):
                 closure feed the first step's codebook learning correctly. The
                 returned loss is passed through.
         """
+        self._assert_state_offload_step_ready()
         self._assert_capturable_if_capturing()
 
         loss = None
@@ -5626,6 +5632,7 @@ class Gefen(torch.optim.Optimizer):
             with torch.enable_grad():
                 loss = closure()
 
+        self._assert_state_offload_step_ready()
         _assert_optimizer_gradients_structurally_valid(self)
 
         # GradScaler invokes native-AMP optimizers even on overflow. Decide
@@ -5673,6 +5680,7 @@ class Gefen(torch.optim.Optimizer):
             not self._use_fused_gefen_automatic_step()
             and not self._use_fused_automatic_vmean()
             and not self.capturable
+            and not self.state_offload_active
         )
 
         # Collect parameters that share block geometry + hyperparameters so they
@@ -5705,7 +5713,12 @@ class Gefen(torch.optim.Optimizer):
                     and p.ndim == 2
                     and not hasattr(p, "placements")
                 ):
-                    self._step_automatic_factored(group, name, p, grad)
+                    if self.state_offload_active:
+                        self._step_with_offloaded_parameter_state(
+                            self._step_automatic_factored, group, name, p, grad
+                        )
+                    else:
+                        self._step_automatic_factored(group, name, p, grad)
                     continue
                 if (
                     batch_nonfused
@@ -5718,7 +5731,12 @@ class Gefen(torch.optim.Optimizer):
                             (group, name, p, grad)
                         )
                         continue
-                self._step_automatic(group, name, p, grad)
+                if self.state_offload_active:
+                    self._step_with_offloaded_parameter_state(
+                        self._step_automatic, group, name, p, grad
+                    )
+                else:
+                    self._step_automatic(group, name, p, grad)
 
         for items in nonfused_groups.values():
             if len(items) == 1:
