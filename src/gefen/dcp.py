@@ -4,18 +4,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import math
-import re
 
 import torch
-
-
-# Names Gefen synthesizes positionally when the caller passes no parameter name
-# (``group_<gi>_param_<pi>`` for a multi-param group, ``param_<n>`` for an
-# implicit/single group). Such names encode *registration order*, not stable
-# parameter identity, so two differently ordered reconstructions produce the
-# same identity list and would cross-assign momentum on load. DCP resharding
-# therefore requires caller-provided names and rejects the synthesized pattern.
-_SYNTHESIZED_NAME_RE = re.compile(r"^(group_\d+_param_\d+|param_\d+)$")
 
 
 # Schema history:
@@ -68,24 +58,53 @@ def _dtensor_from_local(local: torch.Tensor, parameter):
 
 
 def _dense_momentum(optimizer, parameter, state) -> torch.Tensor:
-    indices = state["m_codebook"].reshape(-1).long()
+    """Dequantize one shard's block state into dense fp32 momentum.
+
+    Uses Gefen's chunked dequantize rather than ``codebook[indices.long()]``.
+    Advanced indexing makes a full-size int64 copy of the uint8 indices (8N
+    bytes) plus a full-size fp32 gather (4N) on top of the 4N result, so the
+    transient peaked at ~16 bytes/param -- ~16 GiB on a 1B-param local shard,
+    enough to OOM an otherwise-viable save in the one optimizer whose premise is
+    memory efficiency. ``gefen_dequantize_unpacked_indices`` gathers bounded
+    element chunks straight into the preallocated output, and the magnitude
+    scaling is applied in place, so only the 4N result plus one bounded chunk is
+    live. The gathered values, the broadcast multiply, and therefore the saved
+    dense momentum are bit-for-bit what advanced indexing produced.
+    """
+    from gefen.gefen import gefen_dequantize_unpacked_indices
+
+    stored = state["m_codebook"].reshape(-1)
     magnitude = state["m_magnitude"].reshape(-1).float()
     codebook = optimizer._gefen_codebook
     if codebook is None:
         raise RuntimeError("Gefen DCP save requires an initialized codebook")
-    codebook = codebook.detach().to(device=indices.device, dtype=torch.float32)
+    codebook = codebook.detach().to(device=stored.device, dtype=torch.float32)
     period = _counter(state["automatic_period"], "automatic_period")
-    if period < 1 or indices.numel() != magnitude.numel() * period:
+    if period < 1 or stored.numel() != magnitude.numel() * period:
         raise ValueError("Gefen momentum block geometry is invalid")
+    # An empty fp32 exemplar: the helper takes the output dtype/device from it
+    # (and stays a plain tensor, so no DTensor is reconstructed here).
+    like = torch.empty(0, dtype=torch.float32, device=stored.device)
+    dense = gefen_dequantize_unpacked_indices(codebook, stored, like)
     return (
-        codebook[indices]
-        .reshape(-1, period)
-        .mul(magnitude.reshape(-1, 1))
+        dense.reshape(-1, period)
+        .mul_(magnitude.reshape(-1, 1))
         .reshape(_local(parameter).shape)
     )
 
 
 def _dense_second_moment(parameter, state) -> torch.Tensor:
+    """Expand one shard's per-block ``vmean`` into a dense per-element tensor.
+
+    This is a *repeat*, not a reconstruction: Gefen keeps one second-moment value
+    per block, so the per-element history this dense form implies never existed.
+    Load averages these repeated values into the target blocks, which is exact
+    (to fp32 round-off) only while each target block stays inside one source
+    block -- i.e. when the target blocking matches or refines the source's. A
+    coarser target block averages several source blocks' distinct vmeans
+    together, and that loss is irreversible. See the resume-error note in
+    COMPATIBILITY.md.
+    """
     period = _counter(state["automatic_period"], "automatic_period")
     vmean = state["vmean"].reshape(-1).float()
     local_numel = _local(parameter).numel()
@@ -270,9 +289,9 @@ class GefenDCPState:
             names = group.get("param_names")
             # Index-addressed slots are only safe to reshard if each carries a
             # caller-stable, unique identity. A missing/short param_names list or
-            # a positionally synthesized name (Gefen's default for unnamed
-            # parameters) encodes registration order, not identity, so refuse it
-            # rather than silently cross-assigning momentum on a reordered load.
+            # a name Gefen synthesized for an unnamed parameter encodes
+            # registration order, not identity, so refuse it rather than silently
+            # cross-assigning momentum on a reordered load.
             if names is None or len(names) != len(group["params"]):
                 raise RuntimeError(
                     "GefenDCPState requires caller-provided stable param_names on "
@@ -285,13 +304,19 @@ class GefenDCPState:
                     )
                 )
             for name, parameter in zip(names, group["params"]):
-                if _SYNTHESIZED_NAME_RE.match(str(name)):
+                # Ask whether Gefen *generated* this name, rather than matching
+                # its spelling: the synthesized forms are ordinary identifiers a
+                # model may legitimately use for a real parameter, and rejecting
+                # a caller's own "param_0" locked such an optimizer out of
+                # GefenDCPState entirely. Provenance is recorded at registration.
+                if self.optimizer._param_name_is_synthesized(parameter):
                     raise RuntimeError(
                         "GefenDCPState requires caller-provided stable parameter "
-                        "names, but slot {} carries the synthesized positional "
-                        "name {!r}. Construct the optimizer with explicit "
-                        "parameter names so resharded state is addressed by "
-                        "identity, not registration order.".format(index, str(name))
+                        "names, but slot {} carries the positional name {!r} that "
+                        "Gefen synthesized for an unnamed parameter. Construct the "
+                        "optimizer with explicit parameter names so resharded "
+                        "state is addressed by identity, not registration "
+                        "order.".format(index, str(name))
                     )
                 if not _is_dtensor(parameter):
                     raise RuntimeError(
@@ -355,6 +380,16 @@ class GefenDCPState:
         "m_magnitude",
         "vmean",
     )
+
+    # Fields whose presence means the slot was materialized (or partially so).
+    # ``vmean_step`` is deliberately NOT *required*: a checkpoint written before
+    # the counter existed carries vmean without it, and native Gefen backfills it
+    # from ``step`` at step time (the save below mirrors that backfill). But its
+    # presence still marks a materialize, so a slot carrying only a name and an
+    # orphaned vmean_step is partial -- not fresh. Classifying it as fresh wrote
+    # an "uninitialized" slot with a nonzero counter, which every later load
+    # rejects as incoherent: a silently dead checkpoint.
+    _MATERIALIZED_STATE_FIELDS = _REQUIRED_STATE_FIELDS + ("vmean_step",)
 
     def _identities(self):
         """Stable per-slot identity list (replicated, in slot order).
@@ -468,6 +503,43 @@ class GefenDCPState:
             )
         return parsed
 
+    @staticmethod
+    def _validate_hyper_destinations(group_index, group, entry):
+        """Reject a live tensor hyperparameter that cannot represent its value.
+
+        The commit below fills a tensor hyperparameter in place to preserve its
+        identity/device for any fused kernel holding a reference. ``fill_`` casts
+        to the destination dtype, so restoring a fractional checkpoint lr (1e-3)
+        into a one-element *integral* lr tensor truncates it to 0 and silently
+        freezes every subsequent update. Checking representability here -- during
+        staging, before anything is committed -- keeps that failure fail-atomic
+        instead of discovering it after the state was already replaced.
+        Floating-point destinations are accepted: rounding an fp64 python float
+        into an fp32/bf16 lr tensor is ordinary, pre-existing behavior that
+        matches the native path.
+        """
+        for key in _GROUP_HYPER_KEYS:
+            current = group.get(key)
+            if not torch.is_tensor(current) or current.is_floating_point():
+                continue
+            value = entry[key]
+            if float(value) != float(int(value)):
+                raise ValueError(
+                    "Gefen DCP checkpoint group {} restores {}={!r}, but this "
+                    "optimizer holds it in a {} tensor that cannot represent it "
+                    "(the in-place fill would truncate to {}). Rebuild the "
+                    "optimizer with a floating-point {} tensor (or a plain "
+                    "float) before resuming; refusing to commit a silently "
+                    "truncated value.".format(
+                        group_index,
+                        key,
+                        value,
+                        current.dtype,
+                        int(value),
+                        key,
+                    )
+                )
+
     def _slot_initialized(self, slot: _Slot) -> bool:
         """Classify a slot's live state; reject a partial/malformed materialize.
 
@@ -479,13 +551,11 @@ class GefenDCPState:
         state = self.optimizer.state.get(slot.parameter)
         if not state:
             return False
-        present = [key for key in self._REQUIRED_STATE_FIELDS if key in state]
+        present = [key for key in self._MATERIALIZED_STATE_FIELDS if key in state]
         if not present:
             return False
-        if len(present) != len(self._REQUIRED_STATE_FIELDS):
-            missing = [
-                key for key in self._REQUIRED_STATE_FIELDS if key not in state
-            ]
+        missing = [key for key in self._REQUIRED_STATE_FIELDS if key not in state]
+        if missing:
             raise ValueError(
                 "Gefen DCP slot {} ({}) has partial optimizer state; missing "
                 "{}. Refusing to save it as uninitialized (which would zero the "
@@ -603,6 +673,12 @@ class GefenDCPState:
             self._validate_hyper_entry(group_index, entry)
             for group_index, entry in enumerate(saved_hypers)
         ]
+        # Also verify every live destination can hold the value it is about to be
+        # given, while the commit is still ahead of us (see the helper).
+        for group_index, (group, entry) in enumerate(
+            zip(self.optimizer.param_groups, staged_hypers)
+        ):
+            self._validate_hyper_destinations(group_index, group, entry)
 
         # Reject a deterministic-policy mismatch instead of silently overwriting
         # it, matching native Gefen.load_state_dict: the flag changes fused-routing

@@ -3,11 +3,15 @@
 These tests exercise the *real* save path -- a genuine ``Gefen.step`` learns the
 exact codebook and picks a block period > 1 -- and check that after a DCP reshard
 the restored optimizer (a) keeps Gefen's compact ~1 byte/param block state
-instead of collapsing to per-element period one, and (b) continues within a
-quantization-noise tolerance of a native run at the *target* topology. The
-continuation is tolerance-based, not exact, because routing the momentum through
-a dense DCP reshard re-blocks it against a freshly learned per-shard codebook --
-a different (and inherently lossy) blocking than the native target-topology run.
+instead of collapsing to per-element period one, and (b) continues within
+tolerance of a native run at the *target* topology. The continuation is
+tolerance-based, not exact, because routing the momentum through a dense DCP
+reshard re-quantizes it against a freshly learned per-shard codebook.
+
+These reshards all re-derive the same block period, so they isolate that
+re-quantization error; the second, larger approximation a reshard can incur --
+re-aggregating the per-block second moment when the target blocking coarsens --
+is pinned separately by test_second_moment_reblocking_regimes. See _CONTINUE_TOL.
 """
 
 from __future__ import annotations
@@ -226,11 +230,20 @@ def _run(world, checkpoint_dir, mode, *, device_type="cpu", fused=False, timeout
     return sorted(results, key=lambda item: item["rank"])
 
 
-# Continuation tolerance. The resharded momentum is re-blocked against a codebook
-# relearned on the new local shard -- a different, lossy blocking than the native
-# target-topology run -- so the one-step continuation matches only up to
-# accumulated 256-level quantization noise (empirically ~1e-3 on these shards),
-# not bit-for-bit.
+# Continuation tolerance for the reshards below. Every one of them re-derives the
+# SAME block period (2048) on the target shard, so source and target block
+# boundaries align: the second moment survives the round trip to fp32 round-off
+# (expanding vmean per element and re-averaging each block of identical values
+# returns the original), and the only error left is re-quantizing the momentum
+# against a codebook relearned on the new shard -- measured ~2e-4 here.
+#
+# This tolerance is therefore NOT a general bound on resharded continuation
+# error. A reshard whose target period differs (a shard size whose block-variance
+# search lands elsewhere) *coarsens* the blocking, and load then averages
+# together source blocks whose per-element second-moment history never existed
+# and cannot be recovered. That aggregation error is bounded only by how much
+# vmean varies across the merged blocks -- unrelated to, and measurably larger
+# than, quantization noise. See test_second_moment_reblocking_regimes.
 _CONTINUE_TOL = 5e-3
 
 
@@ -1416,3 +1429,368 @@ def test_dcp_rejects_uninitialized_slot_with_nonzero_counters(tmp_path):
         assert _live_state_signature(optimizer, param) == before
     finally:
         dist.destroy_process_group()
+
+
+# --- Post-merge review round (Codex, after PR #83) -------------------------
+
+
+def _reference_dense_momentum(optimizer, parameter, state):
+    """The pre-fix ``_dense_momentum``: whole-tensor advanced indexing.
+
+    Kept verbatim as the numerics oracle. The chunked implementation that
+    replaced it is a *memory* fix and must reproduce this bit-for-bit.
+    """
+    indices = state["m_codebook"].reshape(-1).long()
+    magnitude = state["m_magnitude"].reshape(-1).float()
+    codebook = optimizer._gefen_codebook.detach().to(
+        device=indices.device, dtype=torch.float32
+    )
+    period = int(state["automatic_period"])
+    return (
+        codebook[indices]
+        .reshape(-1, period)
+        .mul(magnitude.reshape(-1, 1))
+        .reshape(_local(parameter).shape)
+    )
+
+
+@pytest.mark.skipif(
+    not dist.is_available() or not dist.is_gloo_available(),
+    reason="DCP resharding coverage requires Gloo",
+)
+@pytest.mark.parametrize("chunk", [None, 97])
+def test_dense_momentum_is_bit_identical_to_advanced_indexing(tmp_path, chunk, monkeypatch):
+    # The chunked dequantize must not move the saved momentum at all -- neither
+    # in one chunk (the default constant covers these shards whole) nor across
+    # many. The 97-element chunk is deliberately not a divisor of the shard or of
+    # the block period, so chunk boundaries fall mid-block.
+    import gefen.dcp as dcp_mod
+    import gefen.gefen as gefen_mod
+
+    _single_rank_group(tmp_path / "dense-parity-init")
+    try:
+        mesh = init_device_mesh("cpu", (1,), mesh_dim_names=("dp",))
+        param = _shaped_dparam(_SHAPE, mesh)
+        optimizer = Gefen(
+            [("weight", param)], lr=1e-3, fused=False, factored_v_2d=False
+        )
+        for step in range(_SAVE_STEPS):
+            param.grad = distribute_tensor(_shaped_grad(_SHAPE, step), mesh, [Shard(0)])
+            optimizer.step()
+
+        state = optimizer.state[param]
+        expected = _reference_dense_momentum(optimizer, param, state)
+
+        if chunk is not None:
+            monkeypatch.setattr(gefen_mod, "GEFEN_DEQUANT_GATHER_CHUNK", chunk)
+        actual = dcp_mod._dense_momentum(optimizer, param, state)
+
+        assert actual.shape == expected.shape
+        assert actual.dtype == torch.float32
+        assert torch.equal(actual, expected), (
+            (actual - expected).abs().max().item()
+        )
+    finally:
+        dist.destroy_process_group()
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available(),
+    reason="peak-allocation measurement requires CUDA",
+)
+def test_dense_momentum_transient_is_bounded():
+    # Direct unit test (no distributed needed). The pre-fix form built a
+    # full-size int64 index copy (8 bytes/param) and a full-size fp32 gather on
+    # top of the 4-byte/param result -- ~16 bytes/param of transient, which OOMs
+    # an otherwise-viable save on a large shard. The chunked form keeps the
+    # int64/gather scratch bounded to one chunk regardless of shard size, so the
+    # transient is the 4-byte/param result plus a constant.
+    import gefen.dcp as dcp_mod
+
+    class _FakeOptimizer:
+        def __init__(self, codebook):
+            self._gefen_codebook = codebook
+
+    numel = 1 << 26  # 64M elements: many times the bounded chunk
+    period = 64
+    torch.manual_seed(0)
+    optimizer = _FakeOptimizer(torch.sort(torch.randn(256, device="cuda"))[0].float())
+    state = {
+        "m_codebook": torch.randint(
+            0, 256, (numel // period, period), dtype=torch.uint8, device="cuda"
+        ),
+        "m_magnitude": torch.rand(numel // period, 1, device="cuda"),
+        "automatic_period": period,
+    }
+    param = torch.empty(numel // 128, 128, device="cuda", dtype=torch.bfloat16)
+
+    torch.cuda.synchronize()
+    torch.cuda.reset_peak_memory_stats()
+    base = torch.cuda.memory_allocated()
+    dense = dcp_mod._dense_momentum(optimizer, param, state)
+    torch.cuda.synchronize()
+    peak_bytes_per_elem = (torch.cuda.max_memory_allocated() - base) / numel
+
+    assert dense.numel() == numel
+    # The 4-byte/param fp32 result is *kept*, so it is the floor; the pre-fix
+    # form peaked at ~16. Anything at/above 8 means a full-size int64 index copy
+    # (or a second full-size gather) is live again.
+    assert peak_bytes_per_elem < 8.0, peak_bytes_per_elem
+
+
+@pytest.mark.skipif(
+    not dist.is_available() or not dist.is_gloo_available(),
+    reason="DCP resharding coverage requires Gloo",
+)
+def test_dcp_rejects_orphaned_vmean_step_at_save(tmp_path):
+    _single_rank_group(tmp_path / "orphan-vmean-init")
+    try:
+        mesh = init_device_mesh("cpu", (1,), mesh_dim_names=("dp",))
+        param = _shaped_dparam(_SHAPE, mesh)
+        optimizer = Gefen(
+            [("weight", param)], lr=1e-3, fused=False, factored_v_2d=False
+        )
+        for step in range(_SAVE_STEPS):
+            param.grad = distribute_tensor(_shaped_grad(_SHAPE, step), mesh, [Shard(0)])
+            optimizer.step()
+
+        # A slot carrying only its name and an orphaned vmean_step: a partial
+        # materialize. It was classified as wholly fresh, so save wrote an
+        # "uninitialized" slot with a nonzero counter -- a checkpoint every later
+        # load rejects as incoherent. It must be caught at SAVE instead.
+        optimizer.state[param] = {"name": "weight", "vmean_step": 5}
+        with pytest.raises(ValueError, match="partial optimizer state"):
+            GefenDCPState(optimizer).state_dict()
+    finally:
+        dist.destroy_process_group()
+
+
+@pytest.mark.skipif(
+    not dist.is_available() or not dist.is_gloo_available(),
+    reason="DCP resharding coverage requires Gloo",
+)
+def test_dcp_saves_legacy_state_without_vmean_step(tmp_path):
+    _single_rank_group(tmp_path / "legacy-vmean-init")
+    try:
+        mesh = init_device_mesh("cpu", (1,), mesh_dim_names=("dp",))
+        param = _shaped_dparam(_SHAPE, mesh)
+        optimizer = Gefen(
+            [("weight", param)], lr=1e-3, fused=False, factored_v_2d=False
+        )
+        for step in range(_SAVE_STEPS):
+            param.grad = distribute_tensor(_shaped_grad(_SHAPE, step), mesh, [Shard(0)])
+            optimizer.step()
+
+        # A state restored from a checkpoint written before the vmean_step counter
+        # existed carries vmean without it; native backfills it from `step` at
+        # step time. vmean_step marks a materialize but is NOT required, so such a
+        # slot must still save as a complete, initialized slot.
+        del optimizer.state[param]["vmean_step"]
+        saved = GefenDCPState(optimizer).state_dict()
+        assert int(saved["slot_00000000.initialized"]) == 1
+        assert int(saved["slot_00000000.vmean_step"]) == int(
+            saved["slot_00000000.step"]
+        )
+        GefenDCPState(optimizer).load_state_dict(saved)
+        assert "automatic_period" in optimizer.state[param]
+    finally:
+        dist.destroy_process_group()
+
+
+@pytest.mark.skipif(
+    not dist.is_available() or not dist.is_gloo_available(),
+    reason="DCP resharding coverage requires Gloo",
+)
+def test_dcp_rejects_integral_tensor_lr_before_commit(tmp_path):
+    _single_rank_group(tmp_path / "int-lr-init")
+    try:
+        mesh = init_device_mesh("cpu", (1,), mesh_dim_names=("dp",))
+        param = _shaped_dparam(_SHAPE, mesh)
+        optimizer = Gefen(
+            [("weight", param)], lr=1e-3, fused=False, factored_v_2d=False
+        )
+        for step in range(_SAVE_STEPS):
+            param.grad = distribute_tensor(_shaped_grad(_SHAPE, step), mesh, [Shard(0)])
+            optimizer.step()
+        saved = GefenDCPState(optimizer).state_dict()
+
+        # An integral one-element lr tensor cannot hold the checkpoint's 1e-3:
+        # the in-place fill would silently truncate it to 0 and freeze every
+        # later update -- and it ran after the state was already replaced.
+        optimizer.param_groups[0]["lr"] = torch.tensor(1, dtype=torch.int64)
+        state_before = _live_state_signature(optimizer, param)
+        hypers_before = _group_hyper_signature(optimizer)
+
+        with pytest.raises(ValueError, match="cannot represent"):
+            GefenDCPState(optimizer).load_state_dict(saved)
+
+        # Fail-atomic: rejected during staging, so neither the optimizer state nor
+        # the param groups moved, and the lr was never truncated.
+        assert _live_state_signature(optimizer, param) == state_before
+        assert _group_hyper_signature(optimizer) == hypers_before
+        assert int(optimizer.param_groups[0]["lr"]) == 1
+    finally:
+        dist.destroy_process_group()
+
+
+@pytest.mark.skipif(
+    not dist.is_available() or not dist.is_gloo_available(),
+    reason="DCP resharding coverage requires Gloo",
+)
+def test_dcp_accepts_float_tensor_lr(tmp_path):
+    _single_rank_group(tmp_path / "float-lr-init")
+    try:
+        mesh = init_device_mesh("cpu", (1,), mesh_dim_names=("dp",))
+        param = _shaped_dparam(_SHAPE, mesh)
+        optimizer = Gefen(
+            [("weight", param)], lr=2.5e-3, fused=False, factored_v_2d=False
+        )
+        for step in range(_SAVE_STEPS):
+            param.grad = distribute_tensor(_shaped_grad(_SHAPE, step), mesh, [Shard(0)])
+            optimizer.step()
+        saved = GefenDCPState(optimizer).state_dict()
+
+        # A float tensor lr is the supported live form (fused kernels hold a
+        # reference to it): it must still restore in place, identity preserved.
+        live_lr = torch.tensor(9.9e-9, dtype=torch.float32)
+        optimizer.param_groups[0]["lr"] = live_lr
+        GefenDCPState(optimizer).load_state_dict(saved)
+        assert optimizer.param_groups[0]["lr"] is live_lr
+        assert abs(float(live_lr) - 2.5e-3) < 1e-9, float(live_lr)
+    finally:
+        dist.destroy_process_group()
+
+
+@pytest.mark.skipif(
+    not dist.is_available() or not dist.is_gloo_available(),
+    reason="DCP resharding coverage requires Gloo",
+)
+def test_dcp_accepts_caller_named_param_0(tmp_path):
+    _single_rank_group(tmp_path / "real-param0-init")
+    try:
+        mesh = init_device_mesh("cpu", (1,), mesh_dim_names=("dp",))
+        shape = (128, 64)
+        first = _shaped_dparam(shape, mesh)
+        second = _shaped_dparam(shape, mesh)
+        # A model may genuinely declare a parameter called "param_0". Its name
+        # comes from named_parameters(), so it IS caller-stable and unique --
+        # rejecting it on spelling alone locked such an optimizer out of
+        # GefenDCPState entirely. Provenance, not the pattern, decides.
+        optimizer = Gefen(
+            [("param_0", first), ("group_1_param_0", second)],
+            lr=1e-3,
+            fused=False,
+            factored_v_2d=False,
+        )
+        wrapper = GefenDCPState(optimizer)
+        assert [slot.name for slot in wrapper._slots] == ["param_0", "group_1_param_0"]
+
+        for step in range(_SAVE_STEPS):
+            for param in (first, second):
+                param.grad = distribute_tensor(
+                    _shaped_grad(shape, step), mesh, [Shard(0)]
+                )
+            optimizer.step()
+        # It must round-trip, not merely construct.
+        saved = wrapper.state_dict()
+        GefenDCPState(optimizer).load_state_dict(saved)
+        for param in (first, second):
+            assert "automatic_period" in optimizer.state[param]
+    finally:
+        dist.destroy_process_group()
+
+
+@pytest.mark.skipif(
+    not dist.is_available() or not dist.is_gloo_available(),
+    reason="DCP resharding coverage requires Gloo",
+)
+def test_dcp_still_rejects_genuinely_synthesized_names_in_named_group(tmp_path):
+    _single_rank_group(tmp_path / "synth-group-init")
+    try:
+        mesh = init_device_mesh("cpu", (1,), mesh_dim_names=("dp",))
+        first = _shaped_dparam((128, 64), mesh)
+        second = _shaped_dparam((128, 64), mesh)
+        # Unnamed params inside an EXPLICIT group get group_0_param_N. Gefen
+        # generated those, so they still encode registration order and must be
+        # refused however they are spelled.
+        optimizer = Gefen(
+            [{"params": [first, second]}], lr=1e-3, fused=False, factored_v_2d=False
+        )
+        assert optimizer.param_groups[0]["param_names"] == [
+            "group_0_param_0",
+            "group_0_param_1",
+        ]
+        with pytest.raises(RuntimeError, match="synthesized"):
+            GefenDCPState(optimizer)
+    finally:
+        dist.destroy_process_group()
+
+
+@pytest.mark.skipif(
+    not dist.is_available() or not dist.is_gloo_available(),
+    reason="DCP resharding coverage requires Gloo",
+)
+def test_dcp_rejects_synthesized_name_added_after_construction(tmp_path):
+    _single_rank_group(tmp_path / "synth-added-init")
+    try:
+        mesh = init_device_mesh("cpu", (1,), mesh_dim_names=("dp",))
+        shape = (128, 64)
+        first = _shaped_dparam(shape, mesh)
+        optimizer = Gefen(
+            [("alpha", first)], lr=1e-3, fused=False, factored_v_2d=False
+        )
+        # A group added later without names is synthesized just the same, and the
+        # provenance record must follow it through add_param_group.
+        second = _shaped_dparam(shape, mesh)
+        optimizer.add_param_group({"params": [second]})
+        assert optimizer._param_name_is_synthesized(second)
+        assert not optimizer._param_name_is_synthesized(first)
+        with pytest.raises(RuntimeError, match="synthesized"):
+            GefenDCPState(optimizer)
+    finally:
+        dist.destroy_process_group()
+
+
+def test_second_moment_reblocking_regimes():
+    # Pins the two regimes the resume guarantee rests on (direct unit test, no
+    # distributed needed). The saved dense second moment is only each source
+    # block's vmean repeated per element -- the per-element history never existed.
+    #
+    #   aligned / refining (target period divides the source period): every target
+    #     block sits inside one source block, so averaging identical repeated
+    #     values returns them unchanged, to fp32 round-off.
+    #   coarsening (target block spans several source blocks): their distinct
+    #     vmeans are averaged together, irreversibly. Bounded only by the spread
+    #     of vmean across the merged blocks, NOT by quantization noise.
+    import gefen.dcp as dcp_mod
+
+    source_period = 64
+    blocks = 16
+    numel = source_period * blocks
+    # A vmean that genuinely varies block to block, as a real layer's does.
+    vmean = torch.logspace(-6, 0, blocks).reshape(-1, 1)
+    dense_second = vmean.expand(-1, source_period).reshape(-1).clone()
+    momentum = torch.linspace(-1.0, 1.0, numel)
+    codebook = dcp_mod._learn_codebook(
+        [("w", momentum, source_period)], torch.device("cpu")
+    )
+
+    def reblocked_second(period):
+        _, _, new_vmean = dcp_mod._reblock(codebook, momentum, dense_second, period)
+        return new_vmean.reshape(-1, 1).expand(-1, period).reshape(-1)
+
+    # Aligned: recovered to fp32 round-off (the block mean sums then divides).
+    assert torch.allclose(
+        reblocked_second(source_period), dense_second, rtol=1e-6, atol=0
+    )
+    # Refining: still exact -- each sub-block sees one constant value.
+    assert torch.allclose(
+        reblocked_second(source_period // 4), dense_second, rtol=1e-6, atol=0
+    )
+
+    # Coarsening: four source blocks per target block get averaged into one
+    # value. The result is materially wrong, in a way no re-quantization
+    # tolerance covers, and cannot be undone.
+    coarse = reblocked_second(source_period * 4)
+    relative = (coarse - dense_second).abs().max() / dense_second.abs().max()
+    assert relative > 0.1, relative
