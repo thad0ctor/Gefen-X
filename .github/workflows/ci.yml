@@ -1,13 +1,19 @@
 name: CI
 
-# CPU job runs automatically on every push / PR. The GPU test job is opt-in
-# (manual workflow_dispatch) because the kernel parity tests require a CUDA
-# device + nvcc, which GitHub-hosted runners do not provide. Trigger it from
-# the Actions tab if you have a self-hosted GPU runner labelled [self-hosted, gpu].
+# CPU job runs automatically on every pull request and on pushes to main. The
+# push trigger is deliberately scoped to main: a branch that has a PR open is
+# already covered by the `pull_request` event, and listening on both events for
+# every branch runs the whole matrix twice per push. To test a branch before
+# opening a PR, run the workflow from the Actions tab (workflow_dispatch).
+#
+# The GPU test job is opt-in (manual workflow_dispatch) because the kernel
+# parity tests require a CUDA device + nvcc, which GitHub-hosted runners do not
+# provide. Trigger it from the Actions tab if you have a self-hosted GPU runner
+# labelled [self-hosted, gpu].
 
 on:
   push:
-    branches: ["**"]
+    branches: ["main"]
   pull_request:
   workflow_dispatch:
     inputs:
