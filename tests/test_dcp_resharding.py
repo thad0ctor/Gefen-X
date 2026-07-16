@@ -24,7 +24,12 @@ import torch
 import torch.distributed as dist
 from torch import nn
 from torch.distributed.checkpoint import FileSystemReader, FileSystemWriter
-from torch.distributed.tensor import Shard, distribute_tensor, init_device_mesh
+from torch.distributed.tensor import (
+    Replicate,
+    Shard,
+    distribute_tensor,
+    init_device_mesh,
+)
 
 from gefen import Gefen, GefenDCPState
 
@@ -496,6 +501,63 @@ def test_rejects_factored_v_2d(tmp_path):
             factored_v_2d=True,
         )
         with pytest.raises(RuntimeError, match="factored_v_2d"):
+            GefenDCPState(optimizer)
+    finally:
+        dist.destroy_process_group()
+
+
+def test_rejects_non_shard0_placement(tmp_path):
+    # The PR advertises that non-Shard(0) placements fail closed.
+    init_file = tmp_path / "replicate-init"
+    dist.init_process_group(
+        "gloo", init_method="file://{}".format(init_file), rank=0, world_size=1
+    )
+    try:
+        mesh = init_device_mesh("cpu", (1,), mesh_dim_names=("dp",))
+        parameter = nn.Parameter(distribute_tensor(_global_param(), mesh, [Replicate()]))
+        optimizer = Gefen(
+            [("weight", parameter)], lr=1e-3, fused=False, factored_v_2d=False
+        )
+        with pytest.raises(RuntimeError, match="Shard"):
+            GefenDCPState(optimizer)
+    finally:
+        dist.destroy_process_group()
+
+
+def test_rejects_multidimensional_mesh(tmp_path):
+    # Multidimensional meshes fail closed.
+    init_file = tmp_path / "mesh2d-init"
+    dist.init_process_group(
+        "gloo", init_method="file://{}".format(init_file), rank=0, world_size=1
+    )
+    try:
+        mesh = init_device_mesh("cpu", (1, 1), mesh_dim_names=("dp", "tp"))
+        parameter = nn.Parameter(
+            distribute_tensor(_global_param(), mesh, [Shard(0), Replicate()])
+        )
+        optimizer = Gefen(
+            [("weight", parameter)], lr=1e-3, fused=False, factored_v_2d=False
+        )
+        with pytest.raises(RuntimeError, match="one-dimensional"):
+            GefenDCPState(optimizer)
+    finally:
+        dist.destroy_process_group()
+
+
+def test_rejects_muon_sharded_mode(tmp_path):
+    # A group carrying a Muon sharded_mode fails closed.
+    init_file = tmp_path / "shardedmode-init"
+    dist.init_process_group(
+        "gloo", init_method="file://{}".format(init_file), rank=0, world_size=1
+    )
+    try:
+        mesh = init_device_mesh("cpu", (1,), mesh_dim_names=("dp",))
+        parameter = nn.Parameter(distribute_tensor(_global_param(), mesh, [Shard(0)]))
+        optimizer = Gefen(
+            [("weight", parameter)], lr=1e-3, fused=False, factored_v_2d=False
+        )
+        optimizer.param_groups[0]["sharded_mode"] = "approx"
+        with pytest.raises(RuntimeError, match="sharded mode"):
             GefenDCPState(optimizer)
     finally:
         dist.destroy_process_group()
