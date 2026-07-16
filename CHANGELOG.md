@@ -2,19 +2,14 @@
 
 All notable changes to this project are documented here. This project adheres to [Semantic Versioning](https://semver.org/).
 
-## [0.4.1] - 2026-07-15
+## Unreleased
 
-Distributed checkpoint-load and step-failure hardening. All fixes are backward-compatible; no public API changes.
-
-Correctness — checkpoint loads are now atomic:
-
-- `Gefen.load_state_dict` and `GefenMuonHybrid.load_state_dict` stage the full restore on an isolated shadow, validate it, then publish through non-throwing dict swaps, so a malformed, truncated, or mismatched checkpoint — or a CUDA OOM while re-staging tensors — leaves the live optimizer untouched instead of half-loaded and corrupted (#69). The hybrid previously committed the Muon child before validating the backup half and recovered a backup rejection with a second full Muon reload that could itself raise and strand a new-Muon/old-backup optimizer; the shadow-then-publish path makes a rejection a true no-op.
-- The rank-local (DTensor/FSDP) sharded load path now accepts a legacy checkpoint carrying `vmean` without the separate `vmean_step` counter, matching the native load path and the pre-load-atomicity behavior; the step-time resume already backfills the counter from `step`. A current checkpoint (which carries `vmean_step`) and the inverse `vmean_step`-without-`vmean` corruption check are unaffected (#70).
-
-Correctness — pre-collective step failures fan out across every mesh:
-
-- A pre-collective step failure (closure error, structural gradient-presence divergence, or an AMP control decision) is now synchronized over every participating mesh on the shard device before the Muon collective, so a one-rank failure fails all ranks fast instead of deadlocking against peers that entered the collective. Fixes a hang on overlapping meshes where a rank in two meshes abstained while a rank in only one entered that mesh's all-reduce. The sync wrappers are also excluded from Dynamo tracing, matching their siblings, to avoid graph breaks under `torch.compile` + `capturable` (#71).
-- `GefenMuonHybrid` derives its pre-collective failure-sync scope from the union of both children's sharded meshes rather than the Muon child alone, so a preflight failure on a mesh owned only by the backup half (a sharded backup weight with a non-sharded or absent Muon half) is all-reduced across that mesh instead of letting peers step and mutate their backup shard. The standard `fully_shard` case (both halves on one mesh) collapses to exactly the previous Muon-only scope with no extra collective (#74).
+- Add stable post-sharding rebinding, local training, and exact same-topology native checkpoint continuation for narrow one-dimensional default-world DTensors, including uneven and empty shards.
+- Freeze GefenMuon's DTensor parameter membership, order, rebinding, mesh route, and `sharded_mode` after the first collective routing validation; later edits fail before optimizer or parameter mutation because initialized state has no mode-migration rule.
+- Extend `GefenMuonHybrid` atomic rebinding and native load staging to exact AdamW backups and mixed DTensor layouts while preserving nested child state and fail-before-mutation semantics.
+- Bind finalized scoped native checkpoints to their exact process-group identity and local layout, including direct distributed Muon; unscoped distributed Muon retains its complete cross-world-size native checkpoint path.
+- Add representation-qualified checkpoint transitions, including the directional `defined_projection_factored_to_block_live_fp32_target_period_one_v1` portable projection; reverse block-to-factored conversion remains unsupported.
+- Replace the dense-everywhere portable DCP save format with a load-compatible sharded version that stores multi-member canonical fields as DCP DTensors and singleton fields as ordinary full tensors, supports plain-Gefen DTensor resharding and Gefen-backed Hybrid child namespaces, and bounds metadata, chunks, and aggregate payloads.
 
 ## [0.4.0] - 2026-07-12
 

@@ -221,7 +221,7 @@ GEFEN_VERBOSE_BUILD=1 \
   tests/test_muon_fsdp2_parity.py::test_muon_fsdp2_fused_multirank_parity \
   tests/test_muon_fsdp2_parity.py::test_muon_fsdp2_distributed_parity \
   tests/test_muon_fsdp2_parity.py::test_muon_fsdp2_distributed_fluctuating_grad_set \
-  tests/test_muon_fsdp2_parity.py::test_muon_fsdp2_distributed_checkpoint_restore
+  tests/test_muon_fsdp2_parity.py::test_muon_fsdp2_distributed_checkpoint_restore_same_world
 
 JUNIT="$JUNIT" "$PYTHON" - <<'PY'
 import os

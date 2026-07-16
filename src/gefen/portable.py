@@ -480,6 +480,51 @@ def _expand_factored_second_moment(
     return _finish_output(dense, name="dense second moment")
 
 
+def _expand_factored_second_moment_live_fp32_v1(
+    row,
+    column,
+    *,
+    logical_shape,
+    step,
+) -> torch.Tensor:
+    """Expand factored state with the live decomposed fp32 operator ordering."""
+
+    _validate_state_counter(step, name="factored_step", minimum=1)
+    shape = _validate_logical_shape(logical_shape)
+    if len(shape) != 2:
+        raise ValueError("factored second moment requires a 2-D logical shape")
+    row = _validate_plain_tensor(
+        row,
+        name="row second moment",
+        dtype=torch.float32,
+        ndim=1,
+        nonnegative=True,
+    )
+    column = _validate_plain_tensor(
+        column,
+        name="column second moment",
+        dtype=torch.float32,
+        ndim=1,
+        nonnegative=True,
+    )
+    if row.device != column.device:
+        raise ValueError("row and column second moments must share a device")
+    if tuple(row.shape) != (shape[0],) or tuple(column.shape) != (shape[1],):
+        raise ValueError("factored second-moment vectors do not match logical_shape")
+    if math.prod(shape) == 0:
+        return _finish_output(
+            _new_output(shape, dtype=torch.float32, device=row.device),
+            name="live-fp32 dense second moment",
+        )
+
+    # This ordering is the versioned numerical contract. It intentionally
+    # rounds the outer product before division and mirrors Gefen's live
+    # decomposed update, including its minimum-normal denominator clamp.
+    denominator = row.detach().mean().clamp_(min=torch.finfo(torch.float32).tiny)
+    dense = torch.outer(row.detach(), column.detach()).div_(denominator)
+    return _finish_output(dense, name="live-fp32 dense second moment")
+
+
 def _project_factored_second_moment(
     dense,
     *,

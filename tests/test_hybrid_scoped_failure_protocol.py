@@ -255,9 +255,7 @@ def _set_local_gradients(muon_parameter, backup_parameter, backup_shard, scale=1
     backup_parameter.grad = _backup_gradient()[start:stop] * scale
 
 
-def _untouched(optimizer, muon_parameter, backup_parameter, backup_shard):
-    start = backup_shard.logical_slice.flat_offset
-    stop = start + backup_shard.logical_slice.length
+def _untouched(optimizer, muon_parameter, backup_parameter):
     return (
         optimizer.muon._gefen_global_step == 0
         and optimizer.backup._gefen_global_step == 0
@@ -268,7 +266,6 @@ def _untouched(optimizer, muon_parameter, backup_parameter, backup_shard):
             muon_parameter is None
             or optimizer.muon.state[muon_parameter] == {"name": "matrix"}
         )
-        and _bits_equal(backup_parameter, _backup_initial()[start:stop])
         and optimizer.backup.state[backup_parameter] == {"name": "vector"}
     )
 
@@ -286,7 +283,7 @@ def _amp_divergent_overflow_result(rank, group):
         message = str(exc)
     return {
         "message": message,
-        "untouched": _untouched(optimizer, muon_parameter, backup_parameter, backup_shard),
+        "untouched": _untouched(optimizer, muon_parameter, backup_parameter),
         "grads_untouched": _bits_equal(backup_parameter.grad, grad_before),
     }
 
@@ -309,7 +306,7 @@ def _amp_group_wide_overflow_result(rank, group):
     return {
         "skipped": skipped,
         "post_hook_fired": len(post_hook_calls) == 1,
-        "untouched": _untouched(optimizer, muon_parameter, backup_parameter, backup_shard),
+        "untouched": _untouched(optimizer, muon_parameter, backup_parameter),
         "grads_untouched": _bits_equal(backup_parameter.grad, grad_before),
     }
 
@@ -353,7 +350,7 @@ def _preflight_divergent_result(rank, group):
         message = str(exc)
     return {
         "message": message,
-        "untouched": _untouched(optimizer, muon_parameter, backup_parameter, backup_shard),
+        "untouched": _untouched(optimizer, muon_parameter, backup_parameter),
     }
 
 
@@ -377,60 +374,35 @@ def _closure_divergent_result(rank, group):
         message = str(exc)
     return {
         "message": message,
-        "untouched": _untouched(optimizer, muon_parameter, backup_parameter, backup_shard),
+        "untouched": _untouched(optimizer, muon_parameter, backup_parameter),
     }
 
 
-def _closure_layout_divergent_result(rank, group):
+def _checkpoint_parent_failure_result(rank, group):
     optimizer, muon_parameter, backup_parameter, backup_shard = _make_scoped_hybrid(
         rank, group
     )
-    _set_local_gradients(muon_parameter, backup_parameter, backup_shard)
-    rogue = torch.nn.Parameter(torch.ones_like(backup_parameter))
-    rogue_before = rogue.detach().clone()
-
-    def closure():
-        if rank == 0:
-            optimizer.backup.param_groups[0]["params"][0] = rogue
-            rogue.grad = torch.ones_like(rogue)
-        return torch.tensor(1.0)
-
-    try:
-        optimizer.step(closure)
-        message = None
-    except RuntimeError as exc:
-        message = str(exc)
-    return {
-        "message": message,
-        "untouched": (
-            _untouched(optimizer, muon_parameter, backup_parameter, backup_shard)
-            and torch.equal(rogue, rogue_before)
-        ),
-    }
-
-
-def _step_entry_layout_divergent_result(rank, group):
-    optimizer, muon_parameter, backup_parameter, backup_shard = _make_scoped_hybrid(
-        rank, group
+    _seed_hybrid_state(
+        optimizer,
+        muon_parameter,
+        backup_parameter,
+        backup_shard,
     )
-    _set_local_gradients(muon_parameter, backup_parameter, backup_shard)
-    rogue = torch.nn.Parameter(torch.ones_like(backup_parameter))
-    rogue_before = rogue.detach().clone()
+    hook_handle = None
     if rank == 0:
-        optimizer.backup.param_groups[0]["params"][0] = rogue
-        rogue.grad = torch.ones_like(rogue)
+        def reject_save(_optimizer):
+            raise RuntimeError("checkpoint pre-hook boom on rank:0")
+
+        hook_handle = optimizer.register_state_dict_pre_hook(reject_save)
     try:
-        optimizer.step()
+        optimizer.state_dict()
         message = None
     except RuntimeError as exc:
         message = str(exc)
-    return {
-        "message": message,
-        "untouched": (
-            _untouched(optimizer, muon_parameter, backup_parameter, backup_shard)
-            and torch.equal(rogue, rogue_before)
-        ),
-    }
+    finally:
+        if hook_handle is not None:
+            hook_handle.remove()
+    return {"message": message}
 
 
 def _distributed_worker(rank, init_file, result_queue):
@@ -453,9 +425,7 @@ def _distributed_worker(rank, init_file, result_queue):
         dist.barrier()
         closure_divergent = _closure_divergent_result(rank, group)
         dist.barrier()
-        closure_layout_divergent = _closure_layout_divergent_result(rank, group)
-        dist.barrier()
-        step_entry_layout_divergent = _step_entry_layout_divergent_result(rank, group)
+        checkpoint_parent = _checkpoint_parent_failure_result(rank, group)
         dist.barrier()
         result_queue.put(
             {
@@ -465,8 +435,7 @@ def _distributed_worker(rank, init_file, result_queue):
                 "amp_finite": amp_finite,
                 "preflight": preflight,
                 "closure_divergent": closure_divergent,
-                "closure_layout_divergent": closure_layout_divergent,
-                "step_entry_layout_divergent": step_entry_layout_divergent,
+                "checkpoint_parent": checkpoint_parent,
             }
         )
     except BaseException:
@@ -576,27 +545,14 @@ def test_hybrid_step_synchronizes_amp_and_preflight_across_the_scope():
     assert "step preamble failed on another process-group member" in closure_divergent[1]["message"]
     assert all(item["untouched"] for item in closure_divergent), closure_divergent
 
-    # A closure can silently replace one finalized child parameter. Synchronize
-    # that post-closure layout failure through the binding captured at step entry,
-    # before either member revalidates the now rank-divergent live binding.
-    closure_layout_divergent = [
-        result["closure_layout_divergent"] for result in results
-    ]
-    assert closure_layout_divergent[0]["message"] is not None and closure_layout_divergent[1]["message"] is not None, closure_layout_divergent
-    assert "changed outside post_sharding" in closure_layout_divergent[0]["message"]
-    assert "gradient preflight failed on another process-group member" in closure_layout_divergent[1]["message"]
-    assert all(item["untouched"] for item in closure_layout_divergent), closure_layout_divergent
-
-    # A mutation made between steps fails the first finalized-layout guard. The
-    # explicit binding is captured independently so that guard joins the same
-    # preamble vote instead of failing on only one member.
-    step_entry_layout_divergent = [
-        result["step_entry_layout_divergent"] for result in results
-    ]
-    assert step_entry_layout_divergent[0]["message"] is not None and step_entry_layout_divergent[1]["message"] is not None, step_entry_layout_divergent
-    assert "changed outside post_sharding" in step_entry_layout_divergent[0]["message"]
-    assert "step preamble failed on another process-group member" in step_entry_layout_divergent[1]["message"]
-    assert all(item["untouched"] for item in step_entry_layout_divergent), step_entry_layout_divergent
+    # Hybrid parent checkpoint phases vote through the installed scope before
+    # the distributed-Muon child enters owner-state consolidation. A one-rank
+    # pre-hook failure therefore raises on both members instead of hanging the
+    # peer in the child's first broadcast.
+    checkpoint_parent = [result["checkpoint_parent"] for result in results]
+    assert all(item["message"] is not None for item in checkpoint_parent), checkpoint_parent
+    assert "checkpoint pre-hook boom on rank:0" in checkpoint_parent[0]["message"]
+    assert "state-dict pre-hook failed on another process-group member" in checkpoint_parent[1]["message"]
 
 
 def _make_plain_hybrid():

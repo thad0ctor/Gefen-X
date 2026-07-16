@@ -55,11 +55,17 @@ period-one off, stochastic rounding off), with ``ns_schedule="tuned3"`` and
 """
 
 import logging
-from collections import OrderedDict, defaultdict
+from collections import OrderedDict
 
 import torch
 import torch.nn as nn
 
+from gefen._adamw_adapter import (
+    commit_adamw_stage,
+    prepare_adamw_load_state_dict,
+    run_adamw_load_post_hooks,
+    stage_adamw_post_sharding,
+)
 from gefen.codebook import CodebookProcessGroupBinding
 from gefen.contracts import (
     LogicalSlice,
@@ -76,6 +82,11 @@ from gefen.gefen import (
     _assert_optimizer_gradients_structurally_valid,
 )
 from gefen.gefen_muon import GefenMuon
+from gefen.dtensor import (
+    is_exact_dtensor,
+    resolve_local_tensor,
+    validate_dtensor_rebinding_plan,
+)
 from gefen.params import (
     DEFAULT_BACKUP_SUBSTRINGS,
     is_muon_param,
@@ -83,8 +94,18 @@ from gefen.params import (
     validate_split,
 )
 from gefen.rebinding import ParameterRebinding
+from gefen.portable_identity import (
+    _normalize_sharding_manifest,
+    _normalize_shard_identity,
+    _serialize_sharding_manifest,
+    _serialize_shard_identity,
+)
 
 logger = logging.getLogger(__name__)
+
+_HYBRID_NATIVE_BINDING_KEY = "finalized_binding"
+_HYBRID_NATIVE_BINDING_FORMAT = "gefen.hybrid.finalized_native_binding"
+_HYBRID_NATIVE_BINDING_VERSION = 1
 
 _UNKNOWN_STATE_KEY_MSG = (
     "GefenMuonHybrid.state was accessed with a key that is not a parameter of "
@@ -230,8 +251,12 @@ class GefenMuonHybrid(torch.optim.Optimizer):
 
     * ``state_dict()`` schema: NOT the standard ``{"state", "param_groups"}``
       layout, but ``{"muon": <GefenMuon state_dict or None>, "backup":
-      <backup state_dict or None>, "backup_optimizer": "gefen" | "adamw"}``.
-      ``load_state_dict`` only accepts that nested schema; checkpoints
+      <backup state_dict or None>, "backup_optimizer": "gefen" | "adamw"}``,
+      plus a versioned ``finalized_binding`` routing/layout guard after
+      ``post_sharding``. ``load_state_dict`` only accepts that nested schema;
+      finalized and legacy-unfinalized schemas do not cross-load, and a
+      finalized load requires the exact child set, FQN routing, shard identity,
+      and local topology before either child is mutated. Checkpoints
       consolidated/converted to the flat torch layout (e.g. by FSDP/DeepSpeed
       tooling) are rejected rather than silently ignored. Legacy nested
       checkpoints without ``backup_optimizer`` are treated as Gefen-backed.
@@ -570,9 +595,12 @@ class GefenMuonHybrid(torch.optim.Optimizer):
         self._hybrid_post_sharding_finalized = False
         self._hybrid_sharding_manifest = None
         self._hybrid_local_shard_bindings = ()
+        self._hybrid_shard_bindings = {}
         self._hybrid_fqn_roles = ()
         self._hybrid_codebook_process_group = None
         self._hybrid_finalized_slots = ()
+        self._hybrid_rank_local_checkpoint_collective = False
+        self._hybrid_rank_local_checkpoint_device = None
 
         # Composite finalized-layout forensics cache, mirroring the O(local
         # params) scheme Gefen/GefenMuon use for their own step guards. The
@@ -651,12 +679,14 @@ class GefenMuonHybrid(torch.optim.Optimizer):
                 raise TypeError("GefenMuonHybrid post_sharding requires an exact GefenMuon child")
             children.append(("muon", self.muon))
         if self.backup is not None:
-            if self.backup_optimizer != "gefen" or type(self.backup) is not Gefen:
-                raise NotImplementedError(
-                    "GefenMuonHybrid post_sharding does not yet support an AdamW "
-                    "backup; use backup_optimizer='gefen' until AdamW has stable "
-                    "rebinding identity and atomic staged state I/O"
-                )
+            if self.backup_optimizer == "gefen":
+                if type(self.backup) is not Gefen:
+                    raise TypeError("GefenMuonHybrid post_sharding requires an exact Gefen backup child")
+            elif self.backup_optimizer == "adamw":
+                if type(self.backup) is not torch.optim.AdamW:
+                    raise TypeError("GefenMuonHybrid post_sharding requires an exact AdamW backup child")
+            else:
+                raise ValueError("GefenMuonHybrid has an invalid backup optimizer policy")
             children.append(("backup", self.backup))
         if not children:
             raise RuntimeError("GefenMuonHybrid has no child optimizer to rebind")
@@ -685,9 +715,12 @@ class GefenMuonHybrid(torch.optim.Optimizer):
         return (
             self._hybrid_sharding_manifest is None
             and self._hybrid_local_shard_bindings == ()
+            and self._hybrid_shard_bindings == {}
             and self._hybrid_fqn_roles == ()
             and self._hybrid_codebook_process_group is None
             and self._hybrid_finalized_slots == ()
+            and self._hybrid_rank_local_checkpoint_collective is False
+            and self._hybrid_rank_local_checkpoint_device is None
         )
 
     def _assert_composite_rebinding_pristine(self, children) -> None:
@@ -801,11 +834,37 @@ class GefenMuonHybrid(torch.optim.Optimizer):
         manifest_fqns = {shard.parameter.fqn for shard in manifest.shards}
         if seen_fqns != manifest_fqns:
             raise ValueError("GefenMuonHybrid manifest FQNs must exactly match all child slots")
+        dtensor_plan = validate_dtensor_rebinding_plan(rebindings, manifest)
+        rank_local_checkpoint_device = None
+        if dtensor_plan is not None:
+            rank_local_checkpoint_device = next(
+                resolve_local_tensor(item.new_parameter).device
+                for item in rebindings
+                if item.shard.layout is ParameterLayout.DTENSOR_1D_DEFAULT_WORLD
+            )
+        gefen_roles = {
+            role
+            for role, child in children
+            if type(child) in {Gefen, GefenMuon}
+        }
         if codebook_process_group is not None:
-            if any(shard.process_group != codebook_process_group.identity for shard in manifest.shards):
-                raise ValueError("every Hybrid manifest shard must use the shared codebook process-group identity")
-            if any(item.shard.local_member != codebook_process_group.local_member for item in rebindings):
-                raise ValueError("every Hybrid local shard must match the shared codebook member")
+            scoped_fqns = {
+                fqn for fqn, role in fqn_roles.items() if role in gefen_roles
+            }
+            if not scoped_fqns:
+                raise ValueError("a Hybrid codebook binding requires at least one Gefen-backed child")
+            if any(
+                shard.parameter.fqn in scoped_fqns
+                and shard.process_group != codebook_process_group.identity
+                for shard in manifest.shards
+            ):
+                raise ValueError("every Gefen-backed Hybrid shard must use the shared codebook process-group identity")
+            if any(
+                fqn_roles[item.shard.parameter.fqn] in gefen_roles
+                and item.shard.local_member != codebook_process_group.local_member
+                for item in rebindings
+            ):
+                raise ValueError("every Gefen-backed Hybrid local shard must match the shared codebook member")
 
         staged_children = []
         for role, child in children:
@@ -817,22 +876,30 @@ class GefenMuonHybrid(torch.optim.Optimizer):
                 tuple(shard for shard in manifest.shards if shard.parameter.fqn in child_fqns),
                 schema_version=manifest.schema_version,
             )
-            staged = child._stage_post_sharding(
-                child_rebindings,
-                child_manifest,
-                codebook_process_group,
-            )
-            if (
-                type(child.__dict__) is not dict
-                or type(staged.__dict__) is not dict
-                or staged._gefen_codebook_process_group is not codebook_process_group
-                or not staged._finalized_binding_layout_matches()
-            ):
-                raise TypeError("GefenMuonHybrid child staging produced an unsafe finalized optimizer")
+            if type(child) is torch.optim.AdamW:
+                staged = stage_adamw_post_sharding(
+                    child,
+                    child_rebindings,
+                    child_manifest,
+                )
+            else:
+                staged = child._stage_post_sharding(
+                    child_rebindings,
+                    child_manifest,
+                    codebook_process_group,
+                )
+                if (
+                    type(child.__dict__) is not dict
+                    or type(staged.__dict__) is not dict
+                    or staged._gefen_codebook_process_group is not codebook_process_group
+                    or not staged._finalized_binding_layout_matches()
+                ):
+                    raise TypeError("GefenMuonHybrid child staging produced an unsafe finalized optimizer")
             staged_children.append((role, child, staged, child_manifest))
 
         local_bindings = []
         local_fqns = set()
+        shard_bindings = {}
         new_state_param_owner = {}
         finalized_slots = []
         for role, child, staged, _child_manifest in staged_children:
@@ -842,12 +909,22 @@ class GefenMuonHybrid(torch.optim.Optimizer):
                     tuple(tuple(group["params"]) for group in staged.param_groups),
                 )
             )
-            for parameter, shard in staged._gefen_local_shard_bindings:
+            child_bindings = (
+                tuple(
+                    (item.new_parameter, item.shard)
+                    for item in by_role[role]
+                )
+                if type(child) is torch.optim.AdamW
+                else staged._gefen_local_shard_bindings
+            )
+            for parameter, shard in child_bindings:
                 fqn = shard.parameter.fqn
                 if fqn in local_fqns or fqn_roles.get(fqn) != role:
                     raise ValueError("GefenMuonHybrid staged child identities overlap or changed routing")
                 local_fqns.add(fqn)
                 local_bindings.append((parameter, shard))
+                if parameter is not None:
+                    shard_bindings[parameter] = shard
             for group in staged.param_groups:
                 for parameter in group["params"]:
                     parameter_id = id(parameter)
@@ -864,9 +941,12 @@ class GefenMuonHybrid(torch.optim.Optimizer):
             "state_param_owner": new_state_param_owner,
             "manifest": manifest,
             "local_bindings": tuple(local_bindings),
+            "shard_bindings": shard_bindings,
             "fqn_roles": tuple(sorted(fqn_roles.items())),
             "codebook_process_group": codebook_process_group,
             "finalized_slots": tuple(finalized_slots),
+            "rank_local_checkpoint_collective": dtensor_plan is not None,
+            "rank_local_checkpoint_device": rank_local_checkpoint_device,
         }
 
     def post_sharding(
@@ -891,7 +971,10 @@ class GefenMuonHybrid(torch.optim.Optimizer):
             codebook_process_group,
         )
         for _role, child, staged_child, _child_manifest in staged["children"]:
-            dict.update(child.__dict__, staged_child.__dict__)
+            if type(child) is torch.optim.AdamW:
+                commit_adamw_stage(child, staged_child)
+            else:
+                dict.update(child.__dict__, staged_child.__dict__)
         dict.update(
             self.__dict__,
             {
@@ -899,9 +982,16 @@ class GefenMuonHybrid(torch.optim.Optimizer):
                 "_hybrid_post_sharding_finalized": True,
                 "_hybrid_sharding_manifest": staged["manifest"],
                 "_hybrid_local_shard_bindings": staged["local_bindings"],
+                "_hybrid_shard_bindings": staged["shard_bindings"],
                 "_hybrid_fqn_roles": staged["fqn_roles"],
                 "_hybrid_codebook_process_group": staged["codebook_process_group"],
                 "_hybrid_finalized_slots": staged["finalized_slots"],
+                "_hybrid_rank_local_checkpoint_collective": staged[
+                    "rank_local_checkpoint_collective"
+                ],
+                "_hybrid_rank_local_checkpoint_device": staged[
+                    "rank_local_checkpoint_device"
+                ],
                 # Reassigning the composite fields invalidates any warm verdict
                 # (there is none from a pristine hybrid, but bumping keeps the
                 # counter honest and forces the next guard through a full
@@ -988,9 +1078,13 @@ class GefenMuonHybrid(torch.optim.Optimizer):
             self._hybrid_post_sharding_finalized,
             self._hybrid_sharding_manifest,
             self._hybrid_local_shard_bindings,
+            self._hybrid_shard_bindings,
+            len(self._hybrid_shard_bindings),
             self._hybrid_fqn_roles,
             self._hybrid_finalized_slots,
             self._hybrid_codebook_process_group,
+            self._hybrid_rank_local_checkpoint_collective,
+            self._hybrid_rank_local_checkpoint_device,
             self._state_param_owner,
             len(self._state_param_owner),
             self.defaults,
@@ -1006,7 +1100,11 @@ class GefenMuonHybrid(torch.optim.Optimizer):
         live.extend(self._state_param_owner.keys())
         live.extend(self._state_param_owner.values())
         for child in self._subopts:
-            live.append(child._finalized_binding_layout_matches())
+            live.append(
+                True
+                if type(child) is torch.optim.AdamW
+                else child._finalized_binding_layout_matches()
+            )
             GefenMuonHybrid._hybrid_child_param_group_tokens(child, live)
         return tuple(live)
 
@@ -1045,8 +1143,10 @@ class GefenMuonHybrid(torch.optim.Optimizer):
                 not self._hybrid_post_sharding_finalized
                 or type(self._hybrid_sharding_manifest) is not ShardingManifest
                 or type(self._hybrid_local_shard_bindings) is not tuple
+                or type(self._hybrid_shard_bindings) is not dict
                 or type(self._hybrid_fqn_roles) is not tuple
                 or type(self._hybrid_finalized_slots) is not tuple
+                or type(self._hybrid_rank_local_checkpoint_collective) is not bool
                 or type(self._state_param_owner) is not dict
             ):
                 return False
@@ -1072,56 +1172,110 @@ class GefenMuonHybrid(torch.optim.Optimizer):
             if binding is not None:
                 if type(binding) is not CodebookProcessGroupBinding:
                     return False
-                if any(shard.process_group != binding.identity for shard in self._hybrid_sharding_manifest.shards):
+                gefen_roles = {
+                    role
+                    for role, child in children
+                    if type(child) in {Gefen, GefenMuon}
+                }
+                if not gefen_roles or any(
+                    role_by_fqn[shard.parameter.fqn] in gefen_roles
+                    and shard.process_group != binding.identity
+                    for shard in self._hybrid_sharding_manifest.shards
+                ):
                     return False
 
-            expected_local = []
+            local_by_role = {role: [] for role, _child in children}
+            local_fqns = set()
+            for parameter, shard in self._hybrid_local_shard_bindings:
+                if shard not in self._hybrid_sharding_manifest.shards:
+                    return False
+                fqn = shard.parameter.fqn
+                role = role_by_fqn.get(fqn)
+                if role not in local_by_role or fqn in local_fqns:
+                    return False
+                local_fqns.add(fqn)
+                local_by_role[role].append((parameter, shard))
+                if parameter is not None:
+                    if self._hybrid_shard_bindings.get(parameter) != shard:
+                        return False
+            if local_fqns != set(role_by_fqn):
+                return False
+            if tuple(
+                sorted(self._hybrid_local_shard_bindings, key=lambda item: item[1].sort_key)
+            ) != self._hybrid_local_shard_bindings:
+                return False
+
             expected_owner = {}
             expected_slots = []
             for role, child in children:
-                if (
-                    not child._finalized_binding_layout_matches()
-                    or child._gefen_codebook_process_group is not self._hybrid_codebook_process_group
-                ):
-                    return False
-                expected_child_shards = tuple(
-                    shard
-                    for shard in self._hybrid_sharding_manifest.shards
-                    if role_by_fqn.get(shard.parameter.fqn) == role
-                )
-                if child._gefen_sharding_manifest.shards != expected_child_shards:
-                    return False
                 expected_slots.append(
                     (
                         role,
                         tuple(tuple(group["params"]) for group in child.param_groups),
                     )
                 )
-                for parameter, shard in child._gefen_local_shard_bindings:
-                    if role_by_fqn.get(shard.parameter.fqn) != role:
+                if type(child) is torch.optim.AdamW:
+                    if type(child.param_groups) is not list:
                         return False
-                    if binding is not None and (
-                        shard.process_group != binding.identity or shard.local_member != binding.local_member
+                    for group in child.param_groups:
+                        if (
+                            type(group) is not dict
+                            or type(group.get("params")) is not list
+                            or type(group.get("param_names")) is not list
+                            or len(group["params"]) != len(group["param_names"])
+                        ):
+                            return False
+                    child_live = [
+                        parameter
+                        for group in child.param_groups
+                        for parameter in group["params"]
+                    ]
+                    routed_live = [
+                        parameter
+                        for parameter, _shard in local_by_role[role]
+                        if parameter is not None
+                    ]
+                    if len(child_live) != len(routed_live) or any(
+                        not any(parameter is routed for routed in routed_live)
+                        for parameter in child_live
                     ):
                         return False
-                    expected_local.append((parameter, shard))
+                else:
+                    if (
+                        not child._finalized_binding_layout_matches()
+                        or child._gefen_codebook_process_group is not self._hybrid_codebook_process_group
+                    ):
+                        return False
+                    expected_child_shards = tuple(
+                        shard
+                        for shard in self._hybrid_sharding_manifest.shards
+                        if role_by_fqn.get(shard.parameter.fqn) == role
+                    )
+                    if child._gefen_sharding_manifest.shards != expected_child_shards:
+                        return False
+                    child_bindings = tuple(
+                        sorted(
+                            child._gefen_local_shard_bindings,
+                            key=lambda item: item[1].sort_key,
+                        )
+                    )
+                    if len(child_bindings) != len(local_by_role[role]) or any(
+                        not self._same_local_binding(live, expected)
+                        for live, expected in zip(local_by_role[role], child_bindings)
+                    ):
+                        return False
+                    if binding is not None and any(
+                        shard.process_group != binding.identity
+                        or shard.local_member != binding.local_member
+                        for _parameter, shard in child_bindings
+                    ):
+                        return False
                 for group in child.param_groups:
                     for parameter in group["params"]:
                         parameter_id = id(parameter)
                         if parameter_id in expected_owner:
                             return False
                         expected_owner[parameter_id] = (parameter, child)
-            expected_local.sort(key=lambda item: item[1].sort_key)
-            if len(expected_local) != len(self._hybrid_local_shard_bindings):
-                return False
-            if any(
-                not self._same_local_binding(live, expected)
-                for live, expected in zip(
-                    self._hybrid_local_shard_bindings,
-                    expected_local,
-                )
-            ):
-                return False
             if tuple(expected_slots) != self._hybrid_finalized_slots:
                 return False
             if set(expected_owner) != set(self._state_param_owner):
@@ -1129,6 +1283,39 @@ class GefenMuonHybrid(torch.optim.Optimizer):
             for parameter_id, (parameter, child) in expected_owner.items():
                 live = self._state_param_owner[parameter_id]
                 if type(live) is not tuple or len(live) != 2 or live[0] is not parameter or live[1] is not child:
+                    return False
+                if self._hybrid_shard_bindings.get(parameter) is None:
+                    return False
+            if len(self._hybrid_shard_bindings) != len(expected_owner):
+                return False
+            dtensor_plan = validate_dtensor_rebinding_plan(
+                tuple(
+                    ParameterRebinding(parameter, parameter, shard)
+                    for parameter, shard in self._hybrid_local_shard_bindings
+                    if parameter is not None
+                ),
+                self._hybrid_sharding_manifest,
+            )
+            if self._hybrid_rank_local_checkpoint_collective != (
+                dtensor_plan is not None
+            ):
+                return False
+            if dtensor_plan is None:
+                if self._hybrid_rank_local_checkpoint_device is not None:
+                    return False
+            else:
+                expected_checkpoint_device = next(
+                    resolve_local_tensor(parameter).device
+                    for parameter, shard in self._hybrid_local_shard_bindings
+                    if parameter is not None
+                    and shard.layout is ParameterLayout.DTENSOR_1D_DEFAULT_WORLD
+                )
+                if (
+                    type(self._hybrid_rank_local_checkpoint_device)
+                    is not torch.device
+                    or self._hybrid_rank_local_checkpoint_device
+                    != expected_checkpoint_device
+                ):
                     return False
             return True
         except (
@@ -1158,6 +1345,152 @@ class GefenMuonHybrid(torch.optim.Optimizer):
         elif not self._hybrid_identity_metadata_empty():
             raise RuntimeError("GefenMuonHybrid found an incomplete post_sharding identity plan")
 
+    def _rank_local_checkpoint_collective_intent(self) -> bool:
+        """Return whether native checkpoint phases require default-world agreement."""
+
+        return bool(
+            getattr(self, "_hybrid_rank_local_checkpoint_collective", False)
+        )
+
+    def _rank_local_checkpoint_collective_device(self) -> torch.device:
+        import torch.distributed as dist
+
+        backend = str(dist.get_backend()).lower()
+        if "nccl" not in backend:
+            return torch.device("cpu")
+        device = getattr(self, "_hybrid_rank_local_checkpoint_device", None)
+        if device is not None:
+            if device.type == "cuda" and device.index is not None:
+                return device
+            raise RuntimeError(
+                "GefenMuonHybrid rank-local NCCL checkpoint agreement requires a concrete CUDA device"
+            )
+        try:
+            parameters = tuple(
+                parameter
+                for parameter, shard in self._hybrid_local_shard_bindings
+                if parameter is not None
+                and shard.layout is ParameterLayout.DTENSOR_1D_DEFAULT_WORLD
+            )
+        except (AttributeError, TypeError, ValueError):
+            parameters = ()
+        if not parameters:
+            try:
+                parameters = tuple(
+                    parameter
+                    for child in self._subopts
+                    for group in child.param_groups
+                    for parameter in group["params"]
+                    if is_exact_dtensor(parameter)
+                )
+            except (AttributeError, KeyError, TypeError):
+                parameters = ()
+        for parameter in parameters:
+            if is_exact_dtensor(parameter):
+                device = resolve_local_tensor(parameter).device
+                if device.type == "cuda" and device.index is not None:
+                    return device
+        raise RuntimeError(
+            "GefenMuonHybrid rank-local NCCL checkpoint agreement requires a concrete CUDA device"
+        )
+
+    def _synchronize_rank_local_checkpoint_failure(self, error, phase: str) -> None:
+        if self._rank_local_checkpoint_collective_intent():
+            if (
+                not torch.distributed.is_available()
+                or not torch.distributed.is_initialized()
+            ):
+                if error is not None:
+                    raise error
+                raise RuntimeError(
+                    "GefenMuonHybrid rank-local DTensor checkpointing requires initialized torch.distributed"
+                )
+            import torch.distributed as dist
+
+            failed = torch.tensor(
+                int(error is not None),
+                dtype=torch.int32,
+                device=self._rank_local_checkpoint_collective_device(),
+            )
+            dist.all_reduce(failed, op=dist.ReduceOp.MAX)
+            if int(failed.item()) == 0:
+                return
+            if error is not None:
+                raise RuntimeError(
+                    "GefenMuonHybrid rank-local checkpoint {} failed on this rank: {}".format(
+                        phase, error
+                    )
+                ) from error
+            raise RuntimeError(
+                "GefenMuonHybrid rank-local checkpoint {} failed on another rank".format(
+                    phase
+                )
+            )
+
+        binding = getattr(self, "_hybrid_codebook_process_group", None)
+        if type(binding) is not CodebookProcessGroupBinding:
+            binding = None
+            try:
+                binding = next(
+                    candidate
+                    for child in self._subopts
+                    for candidate in (
+                        getattr(child, "_gefen_codebook_process_group", None),
+                    )
+                    if type(candidate) is CodebookProcessGroupBinding
+                )
+            except (AttributeError, StopIteration, TypeError):
+                binding = None
+        if binding is not None and len(binding.identity.ordered_members) > 1:
+            if (
+                not torch.distributed.is_available()
+                or not torch.distributed.is_initialized()
+            ):
+                if error is not None:
+                    raise error
+                raise RuntimeError(
+                    "GefenMuonHybrid scoped checkpointing requires initialized torch.distributed"
+                )
+            import torch.distributed as dist
+
+            failed = torch.tensor(
+                int(error is not None),
+                dtype=torch.int32,
+                device=binding.collective_device,
+            )
+            dist.all_reduce(
+                failed,
+                op=dist.ReduceOp.MAX,
+                group=binding.process_group,
+            )
+            if int(failed.item()) == 0:
+                return
+            if error is not None:
+                raise RuntimeError(
+                    "GefenMuonHybrid scoped checkpoint {} failed on local member {}: {}".format(
+                        phase,
+                        binding.local_member,
+                        error,
+                    )
+                ) from error
+            raise RuntimeError(
+                "GefenMuonHybrid scoped checkpoint {} failed on another process-group member".format(
+                    phase
+                )
+            )
+        if error is not None:
+            raise error
+
+    def _run_rank_local_checkpoint_phase(self, phase: str, callback):
+        result = None
+        error = None
+        try:
+            result = callback()
+        except Exception as exc:
+            error = exc
+        self._synchronize_rank_local_checkpoint_failure(error, phase)
+        return result
+
     def parameter_identity(self, parameter) -> ParameterIdentity:
         """Return the canonical identity bound to one live Hybrid parameter."""
 
@@ -1167,10 +1500,14 @@ class GefenMuonHybrid(torch.optim.Optimizer):
         """Return the stable shard identity bound to one live parameter."""
 
         self._assert_finalized_binding_layout()
+        try:
+            shard = self._hybrid_shard_bindings[parameter]
+        except KeyError:
+            raise KeyError("parameter has no finalized GefenMuonHybrid shard identity")
         entry = self._state_param_owner.get(id(parameter))
         if entry is None or entry[0] is not parameter:
             raise KeyError("parameter has no finalized GefenMuonHybrid shard identity")
-        return entry[1].shard_identity(parameter)
+        return shard
 
     def shard_bindings(self):
         """Return all local tensor/identity pairs in canonical order."""
@@ -1197,6 +1534,125 @@ class GefenMuonHybrid(torch.optim.Optimizer):
 
         self._assert_finalized_binding_layout()
         return self._hybrid_codebook_process_group
+
+    def _serialized_finalized_native_binding(self):
+        if not self._hybrid_post_sharding_finalized:
+            return None
+        self._assert_finalized_binding_layout(full=True)
+        role_by_fqn = dict(self._hybrid_fqn_roles)
+        child_groups = []
+        for role, child in self._gefen_rebinding_children():
+            child_groups.append(
+                {
+                    "role": role,
+                    "groups": [
+                        [
+                            self._hybrid_shard_bindings[parameter].parameter.fqn
+                            for parameter in group["params"]
+                        ]
+                        for group in child.param_groups
+                    ],
+                }
+            )
+        return {
+            "format": _HYBRID_NATIVE_BINDING_FORMAT,
+            "format_version": _HYBRID_NATIVE_BINDING_VERSION,
+            "backup_optimizer": self.backup_optimizer,
+            "manifest": _serialize_sharding_manifest(self._hybrid_sharding_manifest),
+            "routing": [
+                {"fqn": fqn, "role": role}
+                for fqn, role in self._hybrid_fqn_roles
+            ],
+            "local_shards": [
+                {
+                    "role": role_by_fqn[shard.parameter.fqn],
+                    "shard": _serialize_shard_identity(shard),
+                }
+                for _parameter, shard in self._hybrid_local_shard_bindings
+            ],
+            "child_groups": child_groups,
+        }
+
+    @staticmethod
+    def _normalize_finalized_native_binding(value):
+        keys = {
+            "format",
+            "format_version",
+            "backup_optimizer",
+            "manifest",
+            "routing",
+            "local_shards",
+            "child_groups",
+        }
+        if type(value) is not dict or set(value) != keys:
+            raise ValueError("Hybrid finalized native binding has an invalid schema")
+        if value["format"] != _HYBRID_NATIVE_BINDING_FORMAT:
+            raise ValueError("Hybrid finalized native binding has an unsupported format")
+        if type(value["format_version"]) is not int or value["format_version"] != _HYBRID_NATIVE_BINDING_VERSION:
+            raise ValueError("Hybrid finalized native binding has an unsupported format_version")
+        if value["backup_optimizer"] not in {"gefen", "adamw"}:
+            raise ValueError("Hybrid finalized native binding has an invalid backup policy")
+        if type(value["routing"]) is not list:
+            raise ValueError("Hybrid finalized native routing must be a list")
+        routing = []
+        for item in value["routing"]:
+            if type(item) is not dict or set(item) != {"fqn", "role"}:
+                raise ValueError("Hybrid finalized native routing entry has an invalid schema")
+            if type(item["fqn"]) is not str or item["role"] not in {"muon", "backup"}:
+                raise ValueError("Hybrid finalized native routing entry is invalid")
+            routing.append({"fqn": item["fqn"], "role": item["role"]})
+        if len({item["fqn"] for item in routing}) != len(routing):
+            raise ValueError("Hybrid finalized native routing contains duplicate FQNs")
+        if routing != sorted(routing, key=lambda item: item["fqn"]):
+            raise ValueError("Hybrid finalized native routing is not canonical")
+
+        if type(value["local_shards"]) is not list:
+            raise ValueError("Hybrid finalized native local shards must be a list")
+        local_shards = []
+        for item in value["local_shards"]:
+            if type(item) is not dict or set(item) != {"role", "shard"}:
+                raise ValueError("Hybrid finalized native local shard has an invalid schema")
+            if item["role"] not in {"muon", "backup"}:
+                raise ValueError("Hybrid finalized native local shard has an invalid role")
+            local_shards.append(
+                {
+                    "role": item["role"],
+                    "shard": _normalize_shard_identity(item["shard"]),
+                }
+            )
+
+        if type(value["child_groups"]) is not list:
+            raise ValueError("Hybrid finalized native child groups must be a list")
+        child_groups = []
+        seen_roles = set()
+        for item in value["child_groups"]:
+            if type(item) is not dict or set(item) != {"role", "groups"}:
+                raise ValueError("Hybrid finalized native child group entry has an invalid schema")
+            role = item["role"]
+            groups = item["groups"]
+            if role not in {"muon", "backup"} or role in seen_roles or type(groups) is not list:
+                raise ValueError("Hybrid finalized native child group entry is invalid")
+            seen_roles.add(role)
+            normalized_groups = []
+            for group in groups:
+                if type(group) is not list or any(type(fqn) is not str for fqn in group):
+                    raise ValueError("Hybrid finalized native child slots must be FQN lists")
+                normalized_groups.append(list(group))
+            child_groups.append({"role": role, "groups": normalized_groups})
+        return {
+            "format": _HYBRID_NATIVE_BINDING_FORMAT,
+            "format_version": _HYBRID_NATIVE_BINDING_VERSION,
+            "backup_optimizer": value["backup_optimizer"],
+            "manifest": _normalize_sharding_manifest(value["manifest"]),
+            "routing": routing,
+            "local_shards": local_shards,
+            "child_groups": child_groups,
+        }
+
+    def _validate_finalized_native_binding(self, value) -> None:
+        normalized = self._normalize_finalized_native_binding(value)
+        if normalized != self._serialized_finalized_native_binding():
+            raise ValueError("Hybrid finalized native checkpoint binding or routing differs from the live optimizer")
 
     @property
     def _gefen_codebook_process_group(self):
@@ -1443,33 +1899,75 @@ class GefenMuonHybrid(torch.optim.Optimizer):
         return loss
 
     def state_dict(self):
-        self._assert_finalized_binding_layout()
+        self._run_rank_local_checkpoint_phase(
+            "initial state-dict layout validation",
+            self._assert_finalized_binding_layout,
+        )
         # Instance state-dict pre/post hooks, mirroring Optimizer.state_dict:
         # pre-hooks take (optimizer) and return nothing; a post-hook may return
         # a replacement state_dict.
-        for pre_hook in self._optimizer_state_dict_pre_hooks.values():
-            pre_hook(self)
-        self._assert_finalized_binding_layout()
+        def run_pre_hooks():
+            for pre_hook in self._optimizer_state_dict_pre_hooks.values():
+                pre_hook(self)
+
+        self._run_rank_local_checkpoint_phase("state-dict pre-hook", run_pre_hooks)
+        self._run_rank_local_checkpoint_phase(
+            "post-hook state-dict layout validation",
+            self._assert_finalized_binding_layout,
+        )
         state_dict = {
-            "muon": self.muon.state_dict() if self.muon is not None else None,
-            "backup": self.backup.state_dict() if self.backup is not None else None,
+            "muon": (
+                self._run_rank_local_checkpoint_phase(
+                    "muon state-dict serialization",
+                    self.muon.state_dict,
+                )
+                if self.muon is not None
+                else None
+            ),
+            "backup": (
+                self._run_rank_local_checkpoint_phase(
+                    "backup state-dict serialization",
+                    self.backup.state_dict,
+                )
+                if self.backup is not None
+                else None
+            ),
             "backup_optimizer": self.backup_optimizer,
         }
-        for post_hook in self._optimizer_state_dict_post_hooks.values():
-            hook_result = post_hook(self, state_dict)
-            if hook_result is not None:
-                state_dict = hook_result
-        return state_dict
+        if self._hybrid_post_sharding_finalized:
+            state_dict[_HYBRID_NATIVE_BINDING_KEY] = self._run_rank_local_checkpoint_phase(
+                "finalized state-dict binding serialization",
+                self._serialized_finalized_native_binding,
+            )
+
+        def run_post_hooks():
+            prepared = state_dict
+            for post_hook in self._optimizer_state_dict_post_hooks.values():
+                hook_result = post_hook(self, prepared)
+                if hook_result is not None:
+                    prepared = hook_result
+            return prepared
+
+        return self._run_rank_local_checkpoint_phase(
+            "state-dict post-hook",
+            run_post_hooks,
+        )
 
     def optimizer_contract(self) -> OptimizerContract:
         """Return the composite contract without flattening either child schema."""
 
         try:
             GefenMuonHybrid._reject_rebinding_method_shadows(self)
-            rebinding_ready = bool(GefenMuonHybrid._gefen_rebinding_children(self))
+            rebinding_children = GefenMuonHybrid._gefen_rebinding_children(self)
+            rebinding_ready = bool(rebinding_children)
+            codebook_scope_supported = any(
+                type(child) in {Gefen, GefenMuon}
+                for _role, child in rebinding_children
+            )
             identity_ready = GefenMuonHybrid._canonical_identity_ready(self)
         except Exception:
             rebinding_ready = False
+            codebook_scope_supported = False
             identity_ready = False
         try:
             from gefen.portable_hybrid import _hybrid_portable_contract_support
@@ -1500,9 +1998,18 @@ class GefenMuonHybrid(torch.optim.Optimizer):
             muon=muon_contract,
             backup=backup_contract,
             backup_implementation=backup_implementation,
+            adamw_backup=type(self.backup) is torch.optim.AdamW,
+            native_finalized_layouts=(
+                frozenset(
+                    shard.layout
+                    for _parameter, shard in self._hybrid_local_shard_bindings
+                )
+                if identity_ready
+                else frozenset()
+            ),
             canonical_parameter_fqns=identity_ready,
             stable_shard_identity=identity_ready,
-            explicit_process_group_codebook_scope=rebinding_ready,
+            explicit_process_group_codebook_scope=codebook_scope_supported,
             shard_rebinding=rebinding_ready,
             post_sharding=rebinding_ready,
             canonical_global_same_topology=canonical_global_same_topology,
@@ -1549,57 +2056,102 @@ class GefenMuonHybrid(torch.optim.Optimizer):
         )
 
     def load_state_dict(self, state_dict):
-        self._assert_finalized_binding_layout()
+        self._run_rank_local_checkpoint_phase(
+            "initial load layout validation",
+            self._assert_finalized_binding_layout,
+        )
         # Instance load pre-hooks first (a pre-hook may return a replacement
         # dict -- e.g. one that converts a foreign schema), mirroring
         # Optimizer.load_state_dict's shallow copy + hook pass.
-        state_dict = state_dict.copy()
-        for pre_hook in self._optimizer_load_state_dict_pre_hooks.values():
-            hook_result = pre_hook(self, state_dict)
-            if hook_result is not None:
-                state_dict = hook_result
-        self._assert_finalized_binding_layout()
+        def run_pre_hooks():
+            prepared = state_dict.copy()
+            for pre_hook in self._optimizer_load_state_dict_pre_hooks.values():
+                hook_result = pre_hook(self, prepared)
+                if hook_result is not None:
+                    prepared = hook_result
+            return prepared
+
+        state_dict = self._run_rank_local_checkpoint_phase(
+            "load pre-hook",
+            run_pre_hooks,
+        )
+        self._run_rank_local_checkpoint_phase(
+            "post-hook load layout validation",
+            self._assert_finalized_binding_layout,
+        )
 
         # Schema guard: this used to silently skip loading whenever the keys
         # were absent, so resuming from a standard {"state", "param_groups"}
         # checkpoint (e.g. one consolidated/converted by FSDP or DeepSpeed
         # tooling) ran on with ZEROED momentum -- a quiet correctness bug.
-        if "muon" not in state_dict and "backup" not in state_dict:
-            raise ValueError(
-                "GefenMuonHybrid.load_state_dict expects the hybrid's own nested "
-                'schema {{"muon": <GefenMuon state dict or None>, "backup": '
-                '<backup state dict or None>, "backup_optimizer": "gefen" | '
-                '"adamw"}} (what GefenMuonHybrid.state_dict() '
-                "saves), but got keys {}. Consolidated/converted checkpoints in "
-                'the standard {{"state", "param_groups"}} layout are not '
-                "supported; resume from the hybrid-saved checkpoint "
-                "instead.".format(sorted(map(str, state_dict.keys())))
+        def validate_parent_schema():
+            allowed_keys = {
+                "muon",
+                "backup",
+                "backup_optimizer",
+                _HYBRID_NATIVE_BINDING_KEY,
+            }
+            if "muon" not in state_dict and "backup" not in state_dict:
+                raise ValueError(
+                    "GefenMuonHybrid.load_state_dict expects the hybrid's own nested "
+                    'schema {{"muon": <GefenMuon state dict or None>, "backup": '
+                    '<backup state dict or None>, "backup_optimizer": "gefen" | '
+                    '"adamw"}} (what GefenMuonHybrid.state_dict() '
+                    "saves), but got keys {}. Consolidated/converted checkpoints in "
+                    'the standard {{"state", "param_groups"}} layout are not '
+                    "supported; resume from the hybrid-saved checkpoint "
+                    "instead.".format(sorted(map(str, state_dict.keys())))
+                )
+            missing_halves = {"muon", "backup"} - set(state_dict)
+            if missing_halves:
+                raise ValueError(
+                    "GefenMuonHybrid.load_state_dict outer schema is missing {}".format(
+                        " and ".join(sorted(missing_halves))
+                    )
+                )
+            if not set(state_dict).issubset(allowed_keys):
+                raise ValueError(
+                    "GefenMuonHybrid.load_state_dict received an invalid exact outer schema"
+                )
+            finalized_binding = state_dict.get(_HYBRID_NATIVE_BINDING_KEY)
+            if self._hybrid_post_sharding_finalized:
+                if finalized_binding is None:
+                    raise ValueError(
+                        "a finalized Hybrid requires a versioned native binding guard"
+                    )
+                self._validate_finalized_native_binding(finalized_binding)
+            elif finalized_binding is not None:
+                raise ValueError(
+                    "an unfinalized Hybrid cannot load finalized native shard state"
+                )
+            # A half present here but missing/None in the checkpoint (or vice
+            # versa) would silently resume that half from scratch (zeroed
+            # momentum), so reject those presence mismatches before loading either
+            # child. The backup-backend check below runs before child loads too.
+            for attr in ("muon", "backup"):
+                sub = getattr(self, attr)
+                sub_state = state_dict.get(attr)
+                if sub is None and sub_state is not None:
+                    raise ValueError(
+                        "GefenMuonHybrid.load_state_dict: the checkpoint carries a "
+                        '"{}" half but this optimizer has none (was it constructed '
+                        "with a different parameter split?)".format(attr)
+                    )
+                if sub is not None and sub_state is None:
+                    raise ValueError(
+                        "GefenMuonHybrid.load_state_dict: this optimizer has a "
+                        '"{}" half but the checkpoint carries none; loading would '
+                        "silently reset its momentum/state".format(attr)
+                    )
+            # Old hybrid checkpoints predate the selector and necessarily contain a
+            # Gefen backup. Guard the backend before loading either child: torch's
+            # optimizer loader otherwise accepts the other backend's group/state
+            # layout and fails only on a later step (or, worse, misinterprets state).
+            if self.backup is None:
+                return
+            checkpoint_backup_optimizer = state_dict.get(
+                "backup_optimizer", "gefen"
             )
-        # A half present here but missing/None in the checkpoint (or vice
-        # versa) would silently resume that half from scratch (zeroed
-        # momentum), so reject those presence mismatches before loading either
-        # child. The backup-backend check below runs before child loads too.
-        for attr in ("muon", "backup"):
-            sub = getattr(self, attr)
-            sub_state = state_dict.get(attr)
-            if sub is None and sub_state is not None:
-                raise ValueError(
-                    "GefenMuonHybrid.load_state_dict: the checkpoint carries a "
-                    '"{}" half but this optimizer has none (was it constructed '
-                    "with a different parameter split?)".format(attr)
-                )
-            if sub is not None and sub_state is None:
-                raise ValueError(
-                    "GefenMuonHybrid.load_state_dict: this optimizer has a "
-                    '"{}" half but the checkpoint carries none; loading would '
-                    "silently reset its momentum/state".format(attr)
-                )
-        # Old hybrid checkpoints predate the selector and necessarily contain a
-        # Gefen backup. Guard the backend before loading either child: torch's
-        # optimizer loader otherwise accepts the other backend's group/state
-        # layout and fails only on a later step (or, worse, misinterprets state).
-        if self.backup is not None:
-            checkpoint_backup_optimizer = state_dict.get("backup_optimizer", "gefen")
             if checkpoint_backup_optimizer != self.backup_optimizer:
                 raise ValueError(
                     "GefenMuonHybrid.load_state_dict: checkpoint backup_optimizer "
@@ -1608,98 +2160,59 @@ class GefenMuonHybrid(torch.optim.Optimizer):
                         checkpoint_backup_optimizer, self.backup_optimizer
                     )
                 )
-        # Phase one -- stage every child (validate, mutating nothing live). Phase
-        # two -- commit every child's raw state through non-throwing swaps. Phase
-        # three -- only then dispatch any child's load post-hooks. Separating the
-        # raw commit (phase two) from the post-hooks (phase three) matters: a
-        # post-hook can raise, and if it fired while a sibling child were still
-        # uncommitted it would strand the hybrid half-loaded (e.g. muon step N /
-        # backup step N-1). The foreign backup gets the same isolated staging as
-        # the Gefen children -- torch ``AdamW.load_state_dict`` is NOT itself
-        # fail-before-mutation (``__setstate__`` installs the new state via
-        # ``super().__setstate__`` and only then reads ``state[0]["step"]``, so a
-        # checkpoint whose per-parameter state omits ``step`` raises
-        # ``KeyError("step")`` after the live backup has already been mutated).
-        muon_staged = None
-        if self.muon is not None:
-            muon_staged = self.muon._prepare_load_state_dict(state_dict["muon"])
 
-        if self.backup is None:
-            # muon-only hybrid.
-            if muon_staged is not None:
-                self.muon._commit_staged_load_state_dict(muon_staged)
-                self.muon._run_load_state_dict_post_hooks()
-        elif isinstance(self.backup, Gefen):
-            backup_staged = self.backup._prepare_load_state_dict(state_dict["backup"])
-            if muon_staged is not None:
-                self.muon._commit_staged_load_state_dict(muon_staged)
-            self.backup._commit_staged_load_state_dict(backup_staged)
-            if muon_staged is not None:
-                self.muon._run_load_state_dict_post_hooks()
-            self.backup._run_load_state_dict_post_hooks()
-        else:
-            # Foreign backup (torch ``AdamW``): stage it on an isolated shadow
-            # too so a mid-load raise leaves the live backup byte-for-byte
-            # untouched, exactly like the Gefen children.
-            backup_shadow = self._stage_foreign_backup_load(
-                self.backup, state_dict["backup"]
+        self._run_rank_local_checkpoint_phase(
+            "parent load validation",
+            validate_parent_schema,
+        )
+        # Stage every child, including AdamW, before publishing any child. The
+        # commit loop below contains only core dict/container swaps and invokes
+        # no callbacks. Child post-hooks run only after the complete composite
+        # core is visible, so a callback can never observe a half-loaded Hybrid.
+        staged_children = []
+        for role, child in self._gefen_rebinding_children():
+            child_state = state_dict[role]
+
+            def stage_child(child=child, child_state=child_state):
+                return (
+                    prepare_adamw_load_state_dict(child, child_state)
+                    if type(child) is torch.optim.AdamW
+                    else child._prepare_load_state_dict(child_state)
+                )
+
+            staged = self._run_rank_local_checkpoint_phase(
+                "{} load staging".format(role),
+                stage_child,
             )
-            if muon_staged is not None:
-                self.muon._commit_staged_load_state_dict(muon_staged)
-            self._commit_foreign_backup_load(self.backup, backup_shadow)
-            if muon_staged is not None:
-                self.muon._run_load_state_dict_post_hooks()
-            self._run_foreign_backup_post_hooks(self.backup)
+            staged_children.append((role, child, staged))
 
-        for post_hook in self._optimizer_load_state_dict_post_hooks.values():
-            post_hook(self)
+        for _role, child, staged in staged_children:
+            if type(child) is torch.optim.AdamW:
+                commit_adamw_stage(child, staged)
+            else:
+                child._commit_staged_load_state_dict(staged)
+        self._hybrid_layout_forensics_verdict = None
 
-    @staticmethod
-    def _stage_foreign_backup_load(backup, state_dict):
-        """Stage a foreign (non-Gefen) backup load on an isolated shadow.
+        for role, child, _staged in staged_children:
+            def run_child_post_hooks(child=child):
+                if type(child) is torch.optim.AdamW:
+                    run_adamw_load_post_hooks(child)
+                else:
+                    child._run_load_state_dict_post_hooks()
 
-        ``torch.optim.Optimizer.load_state_dict`` is not fail-before-mutation for
-        every optimizer: torch ``AdamW``'s ``__setstate__`` installs the new
-        state via ``super().__setstate__`` and only then reads
-        ``state_values[0]["step"]``, so a checkpoint whose per-parameter state
-        omits ``step`` raises ``KeyError("step")`` after the live backup has
-        already been mutated. Build the full restore on a shallow shadow first
-        (never a ``copy.deepcopy`` of the live state or any process group), so a
-        rejection leaves the live backup byte-for-byte untouched. Returns the
-        shadow; publish it with ``_commit_foreign_backup_load``.
-        """
+            self._run_rank_local_checkpoint_phase(
+                "{} load post-hook".format(role),
+                run_child_post_hooks,
+            )
 
-        # Mirror Optimizer.load_state_dict's pre-hook + shallow-copy pass, then
-        # run the base load on the shadow with its own hook maps emptied so the
-        # staging build is side-effect free (post-hooks are deferred to the
-        # publish step); the raise, if any, happens here on the shadow.
-        state_dict = state_dict.copy()
-        for pre_hook in backup._optimizer_load_state_dict_pre_hooks.values():
-            hook_result = pre_hook(backup, state_dict)
-            if hook_result is not None:
-                state_dict = hook_result
-        shadow = object.__new__(type(backup))
-        shadow.__dict__ = backup.__dict__.copy()
-        shadow.defaults = backup.defaults.copy()
-        shadow.state = defaultdict(dict)
-        shadow._optimizer_load_state_dict_pre_hooks = OrderedDict()
-        shadow._optimizer_load_state_dict_post_hooks = OrderedDict()
-        torch.optim.Optimizer.load_state_dict(shadow, state_dict)
-        return shadow
+        def run_parent_post_hooks():
+            for post_hook in self._optimizer_load_state_dict_post_hooks.values():
+                post_hook(self)
 
-    @staticmethod
-    def _commit_foreign_backup_load(backup, shadow):
-        """Publish a staged foreign-backup restore through non-throwing swaps."""
-
-        live_defaults = backup.defaults
-        live_defaults.update(shadow.defaults)
-        backup.state = shadow.state
-        backup.param_groups = shadow.param_groups
-
-    @staticmethod
-    def _run_foreign_backup_post_hooks(backup):
-        for post_hook in backup._optimizer_load_state_dict_post_hooks.values():
-            post_hook(backup)
+        self._run_rank_local_checkpoint_phase(
+            "load post-hook",
+            run_parent_post_hooks,
+        )
 
     @staticmethod
     def _auto_split(params_or_model, backup_substrings):

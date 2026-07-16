@@ -14,7 +14,12 @@ from gefen.contracts import (
     ShardIdentity,
     ShardingManifest,
 )
-from gefen.portable import _recompress_dense_momentum, _reduce_block_second_moment, _validate_codebook
+from gefen.portable import (
+    _expand_factored_second_moment_live_fp32_v1,
+    _recompress_dense_momentum,
+    _reduce_block_second_moment,
+    _validate_codebook,
+)
 from gefen.portable_fields import _assemble_dense_logical_field, _project_dense_logical_field, _tensor_bits_equal
 from gefen.portable_identity import (
     _normalize_parameter_identity,
@@ -40,7 +45,14 @@ _FRAGMENT_FORMAT = "gefen.portable_state_fragment"
 _FRAGMENT_FORMAT_VERSION = 1
 _FRAGMENT_COVERAGE = "local_logical_optimizer_fragment"
 _MOMENTUM_PROJECTION = "dense_fp32_target_period_one_v1"
-_SECOND_MOMENT_PROJECTION = "exact_representation_target_period_one_v1"
+_SECOND_MOMENT_PROJECTION_EXACT = "exact_representation_target_period_one_v1"
+_SECOND_MOMENT_PROJECTION_FACTORED_TO_BLOCK = "defined_projection_factored_to_block_live_fp32_target_period_one_v1"
+_SECOND_MOMENT_PROJECTIONS = frozenset(
+    {
+        _SECOND_MOMENT_PROJECTION_EXACT,
+        _SECOND_MOMENT_PROJECTION_FACTORED_TO_BLOCK,
+    }
+)
 _MAX_EXACT_COUNTER = (1 << 53) - 1
 
 _FRAGMENT_KEYS = frozenset(
@@ -283,8 +295,13 @@ def _normalize_policy(value, implementation: str):
         raise ValueError("portable semantic state requires stochastic_round=False")
     if value["momentum_projection"] != _MOMENTUM_PROJECTION:
         raise ValueError("unsupported portable momentum projection")
-    if value["second_moment_projection"] != _SECOND_MOMENT_PROJECTION:
+    if value["second_moment_projection"] not in _SECOND_MOMENT_PROJECTIONS:
         raise ValueError("unsupported portable second-moment projection")
+    if (
+        implementation == "gefen.GefenMuon"
+        and value["second_moment_projection"] != _SECOND_MOMENT_PROJECTION_EXACT
+    ):
+        raise ValueError("Muon portable policy requires exact second-moment projection")
     for key in ("factored_v_2d", "force_1d_period_one", "force_2d_period_one"):
         if type(value[key]) is not bool:
             raise ValueError("{} must be a bool".format(key))
@@ -294,6 +311,26 @@ def _normalize_policy(value, implementation: str):
     if type(substrings) is not list or any(type(item) is not str or item != item.lower() for item in substrings):
         raise ValueError("period_one_substrings must be a canonical lowercase string list")
     return {**value, "period_one_substrings": list(substrings)}
+
+
+def _validate_portable_projection_policy(source_policy, target_policy, implementation: str):
+    """Validate exact policy compatibility plus the defined one-way migration."""
+
+    source = _normalize_policy(source_policy, implementation)
+    target = _normalize_policy(target_policy, implementation)
+    invariant_keys = _POLICY_KEYS - {"factored_v_2d", "second_moment_projection"}
+    if any(not _values_equal(source[key], target[key]) for key in invariant_keys):
+        raise ValueError("portable document policy does not match the target")
+    source_factored = source["factored_v_2d"]
+    target_factored = target["factored_v_2d"]
+    if source_factored == target_factored:
+        return
+    if implementation != "gefen.Gefen":
+        raise ValueError("portable document policy does not match the target")
+    if not source_factored and target_factored:
+        raise ValueError("portable block-to-factored second-moment migration is unsupported")
+    if source["second_moment_projection"] != _SECOND_MOMENT_PROJECTION_FACTORED_TO_BLOCK:
+        raise ValueError("portable source policy does not authorize factored-to-block second-moment projection")
 
 
 def _normalize_ns_schedule(value):
@@ -379,8 +416,9 @@ def _normalize_complete_parameter_record(fqn, value, implementation: str, global
             raise ValueError("portable target_period must be exactly one")
         if hints["source_second_moment"] not in {None, "block", "factored"}:
             raise ValueError("portable source_second_moment is invalid")
-        expected_representation = "factored" if policy["factored_v_2d"] and len(shape) == 2 else "block"
-        if options["second_moment_policy"] != expected_representation:
+        configured_factored = policy["factored_v_2d"] and len(shape) == 2
+        representation = options["second_moment_policy"]
+        if representation == "factored" and not configured_factored:
             raise ValueError("parameter second_moment_policy conflicts with the optimizer policy")
         if variant == "pristine":
             expected_keys = frozenset()
@@ -392,11 +430,11 @@ def _normalize_complete_parameter_record(fqn, value, implementation: str, global
                 raise ValueError("period-selected portable state has invalid projection hints")
         elif variant == "initialized_dense":
             expected_keys = frozenset({"step", "momentum", "second_moment", "second_moment_step"})
-            if not periods or hints["source_second_moment"] != "block" or expected_representation != "block":
+            if not periods or hints["source_second_moment"] != "block" or representation != "block":
                 raise ValueError("dense block state conflicts with its policy or projection hints")
         elif variant == "initialized_factored":
             expected_keys = frozenset({"step", "momentum", "v_row", "v_col", "factored_step"})
-            if not periods or hints["source_second_moment"] != "factored" or expected_representation != "factored":
+            if not periods or hints["source_second_moment"] != "factored" or representation != "factored":
                 raise ValueError("factored state conflicts with its policy or projection hints")
         else:
             raise ValueError("unsupported plain portable state_variant")
@@ -544,6 +582,8 @@ def _derived_role(shard: ShardIdentity) -> str:
         return "live" if shard.logical_slice.length else "empty_flat"
     if shard.layout is ParameterLayout.WHOLE_PARAMETER_OWNER:
         return "whole_owner" if shard.local_member == shard.owner else "whole_nonowner"
+    if shard.layout is ParameterLayout.DTENSOR_1D_DEFAULT_WORLD:
+        return "live" if shard.logical_region.numel else "empty_dtensor"
     raise ValueError("unsupported portable fragment layout")
 
 
@@ -555,6 +595,8 @@ def _local_dense_shape(shard: ShardIdentity):
         return shard.parameter.global_shape
     if shard.layout is ParameterLayout.FLATTENED_ELEMENT_SHARD:
         return (shard.logical_slice.length,)
+    if shard.layout is ParameterLayout.DTENSOR_1D_DEFAULT_WORLD:
+        return shard.logical_region.lengths
     raise ValueError("unsupported portable fragment layout")
 
 
@@ -573,7 +615,17 @@ def _normalize_catalog(value, implementation: str, manifest: ShardingManifest, p
             raise ValueError("portable catalog identity does not match the manifest")
         options = _normalize_options(record["algorithm_options"], implementation)
         if implementation == "gefen.Gefen":
-            expected = "factored" if policy["factored_v_2d"] and len(identity.global_shape) == 2 else "block"
+            configured_factored = policy["factored_v_2d"] and len(identity.global_shape) == 2
+            parameter_shards = manifest.for_parameter(fqn)
+            layouts = {shard.layout for shard in parameter_shards}
+            if configured_factored and layouts == {ParameterLayout.REPLICATED}:
+                expected = "factored"
+            elif configured_factored and layouts == {ParameterLayout.DTENSOR_1D_DEFAULT_WORLD}:
+                expected = "block"
+            elif configured_factored:
+                raise ValueError("factored logical matrices require replicated storage or the DTensor block fallback")
+            else:
+                expected = "block"
             if options["second_moment_policy"] != expected:
                 raise ValueError("catalog second_moment_policy conflicts with the optimizer policy")
             if expected == "factored" and any(
@@ -599,7 +651,11 @@ def _normalize_fragment_slot(value, implementation: str, common, catalog, member
     shard_record = _normalize_shard_identity(value["shard"])
     shard = _parse_shard_identity(shard_record)
     allowed_layouts = (
-        {ParameterLayout.REPLICATED, ParameterLayout.FLATTENED_ELEMENT_SHARD}
+        {
+            ParameterLayout.REPLICATED,
+            ParameterLayout.FLATTENED_ELEMENT_SHARD,
+            ParameterLayout.DTENSOR_1D_DEFAULT_WORLD,
+        }
         if implementation == "gefen.Gefen"
         else {ParameterLayout.REPLICATED, ParameterLayout.WHOLE_PARAMETER_OWNER}
     )
@@ -748,7 +804,11 @@ def _normalize_portable_state_fragment(fragment, *, limits):
     manifest_record = _normalize_sharding_manifest(fragment["manifest"])
     manifest = _parse_sharding_manifest(manifest_record)
     allowed_layouts = (
-        {ParameterLayout.REPLICATED, ParameterLayout.FLATTENED_ELEMENT_SHARD}
+        {
+            ParameterLayout.REPLICATED,
+            ParameterLayout.FLATTENED_ELEMENT_SHARD,
+            ParameterLayout.DTENSOR_1D_DEFAULT_WORLD,
+        }
         if implementation == "gefen.Gefen"
         else {ParameterLayout.REPLICATED, ParameterLayout.WHOLE_PARAMETER_OWNER}
     )
@@ -926,10 +986,10 @@ def _assemble_parameter(fqn, slots, manifest: ShardingManifest, catalog_entry, i
                 }
             )
     if implementation == "gefen.Gefen":
-        expected = "factored" if policy["factored_v_2d"] and len(parameter.global_shape) == 2 else "block"
-        if variant == "initialized_dense" and expected != "block":
+        representation = catalog_entry["algorithm_options"]["second_moment_policy"]
+        if variant == "initialized_dense" and representation != "block":
             raise ValueError("block portable state conflicts with factored_v_2d policy")
-        if variant == "initialized_factored" and expected != "factored":
+        if variant == "initialized_factored" and representation != "factored":
             raise ValueError("factored portable state conflicts with factored_v_2d policy")
         hints = {"source_periods": periods, "source_second_moment": source_second, "target_period": 1}
     else:
@@ -1042,6 +1102,7 @@ def _project_portable_parameter_state(
     implementation,
     global_step,
     codebook,
+    source_second_moment_projection,
     target_algorithm_options,
     target_second_moment=None,
 ):
@@ -1054,7 +1115,11 @@ def _project_portable_parameter_state(
     if not isinstance(target_shard, ShardIdentity):
         raise TypeError("target_shard must be a ShardIdentity")
     target_layouts = (
-        {ParameterLayout.REPLICATED, ParameterLayout.FLATTENED_ELEMENT_SHARD}
+        {
+            ParameterLayout.REPLICATED,
+            ParameterLayout.FLATTENED_ELEMENT_SHARD,
+            ParameterLayout.DTENSOR_1D_DEFAULT_WORLD,
+        }
         if implementation == "gefen.Gefen"
         else {ParameterLayout.REPLICATED, ParameterLayout.WHOLE_PARAMETER_OWNER}
     )
@@ -1077,30 +1142,40 @@ def _project_portable_parameter_state(
         "codebook_refresh_every": 0,
         "stochastic_round": False,
         "momentum_projection": _MOMENTUM_PROJECTION,
-        "second_moment_projection": _SECOND_MOMENT_PROJECTION,
+        "second_moment_projection": source_second_moment_projection,
     }
     fqn = target_shard.parameter.fqn
     record = _normalize_complete_parameter_record(fqn, document_record, implementation, global_step, policy)
     if _parse_parameter_identity(record["identity"]) != target_shard.parameter:
         raise ValueError("portable parameter identity does not match the target shard")
     target_options = _normalize_options(target_algorithm_options, implementation)
-    if not _values_equal(record["algorithm_options"], target_options):
-        raise ValueError("portable algorithm options do not match the target")
     if implementation == "gefen.Gefen":
         if target_second_moment not in {"block", "factored"}:
             raise ValueError("plain Gefen projection requires target_second_moment")
         if target_second_moment != target_options["second_moment_policy"]:
             raise ValueError("target_second_moment conflicts with target algorithm options")
+        source_options = record["algorithm_options"]
+        invariant_option_keys = _PLAIN_OPTION_KEYS - {"second_moment_policy"}
+        if any(not _values_equal(source_options[key], target_options[key]) for key in invariant_option_keys):
+            raise ValueError("portable algorithm options do not match the target")
+        source_representation = source_options["second_moment_policy"]
+        if source_representation == "block" and target_second_moment == "factored":
+            raise ValueError("portable block-to-factored second-moment migration is unsupported")
+        if (
+            source_representation == "factored"
+            and target_second_moment == "block"
+            and source_second_moment_projection != _SECOND_MOMENT_PROJECTION_FACTORED_TO_BLOCK
+        ):
+            raise ValueError("portable source policy does not authorize factored-to-block second-moment projection")
         if (
             target_second_moment == "factored"
             and len(target_shard.parameter.global_shape) == 2
             and target_shard.layout is not ParameterLayout.REPLICATED
         ):
             raise ValueError("factored logical matrices require replicated target shards")
-        source_second = record["projection_hints"]["source_second_moment"]
-        if source_second is not None and source_second != target_second_moment:
-            raise ValueError("portable second-moment representation migration is unsupported")
     else:
+        if not _values_equal(record["algorithm_options"], target_options):
+            raise ValueError("portable algorithm options do not match the target")
         if target_second_moment is not None:
             raise ValueError("Muon projection does not accept target_second_moment")
         if (
@@ -1147,15 +1222,37 @@ def _project_portable_parameter_state(
             }
         )
     elif implementation == "gefen.Gefen" and variant == "initialized_factored":
-        if target_shard.layout is not ParameterLayout.REPLICATED:
-            raise ValueError("factored portable state projects only to replicated targets")
-        result.update(
-            {
-                "v_row": _tight_clone(record["state"]["v_row"]),
-                "v_col": _tight_clone(record["state"]["v_col"]),
-                "factored_step": record["state"]["factored_step"],
-            }
-        )
+        second_step = record["state"]["factored_step"]
+        if target_second_moment == "factored":
+            if target_shard.layout is not ParameterLayout.REPLICATED:
+                raise ValueError("factored portable state projects only to replicated targets")
+            result.update(
+                {
+                    "v_row": _tight_clone(record["state"]["v_row"]),
+                    "v_col": _tight_clone(record["state"]["v_col"]),
+                    "factored_step": second_step,
+                }
+            )
+        else:
+            dense_second = _expand_factored_second_moment_live_fp32_v1(
+                record["state"]["v_row"],
+                record["state"]["v_col"],
+                logical_shape=target_shard.parameter.global_shape,
+                step=second_step,
+            )
+            local_second = _project_dense_logical_field(
+                target_shard.parameter,
+                dense_second,
+                target_shard,
+            )
+            if local_second is None:
+                return {}
+            result.update(
+                {
+                    "vmean": _reduce_block_second_moment(local_second, period=1, step=second_step),
+                    "vmean_step": second_step,
+                }
+            )
     elif implementation == "gefen.GefenMuon" and variant == "initialized_dense_normuon":
         if target_shard.layout not in {ParameterLayout.REPLICATED, ParameterLayout.WHOLE_PARAMETER_OWNER}:
             raise ValueError("NorMuon state projects only to replicas or a whole-parameter owner")

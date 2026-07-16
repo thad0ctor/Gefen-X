@@ -10,12 +10,12 @@ import torch.nn as nn
 from gefen.contracts import (
     OptimizerContract,
     ParameterLayout,
+    PlacementKind,
     TopologyChange,
     _gefen_muon_contract,
 )
 from gefen.gefen import (
     Gefen,
-    _amp_optimizer_step_controls,
     _amp_prepare_optimizer_step,
     _assert_optimizer_gradients_structurally_valid,
     _synchronize_step_control_range,
@@ -663,8 +663,9 @@ class GefenMuon(Gefen):
         # The NS/momentum compute (and the persistent momentum state) is therefore
         # cut ~world_size x while staying bit-for-bit identical to "exact". Only
         # the per-step gradient all-gather (a collective every rank must join) and
-        # one extra update broadcast are replicated. Falls back to the "exact"
-        # full-NS-everywhere path for non-1D meshes (e.g. HSDP x TP).
+        # one extra update broadcast are replicated. Multi-rank DTensor support
+        # is deliberately limited to one-dimensional DeviceMeshes; unsupported
+        # multidimensional routes are rejected during parameter registration.
         #
         # Homogeneity assumption: "exact" runs Newton-Schulz redundantly on
         # every rank's own GPU and relies on the results agreeing bit-for-bit,
@@ -760,10 +761,17 @@ class GefenMuon(Gefen):
             capturable=capturable,
             verbose=verbose,
         )
+        # Keep a non-mutating route anchor from construction onward. A later
+        # coordinated eager preflight replaces this with the validated baseline
+        # anchor, but retaining the initial default-world mesh lets that first
+        # preflight reject rank-asymmetric direct param-group edits with a
+        # fixed-size collective instead of letting the edited rank skip it.
+        self._set_muon_collective_intent_anchors_from_live()
 
     def optimizer_contract(self) -> OptimizerContract:
         """Return the immutable Muon state and capability contract."""
 
+        self._assert_live_muon_contract_routing()
         sharded_modes = frozenset(
             group["sharded_mode"] for group in self.param_groups
         )
@@ -777,7 +785,10 @@ class GefenMuon(Gefen):
             for group in self.param_groups
             if not group.get("normuon", False)
         )
-        canonical_state_layouts = self._canonical_state_layouts()
+        try:
+            canonical_state_layouts = self._canonical_state_layouts()
+        except Exception:
+            canonical_state_layouts = frozenset()
         try:
             from gefen.portable_runtime import _portable_runtime_layouts
 
@@ -807,10 +818,14 @@ class GefenMuon(Gefen):
             canonical_parameter_fqns=self._canonical_identity_ready(),
             stable_shard_identity=self._canonical_identity_ready(),
             explicit_process_group_codebook_scope=True,
+            native_dtensor_world_size_redistribution=(
+                self._gefen_codebook_process_group is None
+            ),
             canonical_state_layouts=canonical_state_layouts,
             canonical_global_same_topology=canonical_global_same_topology,
             canonical_global_topology_changing=canonical_global_topology_changing,
             canonical_global_topology_change_kinds=canonical_global_topology_change_kinds,
+            atomic_state_movement=self._atomic_state_movement_supported(),
             whole_parameter_owner=(
                 self._codebook_scope_ready()
                 and any(
@@ -824,6 +839,7 @@ class GefenMuon(Gefen):
         return layout is ParameterLayout.REPLICATED
 
     def _canonical_state_variant_layout(self):
+        self._assert_live_muon_contract_routing()
         sharded_modes = frozenset(
             group["sharded_mode"] for group in self.param_groups
         )
@@ -867,12 +883,25 @@ class GefenMuon(Gefen):
                 raise ValueError(
                     "a GefenMuon whole-parameter non-owner must not retain storage"
                 )
+        elif shard.layout is ParameterLayout.DTENSOR_1D_DEFAULT_WORLD:
+            # The base staging path has already validated that this is an exact
+            # public DTensor on one default-world DeviceMesh, that its Shard or
+            # Replicate placement matches the stable identity, and that its
+            # local storage is dense, materialized, and the declared region
+            # size. Reuse the base local-storage gate here while retaining
+            # Muon's additional logical-matrix requirement above.
+            super()._validate_rebinding_layout(rebinding)
         else:
             raise ValueError(
-                "GefenMuon rebinding supports replicated complete matrices or "
-                "whole-parameter ownership only"
+                "GefenMuon rebinding supports replicated complete matrices, "
+                "whole-parameter ownership, or one-dimensional default-world "
+                "DTensor matrices only"
             )
-        if target is not None and target.numel() != shard.logical_slice.length:
+        if (
+            target is not None
+            and shard.layout is not ParameterLayout.DTENSOR_1D_DEFAULT_WORLD
+            and target.numel() != shard.logical_slice.length
+        ):
             raise ValueError(
                 "GefenMuon rebound tensor numel does not match its logical slice"
             )
@@ -882,6 +911,20 @@ class GefenMuon(Gefen):
             shard.layout is ParameterLayout.WHOLE_PARAMETER_OWNER
             for _, shard in self._gefen_local_shard_bindings
         )
+
+    def _stage_post_sharding(
+        self, rebindings, manifest, codebook_process_group=None
+    ):
+        staged = super()._stage_post_sharding(
+            rebindings, manifest, codebook_process_group
+        )
+        # Commits update the live __dict__ rather than deleting absent keys, so
+        # publish explicit cleared sentinels instead of merely popping the
+        # staged attributes.
+        staged._gefen_muon_collective_intent_baseline = None
+        staged._gefen_muon_capture_plan = None
+        staged._set_muon_collective_intent_anchors_from_live()
+        return staged
 
     def add_param_group(self, param_group):
         """Add a validated 2D Muon parameter group atomically.
@@ -895,6 +938,13 @@ class GefenMuon(Gefen):
             # containers and missing ``params``.
             return super().add_param_group(param_group)
 
+        if getattr(self, "_gefen_muon_collective_intent_baseline", None) is not None:
+            raise RuntimeError(
+                "GefenMuon cannot add a parameter group after DTensor collective "
+                "routing has been validated; construct a new optimizer because "
+                "live optimizer state has no defined group-addition migration"
+            )
+
         group = dict(param_group)
         raw_params = group["params"]
         if isinstance(raw_params, torch.Tensor):
@@ -906,12 +956,31 @@ class GefenMuon(Gefen):
         # Validate tensor type/complex support and Muon's dimensionality before
         # registration. Gefen.add_param_group repeats its own checks, but doing
         # this first keeps a mixed valid/invalid addition all-or-nothing.
+        validated_params = []
         for _, param in self._iter_params_with_names(raw_params):
             if param.ndim != 2:
                 raise ValueError(
                     "GefenMuon only supports 2D parameters whereas we found a "
                     "parameter with size: {}".format(param.size())
                 )
+            validated_params.append(param)
+        for param in validated_params:
+            if self._is_sharded(param):
+                self._validate_muon_dtensor_mesh(param.device_mesh)
+        if (
+            "_gefen_muon_collective_intent_anchors" in self.__dict__
+            and not self._gefen_muon_collective_intent_anchors
+            and any(
+                self._is_sharded(param)
+                and param.device_mesh.size() > 1
+                for param in validated_params
+            )
+        ):
+            raise RuntimeError(
+                "GefenMuon cannot add the first multi-rank DTensor parameter "
+                "group after construction because no common collective routing "
+                "anchor exists; construct a new optimizer with that group"
+            )
 
         defaults = self._muon_group_defaults
         momentum = group.get("momentum", defaults["momentum"])
@@ -1008,13 +1077,78 @@ class GefenMuon(Gefen):
                 "betas": (momentum, 0.0),
             }
         )
-        return super().add_param_group(group)
+        result = super().add_param_group(group)
+        # During Optimizer.__init__ the anchor attribute does not exist yet.
+        # A pristine public addition may introduce the first DTensor mesh; keep
+        # an already-established anchor unchanged so an asymmetric addition is
+        # still visible to the next fixed-size header on the original mesh.
+        if (
+            "_gefen_muon_collective_intent_anchors" in self.__dict__
+            and not self._gefen_muon_collective_intent_anchors
+        ):
+            self._set_muon_collective_intent_anchors_from_live()
+        return result
 
     def _init_gefen_muon_state(self, state, grad_view: torch.Tensor) -> None:
         self._init_gefen_state(state, grad_view)
 
     def _codebook_requires_2d_parameters(self) -> bool:
         return True
+
+    def _codebook_parameter_uses_replicated_scope_controls(
+        self, parameter, shard
+    ) -> bool:
+        if super()._codebook_parameter_uses_replicated_scope_controls(
+            parameter, shard
+        ):
+            return True
+        if (
+            parameter is None
+            or shard.layout is not ParameterLayout.DTENSOR_1D_DEFAULT_WORLD
+            or len(shard.placements) != 1
+            or shard.placements[0].kind is not PlacementKind.DIMENSION_SHARD
+        ):
+            return False
+        for group in self.param_groups:
+            if any(candidate is parameter for candidate in group["params"]):
+                return group["sharded_mode"] in {"exact", "distributed"}
+        return False
+
+    def _preflight_codebook_gradient_collectives(self) -> None:
+        self._assert_sharded_grad_presence_consistent()
+
+    def _preflight_unscoped_manual_codebook_routing(self) -> None:
+        if self._gefen_codebook_process_group is not None:
+            return
+        if self._restore_muon_capture_plan_if_capturing():
+            return
+        # Base manual codebook APIs begin with local finalized-layout and
+        # gradient validation. Run the fixed mesh header first so a malformed
+        # direct group edit cannot make one rank exit while peers continue to a
+        # later DTensor codebook collective.
+        self._assert_sharded_mode_collective_intent_consistent()
+
+    @torch.no_grad()
+    def initialize_codebook(self) -> bool:
+        self._preflight_unscoped_manual_codebook_routing()
+        return super().initialize_codebook()
+
+    @torch.no_grad()
+    def refresh_codebook(self) -> bool:
+        self._preflight_unscoped_manual_codebook_routing()
+        return super().refresh_codebook()
+
+    def _codebook_scope_collective_intent_fingerprint(self):
+        payload = tuple(
+            (
+                slot.group_index,
+                slot.original_slot_index,
+                slot.shard.parameter.fqn,
+                self.param_groups[slot.group_index]["sharded_mode"],
+            )
+            for slot in self._gefen_logical_slots
+        )
+        return self._sha256_int64(repr(payload).encode("utf-8"))
 
     def _iter_gefen_grad_periods(
         self, reuse_existing_periods: bool = False, staged_periods=None
@@ -1443,45 +1577,22 @@ class GefenMuon(Gefen):
     @staticmethod
     @torch._dynamo.disable
     def _collect_sharded_failure_groups(param_groups):
-        """Deduped, deterministically-ordered (process_group, device) pairs.
-
-        Shared by the raw ``GefenMuon`` step scope and ``GefenMuonHybrid``'s
-        union scope. Scans every sharded (non-``approx``) mesh represented in
-        ``param_groups``, keyed and deduplicated by mesh content and iterated in
-        sorted-key order, and within each mesh in its ``get_all_groups()``
-        dimension order. Folding several optimizers' groups through ONE dict
-        keeps a single deterministic order across ranks: an identical mesh owned
-        by more than one child (the standard fully_shard case) collapses to a
-        single collective, and a child-only mesh is still folded in -- never a
-        per-child concatenation that could interleave one rank's row all-reduce
-        against a peer's column all-reduce. Groups with no ``sharded_mode`` key
-        (a foreign backup's conventional torch groups) count as non-approx.
-        """
         import torch.distributed as dist
 
         by_mesh = {}
         for group in param_groups:
             if group.get("sharded_mode") == "approx":
                 continue
-            for param in group["params"]:
-                if not GefenMuon._is_sharded(param):
+            for parameter in group["params"]:
+                if not GefenMuon._is_sharded(parameter):
                     continue
-                mesh = param.device_mesh
+                mesh = parameter.device_mesh
                 if mesh.get_coordinate() is None or mesh.size() < 2:
                     continue
-                process_groups = tuple(mesh.get_all_groups())
-                members = tuple(
-                    int(item)
-                    for item in mesh.mesh.detach().cpu().reshape(-1).tolist()
-                )
-                key = (
-                    str(mesh.device_type),
-                    tuple(int(item) for item in mesh.shape),
-                    members,
-                    tuple(str(pg.group_name) for pg in process_groups),
-                )
+                key, process_groups = GefenMuon._gradient_preflight_mesh_key(mesh)
                 by_mesh.setdefault(
-                    key, (GefenMuon._state_tensor_device(param), process_groups)
+                    key,
+                    (GefenMuon._state_tensor_device(parameter), process_groups),
                 )
         result = []
         for key in sorted(by_mesh):
@@ -1493,36 +1604,17 @@ class GefenMuon(Gefen):
 
     @torch._dynamo.disable
     def _step_failure_process_groups(self):
-        """Return the control scope for eager exact/distributed Muon steps.
-
-        Enter EXACTLY the collectives ``_assert_sharded_grad_presence_consistent``
-        enters, in the same order: every sharded (non-approx) mesh this rank
-        participates in, keyed and deduplicated by mesh content and iterated in
-        sorted-key order, and within each mesh its ``get_all_groups()`` dimension
-        order. Preserving the per-mesh dimension order matters for multi-dim
-        (HSDP/TP) meshes -- flattening and sorting all groups by name could make
-        one rank enter a row all-reduce while a peer is already blocked in its
-        column all-reduce, deadlocking the preflight itself. Each group carries
-        the local shard device so the control flag lands on the same device as
-        the real collectives rather than the ambient ``current_device``.
-
-        Like the grad-presence preflight, this is a single pass per group; a
-        failure only reaches ranks sharing a mesh with the failing rank. Deeply
-        overlapping non-enclosing meshes therefore keep that preflight's existing
-        cross-mesh limitation.
-        """
         if not self._dist_available():
             return ()
-
-        params = [param for group in self.param_groups for param in group["params"]]
-        # The protocol returns host-readable flags and therefore cannot be
-        # captured. Captured steps already require an eager warmup with a fixed
-        # control-flow and gradient-presence pattern.
-        if any(param.device.type == "cuda" for param in params) and (
+        parameters = [
+            parameter
+            for group in self.param_groups
+            for parameter in group["params"]
+        ]
+        if any(parameter.device.type == "cuda" for parameter in parameters) and (
             torch.cuda.is_current_stream_capturing()
         ):
             return ()
-
         return self._collect_sharded_failure_groups(self.param_groups)
 
     @staticmethod
@@ -1531,15 +1623,15 @@ class GefenMuon(Gefen):
         synchronized = bool(local_value)
         for process_group, collective_device in process_groups:
             synchronized = _synchronize_step_failure(
-                synchronized, process_group, collective_device=collective_device
+                synchronized,
+                process_group,
+                collective_device=collective_device,
             )
         return synchronized
 
     @staticmethod
     @torch._dynamo.disable
-    def _synchronize_sharded_step_error(
-        error, phase: str, process_groups
-    ) -> None:
+    def _synchronize_sharded_step_error(error, phase: str, process_groups) -> None:
         if not process_groups:
             if error is not None:
                 raise error
@@ -1549,7 +1641,6 @@ class GefenMuon(Gefen):
         )
         if not failed:
             return
-
         import torch.distributed as dist
 
         if error is not None:
@@ -1559,9 +1650,7 @@ class GefenMuon(Gefen):
                 )
             ) from error
         raise RuntimeError(
-            "GefenMuon {} failed on another process-group member".format(
-                phase
-            )
+            "GefenMuon {} failed on another process-group member".format(phase)
         )
 
     @staticmethod
@@ -1571,48 +1660,27 @@ class GefenMuon(Gefen):
         maximum = minimum
         for process_group, collective_device in process_groups:
             minimum, maximum = _synchronize_step_control_range(
-                minimum, maximum, process_group, collective_device=collective_device
+                minimum,
+                maximum,
+                process_group,
+                collective_device=collective_device,
             )
         return minimum, maximum
 
     @staticmethod
     @torch._dynamo.disable
     def _prepare_synchronized_amp_step(optimizer, process_groups) -> bool:
-        """Agree on AMP controls before unscaling or entering Muon collectives."""
         local_present = hasattr(optimizer, "found_inf") or hasattr(
             optimizer, "grad_scale"
         )
-        if not process_groups:
-            if not local_present:
-                return True
-            return _amp_prepare_optimizer_step(optimizer)
-
-        try:
-            if local_present:
-                local_overflow, grad_scale, scale_value = (
-                    _amp_optimizer_step_controls(optimizer)
-                )
-                local_scale_present = grad_scale is not None
-            else:
-                local_overflow = False
-                local_scale_present = False
-                scale_value = 0.0
-            local_amp_error = None
-        except Exception as exc:
-            local_overflow = False
-            local_scale_present = False
-            scale_value = 0.0
-            local_amp_error = exc
-        GefenMuon._synchronize_sharded_step_error(
-            local_amp_error, "AMP control preflight", process_groups
-        )
-
+        found_inf = getattr(optimizer, "found_inf", None)
+        grad_scale = getattr(optimizer, "grad_scale", None)
         minimum, maximum = GefenMuon._synchronize_sharded_step_control_range(
             (
-                int(local_present),
-                int(local_overflow),
-                int(local_scale_present),
-                scale_value,
+                float(local_present),
+                float(found_inf.item()) if found_inf is not None else 0.0,
+                float(grad_scale is not None),
+                float(grad_scale.item()) if grad_scale is not None else 0.0,
             ),
             process_groups,
         )
@@ -1640,20 +1708,446 @@ class GefenMuon(Gefen):
             )
         if bool(maximum[1]):
             return False
-
         try:
             should_step = _amp_prepare_optimizer_step(optimizer)
-            local_amp_error = None
+            local_error = None
         except Exception as exc:
             should_step = False
-            local_amp_error = exc
+            local_error = exc
         GefenMuon._synchronize_sharded_step_error(
-            local_amp_error, "AMP preparation", process_groups
+            local_error, "AMP preparation", process_groups
         )
         return should_step
 
+    @staticmethod
+    def _gradient_preflight_mesh_key(mesh):
+        process_groups = tuple(mesh.get_all_groups())
+        return (
+            (
+                str(mesh.device_type),
+                tuple(int(item) for item in mesh.shape),
+                tuple(
+                    int(item)
+                    for item in mesh.mesh.detach().cpu().reshape(-1).tolist()
+                ),
+                tuple(str(pg.group_name) for pg in process_groups),
+            ),
+            process_groups,
+        )
+
+    @staticmethod
+    def _gradient_preflight_portable_mesh_key(mesh):
+        """Return rank-neutral mesh identity for cross-rank intent hashes.
+
+        GefenMuon accepts only one-dimensional multi-rank meshes, whose sole
+        process group has one shared c10d name on every member. Include that
+        name so distinct same-topology DeviceMesh instances cannot be confused
+        across ranks while keeping the actual handle local to scheduling.
+        """
+
+        mesh_dim_names = getattr(mesh, "mesh_dim_names", None)
+        process_groups = tuple(mesh.get_all_groups())
+        return (
+            str(mesh.device_type),
+            tuple(int(item) for item in mesh.shape),
+            tuple(
+                int(item)
+                for item in mesh.mesh.detach().cpu().reshape(-1).tolist()
+            ),
+            (
+                None
+                if mesh_dim_names is None
+                else tuple(str(item) for item in mesh_dim_names)
+            ),
+            tuple(str(group.group_name) for group in process_groups),
+        )
+
+    def _validate_muon_dtensor_mesh(self, mesh) -> None:
+        """Reject DTensor mesh routes outside Muon's published contract."""
+
+        if mesh.size() < 2:
+            return
+        if len(mesh.shape) != 1:
+            raise RuntimeError(
+                "GefenMuon supports multi-rank DTensor collective routing only "
+                "on a one-dimensional DeviceMesh; multidimensional meshes are "
+                "not supported"
+            )
+        if (
+            self._gefen_codebook_process_group is not None
+            or not self._dist_available()
+        ):
+            return
+
+        import torch.distributed as dist
+
+        mesh_members = tuple(
+            int(item) for item in mesh.mesh.detach().cpu().reshape(-1).tolist()
+        )
+        world = dist.get_world_size()
+        if len(mesh_members) != world or set(mesh_members) != set(range(world)):
+            raise RuntimeError(
+                "unscoped GefenMuon requires every multi-rank DTensor mesh to "
+                "span the initialized default process group; subgroup and "
+                "partially overlapping meshes require an explicit codebook scope"
+            )
+
+    @staticmethod
+    def _muon_mode_token(mode):
+        if isinstance(mode, str) and mode in {"approx", "exact", "distributed"}:
+            return mode, True
+        if mode is None:
+            return ("invalid", "missing"), False
+        return (
+            "invalid",
+            "{}.{}".format(type(mode).__module__, type(mode).__qualname__),
+            repr(mode),
+        ), False
+
+    def _assert_live_muon_contract_routing(self) -> None:
+        """Validate live route metadata without collectives or mutation."""
+
+        invalid_groups = [
+            index
+            for index, group in enumerate(self.param_groups)
+            if not self._muon_mode_token(group.get("sharded_mode"))[1]
+        ]
+        if invalid_groups:
+            raise RuntimeError(
+                "GefenMuon cannot report an optimizer contract while parameter "
+                "groups {} have an invalid sharded_mode; expected 'approx', "
+                "'exact', or 'distributed'".format(invalid_groups)
+            )
+        intent = self._muon_collective_intent()
+        baseline = getattr(
+            self, "_gefen_muon_collective_intent_baseline", None
+        )
+        if baseline is not None and baseline != intent["signature"]:
+            raise RuntimeError(
+                "GefenMuon cannot report an optimizer contract from live groups "
+                "that differ from its frozen DTensor collective routing; "
+                "construct a new optimizer for parameter-order, rebinding, or "
+                "sharded_mode transitions"
+            )
+
+    def _muon_collective_intent(self):
+        """Describe live DTensor routing without entering a collective."""
+
+        by_mesh = OrderedDict()
+        signature = []
+        portable_structure = []
+        portable_routing = []
+        invalid_modes = []
+        for group_index, group in enumerate(self.param_groups):
+            raw_mode = group.get("sharded_mode")
+            mode_token, mode_valid = self._muon_mode_token(raw_mode)
+            for parameter_index, (name, parameter) in enumerate(
+                self._iter_group_params_with_names(group)
+            ):
+                if not self._is_sharded(parameter):
+                    continue
+                mesh = parameter.device_mesh
+                self._validate_muon_dtensor_mesh(mesh)
+                if mesh.get_coordinate() is None or mesh.size() < 2:
+                    continue
+                mesh_key, process_groups = self._gradient_preflight_mesh_key(mesh)
+                portable_mesh_key = self._gradient_preflight_portable_mesh_key(mesh)
+                entry = by_mesh.get(mesh_key)
+                if entry is None:
+                    entry = {
+                        "process_groups": process_groups,
+                        "device": self._state_tensor_device(parameter),
+                        "items": [],
+                    }
+                    by_mesh[mesh_key] = entry
+                label = str(name)
+                shape = tuple(parameter.shape)
+                dtype = str(parameter.dtype)
+                placements = tuple(str(item) for item in parameter.placements)
+                entry["items"].append(
+                    (
+                        group_index,
+                        parameter_index,
+                        label,
+                        parameter,
+                        raw_mode,
+                    )
+                )
+                signature.append(
+                    (
+                        group_index,
+                        parameter_index,
+                        id(parameter),
+                        id(mesh),
+                        label,
+                        shape,
+                        dtype,
+                        placements,
+                        mode_token,
+                        mesh_key,
+                    )
+                )
+                portable_structure.append(
+                    (
+                        group_index,
+                        parameter_index,
+                        label,
+                        shape,
+                        dtype,
+                        placements,
+                        portable_mesh_key,
+                    )
+                )
+                portable_routing.append(
+                    (group_index, parameter_index, label, mode_token)
+                )
+                if not mode_valid:
+                    invalid_modes.append(label)
+
+        # One retained device anchor makes the fixed optimizer-global header a
+        # single default-world collective even when a later direct edit adds,
+        # removes, or reorders secondary full-world DeviceMeshes. Distributed
+        # construction requires every world rank to begin with at least one
+        # multi-rank DTensor; adding the first one later is rejected separately.
+        anchors = ()
+        if by_mesh:
+            mesh_key = next(iter(by_mesh))
+            anchors = (
+                (
+                    mesh_key,
+                    by_mesh[mesh_key]["process_groups"],
+                    by_mesh[mesh_key]["device"],
+                ),
+            )
+        return {
+            "by_mesh": by_mesh,
+            "signature": tuple(signature),
+            "portable_structure": tuple(portable_structure),
+            "portable_routing": tuple(portable_routing),
+            "invalid_modes": tuple(invalid_modes),
+            "anchors": anchors,
+        }
+
+    def _set_muon_collective_intent_anchors_from_live(self) -> None:
+        self._gefen_muon_collective_intent_anchors = self._muon_collective_intent()[
+            "anchors"
+        ]
+
+    def _freeze_muon_capture_plan(self, intent) -> None:
+        groups = []
+        for group in self.param_groups:
+            names = group.get("param_names")
+            groups.append(
+                (
+                    group,
+                    tuple(group["params"]),
+                    None if names is None else tuple(names),
+                    group["sharded_mode"],
+                )
+            )
+        self._gefen_muon_capture_plan = (
+            tuple(groups),
+            tuple(self._param_names.items()),
+        )
+        self._gefen_muon_collective_intent_anchors = intent["anchors"]
+
+    def _muon_capture_has_cuda_route(self) -> bool:
+        plan = getattr(self, "_gefen_muon_capture_plan", None)
+        if plan is not None:
+            parameters = (
+                parameter
+                for _, group_parameters, _, _ in plan[0]
+                for parameter in group_parameters
+            )
+            if any(parameter.device.type == "cuda" for parameter in parameters):
+                return True
+        return any(
+            anchor[2].type == "cuda"
+            for anchor in getattr(
+                self, "_gefen_muon_collective_intent_anchors", ()
+            )
+        )
+
+    def _restore_muon_capture_plan_if_capturing(self) -> bool:
+        """Route capture from the eagerly validated immutable plan."""
+
+        if not self._muon_capture_has_cuda_route():
+            return False
+        if not torch.cuda.is_current_stream_capturing():
+            return False
+        baseline = getattr(self, "_gefen_muon_collective_intent_baseline", None)
+        plan = getattr(self, "_gefen_muon_capture_plan", None)
+        if baseline is None or plan is None:
+            raise RuntimeError(
+                "GefenMuon DTensor CUDA graph capture requires an eager warmup "
+                "step to validate and freeze sharded_mode routing before capture"
+            )
+
+        groups, param_names = plan
+        # Restore route-affecting public containers before finalized-layout
+        # checks, scoped operation headers, or distributed/regular partitioning.
+        # No rank branches on its mutable public mode or membership during
+        # capture; every rank uses the plan established by the eager handshake.
+        self.param_groups[:] = [record[0] for record in groups]
+        for group, parameters, names, mode in groups:
+            group["params"] = list(parameters)
+            if names is None:
+                group.pop("param_names", None)
+            else:
+                group["param_names"] = list(names)
+            group["sharded_mode"] = mode
+        self._param_names = dict(param_names)
+        return True
+
+    def _muon_intent_digest(self, value):
+        mask = (1 << 63) - 1
+        return tuple(
+            item & mask
+            for item in self._sha256_int64(repr(value).encode("utf-8"))
+        )
+
+    def _reduce_muon_intent_header(
+        self, intent, baseline_changed, *, preparation_failed
+    ):
+        """Exchange one fixed-size validation header on stable mesh anchors."""
+
+        import torch.distributed as dist
+
+        local = (
+            int(preparation_failed),
+            int(bool(intent["invalid_modes"])),
+            len(intent["signature"]),
+            *self._muon_intent_digest(intent["portable_structure"]),
+            *self._muon_intent_digest(intent["portable_routing"]),
+            int(baseline_changed),
+        )
+        encoded = [value for item in local for value in (item, -item)]
+        anchors = getattr(self, "_gefen_muon_collective_intent_anchors", ())
+        if not anchors:
+            anchors = intent["anchors"]
+        if not anchors:
+            return []
+        _, _, device = anchors[0]
+        probe = torch.tensor(encoded, dtype=torch.int64, device=device)
+        dist.all_reduce(probe, op=dist.ReduceOp.MAX, group=dist.group.WORLD)
+        values = probe.cpu().tolist()
+        return [
+            tuple(
+                (values[index], -values[index + 1])
+                for index in range(0, len(values), 2)
+            )
+        ]
+
     @torch._dynamo.disable
-    def _assert_sharded_grad_presence_consistent(self) -> None:
+    def _assert_sharded_mode_collective_intent_consistent(self) -> None:
+        """Agree on and freeze each DTensor parameter's collective routing.
+
+        Unscoped operations exchange one constant-size validation/count/hash
+        header on the initialized default process group. Invalid modes or
+        asymmetric membership, order, rebinding, and routing therefore fail on
+        every rank without a variable communicator schedule. The first
+        successful preflight freezes both eager identity and CUDA-capture
+        routing; later eager drift is rejected because live state has no defined
+        migration.
+        """
+
+        if not self._dist_available():
+            return
+        try:
+            intent = self._muon_collective_intent()
+            preparation_error = None
+        except Exception as exc:
+            preparation_error = exc
+            intent = {
+                "by_mesh": OrderedDict(),
+                "signature": (),
+                "portable_structure": (),
+                "portable_routing": (),
+                "invalid_modes": (),
+                "anchors": (),
+            }
+        baseline = getattr(self, "_gefen_muon_collective_intent_baseline", None)
+        anchors = getattr(self, "_gefen_muon_collective_intent_anchors", ())
+        if not anchors and not intent["anchors"]:
+            if preparation_error is not None:
+                raise RuntimeError(
+                    "GefenMuon could not prepare DTensor collective routing "
+                    "validation"
+                ) from preparation_error
+            return
+        scoped = self._gefen_codebook_process_group is not None
+        baseline_changed = baseline is not None and baseline != intent["signature"]
+
+        if not scoped:
+            headers = self._reduce_muon_intent_header(
+                intent,
+                baseline_changed,
+                preparation_failed=preparation_error is not None,
+            )
+            preparation_failed_any = any(header[0][0] != 0 for header in headers)
+            invalid_any = any(header[1][0] != 0 for header in headers)
+            structure_mismatch = any(
+                header[index][0] != header[index][1]
+                for header in headers
+                for index in range(2, 7)
+            )
+            routing_mismatch = any(
+                header[index][0] != header[index][1]
+                for header in headers
+                for index in range(7, 11)
+            )
+            baseline_changed = any(header[11][0] != 0 for header in headers)
+            if preparation_failed_any:
+                raise RuntimeError(
+                    "GefenMuon requires structurally valid and identical DTensor "
+                    "parameter groups on every rank before optimizer collectives"
+                )
+            if invalid_any:
+                raise RuntimeError(
+                    "GefenMuon requires sharded_mode to be 'approx', 'exact', "
+                    "or 'distributed' on every rank of a DTensor/FSDP mesh"
+                )
+            if structure_mismatch:
+                raise RuntimeError(
+                    "GefenMuon requires identical DTensor parameter membership, "
+                    "order, names, shapes, placements, and mesh routing on every "
+                    "rank before optimizer collectives"
+                )
+            if routing_mismatch:
+                raise RuntimeError(
+                    "GefenMuon requires identical sharded_mode collective intent "
+                    "on every rank of a DTensor/FSDP mesh before exact, "
+                    "distributed, or approximate codebook operations"
+                )
+        elif preparation_error is not None:
+            raise RuntimeError(
+                "GefenMuon requires structurally valid DTensor parameter groups"
+            ) from preparation_error
+        elif intent["invalid_modes"]:
+            # The mandatory scoped operation header has already agreed on the
+            # current fingerprint, so a unanimous invalid value can fail
+            # locally without splitting scope members.
+            raise RuntimeError(
+                "GefenMuon requires sharded_mode to be 'approx', 'exact', or "
+                "'distributed'"
+            )
+
+        if baseline_changed:
+            raise RuntimeError(
+                "GefenMuon rejects post-validation DTensor parameter-order, "
+                "rebinding, or sharded_mode transitions because live optimizer "
+                "state has no defined migration"
+            )
+
+        if baseline is None:
+            self._gefen_muon_collective_intent_baseline = intent["signature"]
+        if getattr(self, "_gefen_muon_capture_plan", None) is None:
+            self._freeze_muon_capture_plan(intent)
+
+    @torch._dynamo.disable
+    def _assert_sharded_grad_presence_consistent(
+        self, *, routing_preflight_done: bool = False
+    ) -> None:
         """Fail before collectives when mesh ranks disagree on the step inputs.
 
         Exact and distributed Muon reconstruct full DTensor gradients with
@@ -1662,30 +2156,24 @@ class GefenMuon(Gefen):
         index. Two rank-local properties therefore must agree mesh-wide before
         any of those collectives start: which parameters have gradients, and
         the order the parameters were registered in. Pack both per DeviceMesh
-        — an activity bit summed across every mesh dimension, and an insertion
+        — an activity bit summed across its one process group, and an insertion
         position reduced to its mesh-wide max and min — so every participating
         rank sees the same global result and raises on the same disagreement
         before codebook learning or optimizer state/parameter mutation begins.
 
-        Plain tensors/DDP and local-shard ``approx`` mode take no Muon gradient
-        collectives and therefore pay no preflight collective. Manual CUDA graph
-        capture also skips this host-branching check: capturable Gefen requires
-        eager warmup before capture, and those warmup steps establish that the
-        graph's fixed gradient-presence pattern is rank-consistent.
+        Plain tensors/DDP take no Muon gradient collectives. Local-shard
+        ``approx`` skips the larger activity/order probes but still joins the
+        fixed-size mode-intent handshake so asymmetric runtime mode changes fail
+        on every mesh rank before mutation. Manual CUDA graph capture first
+        restores the route frozen by eager warmup, then skips this host-branching
+        check; the graph can never partition from mutable public group modes.
         """
+        if self._restore_muon_capture_plan_if_capturing():
+            return
         if not self._dist_available():
             return
-        # Do not initialize or query CUDA for a CPU-only mesh optimizer.
-        # Spawned Gloo workers may run alongside a CUDA-heavy parent process,
-        # and an unrelated current-stream query can otherwise block before the
-        # CPU collective preflight. CUDA-backed optimizers retain the capture
-        # guard.
-        if any(
-            param.device.type == "cuda"
-            for group in self.param_groups
-            for param in group["params"]
-        ) and torch.cuda.is_current_stream_capturing():
-            return
+        if not routing_preflight_done:
+            self._assert_sharded_mode_collective_intent_consistent()
 
         import torch.distributed as dist
 
@@ -1704,23 +2192,11 @@ class GefenMuon(Gefen):
                 mesh = p.device_mesh
                 if mesh.get_coordinate() is None or mesh.size() < 2:
                     continue
-                # Two equivalent DeviceMesh objects can still refer to distinct
-                # c10d groups, and a mis-built training script can register the
-                # same parameters in a different order per rank. Key each mesh
-                # by content instead of object identity, and sort meshes and
-                # items below, so this preflight's own collectives stay matched
-                # under both — and rank-divergent registration order is then
-                # detected positionally rather than corrupting the comparison.
-                process_groups = tuple(mesh.get_all_groups())
-                key = (
-                    str(mesh.device_type),
-                    tuple(int(item) for item in mesh.shape),
-                    tuple(
-                        int(item)
-                        for item in mesh.mesh.detach().cpu().reshape(-1).tolist()
-                    ),
-                    tuple(str(pg.group_name) for pg in process_groups),
-                )
+                # Keep rank-local c10d group handles in the scheduling key, but
+                # preserve first-seen mesh order. The fixed world header has
+                # already compared topology, the stable 1-D process-group token,
+                # and parameter order. Scheduling still uses the live handle.
+                key, process_groups = self._gradient_preflight_mesh_key(mesh)
                 entry = by_mesh.get(key)
                 if entry is None:
                     entry = {
@@ -1736,8 +2212,10 @@ class GefenMuon(Gefen):
         order_mismatches = []
         duplicate_labels = []
         duplicates_anywhere = False
-        for mesh_key in sorted(by_mesh):
-            entry = by_mesh[mesh_key]
+        # The optimizer-global fixed header has already proven identical
+        # parameter membership and order. Follow first-seen parameter/mesh order
+        # here; the stable 1-D process-group token already distinguishes routes.
+        for entry in by_mesh.values():
             mesh = entry["mesh"]
             items = sorted(
                 entry["items"],
@@ -1824,10 +2302,8 @@ class GefenMuon(Gefen):
                 dtype=torch.int32,
                 device=device,
             )
-            # Reducing the same vectors once along every Cartesian mesh
-            # dimension propagates mesh-global results to every rank. This is
-            # two collectives per mesh dimension, independent of the number of
-            # optimizer parameters.
+            # The supported one-dimensional mesh needs exactly two collectives
+            # for these vectors, independent of the optimizer parameter count.
             for process_group in entry["process_groups"]:
                 if dist.get_world_size(process_group) > 1:
                     dist.all_reduce(
@@ -1837,11 +2313,11 @@ class GefenMuon(Gefen):
                         order_probe, op=dist.ReduceOp.MAX, group=process_group
                     )
 
-            # Do not raise inside this loop: with DTensors on overlapping but
-            # non-identical meshes, a rank exiting early would strand peers
-            # that only share a later mesh inside that mesh's all_reduce.
-            # Accumulate every violation and raise after all local meshes
-            # have completed their probe collectives, like the presence path.
+            # Do not raise inside this loop. The fixed world header has
+            # validated the same ordered set of supported full-world meshes on
+            # every rank, so complete every first-seen mesh's probes before
+            # reporting accumulated violations. Otherwise a peer could be left
+            # inside a later validated mesh collective.
             order_flat = order_probe.cpu().tolist()
             if order_flat[-1] > 0:
                 duplicates_anywhere = True
@@ -1927,8 +2403,8 @@ class GefenMuon(Gefen):
         # world), and the per-bucket broadcasts are a pure communication phase.
         # Eligibility (1-D mesh, world>=2) is a property of each param's mesh and
         # so is identical on every rank -> the eligible/fallback split, and thus
-        # the collective order, agrees globally. Non-eligible matrices (multi-dim
-        # HSDP x TP meshes, world==1) keep the replicated exact full-NS path.
+        # the collective order, agrees globally. Plain tensors and world-one
+        # DTensors keep the replicated exact full-NS path.
         eligible, fallback = [], []
         for (group, name, p, grad) in items:
             pg = self._distributed_process_group(p)
@@ -2209,15 +2685,6 @@ class GefenMuon(Gefen):
         update = self._compute_muon_update(group, param_name, p, grad, eff_numel)
         self._apply_muon_update(group, p, update, is_sharded, approx)
 
-    @staticmethod
-    def _state_tensor_device(p: torch.Tensor) -> torch.device:
-        if hasattr(p, "to_local"):
-            local = p.to_local()
-            if hasattr(local, "wait"):
-                local = local.wait()
-            return local.device
-        return p.device
-
     def _distributed_state_items(self, state_dict):
         saved_ids = []
         for saved_group in state_dict["param_groups"]:
@@ -2242,6 +2709,186 @@ class GefenMuon(Gefen):
                 by_pg.setdefault(pg, []).append((name, p, saved_id))
         return by_pg
 
+    def _preflight_muon_checkpoint_routing(self) -> None:
+        """Freeze or validate routing before checkpoint mode decisions."""
+
+        try:
+            capture_plan_restored = self._restore_muon_capture_plan_if_capturing()
+            capture_route_error = None
+        except Exception as exc:
+            capture_plan_restored = False
+            capture_route_error = exc
+        scoped = self._gefen_codebook_process_group is not None
+        if scoped:
+            self._synchronize_codebook_scope_failure(
+                capture_route_error, "checkpoint capture routing preflight"
+            )
+        elif capture_route_error is not None:
+            raise capture_route_error
+        if capture_plan_restored:
+            # A capture must use the immutable eager route and cannot enter the
+            # host-side intent handshake. The downstream checkpoint path keeps
+            # its existing capture restrictions.
+            return
+
+        baseline_before = getattr(
+            self, "_gefen_muon_collective_intent_baseline", None
+        )
+        capture_plan_before = getattr(self, "_gefen_muon_capture_plan", None)
+        anchors_before = getattr(
+            self, "_gefen_muon_collective_intent_anchors", ()
+        )
+        try:
+            self._assert_sharded_mode_collective_intent_consistent()
+            routing_error = None
+        except Exception as exc:
+            routing_error = exc
+        if scoped:
+            self._synchronize_codebook_scope_failure(
+                routing_error, "checkpoint routing preflight"
+            )
+        elif routing_error is not None:
+            raise routing_error
+
+        if not scoped:
+            return
+        try:
+            # Scoped mode intent is part of the fixed operation header. This
+            # second agreement catches a pristine optimizer whose first local
+            # baseline was frozen from rank-divergent public group modes.
+            self._validate_codebook_scope_operation_header("checkpoint")
+        except Exception:
+            # A failed first checkpoint must not leave different private route
+            # baselines or capture plans installed on the scope members.
+            self._gefen_muon_collective_intent_baseline = baseline_before
+            self._gefen_muon_capture_plan = capture_plan_before
+            self._gefen_muon_collective_intent_anchors = anchors_before
+            raise
+
+    def _synchronize_muon_checkpoint_failure(self, error, phase: str) -> None:
+        """Propagate a checkpoint callback/preparation error before collectives."""
+
+        if self._gefen_codebook_process_group is not None:
+            self._synchronize_codebook_scope_failure(
+                error, "checkpoint {}".format(phase)
+            )
+            return
+        anchors = getattr(self, "_gefen_muon_collective_intent_anchors", ())
+        if not anchors or not self._dist_available():
+            if error is not None:
+                raise error
+            return
+
+        # Exact/distributed DTensor state is not rank-local, so the base
+        # checkpoint failure protocol intentionally has no vote for it. Use the
+        # retained full-world anchor solely for error agreement; do not change
+        # the base intent that controls approx payload consolidation.
+        import torch.distributed as dist
+
+        failed = torch.tensor(
+            int(error is not None),
+            dtype=torch.int32,
+            device=anchors[0][2],
+        )
+        dist.all_reduce(failed, op=dist.ReduceOp.MAX, group=dist.group.WORLD)
+        if int(failed.item()) == 0:
+            return
+        if error is not None:
+            raise RuntimeError(
+                "GefenMuon unscoped DTensor checkpoint {} failed on this "
+                "rank: {}".format(phase, error)
+            ) from error
+        raise RuntimeError(
+            "GefenMuon unscoped DTensor checkpoint {} failed on another "
+            "rank".format(phase)
+        )
+
+    def _synchronize_rank_local_checkpoint_failure(self, error, phase: str) -> None:
+        # Base checkpoint phases decide whether to run their failure agreement
+        # only after a callback. Revalidate first so a state/load pre-hook that
+        # edits sharded_mode cannot make that very decision rank-divergent.
+        self._preflight_muon_checkpoint_routing()
+        self._synchronize_muon_checkpoint_failure(error, phase)
+        error = None
+        return super()._synchronize_rank_local_checkpoint_failure(error, phase)
+
+    def state_dict(self):
+        """Export only after agreeing on the live Muon collective route."""
+
+        self._preflight_muon_checkpoint_routing()
+        return super().state_dict()
+
+    def _prepare_distributed_state_dict_consolidation(self, state_dict):
+        """Build every Parallel-Muon owner payload before communication."""
+
+        import pickle
+        import torch.distributed as dist
+
+        plans = []
+        for pg, pg_items in self._distributed_state_items(state_dict).items():
+            world = dist.get_world_size(pg)
+            my_coord = dist.get_group_rank(pg, dist.get_rank())
+            global_ranks = tuple(
+                dist.get_global_rank(pg, coordinate)
+                for coordinate in range(world)
+            )
+            item_plans = []
+            for index, (name, parameter, saved_id) in enumerate(pg_items):
+                owner = _stable_distributed_owner(index, world)
+                tensor_values = []
+                payload = None
+                if my_coord == owner:
+                    metadata = []
+                    state_keys = []
+                    for key, value in state_dict["state"].get(saved_id, {}).items():
+                        key_text = str(key)
+                        state_keys.append(key_text)
+                        if torch.is_tensor(value):
+                            tensor = value.detach()
+                            if not tensor.is_contiguous():
+                                tensor = tensor.contiguous()
+                            metadata.append(
+                                (
+                                    key,
+                                    "tensor",
+                                    tuple(tensor.shape),
+                                    tensor.dtype,
+                                )
+                            )
+                            tensor_values.append(tensor)
+                        else:
+                            metadata.append((key, "object", value))
+                    marker = {
+                        "state_keys": tuple(sorted(state_keys)),
+                        "initialized": any(key != "name" for key in state_keys),
+                    }
+                    payload = (metadata, marker)
+                    # broadcast_object_list serializes this payload internally.
+                    # Exercise serialization before the failure vote so an
+                    # owner-only object error cannot strand its peers.
+                    pickle.dumps(payload)
+                item_plans.append(
+                    {
+                        "name": str(name),
+                        "parameter": parameter,
+                        "saved_id": saved_id,
+                        "owner": owner,
+                        "source": global_ranks[owner],
+                        "is_owner": my_coord == owner,
+                        "tensor_values": tuple(tensor_values),
+                        "payload": payload,
+                        "receive_device": self._state_tensor_device(parameter),
+                    }
+                )
+            plans.append(
+                {
+                    "process_group": pg,
+                    "world_size": world,
+                    "items": tuple(item_plans),
+                }
+            )
+        return tuple(plans)
+
     def _consolidate_distributed_state_dict(self, state_dict):
         # In distributed mode the persistent momentum state is updated only on the
         # stable owner rank for each matrix. Before checkpointing, broadcast each
@@ -2254,100 +2901,116 @@ class GefenMuon(Gefen):
 
         import torch.distributed as dist
 
-        by_pg = self._distributed_state_items(state_dict)
-        if not by_pg:
+        try:
+            plans = self._prepare_distributed_state_dict_consolidation(state_dict)
+            preparation_error = None
+        except Exception as exc:
+            plans = ()
+            preparation_error = exc
+        self._synchronize_muon_checkpoint_failure(
+            preparation_error, "distributed serialization preparation"
+        )
+        if not plans:
             return state_dict
 
-        marker_groups = []
-        for pg, pg_items in by_pg.items():
-            world = dist.get_world_size(pg)
-            my_coord = dist.get_group_rank(pg, dist.get_rank())
-            global_rank = [dist.get_global_rank(pg, c) for c in range(world)]
-            owner_by_saved_id = {
-                saved_id: _stable_distributed_owner(idx, world)
-                for idx, (_, _, saved_id) in enumerate(pg_items)
-            }
+        # Phase one communicates every small owner descriptor. Do not allocate
+        # or inspect descriptor-dependent tensors yet: all ranks must finish the
+        # same metadata schedule even if one later rejects an allocation/schema.
+        received_groups = []
+        for group_plan in plans:
+            pg = group_plan["process_group"]
+            received_items = []
+            for item in group_plan["items"]:
+                obj = [item["payload"]]
+                dist.broadcast_object_list(obj, src=item["source"], group=pg)
+                received_items.append((item, obj[0]))
+            received_groups.append((group_plan, tuple(received_items)))
 
-            for name, p, saved_id in pg_items:
-                owner = owner_by_saved_id[saved_id]
-                src = global_rank[owner]
-                tensor_values = []
-                if my_coord == owner:
-                    pstate = state_dict["state"].get(saved_id, {})
-                    meta = []
-                    for key, value in pstate.items():
-                        if torch.is_tensor(value):
-                            tensor = value.detach()
-                            if not tensor.is_contiguous():
-                                tensor = tensor.contiguous()
-                            meta.append(
-                                (
-                                    key,
-                                    "tensor",
-                                    tuple(tensor.shape),
-                                    tensor.dtype,
-                                )
-                            )
-                            tensor_values.append(tensor)
-                        else:
-                            meta.append((key, "object", value))
-                else:
-                    meta = None
-
-                obj = [meta]
-                dist.broadcast_object_list(obj, src=src, group=pg)
-                meta = obj[0]
-
-                owner_state = {}
-                tensor_idx = 0
-                for entry in meta:
-                    key = entry[0]
-                    kind = entry[1]
-                    if kind == "object":
-                        owner_state[key] = entry[2]
-                        continue
-
-                    _, _, shape, dtype = entry
-                    if my_coord == owner:
-                        tensor = tensor_values[tensor_idx]
-                    else:
-                        tensor = torch.empty(
-                            shape,
-                            dtype=dtype,
-                            device=self._state_tensor_device(p),
+        # Phase two validates every received descriptor and allocates every
+        # non-owner tensor before the first tensor broadcast. A deterministic
+        # allocation/device/schema failure therefore takes one coordinated vote
+        # instead of stranding an owner inside the matching broadcast.
+        try:
+            execution_groups = []
+            for group_plan, received_items in received_groups:
+                execution_items = []
+                marker_params = []
+                for item, payload in received_items:
+                    metadata, marker = payload
+                    if not isinstance(metadata, (list, tuple)):
+                        raise RuntimeError(
+                            "distributed owner metadata is not a sequence"
                         )
-                    dist.broadcast(tensor, src=src, group=pg)
-                    owner_state[key] = tensor
-                    tensor_idx += 1
+                    if not isinstance(marker, dict):
+                        raise RuntimeError(
+                            "distributed owner marker is not a mapping"
+                        )
+                    owner_state = {}
+                    tensors = []
+                    tensor_idx = 0
+                    for entry in metadata:
+                        if not isinstance(entry, (list, tuple)) or len(entry) < 2:
+                            raise RuntimeError(
+                                "distributed owner state metadata is malformed"
+                            )
+                        key, kind = entry[:2]
+                        if kind == "object" and len(entry) == 3:
+                            owner_state[key] = entry[2]
+                            continue
+                        if kind != "tensor" or len(entry) != 4:
+                            raise RuntimeError(
+                                "distributed owner state kind is unsupported"
+                            )
+                        _, _, shape, dtype = entry
+                        if item["is_owner"]:
+                            tensor = item["tensor_values"][tensor_idx]
+                        else:
+                            tensor = torch.empty(
+                                shape,
+                                dtype=dtype,
+                                device=item["receive_device"],
+                            )
+                        owner_state[key] = tensor
+                        tensors.append(tensor)
+                        tensor_idx += 1
+                    if tensor_idx != len(item["tensor_values"]) and item["is_owner"]:
+                        raise RuntimeError(
+                            "distributed owner tensor metadata count is inconsistent"
+                        )
+                    marker_param = {
+                        "saved_id": item["saved_id"],
+                        "name": item["name"],
+                        "shape": tuple(item["parameter"].shape),
+                        "owner": item["owner"],
+                        "state_keys": tuple(marker["state_keys"]),
+                        "initialized": bool(marker["initialized"]),
+                    }
+                    execution_items.append((item, owner_state, tuple(tensors)))
+                    marker_params.append(marker_param)
+                execution_groups.append(
+                    (group_plan, tuple(execution_items), tuple(marker_params))
+                )
+            receive_error = None
+        except Exception as exc:
+            execution_groups = []
+            receive_error = exc
+        self._synchronize_muon_checkpoint_failure(
+            receive_error, "distributed receive preparation"
+        )
 
-                state_dict["state"][saved_id] = owner_state
-
+        # Phase three contains only the preplanned tensor broadcasts followed
+        # by non-throwing publication into the already-validated dictionaries.
+        marker_groups = []
+        for group_plan, execution_items, marker_params in execution_groups:
+            pg = group_plan["process_group"]
+            for item, owner_state, tensors in execution_items:
+                for tensor in tensors:
+                    dist.broadcast(tensor, src=item["source"], group=pg)
+                state_dict["state"][item["saved_id"]] = owner_state
             marker_groups.append(
                 {
-                    "world_size": world,
-                    "params": [
-                        {
-                            "saved_id": saved_id,
-                            "name": str(name),
-                            "shape": tuple(p.shape),
-                            "owner": owner_by_saved_id[saved_id],
-                            "state_keys": tuple(
-                                sorted(
-                                    str(key)
-                                    for key in state_dict["state"]
-                                    .get(saved_id, {})
-                                    .keys()
-                                )
-                            ),
-                            "initialized": any(
-                                str(key) != "name"
-                                for key in state_dict["state"]
-                                .get(saved_id, {})
-                                .keys()
-                            ),
-                        }
-                        for name, p, saved_id in pg_items
-                    ],
+                    "world_size": group_plan["world_size"],
+                    "params": list(marker_params),
                 }
             )
 
@@ -2385,24 +3048,37 @@ class GefenMuon(Gefen):
                 pstate.clear()
                 pstate["name"] = str(name).lower()
 
-    def _state_dict_impl(self):
+    def _state_dict_impl(self, *, consolidate_rank_local: bool = True):
         # Parallel-Muon owner state must be made complete before Gefen's
         # rank-local DTensor adapter serializes the per-rank payload. This
         # ordering matters for mixed optimizers carrying both ``approx`` and
         # ``distributed`` groups: wrapping first replaces every real state entry
         # with opaque transport tensors, which are not owner momentum.
-        state_dict = super()._state_dict_impl(consolidate_rank_local=False)
+        self._preflight_muon_checkpoint_routing()
+        try:
+            state_dict = super()._state_dict_impl(consolidate_rank_local=False)
+            serialization_error = None
+        except Exception as exc:
+            state_dict = None
+            serialization_error = exc
+        self._synchronize_muon_checkpoint_failure(
+            serialization_error, "local serialization preparation"
+        )
         state_dict = self._consolidate_distributed_state_dict(state_dict)
 
         checkpoint_metadata = None
         groups = state_dict.get("param_groups", ())
         if groups:
             checkpoint_metadata = groups[0].get("_gefen_checkpoint_metadata")
-        if self._uses_rank_local_sharded_state():
+        if consolidate_rank_local and self._uses_rank_local_sharded_state():
+            metadata_error = None
             if not isinstance(checkpoint_metadata, dict):
-                raise RuntimeError(
+                metadata_error = RuntimeError(
                     "GefenMuon rank-local checkpoint metadata was not initialized"
                 )
+            self._synchronize_muon_checkpoint_failure(
+                metadata_error, "rank-local serialization preparation"
+            )
             self._consolidate_rank_local_sharded_state(
                 state_dict, checkpoint_metadata
             )
@@ -2836,7 +3512,7 @@ class GefenMuon(Gefen):
 
         # A sharded_mode='distributed' optimizer group may contain a mixture of
         # Parallel-Muon-eligible parameters and replicated fallbacks (plain
-        # tensors, multi-dimensional meshes, or world-one meshes). Save-side
+        # tensors or world-one meshes). Save-side
         # consolidation creates one owner manifest per eligible process group
         # and deliberately leaves fallback state to the ordinary Gefen loader.
         # Bind the proof to those same ordered process-group partitions instead
@@ -3046,7 +3722,17 @@ class GefenMuon(Gefen):
                     )
         self._validate_distributed_codebook(state_dict, required=initialized_any)
 
+    def _prepare_load_state_dict(self, state_dict):
+        """Stage a load only after agreeing on the live Muon route."""
+
+        self._preflight_muon_checkpoint_routing()
+        return super()._prepare_load_state_dict(state_dict)
+
     def _load_state_dict_impl(self, state_dict):
+        self._preflight_muon_checkpoint_routing()
+        routing_baseline_before = getattr(
+            self, "_gefen_muon_collective_intent_baseline", None
+        )
         state_dict = dict(state_dict)
         state_dict = self._pack_legacy_param_groups_for_load(state_dict)
         marker = self._distributed_checkpoint_marker(state_dict)
@@ -3073,8 +3759,35 @@ class GefenMuon(Gefen):
                 "batched_ns_workspace_bytes",
                 BATCHED_NS_DEFAULT_WORKSPACE_BYTES,
             )
+            if not self._muon_mode_token(group.get("sharded_mode"))[1]:
+                raise ValueError(
+                    "GefenMuon checkpoint sharded_mode must be 'approx', "
+                    "'exact', or 'distributed'"
+                )
         self._drop_non_owned_distributed_state()
         self._install_rank_local_checkpoint_schema()
+        # Optimizer.load_state_dict may replace param-group dictionaries. This
+        # method runs on the isolated staged optimizer, so discard capture plans
+        # that still reference pre-load group objects only after the complete
+        # load path above succeeded. After publication, the public load post-hook
+        # phase performs one eager routing preflight and freezes a fresh plan
+        # against the loaded group objects. The staged native-state validator
+        # runs next; publication remains atomic if the loaded route is invalid.
+        loaded_intent = self._muon_collective_intent()
+        if (
+            routing_baseline_before is not None
+            and routing_baseline_before != loaded_intent["signature"]
+        ):
+            raise RuntimeError(
+                "GefenMuon rejects post-validation DTensor parameter-order, "
+                "rebinding, or sharded_mode transitions because live optimizer "
+                "state has no defined migration"
+            )
+        self._gefen_muon_collective_intent_baseline = (
+            loaded_intent["signature"] if loaded_intent["anchors"] else None
+        )
+        self._gefen_muon_capture_plan = None
+        self._gefen_muon_collective_intent_anchors = loaded_intent["anchors"]
 
     @torch.no_grad()
     def step(self, closure=None):
@@ -3082,7 +3795,35 @@ class GefenMuon(Gefen):
         hybrid_preflight_complete = bool(
             getattr(self, "_gefen_hybrid_precollective_preflight", False)
         )
-        if hybrid_preflight_complete or scope_binding is None:
+        process_groups = (
+            self._step_failure_process_groups()
+            if scope_binding is None and not hybrid_preflight_complete
+            else ()
+        )
+        try:
+            capture_plan_restored = self._restore_muon_capture_plan_if_capturing()
+            capture_route_error = None
+        except Exception as exc:
+            capture_plan_restored = False
+            capture_route_error = exc
+        if scope_binding is not None:
+            self._synchronize_prevalidated_codebook_scope_failure(
+                capture_route_error, "capture routing preflight", scope_binding
+            )
+        elif capture_route_error is not None:
+            raise capture_route_error
+
+        initial_routing_preflight_done = (
+            scope_binding is None and not capture_plan_restored
+        )
+        if initial_routing_preflight_done:
+            # Run before finalized-layout forensics so a direct asymmetric
+            # membership/rebinding edit is rejected by every mesh member, not
+            # just by the rank whose local layout cache notices it first.
+            self._assert_sharded_mode_collective_intent_consistent()
+
+        loss = None
+        try:
             self._assert_finalized_binding_layout()
             self._assert_runtime_codebook_process_group()
             if self._has_unscoped_whole_owner_bindings():
@@ -3090,90 +3831,83 @@ class GefenMuon(Gefen):
                     "GefenMuon whole-parameter owner stepping requires the separate "
                     "explicit process-group codebook scope"
                 )
-        loss = None
-        if not hybrid_preflight_complete and scope_binding is not None:
-            # The explicit convention binding is the exclusive control scope:
-            # synchronize on it before any operation header or mesh collective,
-            # never in addition to the mainline DTensor-derived scope.
-            try:
-                self._assert_finalized_binding_layout()
-                self._assert_runtime_codebook_process_group()
-                if self._has_unscoped_whole_owner_bindings():
-                    raise RuntimeError(
-                        "GefenMuon whole-parameter owner stepping requires the separate "
-                        "explicit process-group codebook scope"
-                    )
-                self._assert_capturable_if_capturing()
-                self._assert_codebook_capture_ready()
-                if closure is not None:
-                    with torch.enable_grad():
-                        loss = closure()
-                local_preamble_error = None
-            except Exception as exc:
-                loss = None
-                local_preamble_error = exc
+            self._assert_capturable_if_capturing()
+            self._assert_codebook_capture_ready()
+            if closure is not None:
+                with torch.enable_grad():
+                    loss = closure()
+            local_preamble_error = None
+        except Exception as exc:
+            loss = None
+            local_preamble_error = exc
+        if scope_binding is not None:
             self._synchronize_prevalidated_codebook_scope_failure(
                 local_preamble_error, "step preamble", scope_binding
             )
+        elif process_groups:
+            self._synchronize_sharded_step_error(
+                local_preamble_error, "step preflight", process_groups
+            )
+        elif local_preamble_error is not None:
+            raise local_preamble_error
 
-            # The closure can replace a finalized parameter or otherwise
-            # invalidate the runtime binding. It can also rebind (or clear) the
-            # runtime process-group between capture and the operation header; a
-            # rank that silently swapped to None or a different binding would
-            # enter a different header collective than its peers and deadlock.
-            # Recheck against the captured binding and synchronize structural
-            # failures before any peer enters a scoped codebook collective.
-            try:
-                if self._gefen_codebook_process_group is not scope_binding:
-                    raise RuntimeError(
-                        "GefenMuon codebook process-group binding changed during the step preamble"
-                    )
-                self._assert_finalized_binding_layout()
-                self._assert_runtime_codebook_process_group()
-                _assert_optimizer_gradients_structurally_valid(
-                    self, require_2d_params=True
+        routing_preflight_done = (
+            initial_routing_preflight_done and closure is None
+        )
+        try:
+            if self._gefen_codebook_process_group is not scope_binding:
+                raise RuntimeError(
+                    "GefenMuon codebook process-group binding changed during the step preamble"
                 )
-                local_preflight_error = None
-            except Exception as exc:
-                local_preflight_error = exc
+            self._assert_finalized_binding_layout()
+            self._assert_runtime_codebook_process_group()
+            if (
+                scope_binding is None
+                and not routing_preflight_done
+                and not capture_plan_restored
+            ):
+                self._assert_sharded_mode_collective_intent_consistent()
+                routing_preflight_done = True
+            _assert_optimizer_gradients_structurally_valid(
+                self, require_2d_params=True
+            )
+            local_preflight_error = None
+        except Exception as exc:
+            local_preflight_error = exc
+        if scope_binding is not None:
             self._synchronize_prevalidated_codebook_scope_failure(
                 local_preflight_error, "gradient preflight", scope_binding
             )
-            self._validate_codebook_scope_operation_header("step")
-            self._ensure_codebook_scope_agreement()
-
-            if not self._prepare_scoped_amp_optimizer_step():
-                return loss
-        elif not hybrid_preflight_complete:
-            process_groups = self._step_failure_process_groups()
-            try:
-                self._assert_capturable_if_capturing()
-                self._assert_codebook_capture_ready()
-                if closure is not None:
-                    with torch.enable_grad():
-                        loss = closure()
-                # A closure can rebind param_groups (e.g. swap in a rogue
-                # parameter), so re-assert the finalized binding layout after it
-                # runs -- before any state mutation -- matching the scoped path
-                # and the pre-Tier-2 step. The raise is caught below and
-                # synchronized so every mesh member fails together.
-                self._assert_finalized_binding_layout()
-                _assert_optimizer_gradients_structurally_valid(
-                    self, require_2d_params=True
-                )
-                local_preflight_error = None
-            except Exception as exc:
-                loss = None
-                local_preflight_error = exc
+        elif process_groups:
             self._synchronize_sharded_step_error(
                 local_preflight_error, "step preflight", process_groups
             )
+        elif local_preflight_error is not None:
+            raise local_preflight_error
+        self._validate_codebook_scope_operation_header("step")
+        self._ensure_codebook_scope_agreement()
 
-            # Every mesh member enters the AMP control agreement, including a
-            # member with no local GradScaler attributes. This prevents the
-            # protocol-presence decision itself from becoming rank-divergent.
-            if not self._prepare_synchronized_amp_step(self, process_groups):
-                return loss
+        # Native GradScaler calls AMP-aware optimizers even when its non-finite
+        # scan found an overflow. Skip before the sharded preflight, first-step
+        # codebook learning, or any optimizer/parameter mutation; finite scaled
+        # gradients are unscaled once here for every existing Muon path.
+        if scope_binding is not None:
+            should_step = self._prepare_scoped_amp_optimizer_step()
+        elif hybrid_preflight_complete:
+            should_step = True
+        else:
+            should_step = self._prepare_synchronized_amp_step(
+                self, process_groups
+            )
+        if not should_step:
+            return loss
+
+        # Validate/freeze sharded routing before any rank-local mode branch. In
+        # manual CUDA capture the early capture-plan restore has already forced
+        # the coordinated route, so this helper performs no host collective.
+        self._assert_sharded_grad_presence_consistent(
+            routing_preflight_done=routing_preflight_done
+        )
 
         # Partition the work once so distributed-mode sharded params can take the
         # stable-owner Parallel-Muon path while every other param keeps the normal
@@ -3199,14 +3933,6 @@ class GefenMuon(Gefen):
                     distributed_items.append((group, name, p, grad))
                 elif grad is not None:
                     regular_items.append((group, name, p, grad))
-
-        # This must precede _maybe_refresh_gefen_codebook(): the first-step
-        # Muon codebook iterator itself calls full_tensor() in exact/distributed
-        # modes, before either update dispatcher gets a chance to validate the
-        # active set. The preflight is mutation-free and gives every mesh rank
-        # the same clear error instead of leaving active ranks in an unmatched
-        # collective.
-        self._assert_sharded_grad_presence_consistent()
 
         self._maybe_refresh_gefen_codebook()
         self._maybe_save_gefen_grad_histogram()

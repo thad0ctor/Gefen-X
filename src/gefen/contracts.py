@@ -22,6 +22,7 @@ from typing import (
 
 CONTRACT_SCHEMA_VERSION = 1
 IDENTITY_SCHEMA_VERSION = 1
+CHECKPOINT_STATE_TRANSITION_SCHEMA_VERSION = 1
 
 
 class StateScope(str, Enum):
@@ -103,6 +104,28 @@ class CheckpointTransport(str, Enum):
     COMPOSITE_NATIVE = "composite_native"
     CANONICAL_LOCAL = "canonical_local"
     CANONICAL_GLOBAL = "canonical_global"
+
+
+class CheckpointStateRepresentation(str, Enum):
+    """Persistent optimizer-state representation at one checkpoint endpoint."""
+
+    BLOCK_SECOND_MOMENT = "block_second_moment"
+    FACTORED_SECOND_MOMENT = "factored_second_moment"
+
+
+class CheckpointStateTransitionKind(str, Enum):
+    """Numerical relationship between source and target checkpoint state."""
+
+    EXACT = "exact"
+    DEFINED_PROJECTION = "defined_projection"
+
+
+class CheckpointProjectionQualifier(str, Enum):
+    """Versioned numerical rule for a defined checkpoint projection."""
+
+    FACTORED_TO_BLOCK_LIVE_FP32_TARGET_PERIOD_ONE_V1 = (
+        "defined_projection_factored_to_block_live_fp32_target_period_one_v1"
+    )
 
 
 class TopologyChange(str, Enum):
@@ -798,8 +821,6 @@ class StateField:
             raise TypeError("StateField.geometry must be a StateGeometry")
         if not isinstance(self.key_match, StateKeyMatch):
             raise TypeError("StateField.key_match must be a StateKeyMatch")
-        if type(self.checkpointed) is not bool:
-            raise TypeError("StateField.checkpointed must be a bool")
         if type(self.optional) is not bool:
             raise TypeError("StateField.optional must be a bool")
 
@@ -855,9 +876,6 @@ class StateVariant:
             raise TypeError("StateVariant.extent must be a StateExtent")
         if not isinstance(self.role, ParameterStateRole):
             raise TypeError("StateVariant.role must be a ParameterStateRole")
-        for name in ("initialized", "migration_only"):
-            if type(getattr(self, name)) is not bool:
-                raise TypeError("StateVariant.{} must be a bool".format(name))
         if not set(self.inactive_fields).issubset(self.fields):
             raise ValueError("StateVariant.inactive_fields must be present in fields")
         if self.parameter_ranks is not None and set(self.parameter_ranks) & set(
@@ -955,8 +973,116 @@ class TrainingSupport:
 
 
 @dataclass(frozen=True)
+class CheckpointStateTransition:
+    """One directional, representation-qualified restore path.
+
+    Exact transitions refine the legacy layout sets on ``CheckpointSupport``. Defined projections are additive qualified paths and therefore do not broaden those legacy exact-restore sets.
+    """
+
+    source: CheckpointStateRepresentation
+    target: CheckpointStateRepresentation
+    kind: CheckpointStateTransitionKind
+    same_topology: AbstractSet[ParameterLayout]
+    topology_changing: AbstractSet[ParameterLayout]
+    topology_change_kinds: AbstractSet[TopologyChange] = frozenset()
+    qualifier: Optional[CheckpointProjectionQualifier] = None
+    schema_version: int = CHECKPOINT_STATE_TRANSITION_SCHEMA_VERSION
+
+    @property
+    def target_layouts(self) -> FrozenSet[ParameterLayout]:
+        """Return every target layout covered by this directional path."""
+
+        return self.same_topology | self.topology_changing
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "same_topology", _frozenset(self.same_topology))
+        object.__setattr__(
+            self, "topology_changing", _frozenset(self.topology_changing)
+        )
+        object.__setattr__(
+            self,
+            "topology_change_kinds",
+            _frozenset(self.topology_change_kinds),
+        )
+        if not isinstance(self.source, CheckpointStateRepresentation):
+            raise TypeError(
+                "CheckpointStateTransition.source must be a CheckpointStateRepresentation"
+            )
+        if not isinstance(self.target, CheckpointStateRepresentation):
+            raise TypeError(
+                "CheckpointStateTransition.target must be a CheckpointStateRepresentation"
+            )
+        if not isinstance(self.kind, CheckpointStateTransitionKind):
+            raise TypeError(
+                "CheckpointStateTransition.kind must be a CheckpointStateTransitionKind"
+            )
+        if any(
+            not isinstance(layout, ParameterLayout)
+            for layout in self.same_topology | self.topology_changing
+        ):
+            raise TypeError(
+                "CheckpointStateTransition layouts must be ParameterLayout values"
+            )
+        if any(
+            not isinstance(change, TopologyChange)
+            for change in self.topology_change_kinds
+        ):
+            raise TypeError(
+                "CheckpointStateTransition.topology_change_kinds must contain TopologyChange values"
+            )
+        if not self.same_topology and not self.topology_changing:
+            raise ValueError(
+                "CheckpointStateTransition must declare at least one target layout"
+            )
+        if bool(self.topology_changing) != bool(self.topology_change_kinds):
+            raise ValueError(
+                "transition topology-changing layouts and change kinds must be declared together"
+            )
+        if (
+            type(self.schema_version) is not int
+            or self.schema_version != CHECKPOINT_STATE_TRANSITION_SCHEMA_VERSION
+        ):
+            raise ValueError("unsupported checkpoint state-transition schema version")
+        if self.kind is CheckpointStateTransitionKind.EXACT:
+            if self.source is not self.target:
+                raise ValueError(
+                    "exact checkpoint state transitions require identical representations"
+                )
+            if self.qualifier is not None:
+                raise ValueError(
+                    "exact checkpoint state transitions must not carry a projection qualifier"
+                )
+        else:
+            if self.source is self.target:
+                raise ValueError(
+                    "defined checkpoint projections require distinct representations"
+                )
+            if not isinstance(self.qualifier, CheckpointProjectionQualifier):
+                raise TypeError(
+                    "defined checkpoint projections require a CheckpointProjectionQualifier"
+                )
+        if (
+            self.qualifier
+            is CheckpointProjectionQualifier.FACTORED_TO_BLOCK_LIVE_FP32_TARGET_PERIOD_ONE_V1
+            and (
+                self.source
+                is not CheckpointStateRepresentation.FACTORED_SECOND_MOMENT
+                or self.target
+                is not CheckpointStateRepresentation.BLOCK_SECOND_MOMENT
+                or self.kind
+                is not CheckpointStateTransitionKind.DEFINED_PROJECTION
+            )
+        ):
+            raise ValueError(
+                "factored-to-block live-fp32 projection qualifier requires its declared direction and kind"
+            )
+
+
+@dataclass(frozen=True)
 class CheckpointSupport:
     """One transport's separately qualified checkpoint capability.
+
+    The legacy layout sets describe exact same-representation restores. ``state_transitions`` refines those exact claims and adds separately qualified projection paths without broadening the legacy sets.
 
     ``atomic_load`` means each participating optimizer instance validates and
     prepares its core restore before local mutation. It does not claim a
@@ -973,6 +1099,7 @@ class CheckpointSupport:
     required_sharded_modes: AbstractSet[str] = frozenset()
     requires_collective: bool = False
     atomic_load: bool = False
+    state_transitions: Sequence[CheckpointStateTransition] = ()
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "same_topology", _frozenset(self.same_topology))
@@ -987,6 +1114,7 @@ class CheckpointSupport:
             "required_sharded_modes",
             _frozenset(self.required_sharded_modes),
         )
+        object.__setattr__(self, "state_transitions", _tuple(self.state_transitions))
         if self.mesh_dimensions is not None:
             object.__setattr__(self, "mesh_dimensions", _tuple(self.mesh_dimensions))
             _validate_dimensions("mesh_dimensions", self.mesh_dimensions, positive=True)
@@ -996,13 +1124,58 @@ class CheckpointSupport:
             raise TypeError(
                 "CheckpointSupport.process_group_scope must be a ProcessGroupScope"
             )
-        for name in ("requires_collective", "atomic_load"):
-            if type(getattr(self, name)) is not bool:
-                raise TypeError("CheckpointSupport.{} must be a bool".format(name))
         if bool(self.topology_changing) != bool(self.topology_change_kinds):
             raise ValueError(
                 "topology-changing layouts and change kinds must be declared together"
             )
+        if any(
+            not isinstance(transition, CheckpointStateTransition)
+            for transition in self.state_transitions
+        ):
+            raise TypeError(
+                "CheckpointSupport.state_transitions must contain CheckpointStateTransition values"
+            )
+        transition_keys = tuple(
+            (
+                transition.source,
+                transition.target,
+                transition.kind,
+                transition.qualifier,
+                transition.schema_version,
+            )
+            for transition in self.state_transitions
+        )
+        if len(set(transition_keys)) != len(transition_keys):
+            raise ValueError(
+                "CheckpointSupport state-transition declarations must be unique"
+            )
+        exact = tuple(
+            transition
+            for transition in self.state_transitions
+            if transition.kind is CheckpointStateTransitionKind.EXACT
+        )
+        if exact:
+            exact_same = frozenset(
+                layout for transition in exact for layout in transition.same_topology
+            )
+            exact_changing = frozenset(
+                layout
+                for transition in exact
+                for layout in transition.topology_changing
+            )
+            exact_change_kinds = frozenset(
+                change
+                for transition in exact
+                for change in transition.topology_change_kinds
+            )
+            if (
+                exact_same != self.same_topology
+                or exact_changing != self.topology_changing
+                or exact_change_kinds != self.topology_change_kinds
+            ):
+                raise ValueError(
+                    "exact state transitions must cover the CheckpointSupport layout and topology-change declarations"
+                )
 
 
 @dataclass(frozen=True)
@@ -1102,10 +1275,7 @@ class OptimizerContract:
         object.__setattr__(self, "children", _tuple(self.children))
         if not self.implementation:
             raise ValueError("OptimizerContract.implementation must be non-empty")
-        if (
-            type(self.schema_version) is not int
-            or self.schema_version != CONTRACT_SCHEMA_VERSION
-        ):
+        if self.schema_version != CONTRACT_SCHEMA_VERSION:
             raise ValueError(
                 "unsupported optimizer contract schema version: {}".format(
                     self.schema_version
@@ -1159,6 +1329,29 @@ class PortableStateProvider(Protocol):
         limits,
     ) -> None:
         """Collectively stage and atomically publish portable global state."""
+
+
+@runtime_checkable
+class StateMovementProvider(Protocol):
+    """Structural protocol for quiescent atomic optimizer-state movement."""
+
+    def move_state_(self, device=None) -> None:
+        """Co-locate authoritative state with the optimizer's live parameters."""
+
+
+@runtime_checkable
+class StateOffloadProvider(Protocol):
+    """Structural protocol for persistent live optimizer-state offload."""
+
+    @property
+    def state_offload_device(self):
+        """Return the active offload device, or ``None`` while resident."""
+
+    def offload_state_(self, device="cpu") -> None:
+        """Atomically park supported state and enable transparent step paging."""
+
+    def restore_state_(self) -> None:
+        """Atomically co-locate state with parameters and disable offload."""
 
 
 _ALL_PRECISIONS = frozenset(
@@ -1324,6 +1517,8 @@ def _negative_capabilities(
     shard_rebinding: bool = False,
     post_sharding: bool = False,
     canonical_state_io: bool = False,
+    atomic_state_movement: bool = False,
+    state_offload: bool = False,
 ) -> OptimizerCapabilities:
     return OptimizerCapabilities(
         training=training,
@@ -1337,8 +1532,8 @@ def _negative_capabilities(
         shard_rebinding=shard_rebinding,
         post_sharding=post_sharding,
         canonical_state_io=canonical_state_io,
-        atomic_state_movement=False,
-        state_offload=False,
+        atomic_state_movement=atomic_state_movement,
+        state_offload=state_offload,
     )
 
 
@@ -1353,6 +1548,9 @@ def _gefen_contract(
     canonical_global_same_topology: AbstractSet[ParameterLayout] = frozenset(),
     canonical_global_topology_changing: AbstractSet[ParameterLayout] = frozenset(),
     canonical_global_topology_change_kinds: AbstractSet[TopologyChange] = frozenset(),
+    canonical_global_state_transitions: Sequence[CheckpointStateTransition] = (),
+    atomic_state_movement: bool = False,
+    state_offload: bool = False,
 ) -> OptimizerContract:
     canonical_state_layouts = _frozenset(canonical_state_layouts)
     canonical_global_same_topology = _frozenset(canonical_global_same_topology)
@@ -1360,6 +1558,7 @@ def _gefen_contract(
     canonical_global_topology_change_kinds = _frozenset(
         canonical_global_topology_change_kinds
     )
+    canonical_global_state_transitions = _tuple(canonical_global_state_transitions)
     block_fields = (
         StateField("vmean", StateScope.PARAMETER, StateGeometry.BLOCK, True),
         StateField("vmean_step", StateScope.PARAMETER, StateGeometry.SCALAR, True),
@@ -1551,6 +1750,7 @@ def _gefen_contract(
                 topology_change_kinds=canonical_global_topology_change_kinds,
                 requires_collective=True,
                 atomic_load=True,
+                state_transitions=canonical_global_state_transitions,
             )
         )
     return OptimizerContract(
@@ -1570,6 +1770,8 @@ def _gefen_contract(
                 or canonical_global_same_topology
                 or canonical_global_topology_changing
             ),
+            atomic_state_movement=atomic_state_movement,
+            state_offload=state_offload,
         ),
     )
 
@@ -1603,10 +1805,12 @@ def _gefen_muon_contract(
     stable_shard_identity: bool = False,
     explicit_process_group_codebook_scope: bool = False,
     whole_parameter_owner: bool = False,
+    native_dtensor_world_size_redistribution: bool = True,
     canonical_state_layouts: AbstractSet[ParameterLayout] = frozenset(),
     canonical_global_same_topology: AbstractSet[ParameterLayout] = frozenset(),
     canonical_global_topology_changing: AbstractSet[ParameterLayout] = frozenset(),
     canonical_global_topology_change_kinds: AbstractSet[TopologyChange] = frozenset(),
+    atomic_state_movement: bool = False,
 ) -> OptimizerContract:
     canonical_state_layouts = _frozenset(canonical_state_layouts)
     canonical_global_same_topology = _frozenset(canonical_global_same_topology)
@@ -1875,14 +2079,21 @@ def _gefen_muon_contract(
             )
         )
     if sharded_modes == frozenset({"distributed"}):
+        native_dtensor_topology_changing = (
+            frozenset({_DTENSOR_LAYOUT})
+            if native_dtensor_world_size_redistribution
+            else frozenset()
+        )
         checkpoints.append(
             CheckpointSupport(
                 CheckpointTransport.NATIVE_OPTIMIZER,
                 frozenset({_DTENSOR_LAYOUT}),
-                frozenset({_DTENSOR_LAYOUT}),
+                native_dtensor_topology_changing,
                 ProcessGroupScope.INFERRED_DEVICE_MESH,
-                topology_change_kinds=frozenset(
-                    {TopologyChange.WORLD_SIZE_OWNER_REDISTRIBUTION}
+                topology_change_kinds=(
+                    frozenset({TopologyChange.WORLD_SIZE_OWNER_REDISTRIBUTION})
+                    if native_dtensor_topology_changing
+                    else frozenset()
                 ),
                 mesh_dimensions=(1,),
                 required_sharded_modes=frozenset({"distributed"}),
@@ -1931,6 +2142,7 @@ def _gefen_muon_contract(
                 or canonical_global_same_topology
                 or canonical_global_topology_changing
             ),
+            atomic_state_movement=atomic_state_movement,
         ),
     )
 
@@ -1939,6 +2151,7 @@ def _hybrid_training(
     muon: Optional[OptimizerContract],
     backup: Optional[OptimizerContract],
     backup_present: bool,
+    adamw_backup: bool,
 ) -> Tuple[TrainingSupport, ...]:
     """Compose hybrid training claims from the routed children's own claims.
 
@@ -1946,9 +2159,8 @@ def _hybrid_training(
     declares the ordered union of the present children's validated claims; an
     adapter must read each role's child contract together with the frozen
     parameter routing rather than apply one entry to every parameter. A backup
-    child without a contract of its own (AdamW) contributes only the plain
-    replicated layout the composite actually exercises for it, because no code
-    validates any other layout for that child.
+    child without a contract of its own (AdamW) contributes only the layouts
+    that the Hybrid's exact-type adapter validates directly.
     """
 
     child_claims = []
@@ -1957,9 +2169,30 @@ def _hybrid_training(
     if backup is not None:
         child_claims.append(backup.capabilities.training)
     elif backup_present:
-        child_claims.append(
-            (TrainingSupport(ParameterLayout.REPLICATED, ProcessGroupScope.NONE),)
-        )
+        backup_claims = [
+            TrainingSupport(ParameterLayout.REPLICATED, ProcessGroupScope.NONE)
+        ]
+        if adamw_backup:
+            backup_claims.extend(
+                (
+                    TrainingSupport(
+                        ParameterLayout.FLATTENED_ELEMENT_SHARD,
+                        ProcessGroupScope.NONE,
+                    ),
+                    TrainingSupport(
+                        ParameterLayout.WHOLE_PARAMETER_OWNER,
+                        ProcessGroupScope.ADAPTER_DEFINED,
+                        requires_complete_parameter_storage=True,
+                        requires_post_step_parameter_sync=True,
+                    ),
+                    TrainingSupport(
+                        _DTENSOR_LAYOUT,
+                        ProcessGroupScope.INFERRED_DEVICE_MESH,
+                        mesh_dimensions=(1,),
+                    ),
+                )
+            )
+        child_claims.append(tuple(backup_claims))
     training = []
     for claims in child_claims:
         for support in claims:
@@ -1973,6 +2206,8 @@ def _hybrid_contract(
     muon: Optional[OptimizerContract],
     backup: Optional[OptimizerContract],
     backup_implementation: str,
+    adamw_backup: bool = False,
+    native_finalized_layouts: AbstractSet[ParameterLayout] = frozenset(),
     canonical_parameter_fqns: bool = False,
     stable_shard_identity: bool = False,
     explicit_process_group_codebook_scope: bool = False,
@@ -1989,13 +2224,36 @@ def _hybrid_contract(
             StateGeometry.OPAQUE,
             True,
         ),
+        StateField(
+            "finalized_binding",
+            StateScope.OPTIMIZER_COMMON,
+            StateGeometry.OPAQUE,
+            True,
+            optional=True,
+            description="Versioned exact shard-binding, routing, and child-slot guard for finalized native checkpoints.",
+        ),
     )
     children = []
     if muon is not None:
         children.append(OptimizerChildContract("muon", muon.implementation, muon))
     if backup_implementation:
         children.append(OptimizerChildContract("backup", backup_implementation, backup))
-    training = _hybrid_training(muon, backup, bool(backup_implementation))
+    training = _hybrid_training(
+        muon,
+        backup,
+        bool(backup_implementation),
+        adamw_backup,
+    )
+    native_finalized_layouts = _frozenset(native_finalized_layouts)
+    native_local_layouts = frozenset({ParameterLayout.REPLICATED}) | (
+        native_finalized_layouts
+        & frozenset(
+            {
+                ParameterLayout.FLATTENED_ELEMENT_SHARD,
+                ParameterLayout.WHOLE_PARAMETER_OWNER,
+            }
+        )
+    )
     canonical_global_same_topology = _frozenset(canonical_global_same_topology)
     canonical_global_topology_changing = _frozenset(canonical_global_topology_changing)
     canonical_global_topology_change_kinds = _frozenset(
@@ -2004,11 +2262,24 @@ def _hybrid_contract(
     checkpoints = [
         CheckpointSupport(
             CheckpointTransport.COMPOSITE_NATIVE,
-            frozenset({ParameterLayout.REPLICATED}),
+            native_local_layouts,
             frozenset(),
             ProcessGroupScope.NONE,
+            atomic_load=True,
         ),
     ]
+    if _DTENSOR_LAYOUT in native_finalized_layouts:
+        checkpoints.append(
+            CheckpointSupport(
+                CheckpointTransport.COMPOSITE_NATIVE,
+                frozenset({_DTENSOR_LAYOUT}),
+                frozenset(),
+                ProcessGroupScope.DEFAULT_WORLD,
+                mesh_dimensions=(1,),
+                requires_collective=True,
+                atomic_load=True,
+            )
+        )
     if canonical_global_same_topology or canonical_global_topology_changing:
         checkpoints.append(
             CheckpointSupport(
@@ -2046,8 +2317,13 @@ def _hybrid_contract(
 
 
 __all__ = [
+    "CHECKPOINT_STATE_TRANSITION_SCHEMA_VERSION",
     "CONTRACT_SCHEMA_VERSION",
     "IDENTITY_SCHEMA_VERSION",
+    "CheckpointProjectionQualifier",
+    "CheckpointStateRepresentation",
+    "CheckpointStateTransition",
+    "CheckpointStateTransitionKind",
     "CheckpointSupport",
     "CheckpointTransport",
     "CanonicalStateProvider",
@@ -2073,6 +2349,8 @@ __all__ = [
     "StateField",
     "StateGeometry",
     "StateKeyMatch",
+    "StateMovementProvider",
+    "StateOffloadProvider",
     "StateScope",
     "StateVariant",
     "TrainingSupport",

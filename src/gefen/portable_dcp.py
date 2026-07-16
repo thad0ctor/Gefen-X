@@ -14,7 +14,6 @@ from gefen.portable_wire import (
     _CanonicalWireLimits,
     _CanonicalWirePlan,
     _parse_canonical_wire_metadata,
-    _prepare_canonical_wire_value,
     _reconstruct_canonical_wire_value,
 )
 
@@ -25,6 +24,12 @@ _DCP_PAYLOAD_SUFFIX = "__"
 _DCP_PAYLOAD_DIGITS = 16
 _DCP_SAVE_PREFLIGHT_TRANSACTION = "gefen-portable-dcp-save-preflight-v1"
 _DCP_LOAD_PREFLIGHT_TRANSACTION = "gefen-portable-dcp-load-preflight-v1"
+
+
+def _prepare_canonical_wire_value(value, limits):
+    from gefen.portable_wire import _prepare_canonical_wire_value as prepare
+
+    return prepare(value, limits)
 
 
 def _require_namespace(namespace, limits: PortableStateLimits) -> str:
@@ -206,7 +211,7 @@ def _preflight_dcp_operation(
         _validate_dcp_runtime(binding)
         context = {
             **base_context,
-            "dcp_envelope_version": 1,
+            "dcp_envelope_version": 2,
             "dcp_namespace": normalized_namespace,
             "dcp_storage": storage_identity,
             "transaction_id": normalized_transaction,
@@ -451,7 +456,6 @@ def save_portable_dcp(
 ):
     """Collectively save one tensor-only portable optimizer document through DCP."""
 
-    import torch.distributed.checkpoint as dcp
     from torch.distributed.checkpoint.storage import StorageWriter
 
     binding, transaction_id, limits, namespace = _preflight_dcp_operation(
@@ -464,38 +468,33 @@ def save_portable_dcp(
         storage_type=StorageWriter,
         operation="save",
     )
-    document = optimizer.export_portable_state(
-        checkpoint_process_group=binding,
-        transaction_id=transaction_id,
-        limits=limits,
-    )
-    wire_limits = limits._wire_limits(collective=True)
-    plan = None
-    state = None
-    digest = bytes(32)
-    error = None
-    try:
-        plan = _prepare_canonical_wire_value(document, wire_limits)
-        state = _state_from_plan(namespace, plan, wire_limits)
-        digest = plan.fragment_digest
-    except Exception as exc:
-        error = exc
-    from gefen.portable_collective import _collective_unanimous_status
+    from gefen.hybrid import GefenMuonHybrid
 
-    _collective_unanimous_status(
-        binding,
-        error,
-        operation="portable_dcp_save_encode",
-        transaction_id=transaction_id,
-        context_digest=digest,
-        limits=wire_limits,
-    )
-    assert plan is not None and state is not None
-    return dcp.save(
-        state,
-        storage_writer=storage_writer,
-        process_group=binding.process_group,
-    )
+    if type(optimizer) is GefenMuonHybrid:
+        from gefen.portable_dcp_hybrid_sharded import (
+            _save_sharded_hybrid_dcp,
+        )
+
+        return _save_sharded_hybrid_dcp(
+            optimizer,
+            binding=binding,
+            storage_writer=storage_writer,
+            transaction_id=transaction_id,
+            limits=limits,
+            namespace=namespace,
+        )
+    else:
+        from gefen.portable_dcp_sharded import _save_sharded_portable_dcp
+
+        return _save_sharded_portable_dcp(
+            optimizer,
+            binding=binding,
+            storage_writer=storage_writer,
+            transaction_id=transaction_id,
+            limits=limits,
+            namespace=namespace,
+        )
+    raise AssertionError("unreachable portable DCP optimizer dispatch")
 
 
 def load_portable_dcp(
@@ -522,6 +521,68 @@ def load_portable_dcp(
         storage_type=StorageReader,
         operation="load",
     )
+    from gefen.hybrid import GefenMuonHybrid
+
+    modern = False
+    checkpoint_metadata = None
+    error = None
+    try:
+        checkpoint_metadata = storage_reader.read_metadata()
+        if type(optimizer) is GefenMuonHybrid:
+            from gefen.portable_dcp_hybrid_sharded import (
+                _metadata_storage_spec,
+            )
+        else:
+            from gefen.portable_dcp_sharded import _metadata_storage_spec
+
+        modern = (
+            _metadata_storage_spec(
+                checkpoint_metadata,
+                namespace=namespace,
+                limits=limits,
+            )
+            is not None
+        )
+    except Exception as exc:
+        error = exc
+    from gefen.portable_collective import _collective_unanimous_status
+
+    _collective_unanimous_status(
+        binding,
+        error,
+        operation="portable_dcp_load_envelope",
+        transaction_id=transaction_id,
+        context_digest=bytes(31) + bytes((2 if modern else 1,)),
+        limits=limits._wire_limits(collective=True),
+    )
+    assert checkpoint_metadata is not None
+    if modern:
+        if type(optimizer) is GefenMuonHybrid:
+            from gefen.portable_dcp_hybrid_sharded import (
+                _load_sharded_hybrid_dcp,
+            )
+
+            return _load_sharded_hybrid_dcp(
+                optimizer,
+                binding=binding,
+                storage_reader=storage_reader,
+                checkpoint_metadata=checkpoint_metadata,
+                transaction_id=transaction_id,
+                limits=limits,
+                namespace=namespace,
+            )
+        else:
+            from gefen.portable_dcp_sharded import _load_sharded_portable_dcp
+
+            return _load_sharded_portable_dcp(
+                optimizer,
+                binding=binding,
+                storage_reader=storage_reader,
+                checkpoint_metadata=checkpoint_metadata,
+                transaction_id=transaction_id,
+                limits=limits,
+                namespace=namespace,
+            )
     wire_limits = limits._wire_limits(collective=True)
     state = {namespace: {}}
     dcp.load(

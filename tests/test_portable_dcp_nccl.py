@@ -54,8 +54,8 @@ def _limits():
     )
 
 
-def _members():
-    return tuple("rank:{}".format(rank) for rank in range(_WORLD))
+def _members(world_size, prefix):
+    return tuple("{}:{}".format(prefix, rank) for rank in range(world_size))
 
 
 def _replicated_manifest(identity, group):
@@ -95,7 +95,7 @@ def _optimizer(rank, group, *, deterministic):
         deterministic=deterministic,
     )
     manifest, shards = _replicated_manifest(ParameterIdentity(_FQN, (2, 4)), group)
-    member = _members()[rank]
+    member = group.ordered_members[rank]
     codebook_binding = CodebookProcessGroupBinding(
         group,
         member,
@@ -230,7 +230,7 @@ def _strict_worker_warnings():
     )
 
 
-def _worker(rank, init_file, checkpoint_dir, result_queue):
+def _worker(rank, world_size, init_file, checkpoint_dir, result_queue):
     _strict_worker_warnings()
     try:
         torch.cuda.set_device(rank)
@@ -238,10 +238,13 @@ def _worker(rank, init_file, checkpoint_dir, result_queue):
             "nccl",
             init_method="file://{}".format(init_file),
             rank=rank,
-            world_size=_WORLD,
+            world_size=world_size,
             timeout=timedelta(seconds=90),
         )
-        group = ProcessGroupIdentity("portable_dcp_nccl", _members())
+        group = ProcessGroupIdentity(
+            "portable_dcp_nccl",
+            _members(world_size, "rank"),
+        )
         source, source_parameter, source_binding = _optimizer(
             rank,
             group,
@@ -309,7 +312,160 @@ def _worker(rank, init_file, checkpoint_dir, result_queue):
             dist.destroy_process_group()
 
 
-def _run_workers(checkpoint_dir):
+def _cross_world_save_worker(
+    rank,
+    world_size,
+    init_file,
+    checkpoint_dir,
+    result_queue,
+):
+    _strict_worker_warnings()
+    try:
+        torch.cuda.set_device(rank)
+        dist.init_process_group(
+            "nccl",
+            init_method="file://{}".format(init_file),
+            rank=rank,
+            world_size=world_size,
+            timeout=timedelta(seconds=90),
+        )
+        group = ProcessGroupIdentity(
+            "portable_dcp_nccl_save",
+            _members(world_size, "save"),
+        )
+        source, source_parameter, source_binding = _optimizer(
+            rank,
+            group,
+            deterministic=True,
+        )
+        _seed_state(source, source_parameter)
+        save_portable_dcp(
+            source,
+            checkpoint_process_group=source_binding,
+            storage_writer=FileSystemWriter(checkpoint_dir),
+            transaction_id="portable-dcp-nccl-two-to-four-save",
+            limits=_limits(),
+        )
+        entries = FileSystemReader(checkpoint_dir).read_metadata().state_dict_metadata
+        field_entries = [
+            entry
+            for key, entry in entries.items()
+            if key.startswith("optimizer.__gefen_portable_field_")
+        ]
+        result_queue.put(
+            {
+                "rank": rank,
+                "saved": True,
+                "v2_sharded": (
+                    "optimizer.__gefen_portable_metadata_v2__" in entries
+                    and bool(field_entries)
+                    and all(
+                        len(entry.chunks) == world_size
+                        for entry in field_entries
+                    )
+                ),
+            }
+        )
+    except BaseException:
+        result_queue.put({"rank": rank, "fatal_error": traceback.format_exc()})
+    finally:
+        if dist.is_available() and dist.is_initialized():
+            dist.destroy_process_group()
+
+
+def _cross_world_load_worker(
+    rank,
+    world_size,
+    init_file,
+    checkpoint_dir,
+    result_queue,
+):
+    _strict_worker_warnings()
+    try:
+        torch.cuda.set_device(rank)
+        dist.init_process_group(
+            "nccl",
+            init_method="file://{}".format(init_file),
+            rank=rank,
+            world_size=world_size,
+            timeout=timedelta(seconds=90),
+        )
+        group = ProcessGroupIdentity(
+            "portable_dcp_nccl_load",
+            _members(world_size, "load"),
+        )
+        target, target_parameter, target_binding = _optimizer(
+            rank,
+            group,
+            deterministic=False,
+        )
+        reference, reference_parameter, _reference_binding = _optimizer(
+            rank,
+            group,
+            deterministic=True,
+        )
+        _seed_state(reference, reference_parameter)
+        load_portable_dcp(
+            target,
+            checkpoint_process_group=target_binding,
+            storage_reader=FileSystemReader(checkpoint_dir),
+            transaction_id="portable-dcp-nccl-two-to-four-load",
+            limits=_limits(),
+        )
+        restored_exact = (
+            _tensor_bits_equal(target_parameter, reference_parameter)
+            and _optimizer_state_equal(
+                target,
+                target_parameter,
+                reference,
+                reference_parameter,
+            )
+        )
+        gradient = torch.tensor(
+            [0.25, -0.5, 0.75, -1.0, 1.25, -1.5, 1.75, -2.0],
+            dtype=torch.float32,
+            device=target_parameter.device,
+        ).reshape(2, 4)
+        target_parameter.grad = gradient.clone()
+        reference_parameter.grad = gradient.clone()
+        target.step()
+        reference.step()
+        continuation = {
+            "parameter": _tensor_bits_equal(
+                target_parameter,
+                reference_parameter,
+            ),
+            "global_step": (
+                target._gefen_global_step == reference._gefen_global_step
+            ),
+            "deterministic": (
+                target._deterministic is reference._deterministic
+            ),
+            "codebook": _tensor_bits_equal(
+                target._gefen_codebook,
+                reference._gefen_codebook,
+            ),
+            "state": _state_equal(
+                target.state[target_parameter],
+                reference.state[reference_parameter],
+            ),
+        }
+        result_queue.put(
+            {
+                "rank": rank,
+                "restored_exact": restored_exact,
+                "next_step_exact": all(continuation.values()),
+                "continuation": continuation,
+            }
+        )
+    except BaseException:
+        result_queue.put({"rank": rank, "fatal_error": traceback.format_exc()})
+    finally:
+        if dist.is_available() and dist.is_initialized():
+            dist.destroy_process_group()
+
+
+def _run_phase(worker, world_size, checkpoint_dir):
     context = mp.get_context("spawn")
     result_queue = context.Queue()
     descriptor, init_file = tempfile.mkstemp(prefix="gefen-portable-dcp-nccl-")
@@ -317,10 +473,10 @@ def _run_workers(checkpoint_dir):
     os.unlink(init_file)
     processes = [
         context.Process(
-            target=_worker,
-            args=(rank, init_file, checkpoint_dir, result_queue),
+            target=worker,
+            args=(rank, world_size, init_file, checkpoint_dir, result_queue),
         )
-        for rank in range(_WORLD)
+        for rank in range(world_size)
     ]
     results = []
     try:
@@ -346,9 +502,13 @@ def _run_workers(checkpoint_dir):
         result_queue.join_thread()
         if os.path.exists(init_file):
             os.unlink(init_file)
-    assert len(results) == _WORLD, (results, [process.exitcode for process in processes])
+    assert len(results) == world_size, (results, [process.exitcode for process in processes])
     assert all(process.exitcode == 0 for process in processes), [process.exitcode for process in processes]
     return sorted(results, key=lambda item: item["rank"])
+
+
+def _run_workers(checkpoint_dir):
+    return _run_phase(_worker, _WORLD, checkpoint_dir)
 
 
 @pytest.mark.skipif(
@@ -362,3 +522,30 @@ def test_portable_dcp_round_trip_and_next_step_are_exact_on_nccl(tmp_path):
     assert [result["rank"] for result in results] == [0, 1]
     assert all(result["restored_exact"] and result["next_step_exact"] for result in results), results
     assert all(all(result["continuation"].values()) for result in results), results
+
+
+@pytest.mark.skipif(
+    not dist.is_available()
+    or not dist.is_nccl_available()
+    or torch.cuda.device_count() < 4,
+    reason="portable DCP 2-to-4 coverage requires NCCL and four CUDA devices",
+)
+def test_portable_dcp_checkpoint_saved_on_two_gpus_resumes_on_four(tmp_path):
+    checkpoint_dir = str(tmp_path / "checkpoint-two-to-four")
+    save_results = _run_phase(
+        _cross_world_save_worker,
+        2,
+        checkpoint_dir,
+    )
+    assert all("fatal_error" not in result for result in save_results), save_results
+    assert all(result["saved"] and result["v2_sharded"] for result in save_results)
+
+    load_results = _run_phase(
+        _cross_world_load_worker,
+        4,
+        checkpoint_dir,
+    )
+    assert all("fatal_error" not in result for result in load_results), load_results
+    assert [result["rank"] for result in load_results] == [0, 1, 2, 3]
+    assert all(result["restored_exact"] and result["next_step_exact"] for result in load_results), load_results
+    assert all(all(result["continuation"].values()) for result in load_results), load_results

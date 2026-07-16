@@ -738,83 +738,184 @@ def test_rank_local_full_dcp_set_optimizer_state_is_exact_under_fully_shard(
     assert all(all(rank_check) for rank_check in checks), checks
 
 
-@pytest.mark.skipif(
-    not torch.distributed.is_available()
-    or not torch.distributed.is_gloo_available(),
-    reason="rank-local unwrap needs a (gloo) process group and DTensor",
-)
-def test_rank_local_unwrap_tolerates_and_backfills_legacy_vmean():
-    # Exercise the actual load path -- _unwrap_rank_local_sharded_checkpoint --
-    # not just the validator: a pre-counter rank-local checkpoint (vmean without
-    # the separate vmean_step counter) must load, and the first resumed step must
-    # backfill vmean_step from step. A single-rank gloo world drives the same
-    # rank_local_dtensor_v2 format the multi-rank path uses, so it stays a
-    # CPU-only regression guard for the load-path tolerance (rejected pre-fix).
+def _fully_shard_rebinding_worker(
+    rank: int, world: int, port: str, fused: bool, result_queue
+) -> None:
     import torch.distributed as dist
     import torch.nn as nn
+    from torch.distributed.checkpoint.state_dict import (
+        StateDictOptions,
+        get_optimizer_state_dict,
+        set_optimizer_state_dict,
+    )
     from torch.distributed.device_mesh import init_device_mesh
+    from torch.distributed.fsdp import fully_shard
     from torch.distributed.tensor import Shard, distribute_tensor
 
-    os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
-    os.environ["MASTER_PORT"] = _free_port()
-    os.environ["RANK"] = "0"
-    os.environ["WORLD_SIZE"] = "1"
-    dist.init_process_group("gloo", rank=0, world_size=1)
+    from gefen import (
+        Gefen,
+        LogicalRegion,
+        ParameterIdentity,
+        ParameterLayout,
+        ParameterRebinding,
+        PlacementKind,
+        ProcessGroupIdentity,
+        ShardIdentity,
+        ShardPlacement,
+        ShardingManifest,
+    )
+
+    os.environ["MASTER_ADDR"] = "127.0.0.1"
+    os.environ["MASTER_PORT"] = port
+    os.environ["RANK"] = str(rank)
+    os.environ["WORLD_SIZE"] = str(world)
+    torch.cuda.set_device(rank)
+    dist.init_process_group("nccl", rank=rank, world_size=world)
     try:
-        from gefen import Gefen
+        mesh = init_device_mesh("cuda", (world,), mesh_dim_names=("dp",))
+        dtype = torch.bfloat16 if fused else torch.float32
+        full = torch.linspace(-1, 1, 64, device="cuda", dtype=dtype).reshape(8, 8)
+        first_grad = torch.arange(64, device="cuda", dtype=torch.float32).sin().reshape(8, 8).to(dtype)
+        second_grad = torch.arange(64, device="cuda", dtype=torch.float32).cos().reshape(8, 8).to(dtype)
 
-        mesh = init_device_mesh("cpu", (1,), mesh_dim_names=("dp",))
-
-        def build():
-            model = nn.Module()
-            model.register_parameter(
-                "w",
-                nn.Parameter(
-                    distribute_tensor(
-                        torch.linspace(-1, 1, 64).reshape(8, 8), mesh, [Shard(0)]
-                    )
-                ),
+        identity = ParameterIdentity("Model.Weight", (8, 8))
+        group = ProcessGroupIdentity(
+            "data_parallel", tuple("rank:{}".format(item) for item in range(world))
+        )
+        chunk = (identity.global_shape[0] + world - 1) // world
+        shards = []
+        for coordinate, member in enumerate(group.ordered_members):
+            offset = min(coordinate * chunk, identity.global_shape[0])
+            length = max(
+                0,
+                min(identity.global_shape[0], offset + chunk) - offset,
             )
+            shards.append(
+                ShardIdentity(
+                    identity,
+                    ParameterLayout.DTENSOR_1D_DEFAULT_WORLD,
+                    LogicalRegion((offset, 0), (length, identity.global_shape[1])),
+                    placements=(
+                        ShardPlacement(
+                            "dp",
+                            PlacementKind.DIMENSION_SHARD,
+                            coordinate,
+                            world,
+                            parameter_dimension=0,
+                        ),
+                    ),
+                    process_group=group,
+                    local_member=member,
+                )
+            )
+        manifest = ShardingManifest(tuple(shards))
+
+        def construct(values):
+            model = nn.Linear(8, 8, bias=False, device="cuda", dtype=dtype)
+            with torch.no_grad():
+                model.weight.copy_(values)
+            old = model.weight
             optimizer = Gefen(
-                [{"params": [("w", model.w)]}],
+                model.named_parameters(),
                 lr=1e-3,
-                fused=False,
+                fused=fused,
+                deterministic=True,
                 factored_v_2d=False,
+                force_2d_period_one=True,
+            )
+            fully_shard(model, mesh=mesh)
+            optimizer.post_sharding(
+                (ParameterRebinding(old, model.weight, shards[rank]),),
+                manifest=manifest,
             )
             return model, optimizer
 
-        def apply_grad(model):
-            model.w.grad = distribute_tensor(
-                torch.arange(64).reshape(8, 8).float().cos(), mesh, [Shard(0)]
+        model, optimizer = construct(full)
+        identity_ok = (
+            optimizer.shard_identity(model.weight) == shards[rank]
+            and optimizer.sharding_manifest() == manifest
+        )
+        model.weight.grad = distribute_tensor(first_grad, mesh, [Shard(0)])
+        optimizer.step()
+        current = model.weight.detach().full_tensor().clone()
+        checkpoint = get_optimizer_state_dict(
+            model,
+            optimizer,
+            options=StateDictOptions(full_state_dict=True, cpu_offload=True),
+        )
+
+        resumed_model, resumed = construct(current)
+        set_optimizer_state_dict(
+            resumed_model,
+            resumed,
+            checkpoint if rank == 0 else {},
+            options=StateDictOptions(
+                full_state_dict=True,
+                broadcast_from_rank0=True,
+            ),
+        )
+        restored = (
+            torch.equal(
+                resumed._gefen_codebook.detach().cpu(),
+                optimizer._gefen_codebook.detach().cpu(),
             )
-
-        model, optimizer = build()
-        for _ in range(2):
-            apply_grad(model)
-            optimizer.step()
-
-        # Save a pre-counter rank-local checkpoint: drop the separate vmean_step
-        # counter from the live state before serializing.
-        param = optimizer.param_groups[0]["params"][0]
-        assert "vmean_step" in optimizer.state[param]
-        optimizer.state[param].pop("vmean_step")
-        checkpoint = copy.deepcopy(optimizer.state_dict())
-        assert any(
-            "rank_local_sharded_state" in group.get("_gefen_checkpoint_metadata", {})
-            for group in checkpoint["param_groups"]
-        ), "expected a rank-local sharded checkpoint"
-
-        # Load through the rank-local unwrap path (rejected before the fix). The
-        # pre-counter payload must be accepted with vmean_step still absent...
-        target_model, target_optimizer = build()
-        target_optimizer.load_state_dict(checkpoint)
-        target_param = target_optimizer.param_groups[0]["params"][0]
-        assert "vmean" in target_optimizer.state[target_param]
-        assert "vmean_step" not in target_optimizer.state[target_param]
-
-        # ...and the first resumed step must backfill vmean_step from step.
-        apply_grad(target_model)
-        target_optimizer.step()
-        assert "vmean_step" in target_optimizer.state[target_param]
+            and torch.equal(
+                resumed.state[resumed_model.weight]["m_codebook"].detach().cpu(),
+                optimizer.state[model.weight]["m_codebook"].detach().cpu(),
+            )
+        )
+        model.weight.grad = distribute_tensor(second_grad, mesh, [Shard(0)])
+        resumed_model.weight.grad = distribute_tensor(second_grad, mesh, [Shard(0)])
+        optimizer.step()
+        resumed.step()
+        continued = torch.equal(
+            model.weight.detach().full_tensor(),
+            resumed_model.weight.detach().full_tensor(),
+        )
+        checks = [None] * world
+        dist.all_gather_object(checks, (identity_ok, restored, continued))
+        if rank == 0:
+            result_queue.put(checks)
+    except BaseException:
+        result_queue.put([{"rank": rank, "traceback": traceback.format_exc()}])
+        raise
     finally:
         dist.destroy_process_group()
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available()
+    or torch.cuda.device_count() < 2
+    or not torch.distributed.is_nccl_available(),
+    reason="fully_shard DTensor rebinding requires two CUDA GPUs and NCCL",
+)
+@pytest.mark.parametrize("fused", [False, True])
+def test_post_sharding_rebinding_and_dcp_are_exact_under_fully_shard(fused):
+    import torch.multiprocessing as mp
+
+    context = mp.get_context("spawn")
+    result_queue = context.Queue()
+    port = _free_port()
+    processes = [
+        context.Process(
+            target=_fully_shard_rebinding_worker,
+            args=(rank, 2, port, fused, result_queue),
+        )
+        for rank in range(2)
+    ]
+    for process in processes:
+        process.start()
+    try:
+        checks = result_queue.get(timeout=300)
+    except queue.Empty:
+        checks = None
+    for process in processes:
+        process.join(timeout=300)
+    for process in processes:
+        if process.is_alive():
+            process.terminate()
+            process.join(timeout=10)
+    assert checks is not None, "fully_shard rebinding workers timed out"
+    assert all(process.exitcode == 0 for process in processes)
+    assert all(isinstance(rank_check, tuple) for rank_check in checks), checks
+    assert all(all(rank_check) for rank_check in checks), checks

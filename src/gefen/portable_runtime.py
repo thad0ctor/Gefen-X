@@ -14,6 +14,7 @@ from gefen.checkpoint import CheckpointProcessGroupBinding
 from gefen.codebook import CodebookProcessGroupBinding
 from gefen.contracts import (
     IDENTITY_SCHEMA_VERSION,
+    LogicalRegion,
     LogicalSlice,
     ParameterIdentity,
     ParameterLayout,
@@ -23,6 +24,7 @@ from gefen.contracts import (
     ShardPlacement,
     ShardingManifest,
 )
+from torch.distributed.tensor import DTensor, Replicate, Shard
 from gefen.portable import (
     _decode_quantized_momentum,
     _expand_block_second_moment,
@@ -42,7 +44,8 @@ from gefen.portable_schema import portable_state_digest
 from gefen.portable_state import (
     PortableStateLimits,
     _MOMENTUM_PROJECTION,
-    _SECOND_MOMENT_PROJECTION,
+    _SECOND_MOMENT_PROJECTION_EXACT,
+    _SECOND_MOMENT_PROJECTION_FACTORED_TO_BLOCK,
     _assemble_portable_state_fragments,
     _build_portable_state_fragment,
     _derived_role,
@@ -53,7 +56,7 @@ from gefen.portable_state import (
     _normalize_policy,
     _normalize_portable_state_fragment,
     _project_portable_parameter_state,
-    _values_equal,
+    _validate_portable_projection_policy,
 )
 from gefen.rebinding import LogicalSlotBinding
 
@@ -71,6 +74,7 @@ _STATUS_FALLBACK_LIMITS = PortableStateLimits(
 )._wire_limits()
 
 _PLAIN_GROUP_REQUIRED = frozenset({"params", "param_names", "lr", "beta1", "beta2", "eps", "weight_decay"})
+_RANK_LOCAL_GROUP_METADATA_KEY = "_gefen_checkpoint_metadata"
 _PLAIN_GROUP_ALLOWED = _PLAIN_GROUP_REQUIRED | {"name"}
 _MUON_GROUP_REQUIRED = _PLAIN_GROUP_REQUIRED | frozenset(
     {
@@ -134,6 +138,8 @@ _PLAIN_FACTORED_KEYS = frozenset(
 )
 _MUON_KEYS = frozenset({"name", "automatic_period", "step", "m_codebook", "m_magnitude"})
 _NORMUON_KEYS = _MUON_KEYS | {"normuon_v", "normuon_step"}
+_RANK_LOCAL_PAYLOAD_KEY_PREFIX = "_gefen_rank_local_payload_"
+_RANK_LOCAL_MEMBER_KEY = "_gefen_rank_local_member"
 
 
 def _bounded_utf8_length(value: str, *, limit: int, name: str) -> int:
@@ -315,20 +321,34 @@ def _validate_exact_shard_identity(shard) -> ShardIdentity:
         shard.parameter.global_shape,
         schema_version=shard.parameter.schema_version,
     )
-    if type(shard.logical_slice) is not LogicalSlice:
-        raise TypeError("portable state requires exact LogicalSlice values")
+    if shard.layout is ParameterLayout.DTENSOR_1D_DEFAULT_WORLD:
+        if type(shard.logical_slice) is not LogicalRegion:
+            raise TypeError("portable DTensor state requires exact LogicalRegion values")
+        if (
+            type(shard.logical_slice.offsets) is not tuple
+            or type(shard.logical_slice.lengths) is not tuple
+            or any(type(value) is not int for value in shard.logical_slice.offsets + shard.logical_slice.lengths)
+        ):
+            raise TypeError("portable DTensor regions require exact primitive fields")
+        logical_extent = LogicalRegion(
+            shard.logical_slice.offsets,
+            shard.logical_slice.lengths,
+        )
+    else:
+        if type(shard.logical_slice) is not LogicalSlice:
+            raise TypeError("portable state requires exact LogicalSlice values")
+        if type(shard.logical_slice.flat_offset) is not int or type(shard.logical_slice.length) is not int:
+            raise TypeError("portable logical slices require exact primitive fields")
+        logical_extent = LogicalSlice(
+            shard.logical_slice.flat_offset,
+            shard.logical_slice.length,
+        )
     if (
-        type(shard.logical_slice.flat_offset) is not int
-        or type(shard.logical_slice.length) is not int
-        or type(shard.local_member) is not str
+        type(shard.local_member) is not str
         or (shard.owner is not None and type(shard.owner) is not str)
         or type(shard.schema_version) is not int
     ):
         raise TypeError("portable shard identities require exact primitive fields")
-    logical_slice = LogicalSlice(
-        shard.logical_slice.flat_offset,
-        shard.logical_slice.length,
-    )
     process_group = _validate_exact_process_group_identity(shard.process_group)
     if type(shard.placements) is not tuple or any(
         type(placement) is not ShardPlacement for placement in shard.placements
@@ -358,7 +378,7 @@ def _validate_exact_shard_identity(shard) -> ShardIdentity:
     validated = ShardIdentity(
         parameter,
         shard.layout,
-        logical_slice,
+        logical_extent,
         placements=placements,
         process_group=process_group,
         local_member=shard.local_member,
@@ -535,16 +555,21 @@ def _live_policy(optimizer, implementation: str):
     raw = optimizer._canonical_policy()
     if type(raw) is not dict:
         raise ValueError("live portable policy must be a plain dictionary")
+    factored_v_2d = raw.get("factored_v_2d")
     policy = {
         "schema_version": 1,
-        "factored_v_2d": raw.get("factored_v_2d"),
+        "factored_v_2d": factored_v_2d,
         "force_1d_period_one": raw.get("force_1d_period_one"),
         "force_2d_period_one": raw.get("force_2d_period_one"),
         "period_one_substrings": raw.get("period_one_substrings"),
         "codebook_refresh_every": raw.get("codebook_refresh_every"),
         "stochastic_round": raw.get("stochastic_round"),
         "momentum_projection": _MOMENTUM_PROJECTION,
-        "second_moment_projection": _SECOND_MOMENT_PROJECTION,
+        "second_moment_projection": (
+            _SECOND_MOMENT_PROJECTION_FACTORED_TO_BLOCK
+            if implementation == _PLAIN_IMPLEMENTATION and factored_v_2d is True
+            else _SECOND_MOMENT_PROJECTION_EXACT
+        ),
     }
     return _normalize_policy(policy, implementation)
 
@@ -556,13 +581,25 @@ def _normalized_ns_schedule(group):
     return [[float(a), float(b), float(c)] for a, b, c in schedule]
 
 
-def _group_options(group, implementation: str, *, second_moment_policy=None):
+def _group_options(
+    group,
+    implementation: str,
+    *,
+    second_moment_policy=None,
+    allow_rank_local_metadata=False,
+):
     if type(group) is not dict:
         raise TypeError("portable parameter groups must be plain dictionaries")
     allowed = _PLAIN_GROUP_ALLOWED if implementation == _PLAIN_IMPLEMENTATION else _MUON_GROUP_ALLOWED
     required = _PLAIN_GROUP_REQUIRED if implementation == _PLAIN_IMPLEMENTATION else _MUON_GROUP_REQUIRED
+    if allow_rank_local_metadata:
+        if implementation != _PLAIN_IMPLEMENTATION:
+            raise ValueError("rank-local group metadata is only valid for plain Gefen")
+        allowed = allowed | {_RANK_LOCAL_GROUP_METADATA_KEY}
     if not required.issubset(group) or not set(group).issubset(allowed):
         raise ValueError("portable parameter group contains missing or unknown keys")
+    if _RANK_LOCAL_GROUP_METADATA_KEY in group and type(group[_RANK_LOCAL_GROUP_METADATA_KEY]) is not dict:
+        raise TypeError("portable rank-local group metadata must be a plain dictionary")
     if type(group["params"]) is not list or type(group["param_names"]) is not list:
         raise TypeError("portable parameter group params and names must be plain lists")
 
@@ -608,7 +645,75 @@ def _group_options(group, implementation: str, *, second_moment_policy=None):
     )
 
 
+def _dtensor_local_storage(parameter) -> torch.Tensor:
+    if type(parameter) is not DTensor:
+        raise TypeError("portable DTensor state requires an exact torch.distributed.tensor.DTensor")
+    local = parameter.to_local()
+    if hasattr(local, "wait"):
+        local = local.wait()
+    if type(local) is not torch.Tensor:
+        raise TypeError("portable DTensor state requires exact local torch.Tensor storage")
+    if (
+        local.layout is not torch.strided
+        or local.device.type not in {"cpu", "cuda"}
+        or local.dtype not in {torch.float16, torch.bfloat16, torch.float32, torch.float64}
+        or local.dtype.is_complex
+        or local.is_meta
+        or local.is_nested
+        or local.is_quantized
+        or getattr(local, "fake_mode", None) is not None
+    ):
+        raise TypeError("portable DTensor state requires supported materialized local storage")
+    return local
+
+
+def _parameter_local_storage(parameter, shard: ShardIdentity) -> torch.Tensor:
+    if shard.layout is ParameterLayout.DTENSOR_1D_DEFAULT_WORLD:
+        return _dtensor_local_storage(parameter)
+    if isinstance(parameter, DTensor) or (
+        isinstance(parameter, torch.Tensor)
+        and hasattr(parameter, "to_local")
+        and hasattr(parameter, "placements")
+        and hasattr(parameter, "device_mesh")
+    ):
+        raise TypeError("portable state rejects DTensor-like storage for a non-DTensor identity")
+    return parameter
+
+
 def _parameter_supported(parameter, shard: ShardIdentity) -> bool:
+    if shard.layout is ParameterLayout.DTENSOR_1D_DEFAULT_WORLD:
+        if type(parameter) is not DTensor:
+            return False
+        local = _dtensor_local_storage(parameter)
+        if (
+            tuple(parameter.shape) != shard.parameter.global_shape
+            or parameter.dtype != local.dtype
+            or tuple(local.shape) != shard.logical_region.lengths
+            or local.numel() != shard.logical_region.numel
+            or len(tuple(parameter.placements)) != 1
+        ):
+            return False
+        descriptor = shard.placements[0]
+        placement = tuple(parameter.placements)[0]
+        if descriptor.kind is PlacementKind.REPLICATE:
+            if type(placement) is not Replicate:
+                return False
+        elif (
+            descriptor.kind is not PlacementKind.DIMENSION_SHARD
+            or type(placement) is not Shard
+            or type(placement.dim) is not int
+            or placement.dim != descriptor.parameter_dimension
+        ):
+            return False
+        mesh = parameter.device_mesh
+        coordinate = mesh.get_coordinate()
+        dim_names = tuple(mesh.mesh_dim_names or ())
+        return (
+            tuple(mesh.shape) == (descriptor.parts,)
+            and (not dim_names or dim_names == (descriptor.mesh_axis,))
+            and coordinate is not None
+            and list(coordinate) == [descriptor.coordinate]
+        )
     if type(parameter) not in {torch.Tensor, nn.Parameter} or not (
         parameter.layout is torch.strided
         and parameter.device.type in {"cpu", "cuda"}
@@ -677,6 +782,7 @@ def _validate_optimizer_shell(
             if shard.layout not in {
                 ParameterLayout.REPLICATED,
                 ParameterLayout.FLATTENED_ELEMENT_SHARD,
+                ParameterLayout.DTENSOR_1D_DEFAULT_WORLD,
             }:
                 raise ValueError("plain portable state has an unsupported layout")
         elif shard.layout not in {
@@ -723,16 +829,77 @@ def _live_maps(optimizer, binding: CheckpointProcessGroupBinding):
         raise ValueError("portable optimizer state contains missing or foreign parameter keys")
     if type(optimizer._param_names) is not dict or set(optimizer._param_names) != expected_live:
         raise ValueError("portable parameter-name state does not match live parameters")
+    _validate_rank_local_transport_schema(optimizer, binding)
     return local_by_fqn
 
 
-def _parameter_storage_token(parameter):
+def _validate_rank_local_transport_schema(
+    optimizer,
+    binding: CheckpointProcessGroupBinding,
+) -> None:
+    parameters = [
+        parameter
+        for group in optimizer.param_groups
+        for parameter in group["params"]
+    ]
+
+    def transport_keys(state):
+        return tuple(
+            key
+            for key in state
+            if type(key) is str
+            and (
+                key == _RANK_LOCAL_MEMBER_KEY
+                or key.startswith(_RANK_LOCAL_PAYLOAD_KEY_PREFIX)
+            )
+        )
+
+    has_dtensor = any(
+        shard.layout is ParameterLayout.DTENSOR_1D_DEFAULT_WORLD
+        for _parameter, shard in optimizer._gefen_local_shard_bindings
+    )
+    if not has_dtensor:
+        if any(transport_keys(optimizer.state[parameter]) for parameter in parameters):
+            raise ValueError("portable state contains unexpected rank-local transport keys")
+        return
+    if optimizer._gefen_rank_local_checkpoint_collective is not True or not parameters:
+        raise ValueError("portable DTensor state requires an installed rank-local transport schema")
+
+    expected_payload_keys = {
+        "{}{}".format(_RANK_LOCAL_PAYLOAD_KEY_PREFIX, rank)
+        for rank in range(len(binding.identity.ordered_members))
+    }
+    for parameter_index, parameter in enumerate(parameters):
+        state = optimizer.state[parameter]
+        keys = transport_keys(state)
+        if parameter_index == 0:
+            if set(keys) != expected_payload_keys:
+                raise ValueError("portable rank-local carrier keys do not match the default world")
+            for key in expected_payload_keys:
+                value = state[key]
+                if (
+                    type(value) is not torch.Tensor
+                    or value.layout is not torch.strided
+                    or value.device.type != "cpu"
+                    or value.dtype != torch.uint8
+                    or tuple(value.shape) != (1,)
+                    or value.requires_grad
+                    or not value.is_contiguous()
+                    or value.storage_offset() != 0
+                    or value.untyped_storage().nbytes() != 1
+                    or int(value.item()) != 0
+                ):
+                    raise ValueError("portable rank-local carrier payload has an invalid schema")
+        elif keys != (_RANK_LOCAL_MEMBER_KEY,) or state[_RANK_LOCAL_MEMBER_KEY] is not True:
+            raise ValueError("portable rank-local member marker has an invalid schema")
+
+
+def _tensor_storage_metadata_token(parameter):
     try:
         version = parameter._version
     except RuntimeError:
         version = None
     return (
-        id(parameter),
         version,
         str(parameter.device),
         str(parameter.dtype),
@@ -745,6 +912,49 @@ def _parameter_storage_token(parameter):
         parameter.untyped_storage().data_ptr(),
         parameter.untyped_storage().nbytes(),
     )
+
+
+def _ordinary_parameter_storage_token(parameter):
+    return (id(parameter), _tensor_storage_metadata_token(parameter))
+
+
+def _parameter_storage_token(parameter):
+    if type(parameter) is DTensor:
+        local = _dtensor_local_storage(parameter)
+        try:
+            version = parameter._version
+        except RuntimeError:
+            version = None
+        placements = []
+        for placement in tuple(parameter.placements):
+            if type(placement) is Shard:
+                placements.append(("shard", placement.dim))
+            elif type(placement) is Replicate:
+                placements.append(("replicate",))
+            else:
+                placements.append((type(placement).__module__, type(placement).__qualname__, repr(placement)))
+        mesh = parameter.device_mesh
+        coordinate = mesh.get_coordinate()
+        return (
+            "dtensor",
+            id(parameter),
+            version,
+            str(parameter.dtype),
+            tuple(parameter.shape),
+            tuple(placements),
+            tuple(mesh.shape),
+            tuple(mesh.mesh_dim_names or ()),
+            None if coordinate is None else tuple(coordinate),
+            _tensor_storage_metadata_token(local),
+        )
+    if isinstance(parameter, DTensor) or (
+        isinstance(parameter, torch.Tensor)
+        and hasattr(parameter, "to_local")
+        and hasattr(parameter, "placements")
+        and hasattr(parameter, "device_mesh")
+    ):
+        raise TypeError("portable state rejects DTensor-like tensor subclasses")
+    return _ordinary_parameter_storage_token(parameter)
 
 
 def _portable_value_token(value):
@@ -875,12 +1085,25 @@ def _portable_live_token(optimizer):
 
 
 def _catalog_and_options(optimizer, implementation: str, policy):
+    allow_rank_local_metadata = (
+        implementation == _PLAIN_IMPLEMENTATION
+        and optimizer._gefen_rank_local_checkpoint_collective is True
+        and any(
+            slot.shard.layout is ParameterLayout.DTENSOR_1D_DEFAULT_WORLD
+            for slot in optimizer._gefen_logical_slots
+        )
+    )
     group_options = []
     for group in optimizer.param_groups:
         # Plain options depend on each logical parameter rank, so validate the
         # group shell here and construct per-slot values below.
         if implementation == _PLAIN_IMPLEMENTATION:
-            _group_options(group, implementation, second_moment_policy="block")
+            _group_options(
+                group,
+                implementation,
+                second_moment_policy="block",
+                allow_rank_local_metadata=allow_rank_local_metadata,
+            )
             group_options.append(group)
         else:
             group_options.append(_group_options(group, implementation))
@@ -892,14 +1115,19 @@ def _catalog_and_options(optimizer, implementation: str, policy):
         if slot.group_index >= len(group_options):
             raise ValueError("portable logical slot group index is out of range")
         if implementation == _PLAIN_IMPLEMENTATION:
-            second = "factored" if policy["factored_v_2d"] and len(identity.global_shape) == 2 else "block"
+            configured_factored = policy["factored_v_2d"] and len(identity.global_shape) == 2
+            second = "factored" if configured_factored and slot.shard.layout is ParameterLayout.REPLICATED else "block"
             options = _group_options(
                 group_options[slot.group_index],
                 implementation,
                 second_moment_policy=second,
+                allow_rank_local_metadata=allow_rank_local_metadata,
             )
-            if second == "factored" and slot.shard.layout is not ParameterLayout.REPLICATED:
-                raise ValueError("factored portable state supports replicated matrices only")
+            if configured_factored and slot.shard.layout not in {
+                ParameterLayout.REPLICATED,
+                ParameterLayout.DTENSOR_1D_DEFAULT_WORLD,
+            }:
+                raise ValueError("factored portable state supports replicated matrices or the DTensor block fallback")
         else:
             options = group_options[slot.group_index]
             if slot.shard.layout is ParameterLayout.WHOLE_PARAMETER_OWNER and options["sharded_mode"] != "distributed":
@@ -968,9 +1196,24 @@ def _parameter_state_core(optimizer, parameter, compatibility_name: str):
     state = optimizer.state[parameter]
     if type(state) is not dict:
         raise TypeError("portable per-parameter state must be a plain dictionary")
-    if any(key not in _AUTHORITATIVE_STATE_KEYS and key not in _IGNORED_DERIVED_STATE_KEYS for key in state):
+    def is_transport_key(key):
+        return type(key) is str and (
+            key == _RANK_LOCAL_MEMBER_KEY
+            or key.startswith(_RANK_LOCAL_PAYLOAD_KEY_PREFIX)
+        )
+
+    if any(
+        key not in _AUTHORITATIVE_STATE_KEYS
+        and key not in _IGNORED_DERIVED_STATE_KEYS
+        and not is_transport_key(key)
+        for key in state
+    ):
         raise ValueError("portable parameter state contains an unknown key")
-    core = {key: value for key, value in state.items() if key not in _IGNORED_DERIVED_STATE_KEYS}
+    core = {
+        key: value
+        for key, value in state.items()
+        if key not in _IGNORED_DERIVED_STATE_KEYS and not is_transport_key(key)
+    }
     if core.get("name") != compatibility_name:
         raise ValueError("portable parameter state name does not match its logical slot")
     return core
@@ -1474,8 +1717,11 @@ def _stage_portable_import(
         prepared_local,
     )
     target_fragment = prepared_local["target_descriptor"]
-    if not _values_equal(document["policy"], target_fragment["policy"]):
-        raise ValueError("portable document policy does not match the target")
+    _validate_portable_projection_policy(
+        document["policy"],
+        target_fragment["policy"],
+        implementation,
+    )
     common = document["common"]
     if set(document["parameters"]) != set(target_fragment["catalog"]):
         raise ValueError("portable parameter catalog does not match the target")
@@ -1493,6 +1739,7 @@ def _stage_portable_import(
             implementation=implementation,
             global_step=common["gefen_global_step"],
             codebook=common["gefen_codebook"],
+            source_second_moment_projection=document["policy"]["second_moment_projection"],
             target_algorithm_options=target_options,
             target_second_moment=target_second,
         )
@@ -1515,7 +1762,30 @@ def _stage_portable_import(
     staging_owner = object.__new__(type(optimizer))
     staging_owner.__dict__ = optimizer.__dict__.copy()
     staging_owner._deterministic = common["gefen_deterministic"]
+    has_dtensor_target = any(
+        shard.layout is ParameterLayout.DTENSOR_1D_DEFAULT_WORLD
+        for _parameter, shard in local_by_fqn.values()
+    )
+    if has_dtensor_target:
+        # The native rank-local checkpoint envelope deliberately accepts only
+        # exact-topology restores. Portable state has already projected the
+        # canonical global record to this target topology, so stage that local
+        # result through the native semantic validator without presenting it as
+        # a rank-local checkpoint. These method shadows exist only on the
+        # isolated staging owner and are removed before publication.
+        native.pop("gefen_native_local_shards", None)
+        for group in native["param_groups"]:
+            metadata = dict(group[_RANK_LOCAL_GROUP_METADATA_KEY])
+            metadata.pop("native_local_shards", None)
+            group[_RANK_LOCAL_GROUP_METADATA_KEY] = metadata
+        staging_owner._uses_rank_local_sharded_state = lambda: False
+        staging_owner._serialized_native_local_shards = lambda: None
     staged = staging_owner._stage_load_state_dict(native)
+    if has_dtensor_target:
+        staged.__dict__.pop("_uses_rank_local_sharded_state", None)
+        staged.__dict__.pop("_serialized_native_local_shards", None)
+        staged._install_rank_local_checkpoint_schema()
+        _validate_rank_local_transport_schema(staged, binding)
     optimizer._preserve_canonical_target_configuration(staged)
     if (
         type(staged.__dict__) is not dict
@@ -1663,6 +1933,7 @@ def _validate_readiness_slot(
         return
     if parameter is None:
         raise ValueError("a portable payload shard requires local storage")
+    parameter_storage = _parameter_local_storage(parameter, shard)
 
     core = _parameter_state_core(optimizer, parameter, slot.compatibility_name)
     keys = frozenset(core)
@@ -1702,7 +1973,7 @@ def _validate_readiness_slot(
     )
     if indices.device != magnitudes.device:
         raise ValueError("momentum indices and magnitudes must share a device")
-    if indices.device != parameter.device:
+    if indices.device != parameter_storage.device:
         raise ValueError("portable parameter state must share its parameter device")
 
     if implementation == _PLAIN_IMPLEMENTATION:
@@ -1729,7 +2000,7 @@ def _validate_readiness_slot(
                 nonnegative=True,
                 validate_values=validate_values,
             )
-            if v_row.device != parameter.device or v_col.device != parameter.device:
+            if v_row.device != parameter_storage.device or v_col.device != parameter_storage.device:
                 raise ValueError("factored portable state must share its parameter device")
             return
         if keys != _PLAIN_BLOCK_KEYS:
@@ -1745,7 +2016,7 @@ def _validate_readiness_slot(
             nonnegative=True,
             validate_values=validate_values,
         )
-        if vmean.device != parameter.device:
+        if vmean.device != parameter_storage.device:
             raise ValueError("block portable state must share its parameter device")
         return
 
@@ -1764,7 +2035,7 @@ def _validate_readiness_slot(
             nonnegative=True,
             validate_values=validate_values,
         )
-        if normuon_v.device != parameter.device:
+        if normuon_v.device != parameter_storage.device:
             raise ValueError("NorMuon portable state must share its parameter device")
 
 

@@ -1067,12 +1067,25 @@ if pytest is not None:
         or torch.cuda.device_count() < 2,
         reason="distributed Muon checkpoint test requires >=2 CUDA GPUs + NCCL",
     )
-    def test_muon_fsdp2_distributed_checkpoint_restore(tmp_path):
-        load_world = 4 if torch.cuda.device_count() >= 4 else 2
+    def test_muon_fsdp2_distributed_checkpoint_restore_same_world(tmp_path):
         assert _run_distributed_checkpoint_case(
-            tmp_path / "gefen_muon_distributed.pt",
+            tmp_path / "gefen_muon_distributed_same_world.pt",
             save_world=2,
-            load_world=load_world,
+            load_world=2,
+        )
+
+    @pytest.mark.skipif(
+        not torch.cuda.is_available()
+        or not torch.distributed.is_available()
+        or not torch.distributed.is_nccl_available()
+        or torch.cuda.device_count() < 4,
+        reason="distributed Muon 2-to-4 checkpoint test requires >=4 CUDA GPUs + NCCL",
+    )
+    def test_muon_fsdp2_distributed_checkpoint_restore_two_to_four(tmp_path):
+        assert _run_distributed_checkpoint_case(
+            tmp_path / "gefen_muon_distributed_two_to_four.pt",
+            save_world=2,
+            load_world=4,
         )
 
 

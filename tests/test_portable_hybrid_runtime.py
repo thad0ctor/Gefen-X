@@ -327,9 +327,18 @@ def test_hybrid_portable_composite_uses_collective_tensor_limit():
     _assert_same_optimizer_state(source, target)
 
 
-def test_hybrid_portable_dcp_round_trip(tmp_path):
+def test_hybrid_portable_dcp_round_trip(tmp_path, monkeypatch):
     source, source_matrix, source_bias, source_binding = _initialized_source()
     checkpoint = tmp_path / "hybrid-portable"
+
+    def reject_dense_export(*_args, **_kwargs):
+        raise AssertionError("sharded Hybrid DCP must not call dense export")
+
+    monkeypatch.setattr(
+        type(source),
+        "export_portable_state",
+        reject_dense_export,
+    )
     save_portable_dcp(
         source,
         checkpoint_process_group=source_binding,
@@ -337,6 +346,11 @@ def test_hybrid_portable_dcp_round_trip(tmp_path):
         transaction_id="hybrid-dcp-save-v1",
         limits=_limits(),
     )
+    keys = dcp.FileSystemReader(checkpoint).read_metadata().state_dict_metadata
+    assert "optimizer.__gefen_portable_composite_metadata_v2__" in keys
+    assert "optimizer.__gefen_portable_metadata_v1__" not in keys
+    assert any(key.startswith("optimizer-gefen-muon.__gefen_portable_field_") for key in keys)
+    assert any(key.startswith("optimizer-gefen-backup.__gefen_portable_field_") for key in keys)
     target, target_matrix, target_bias, target_binding = _target_from_source(
         source_matrix,
         source_bias,
@@ -357,6 +371,38 @@ def test_hybrid_portable_dcp_round_trip(tmp_path):
     target.step()
     assert torch.equal(source_matrix, target_matrix)
     assert torch.equal(source_bias, target_bias)
+    _assert_same_optimizer_state(source, target)
+
+
+def test_public_loader_accepts_legacy_v1_hybrid_checkpoint(tmp_path):
+    from gefen import portable_dcp
+
+    source, source_matrix, source_bias, source_binding = _initialized_source()
+    limits = _limits()
+    document = source.export_portable_state(
+        checkpoint_process_group=source_binding,
+        transaction_id="legacy-v1-hybrid-export",
+        limits=limits,
+    )
+    wire_limits = limits._wire_limits(collective=True)
+    plan = portable_dcp._prepare_canonical_wire_value(document, wire_limits)
+    state = portable_dcp._state_from_plan("optimizer", plan, wire_limits)
+    checkpoint = tmp_path / "legacy-v1-hybrid"
+    dcp.save(state, storage_writer=dcp.FileSystemWriter(checkpoint))
+    keys = dcp.FileSystemReader(checkpoint).read_metadata().state_dict_metadata
+    assert "optimizer.__gefen_portable_metadata_v1__" in keys
+    assert "optimizer.__gefen_portable_composite_metadata_v2__" not in keys
+    target, _target_matrix, _target_bias, target_binding = _target_from_source(
+        source_matrix,
+        source_bias,
+    )
+    load_portable_dcp(
+        target,
+        checkpoint_process_group=target_binding,
+        storage_reader=dcp.FileSystemReader(checkpoint),
+        transaction_id="legacy-v1-hybrid-load",
+        limits=limits,
+    )
     _assert_same_optimizer_state(source, target)
 
 

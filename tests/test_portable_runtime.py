@@ -23,7 +23,7 @@ from gefen.contracts import (
 )
 from gefen.gefen import Gefen
 from gefen.gefen_muon import GefenMuon
-from gefen.portable import _decode_quantized_momentum
+from gefen.portable import _decode_quantized_momentum, _recompress_dense_momentum
 from gefen.portable_runtime import (
     _export_portable_state,
     _import_portable_state,
@@ -52,15 +52,23 @@ def _bindings(group):
     )
 
 
-def _finalize(optimizer, parameter, *, layout):
+def _finalize(optimizer, parameter, *, layout, global_shape=None):
     group = ProcessGroupIdentity("checkpoint", (_MEMBER,))
-    identity = ParameterIdentity("layer.weight", tuple(parameter.shape))
+    identity = ParameterIdentity(
+        "layer.weight",
+        tuple(parameter.shape) if global_shape is None else global_shape,
+    )
     if layout is ParameterLayout.REPLICATED:
         kind = PlacementKind.REPLICATE
         owner = None
-    else:
+    elif layout is ParameterLayout.FLATTENED_ELEMENT_SHARD:
+        kind = PlacementKind.FLAT_SHARD
+        owner = None
+    elif layout is ParameterLayout.WHOLE_PARAMETER_OWNER:
         kind = PlacementKind.WHOLE_PARAMETER_OWNER
         owner = _MEMBER
+    else:
+        raise AssertionError("unsupported test layout")
     shard = ShardIdentity(
         identity,
         layout,
@@ -79,8 +87,11 @@ def _finalize(optimizer, parameter, *, layout):
     return checkpoint_binding
 
 
-def _plain(*, factored, deterministic):
-    parameter = torch.nn.Parameter(torch.arange(1, 7, dtype=torch.float32).reshape(2, 3))
+def _plain(*, factored, deterministic, layout=ParameterLayout.REPLICATED):
+    values = torch.arange(1, 7, dtype=torch.float32).reshape(2, 3)
+    parameter = torch.nn.Parameter(
+        values.reshape(-1) if layout is ParameterLayout.FLATTENED_ELEMENT_SHARD else values
+    )
     optimizer = Gefen(
         [("weight", parameter)],
         fused=False,
@@ -88,7 +99,12 @@ def _plain(*, factored, deterministic):
         force_2d_period_one=True,
         deterministic=deterministic,
     )
-    binding = _finalize(optimizer, parameter, layout=ParameterLayout.REPLICATED)
+    binding = _finalize(
+        optimizer,
+        parameter,
+        layout=layout,
+        global_shape=(2, 3),
+    )
     return optimizer, parameter, binding
 
 
@@ -178,10 +194,11 @@ def test_initialized_singleton_export_import_round_trip(variant):
     elif variant == "block":
         assert support.topology_changing == frozenset(
             {
-                ParameterLayout.REPLICATED,
-                ParameterLayout.FLATTENED_ELEMENT_SHARD,
-            }
-        )
+                    ParameterLayout.REPLICATED,
+                    ParameterLayout.FLATTENED_ELEMENT_SHARD,
+                    ParameterLayout.DTENSOR_1D_DEFAULT_WORLD,
+                }
+            )
         assert support.topology_change_kinds == frozenset({TopologyChange.PLACEMENT_RESHARD})
     else:
         assert support.topology_changing == frozenset(
@@ -235,6 +252,132 @@ def test_initialized_singleton_export_import_round_trip(variant):
     else:
         assert torch.equal(target_state["normuon_v"], record["state"]["normuon_v"])
         assert target_state["normuon_step"] == 2
+
+
+def test_factored_to_flat_block_import_matches_target_topology_reference_continuation():
+    source, source_parameter, source_binding = _plain(factored=True, deterministic=True)
+    target, target_parameter, target_binding = _plain(
+        factored=False,
+        deterministic=False,
+        layout=ParameterLayout.FLATTENED_ELEMENT_SHARD,
+    )
+    reference, reference_parameter, _ = _plain(
+        factored=False,
+        deterministic=True,
+        layout=ParameterLayout.FLATTENED_ELEMENT_SHARD,
+    )
+    _initialize(source, source_parameter, variant="factored")
+    document = _export_portable_state(
+        source,
+        checkpoint_process_group=source_binding,
+        transaction_id="export-factored-to-block",
+        limits=_limits(),
+    )
+    assert "factored_to_block_live_fp32" in document["policy"]["second_moment_projection"]
+
+    _import_portable_state(
+        target,
+        document,
+        checkpoint_process_group=target_binding,
+        transaction_id="import-factored-to-block",
+        limits=_limits(),
+    )
+
+    record = document["parameters"]["layer.weight"]
+    expected_second = torch.outer(record["state"]["v_row"], record["state"]["v_col"]).div_(
+        record["state"]["v_row"].mean().clamp_(min=torch.finfo(torch.float32).tiny)
+    )
+    target_state = target.state[target_parameter]
+    assert torch.equal(target_state["vmean"].reshape(2, 3).view(torch.int32), expected_second.view(torch.int32))
+    assert target_state["vmean_step"] == record["state"]["factored_step"]
+
+    reference._gefen_global_step = document["common"]["gefen_global_step"]
+    reference._gefen_codebook = document["common"]["gefen_codebook"].clone()
+    reference._deterministic = document["common"]["gefen_deterministic"]
+    reference_indices, reference_magnitudes = _recompress_dense_momentum(
+        record["state"]["momentum"],
+        reference._gefen_codebook,
+        period=1,
+        step=record["state"]["step"],
+    )
+    reference.state[reference_parameter].update(
+        {
+            "automatic_period": 1,
+            "step": record["state"]["step"],
+            "m_codebook": reference_indices,
+            "m_magnitude": reference_magnitudes,
+            "vmean": expected_second.reshape(-1, 1).clone(),
+            "vmean_step": record["state"]["factored_step"],
+        }
+    )
+
+    gradient = torch.tensor([[-0.75, 0.5, 2.0], [3.25, -1.5, 0.125]], dtype=torch.float32)
+    target_parameter.grad = gradient.reshape(-1).clone()
+    reference_parameter.grad = gradient.reshape(-1).clone()
+    target.step()
+    reference.step()
+
+    assert torch.equal(target_parameter.view(torch.int32), reference_parameter.view(torch.int32))
+    assert target._gefen_global_step == reference._gefen_global_step == 5
+    reference_state = reference.state[reference_parameter]
+    for key in ("automatic_period", "step", "vmean_step"):
+        assert target_state[key] == reference_state[key]
+    assert torch.equal(target_state["m_codebook"], reference_state["m_codebook"])
+    for key in ("m_magnitude", "vmean"):
+        assert torch.equal(target_state[key].view(torch.int32), reference_state[key].view(torch.int32))
+
+
+def test_factored_to_block_projection_overflow_fails_before_live_mutation():
+    source, source_parameter, source_binding = _plain(factored=True, deterministic=True)
+    target, target_parameter, target_binding = _plain(factored=False, deterministic=False)
+    _initialize(source, source_parameter, variant="factored")
+    _initialize(target, target_parameter, variant="block")
+    maximum = torch.finfo(torch.float32).max
+    source.state[source_parameter]["v_row"] = torch.full((2,), maximum)
+    source.state[source_parameter]["v_col"] = torch.full((3,), maximum)
+    document = _export_portable_state(
+        source,
+        checkpoint_process_group=source_binding,
+        transaction_id="export-factored-overflow",
+        limits=_limits(),
+    )
+    before = target._canonical_import_live_token()
+
+    with pytest.raises(RuntimeError, match="cannot be represented"):
+        _import_portable_state(
+            target,
+            document,
+            checkpoint_process_group=target_binding,
+            transaction_id="import-factored-overflow",
+            limits=_limits(),
+        )
+
+    assert target._canonical_import_live_token() == before
+
+
+def test_block_to_factored_import_is_rejected_before_live_mutation():
+    source, source_parameter, source_binding = _plain(factored=False, deterministic=True)
+    target, target_parameter, target_binding = _plain(factored=True, deterministic=False)
+    _initialize(source, source_parameter, variant="block")
+    _initialize(target, target_parameter, variant="factored")
+    document = _export_portable_state(
+        source,
+        checkpoint_process_group=source_binding,
+        transaction_id="export-block-for-reverse-rejection",
+        limits=_limits(),
+    )
+    before = target._canonical_import_live_token()
+
+    with pytest.raises(RuntimeError, match="block-to-factored"):
+        _import_portable_state(
+            target,
+            document,
+            checkpoint_process_group=target_binding,
+            transaction_id="import-block-to-factored",
+            limits=_limits(),
+        )
+
+    assert target._canonical_import_live_token() == before
 
 
 def test_import_rejects_corrupt_document_without_live_mutation():

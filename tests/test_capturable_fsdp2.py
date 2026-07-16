@@ -362,6 +362,156 @@ def _worker(rank, world, case_name, port, q):
             dist.destroy_process_group()
 
 
+def _frozen_routing_worker(rank, world, port, q):
+    import torch.distributed as dist
+    from torch.distributed.tensor import init_device_mesh
+
+    os.environ["MASTER_ADDR"] = "127.0.0.1"
+    os.environ["MASTER_PORT"] = port
+    os.environ["RANK"] = str(rank)
+    os.environ["WORLD_SIZE"] = str(world)
+    torch.cuda.set_device(rank)
+    device = torch.device("cuda", rank)
+    dist.init_process_group(
+        "nccl", rank=rank, world_size=world, timeout=timedelta(seconds=180)
+    )
+    try:
+        mesh = init_device_mesh("cuda", (world,))
+        case = {
+            "kind": "muon",
+            "sharded_mode": "approx",
+            "specs": [("route_w", (32, 32))],
+            "dtype": torch.bfloat16,
+        }
+        full_init = _make_full_tensors(
+            case["specs"],
+            seed=8100,
+            device=device,
+            dtype=case["dtype"],
+            scale=0.1,
+        )
+        full_grad = _make_full_tensors(
+            case["specs"],
+            seed=8200,
+            device=device,
+            dtype=case["dtype"],
+            scale=0.01,
+        )
+        params = _build_params(case["specs"], full_init, mesh)
+        lr = torch.tensor(1e-1, device=device)
+        optimizer = _build_optimizer(case, params, lr)
+        static_grads = _attach_static_grads(params, full_grad, mesh)
+        _fill_static_grads(static_grads, full_grad, rank, world)
+
+        side = torch.cuda.Stream(device=rank)
+        side.wait_stream(torch.cuda.current_stream(rank))
+        with torch.cuda.stream(side):
+            for _ in range(WARMUP):
+                optimizer.step()
+        torch.cuda.current_stream(rank).wait_stream(side)
+        torch.cuda.synchronize(rank)
+        parameter = params[0][1]
+        before = parameter.to_local().detach().clone()
+        warm_mode = optimizer.param_groups[0]["sharded_mode"]
+        warm_state_local = (
+            optimizer.state[parameter]["m_codebook"].numel()
+            == parameter.to_local().numel()
+        )
+
+        if rank == 0:
+            optimizer.param_groups[0]["sharded_mode"] = "exact"
+        dist.barrier()
+        asymmetric_graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(asymmetric_graph):
+            optimizer.step()
+        torch.cuda.synchronize(rank)
+        asymmetric_restored = optimizer.param_groups[0]["sharded_mode"] == "approx"
+        dist.barrier()
+        asymmetric_graph.replay()
+        torch.cuda.synchronize(rank)
+        dist.barrier()
+
+        optimizer.param_groups[0]["sharded_mode"] = "distributed"
+        unanimous_graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(unanimous_graph):
+            optimizer.step()
+        torch.cuda.synchronize(rank)
+        unanimous_restored = optimizer.param_groups[0]["sharded_mode"] == "approx"
+        dist.barrier()
+        unanimous_graph.replay()
+        torch.cuda.synchronize(rank)
+        dist.barrier()
+
+        after = parameter.to_local().detach().clone()
+        max_parameter_change = (after.float() - before.float()).abs().max().item()
+        # Recording does not execute the captured step; only the two explicit
+        # replays advance device-side counters beyond eager warmup.
+        counters_ok, counter_message = _assert_counters(optimizer, WARMUP + 2)
+        q.put(
+            (
+                "frozen-routing",
+                rank,
+                {
+                    "warm_mode": warm_mode,
+                    "warm_state_local": warm_state_local,
+                    "asymmetric_restored": asymmetric_restored,
+                    "unanimous_restored": unanimous_restored,
+                    "parameter_changed": max_parameter_change > 0.0,
+                    "max_parameter_change": max_parameter_change,
+                    "counters_ok": counters_ok,
+                    "counter_message": counter_message,
+                },
+            )
+        )
+    except Exception:
+        q.put(("error", rank, traceback.format_exc()))
+    finally:
+        if dist.is_initialized():
+            dist.destroy_process_group()
+
+
+def _run_frozen_routing_case():
+    import torch.multiprocessing as mp
+
+    ctx = mp.get_context("spawn")
+    q = ctx.Queue()
+    port = _get_free_port()
+    procs = [
+        ctx.Process(target=_frozen_routing_worker, args=(rank, WORLD, port, q))
+        for rank in range(WORLD)
+    ]
+    for proc in procs:
+        proc.start()
+
+    messages = []
+    deadline = time.monotonic() + 240
+    while time.monotonic() < deadline and len(messages) < WORLD:
+        try:
+            messages.append(q.get(timeout=0.5))
+        except queue.Empty:
+            if not any(proc.is_alive() for proc in procs):
+                break
+    for proc in procs:
+        proc.join(timeout=10)
+    for proc in procs:
+        if proc.is_alive():
+            proc.terminate()
+            proc.join(timeout=10)
+
+    assert all(proc.exitcode == 0 for proc in procs), [
+        proc.exitcode for proc in procs
+    ]
+    errors = [message[2] for message in messages if message[0] == "error"]
+    assert not errors, "\n".join(errors)
+    results = {
+        message[1]: message[2]
+        for message in messages
+        if message[0] == "frozen-routing"
+    }
+    assert set(results) == set(range(WORLD)), messages
+    return results
+
+
 def _run_case(case_name):
     import torch.multiprocessing as mp
 
@@ -467,6 +617,23 @@ if pytest is not None:
     @pytest.mark.parametrize("case_name", list(DEFAULT_CASES))
     def test_capturable_fsdp2_capture(case_name):
         assert _run_case(case_name)
+
+    @pytest.mark.skipif(
+        not torch.cuda.is_available()
+        or not torch.distributed.is_available()
+        or not torch.distributed.is_nccl_available()
+        or torch.cuda.device_count() < WORLD,
+        reason="capturable FSDP2 capture needs >=2 CUDA GPUs and NCCL",
+    )
+    def test_capturable_muon_freezes_warmup_routing_before_mode_partition():
+        results = _run_frozen_routing_case()
+        for result in results.values():
+            assert result["warm_mode"] == "approx", result
+            assert result["warm_state_local"], result
+            assert result["asymmetric_restored"], result
+            assert result["unanimous_restored"], result
+            assert result["counters_ok"], result["counter_message"]
+            assert result["parameter_changed"], result["max_parameter_change"]
 
 
 if __name__ == "__main__":
