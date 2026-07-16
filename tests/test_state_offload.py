@@ -303,3 +303,36 @@ def test_active_offload_load_colocates_cpu_mapped_codebook():
         not torch.is_tensor(value) or value.device.type == "cpu"
         for value in optimizer.state[parameter].values()
     )
+
+
+def _to_cpu_tree(value):
+    if torch.is_tensor(value):
+        return value.cpu()
+    if isinstance(value, dict):
+        return {key: _to_cpu_tree(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_to_cpu_tree(item) for item in value]
+    return value
+
+
+@CUDA_REQUIRED
+def test_offload_activation_colocates_cpu_mapped_codebook():
+    # Inactive map_location='cpu' load leaves the codebook on CPU; enabling
+    # offload afterwards must restore the CUDA-resident invariant so the very
+    # next step succeeds (the common resume-then-enable-offload flow).
+    optimizer, parameter = _initialized(device="cuda")
+    cpu_mapped = _to_cpu_tree(copy.deepcopy(optimizer.state_dict()))
+    optimizer.load_state_dict(cpu_mapped)
+    assert optimizer._gefen_codebook.device.type == "cpu"
+    assert not optimizer.state_offload_active
+
+    optimizer.offload_state_()
+    assert optimizer.state_offload_active
+    assert optimizer._gefen_codebook.device.type == "cuda"
+
+    parameter.grad = torch.linspace(-1.0, 1.0, 8, device="cuda")
+    optimizer.step()
+    assert all(
+        not torch.is_tensor(value) or value.device.type == "cpu"
+        for value in optimizer.state[parameter].values()
+    )

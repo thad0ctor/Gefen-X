@@ -453,9 +453,18 @@ class StateOffloadMixin:
         reason = self._state_offload_rejection_reason(require_cpu_state=False)
         if reason is not None:
             raise RuntimeError("Gefen state offload is unavailable: {}".format(reason))
+        # Stage everything before mutating self: a failure in either stage
+        # leaves the live optimizer untouched. Activation must also restore the
+        # CUDA-resident codebook invariant, since an inactive map_location='cpu'
+        # load can have left the codebook on CPU while validation (which runs
+        # with require_cpu_state=False) still permits it.
         state = self._stage_all_parameter_state_to_cpu()
+        codebook = self._stage_offload_codebook_on_parameter_device()
         self.__dict__.update(
             state=state,
+            _gefen_codebook=codebook,
+            _gefen_codebook_by_device={},
+            _gefen_codebook_lut_by_device={},
             _gefen_state_offload_device=torch.device("cpu"),
             _gefen_state_offload_poisoned=False,
             _static_mark_sig=None,
@@ -469,22 +478,43 @@ class StateOffloadMixin:
         if self.state_offload_active:
             self.move_state_()
 
-    def _colocate_offload_codebook_with_parameters(self) -> None:
-        """Restore the CUDA-resident codebook invariant on a staged load shadow.
+    def _stage_offload_codebook_on_parameter_device(self):
+        """Return the shared codebook staged onto its parameter device.
 
         Offload keeps the small shared codebook co-located with the parameters
         while per-parameter state lives on CPU. A checkpoint restored with
-        ``map_location='cpu'`` can deposit the codebook on CPU; move it back onto
-        the parameter device and drop the now-stale per-device caches so the next
-        step does not trip the "codebook must remain CUDA-resident" guard.
+        ``map_location='cpu'`` can deposit the codebook on CPU; return a fresh
+        tight copy on the parameter device when relocation is needed, else the
+        current codebook unchanged. Staging never mutates ``self`` so callers can
+        fold the result into an atomic update and roll back on failure.
         """
 
-        if not torch.is_tensor(self._gefen_codebook):
+        codebook = self._gefen_codebook
+        if not torch.is_tensor(codebook):
+            return codebook
+        target = self._gefen_codebook_device()
+        if codebook.device == target:
+            return codebook
+        staged = self._copy_state_tensor_for_move(codebook, target)
+        self._validate_staged_state_tensor(codebook, staged, target)
+        if target.type == "cuda":
+            torch.cuda.synchronize(target)
+        return staged
+
+    def _colocate_offload_codebook_with_parameters(self) -> None:
+        """Restore the CUDA-resident codebook invariant on a staged load shadow.
+
+        Move the shared codebook back onto the parameter device (see
+        :meth:`_stage_offload_codebook_on_parameter_device`) and drop the
+        now-stale per-device caches so the next step does not trip the "codebook
+        must remain CUDA-resident" guard. Staging precedes mutation, so a failure
+        leaves the shadow untouched.
+        """
+
+        staged = self._stage_offload_codebook_on_parameter_device()
+        if staged is self._gefen_codebook:
             return
-        device = self._gefen_codebook_device()
-        if self._gefen_codebook.device == device:
-            return
-        self._gefen_codebook = self._gefen_codebook.to(device)
+        self._gefen_codebook = staged
         self._gefen_codebook_by_device = {}
         self._gefen_codebook_lut_by_device = {}
 
