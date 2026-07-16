@@ -121,12 +121,12 @@ Gefen drops into standard distributed training like any other PyTorch optimizer,
 |---|---|
 | DDP | All optimizers |
 | FSDP2 | All optimizers; training-time CPU offload (`CPUOffloadPolicy`) validated for plain Gefen, single and multi-GPU |
-| FSDP2 checkpoints | Plain Gefen can use `GefenDCPState` for DCP resharding; the native full-state path and Muon `approx` remain same-topology |
+| FSDP2 checkpoints | Plain Gefen can use `GefenDCPState` to reshard N ranks to M; same-topology resumes use the bit-exact native full-state path (Muon `approx` too) |
 | Muon `distributed` checkpoints | Resume on any GPU count, even a single GPU — [details](#experimental-lever-sharded-newton-schulz-under-fsdp2-sharded_mode) |
 | DeepSpeed ZeRO 1-3 | Plain Gefen (client optimizer); optimizer CPU-offload verified at ZeRO-2/3, parameter offload at ZeRO-3 (full fine-tune and LoRA); use FSDP2 or DDP for the Muon family — config note below |
 | Megatron-LM | All optimizers, including checkpoint resume — [scope](https://github.com/thad0ctor/Gefen-X/blob/main/COMPATIBILITY.md#megatron-lm-integration-scope) |
 
-> **FSDP2 checkpoint scope.** Plain Gefen can save shard-addressable optimizer state through `torch.distributed.checkpoint` by wrapping it with `GefenDCPState`; a checkpoint saved on N ranks can load on M ranks for a one-dimensional default-world `Shard(0)` mesh. The existing native full-state path and Muon `approx` remain same-topology — [full details](https://github.com/thad0ctor/Gefen-X/blob/main/COMPATIBILITY.md#optimizer-checkpoint-scope).
+> **FSDP2 checkpoint scope.** `GefenDCPState` is for **resharding** plain Gefen: wrap the optimizer with it for `torch.distributed.checkpoint`, and a checkpoint saved on N ranks loads on M ranks for a one-dimensional default-world `Shard(0)` mesh. Load re-blocks the resharded state back to Gefen's compact ~1 byte/param form, so resume is a correct continuation within quantization noise rather than a bit-exact restore; same-topology resumes should use the bit-exact native full-state path (Muon `approx` too). Requires `factored_v_2d=False` and `capturable=False` — [full details](https://github.com/thad0ctor/Gefen-X/blob/main/COMPATIBILITY.md#optimizer-checkpoint-scope).
 >
 > **FSDP2 CPU offload.** Training-time CPU offload via `CPUOffloadPolicy` (`fully_shard(module, offload_policy=CPUOffloadPolicy())`) is validated for plain Gefen on single and multiple GPUs: each rank steps its CPU-resident local shard directly (the codebook is learned rank-locally, with no cross-rank codebook collective), and the multi-GPU run completes on an NCCL-only process group.
 
@@ -636,7 +636,7 @@ Measured (Qwen3-0.6B, 2 and 4 GPUs): `"distributed"` matched `"exact"` in the re
 ## Known limitations
 
 - **Hybrid checkpoint schema.** `GefenMuonHybrid`'s `state_dict()` uses its own nested `{"muon": ..., "backup": ..., "backup_optimizer": "gefen" | "adamw"}` layout. Resume from a checkpoint the hybrid itself saved—not one consolidated or converted to the flat torch `{state, param_groups}` layout. Cross-backend loads are rejected before either child is mutated; legacy untagged hybrid checkpoints are interpreted as Gefen-backed.
-- **FSDP2 optimizer resharding is explicit.** Use `dcp.save({"optimizer": GefenDCPState(optimizer)}, ...)` and the matching `dcp.load` call for plain Gefen on a one-dimensional default-world `Shard(0)` mesh. Muon, Hybrid, other placements, and the native full-state format remain same-topology and fail closed — [details](https://github.com/thad0ctor/Gefen-X/blob/main/COMPATIBILITY.md#optimizer-checkpoint-scope).
+- **FSDP2 optimizer resharding is explicit.** Use `dcp.save({"optimizer": GefenDCPState(optimizer)}, ...)` and the matching `dcp.load` call to reshard plain Gefen across world sizes on a one-dimensional default-world `Shard(0)` mesh (`factored_v_2d=False`, `capturable=False`). Load re-blocks the state to Gefen's compact form and continues within quantization noise; for a same-topology resume use the bit-exact native path instead. Muon, Hybrid, other placements, and the native full-state format remain same-topology and fail closed — [details](https://github.com/thad0ctor/Gefen-X/blob/main/COMPATIBILITY.md#optimizer-checkpoint-scope).
 - **True-FP16 overflow skips are invisible to Accelerate's `step_was_skipped` flag.** BF16 and standard AMP are unaffected and are the recommended modes in Trainer/Accelerate.
 
 ## Troubleshooting

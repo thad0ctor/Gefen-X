@@ -8,7 +8,6 @@ import torch
 
 
 _FORMAT_VERSION = 1
-_CODEBOOK = torch.linspace(-1.0, 1.0, 256, dtype=torch.float32)
 
 
 def _local(value):
@@ -82,6 +81,90 @@ def _dense_second_moment(parameter, state) -> torch.Tensor:
     )
 
 
+def _choose_period(name: str, parameter, second: torch.Tensor) -> int:
+    """Re-derive a compact block period for the resharded local shard.
+
+    Runs Gefen's block-variance period search on the dense per-element second
+    moment (a grad^2 proxy -- ``vmean`` is itself the EMA of block-mean grad^2),
+    exactly as the native first step runs it on grad^2. The result is a divisor
+    of the *new* local numel, so the restored state keeps ~1 byte/param instead
+    of collapsing to per-element (period one).
+    """
+    from gefen.partitioning import find_period_by_block_variance
+
+    flat = second.reshape(-1)
+    if flat.numel() < 8:
+        return 1
+    if flat.device.type == "cuda":
+        return find_period_by_block_variance(
+            flat.detach().float(),
+            print_results=False,
+            parameter_name=name,
+            parameter_shape=tuple(parameter.shape),
+            backend="gpu",
+            input_is_squared=True,
+        )
+    return find_period_by_block_variance(
+        flat.detach().float().cpu().numpy(),
+        print_results=False,
+        parameter_name=name,
+        parameter_shape=tuple(parameter.shape),
+        backend="cpu",
+        input_is_squared=True,
+    )
+
+
+def _learn_codebook(name_flat_period, device):
+    """Re-learn one exact codebook per rank from the resharded local momentum.
+
+    Mirrors the native per-rank codebook (one histogram across all of the rank's
+    parameters); the resharded momentum is the distribution being quantized, so
+    learning from it directly minimizes the re-quantization error on this shard.
+    Returns ``None`` when there is no initialized momentum to learn from.
+    """
+    from gefen.gefen import learn_gefen_exact_codebook_from_grad_periods
+
+    grad_periods = [
+        (name, flat, period, flat) for name, flat, period in name_flat_period
+    ]
+    if not grad_periods:
+        return None
+    return learn_gefen_exact_codebook_from_grad_periods(
+        grad_periods=grad_periods,
+        codebook_device=device,
+        num_codebooks=256,
+        force_endpoints=True,
+        verbose=False,
+        compute_mse_logging=False,
+        use_fused_histogram=False,
+    )
+
+
+def _reblock(codebook, momentum: torch.Tensor, second: torch.Tensor, period: int):
+    """Re-quantize a dense fp32 momentum shard into compact Gefen block state.
+
+    Reproduces the native quantize arithmetic (``_automatic_momentum_update``):
+    per-block max-abs magnitude, normalize into the codebook domain, nearest
+    codeword indices. ``vmean`` is the per-block mean of the dense second moment
+    (the block-mean grad^2 for the new blocking). Returns
+    ``(m_codebook, m_magnitude, vmean)``.
+    """
+    from gefen.gefen import (
+        automatic_partition_reduce,
+        automatic_partition_view,
+        gefen_nearest_codebook_indices,
+    )
+
+    flat = momentum.reshape(-1)
+    blocks = automatic_partition_view(flat, period)
+    magnitude = automatic_partition_reduce(flat.abs(), period, reduce_op="max")
+    nonzero = magnitude > 0
+    normalized = torch.where(nonzero, blocks / magnitude, torch.zeros_like(blocks))
+    indices = gefen_nearest_codebook_indices(codebook, normalized)
+    vmean = automatic_partition_reduce(second.reshape(-1), period, reduce_op="mean")
+    return indices, magnitude.float(), vmean.float()
+
+
 @dataclass(frozen=True)
 class _Slot:
     index: int
@@ -93,10 +176,18 @@ class GefenDCPState:
     """DCP ``Stateful`` wrapper for reshardable plain-Gefen FSDP2 state.
 
     Use this object as the optimizer value passed to
-    :func:`torch.distributed.checkpoint.save` and ``load``. The adapter is
-    intentionally limited to plain :class:`gefen.Gefen`, one-dimensional
-    default-world DTensors, and one ``Shard(0)`` placement. Native
-    ``state_dict`` checkpoints remain unchanged.
+    :func:`torch.distributed.checkpoint.save` and ``load``. Save dequantizes the
+    quantized momentum against the learned per-rank codebook into dense
+    ``Shard(0)`` DTensors; load reshards those dense tensors and re-blocks them
+    back into Gefen's compact per-block state (re-running the period search,
+    relearning the codebook, and re-quantizing on each new local shard), so the
+    restored optimizer keeps its ~1 byte/param footprint. Because it goes through
+    a dense reshard this path is for *changing* topology; same-topology resumes
+    should use the native bit-exact ``state_dict`` path (left unchanged).
+
+    The adapter is intentionally limited to plain :class:`gefen.Gefen` with
+    ``factored_v_2d=False`` and ``capturable=False``, one-dimensional
+    default-world DTensors, and one ``Shard(0)`` placement.
     """
 
     def __init__(self, optimizer):
@@ -113,6 +204,20 @@ class GefenDCPState:
                 "GefenDCPState requires an initialized distributed process group"
             )
         import torch.distributed as dist
+
+        if getattr(self.optimizer, "capturable", False):
+            raise RuntimeError(
+                "GefenDCPState does not support capturable=True: the step and "
+                "global-step counters are per-device tensors under capturable "
+                "(and compiled) execution, so their serialized host-side "
+                "semantics differ. Checkpoint with capturable=False."
+            )
+        if getattr(self.optimizer, "_factored_v_2d", False):
+            raise RuntimeError(
+                "GefenDCPState does not support factored_v_2d=True: the factored "
+                "row/column second moment is not shard-addressable. Construct the "
+                "optimizer with factored_v_2d=False for DCP resharding."
+            )
 
         slots = []
         index = 0
@@ -266,30 +371,47 @@ class GefenDCPState:
         deterministic = bool(
             _counter(state_dict["deterministic"], "deterministic")
         )
-        new_state = {}
-        codebook = _CODEBOOK.to(
-            device=_local(self._slots[0].parameter).device,
-            dtype=torch.float32,
+
+        # Re-block the resharded dense momentum back into Gefen's compact
+        # per-block representation instead of collapsing it to period one. Going
+        # through a dense DCP reshard is inherently a new blocking (so this is
+        # NOT bit-exact to a native same-topology resume), but it restores the
+        # ~1 byte/param memory profile and is a correct, finite continuation:
+        # per new local shard we re-run the block-variance period search, relearn
+        # the exact codebook, and re-quantize. All of this happens BEFORE the
+        # optimizer state is cleared, preserving the fail-atomic load contract.
+        device = _local(self._slots[0].parameter).device
+        periods = {}
+        for slot, initialized, step, vmean_step, momentum, second in staged:
+            if initialized:
+                periods[slot.index] = _choose_period(
+                    slot.name, slot.parameter, second
+                )
+        codebook = _learn_codebook(
+            [
+                (slot.name, momentum.reshape(-1), periods[slot.index])
+                for slot, initialized, _, _, momentum, _ in staged
+                if initialized
+            ],
+            device,
         )
+
+        new_state = {}
         for slot, initialized, step, vmean_step, momentum, second in staged:
             if not initialized:
                 new_state[slot.parameter] = {"name": slot.name}
                 continue
-            flat = momentum.reshape(-1)
-            indices = torch.where(
-                torch.signbit(flat),
-                torch.zeros(flat.numel(), dtype=torch.uint8, device=flat.device),
-                torch.full(
-                    (flat.numel(),), 255, dtype=torch.uint8, device=flat.device
-                ),
+            period = periods[slot.index]
+            m_codebook, m_magnitude, vmean = _reblock(
+                codebook, momentum, second, period
             )
             new_state[slot.parameter] = {
                 "name": slot.name,
-                "automatic_period": 1,
+                "automatic_period": period,
                 "step": step,
-                "m_codebook": indices.reshape(-1, 1),
-                "m_magnitude": flat.abs().reshape(-1, 1),
-                "vmean": second.reshape(-1, 1).clone(),
+                "m_codebook": m_codebook,
+                "m_magnitude": m_magnitude,
+                "vmean": vmean,
                 "vmean_step": vmean_step,
             }
 
@@ -297,6 +419,11 @@ class GefenDCPState:
         self.optimizer.state.update(new_state)
         self.optimizer._gefen_global_step = global_step
         self.optimizer._deterministic = deterministic
+        # A relearned codebook reflects this rank's resharded momentum and is kept
+        # by _maybe_refresh_gefen_codebook on the next step (which then also skips
+        # re-predicting periods, keeping the restored block geometry consistent).
+        # With no initialized momentum there is nothing to learn from; leave the
+        # codebook unset so the next real step learns it cold.
         self.optimizer._gefen_codebook = codebook
         self.optimizer._gefen_codebook_by_device.clear()
         self.optimizer._gefen_codebook_lut_by_device.clear()
