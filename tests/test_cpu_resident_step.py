@@ -283,3 +283,56 @@ def test_cpu_vs_cuda_nonfused_parity(dtype, rtol, atol):
     assert torch.allclose(p_cpu, p_cuda, rtol=rtol, atol=atol), (
         (p_cpu - p_cuda).abs().max().item()
     )
+
+
+@CUDA
+def test_grad_param_mismatch_fails_before_codebook_mutation():
+    """The co-location check runs in the pre-mutation preflight, so a first-step
+    param/grad device mismatch must leave the shared codebook unlearned (fail
+    before mutation). A caller that catches, colocates, and retries then learns
+    the codebook from the valid gradient instead of reusing a stale one."""
+    p = nn.Parameter(torch.randn(16, 16).cuda())
+    opt = Gefen([("w", p)], lr=1e-2, fused=False)
+    p.grad = torch.randn(16, 16, device="cuda") * 0.1
+    p.data = p.data.cpu()  # page param to CPU after grad set -> mismatch
+
+    assert opt._gefen_codebook is None
+    with pytest.raises(RuntimeError, match="same device"):
+        opt.step()
+    assert opt._gefen_codebook is None, "codebook learned despite the rejected step"
+    assert "automatic_period" not in opt.state.get(p, {})
+
+    # Colocate and retry: now the codebook is learned from the valid gradient.
+    p.grad = torch.randn(16, 16) * 0.1  # CPU grad, co-located with the CPU param
+    opt.step()
+    assert opt._gefen_codebook is not None
+    assert opt._gefen_codebook.device.type == "cpu"
+    assert torch.isfinite(p.detach()).all()
+
+
+@CUDA
+@pytest.mark.parametrize("factored", [True, False])
+def test_tensor_lr_survives_cpu_paging(factored):
+    """A supported tensor-valued lr must keep the CPU-resident step working after
+    the parameter is paged across devices: the non-fused path scalarizes the lr,
+    so a CUDA-resident lr tensor does not strand the CPU-resident update."""
+    torch.manual_seed(0)
+    p = nn.Parameter(torch.randn(16, 24).cuda())
+    opt = Gefen(
+        [("w", p)],
+        lr=torch.tensor(1e-2, device="cuda"),
+        fused=False,
+        factored_v_2d=factored,
+    )
+    gen = torch.Generator().manual_seed(0)
+
+    def _step_on(device):
+        p.data = p.data.to(device)
+        p.grad = (torch.randn(16, 24, generator=gen) * 0.1).to(device)
+        opt.step()
+        opt.zero_grad(set_to_none=True)
+
+    _step_on(torch.device("cuda"))
+    _step_on(torch.device("cpu"))  # lr tensor still on CUDA -> must not strand
+    _step_on(torch.device("cuda"))
+    assert torch.isfinite(p.detach()).all()

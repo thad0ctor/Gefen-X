@@ -122,7 +122,7 @@ Gefen drops into standard distributed training like any other PyTorch optimizer,
 | FSDP2 | All optimizers; training-time CPU offload (`CPUOffloadPolicy`) validated for plain Gefen, single and multi-GPU |
 | FSDP2 checkpoints | Plain Gefen and Muon `approx`; resume needs the same GPU count — scope note below |
 | Muon `distributed` checkpoints | Resume on any GPU count, even a single GPU — [details](#experimental-lever-sharded-newton-schulz-under-fsdp2-sharded_mode) |
-| DeepSpeed ZeRO 1-3 | Plain Gefen, including optimizer/param CPU-offload (full fine-tune and LoRA); use FSDP2 or DDP for the Muon family — config note below |
+| DeepSpeed ZeRO 1-3 | Plain Gefen (client optimizer); optimizer/param CPU-offload verified at ZeRO-2/3 (full fine-tune and LoRA); use FSDP2 or DDP for the Muon family — config note below |
 | Megatron-LM | All optimizers, including checkpoint resume — [scope](https://github.com/thad0ctor/Gefen-X/blob/main/COMPATIBILITY.md#megatron-lm-integration-scope) |
 
 > **FSDP2 checkpoint scope.** Plain Gefen and Muon `approx` save and resume exactly through PyTorch's standard full-state checkpoint calls, as long as the GPU count and sharding layout are unchanged and every GPU joins the save. Anything outside that scope refuses to load instead of corrupting state — [full details](https://github.com/thad0ctor/Gefen-X/blob/main/COMPATIBILITY.md#optimizer-checkpoint-scope).

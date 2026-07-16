@@ -108,11 +108,15 @@ def test_gefen_steps_fsdp2_cpu_offload_shards_single_rank():
         target=_fsdp2_cpu_offload_worker, args=(0, 1, port, result_queue)
     )
     proc.start()
-    checks = result_queue.get(timeout=180)
-    proc.join(timeout=30)
-    if proc.is_alive():
-        proc.terminate()
-        proc.join(timeout=10)
+    try:
+        checks = result_queue.get(timeout=180)
+    finally:
+        # Always reap the worker -- if the queue read times out, we must still
+        # join/terminate so a hung NCCL worker does not keep the GPU occupied.
+        proc.join(timeout=30)
+        if proc.is_alive():
+            proc.terminate()
+            proc.join(timeout=10)
     assert proc.exitcode == 0
     failed = {k: v for k, v in checks.items() if not v}
     assert not failed, f"FSDP2 CPU-offload checks failed: {failed}"

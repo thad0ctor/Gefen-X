@@ -934,6 +934,36 @@ def _assert_optimizer_gradients_structurally_valid(
                         tuple(grad.shape), str(name), tuple(param.shape)
                     )
                 )
+            # The update is applied in place into the parameter while all of the
+            # update math runs on the gradient's device; the parameter, its
+            # gradient, and its optimizer state must therefore be co-located (the
+            # CPU-offload contract). A genuine param/grad device split cannot
+            # produce a correct in-place write and otherwise fails opaquely deep
+            # in an add_/kernel. Reject it here in the pre-mutation preflight --
+            # before shared-codebook learning/refresh and the per-parameter loop
+            # -- so a mismatch fails atomically without leaving a codebook or
+            # per-param state learned from the rejected gradient. Normal autograd
+            # produces the gradient on the parameter's own device, so this never
+            # fires for a same-device run. DTensor / async gradients are sharded
+            # wrappers whose local-shard device is resolved by the
+            # .to_local()/.wait() unwrap downstream and can legitimately differ
+            # from the wrapper's reported device, so skip the check for them and
+            # only enforce co-location for plain tensors (the CPU-offload case).
+            if (
+                not hasattr(grad, "to_local")
+                and not hasattr(grad, "wait")
+                and not hasattr(param, "placements")
+                and grad.device != param.device
+            ):
+                raise RuntimeError(
+                    "Gefen requires each parameter and its gradient to live on "
+                    "the same device (param {!r} is on {} but its gradient is on "
+                    "{}). For CPU-offloaded training keep the parameter, its "
+                    "gradient, and its optimizer state co-located on the same "
+                    "device for the step.".format(
+                        str(name), param.device, grad.device
+                    )
+                )
 
 
 class Gefen(torch.optim.Optimizer):
@@ -2880,6 +2910,13 @@ class Gefen(torch.optim.Optimizer):
         # path; returns the reconstructed fp32 momentum (codebook * magnitude).
         shared_m = self._automatic_momentum_update_merged(state, grad_view, beta1)
 
+        # The weight-decay and update multiplies below run on the compute
+        # device; a tensor lr stranded on another device (a CUDA lr after the
+        # parameter was paged to CPU) would break them. Scalarize when not
+        # capturable -- bit-identical to the 0-dim tensor (value == lr.item()).
+        # Capturable keeps the on-device tensor lr for its device-tensor math.
+        if torch.is_tensor(lr) and not self.capturable:
+            lr = self._lr_scalar(group)
         if group["weight_decay"] > 0.0:
             p.mul_(1 - lr * group["weight_decay"])
         update = shared_m.view(p.shape).mul_(stepsize).mul_(lr)
@@ -3544,10 +3581,16 @@ class Gefen(torch.optim.Optimizer):
             # only when vmean was lazily recreated after a factored->legacy
             # toggle.
             bias_correction_2 = 1 - beta2 ** state["vmean_step"]
-            if torch.is_tensor(lr) and (use_full_fused or use_v2_full):
-                # The fused kernel bindings take lr / wd_factor as host
-                # doubles; scalarize a tensor lr through the cached no-sync
-                # .item() hoist (_lr_scalar) instead of passing the tensor.
+            if torch.is_tensor(lr) and not self.capturable:
+                # The fused kernel bindings take lr / wd_factor as host doubles,
+                # and the non-fused decomposed path multiplies the update by lr
+                # on the compute device -- a tensor lr stranded on another device
+                # (e.g. a CUDA lr after the parameter was paged to CPU) would
+                # break that in-place math. Scalarize through the cached no-sync
+                # .item() hoist (_lr_scalar); the value equals lr.item(), so this
+                # is bit-identical to passing the 0-dim tensor. Capturable keeps
+                # the on-device tensor lr for CUDA-graph replay (never a
+                # CPU-offload path).
                 lr = self._lr_scalar(group)
 
         if use_full_fused:
@@ -5647,35 +5690,10 @@ class Gefen(torch.optim.Optimizer):
                     raise RuntimeError("Gefen does not support sparse gradients")
                 if torch.is_complex(grad):
                     raise RuntimeError("Gefen does not support complex gradients")
-                # The update is applied in place into the parameter while all of
-                # the update math runs on the gradient's device; the parameter,
-                # its gradient, and its optimizer state must therefore be
-                # co-located (the Phase-1 CPU-offload contract). A genuine
-                # param/grad device split cannot produce a correct in-place
-                # write and otherwise fails opaquely deep in an add_/kernel, so
-                # reject it here with an actionable message. Normal autograd
-                # produces the gradient on the parameter's own device, so this
-                # never fires for a same-device run. DTensor / async gradients
-                # are sharded wrappers whose local-shard device is resolved by
-                # the .to_local()/.wait() unwrap downstream and can legitimately
-                # differ from the wrapper's reported device, so skip the check
-                # for them and only enforce co-location for plain tensors (the
-                # CPU-offload case).
-                if (
-                    not hasattr(grad, "to_local")
-                    and not hasattr(grad, "wait")
-                    and not hasattr(p, "placements")
-                    and grad.device != p.device
-                ):
-                    raise RuntimeError(
-                        "Gefen requires each parameter and its gradient to live "
-                        "on the same device (param '{}' is on {} but its "
-                        "gradient is on {}). For CPU-offloaded training keep the "
-                        "parameter, its gradient, and its optimizer state "
-                        "co-located on the same device for the step.".format(
-                            name, p.device, grad.device
-                        )
-                    )
+                # Parameter / gradient device co-location is enforced up front in
+                # _assert_optimizer_gradients_structurally_valid (before any
+                # codebook or per-param state mutation), so by here a plain
+                # tensor's grad and param share a device.
                 # Factored-v routing (opt-in): plain 2D params keep their
                 # quantized momentum but step through the factored-second-
                 # moment path (in-kernel elementwise stepsize on the fused
