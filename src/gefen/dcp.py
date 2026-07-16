@@ -540,6 +540,42 @@ class GefenDCPState:
                     )
                 )
 
+    def _validate_rank_local(self, state_dict, staged_hypers):
+        """Validate the checkpoint against THIS rank's live optimizer.
+
+        Split out from the replicated checkpoint-only validation because every
+        check here reads rank-local state -- the live hyperparameter destinations
+        and the constructor's deterministic flag -- and so may fail on one rank
+        while passing on another. Callers must run this inside the synchronized
+        staging block, where a raise becomes a group-wide abort; raising it
+        outside would deadlock the peers in the _synchronize_step_failure
+        collective. All checks stay ahead of the commit, preserving fail-atomic.
+        """
+        # Verify every live destination can hold the value it is about to be
+        # given, while the commit is still ahead of us (see the helper).
+        for group_index, (group, entry) in enumerate(
+            zip(self.optimizer.param_groups, staged_hypers)
+        ):
+            self._validate_hyper_destinations(group_index, group, entry)
+
+        # Reject a deterministic-policy mismatch instead of silently overwriting
+        # it, matching native Gefen.load_state_dict: the flag changes fused-routing
+        # / replica-determinism semantics, so resuming under a different policy
+        # requires an intentional migration, not a checkpoint that flips it.
+        checkpoint_deterministic = bool(
+            _counter(state_dict["deterministic"], "deterministic")
+        )
+        if checkpoint_deterministic != bool(self.optimizer._deterministic):
+            raise ValueError(
+                "Gefen DCP checkpoint deterministic={!r}, but this optimizer was "
+                "constructed with deterministic={!r}. Resuming under a different "
+                "replica-determinism policy requires an intentional state "
+                "migration or a fresh optimizer; refusing to change it "
+                "silently.".format(
+                    checkpoint_deterministic, bool(self.optimizer._deterministic)
+                )
+            )
+
     def _slot_initialized(self, slot: _Slot) -> bool:
         """Classify a slot's live state; reject a partial/malformed materialize.
 
@@ -673,30 +709,13 @@ class GefenDCPState:
             self._validate_hyper_entry(group_index, entry)
             for group_index, entry in enumerate(saved_hypers)
         ]
-        # Also verify every live destination can hold the value it is about to be
-        # given, while the commit is still ahead of us (see the helper).
-        for group_index, (group, entry) in enumerate(
-            zip(self.optimizer.param_groups, staged_hypers)
-        ):
-            self._validate_hyper_destinations(group_index, group, entry)
-
-        # Reject a deterministic-policy mismatch instead of silently overwriting
-        # it, matching native Gefen.load_state_dict: the flag changes fused-routing
-        # / replica-determinism semantics, so resuming under a different policy
-        # requires an intentional migration, not a checkpoint that flips it.
-        checkpoint_deterministic = bool(
-            _counter(state_dict["deterministic"], "deterministic")
-        )
-        if checkpoint_deterministic != bool(self.optimizer._deterministic):
-            raise ValueError(
-                "Gefen DCP checkpoint deterministic={!r}, but this optimizer was "
-                "constructed with deterministic={!r}. Resuming under a different "
-                "replica-determinism policy requires an intentional state "
-                "migration or a fresh optimizer; refusing to change it "
-                "silently.".format(
-                    checkpoint_deterministic, bool(self.optimizer._deterministic)
-                )
-            )
+        # NOTE: validation that reads the LIVE optimizer -- hyperparameter
+        # destinations and the deterministic flag -- is deliberately NOT done
+        # here. It is rank-local, so it can fail on one rank and pass on another;
+        # raising it outside the synchronized block below would let the failing
+        # rank exit while its peers block forever in the _synchronize_step_failure
+        # collective, turning a validation error into a distributed hang. It runs
+        # inside that block instead (_validate_rank_local).
 
         # Stage, validate, and re-block everything locally BEFORE mutating any
         # live optimizer state. The whole preparation runs inside this helper so a
@@ -850,6 +869,7 @@ class GefenDCPState:
         local_error = None
         prepared = None
         try:
+            self._validate_rank_local(state_dict, staged_hypers)
             prepared = _stage()
         except Exception as exc:  # resynchronized across the group below
             local_error = exc

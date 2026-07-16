@@ -10,8 +10,9 @@ reshard re-quantizes it against a freshly learned per-shard codebook.
 
 These reshards all re-derive the same block period, so they isolate that
 re-quantization error; the second, larger approximation a reshard can incur --
-re-aggregating the per-block second moment when the target blocking coarsens --
-is pinned separately by test_second_moment_reblocking_regimes. See _CONTINUE_TOL.
+re-aggregating the per-block second moment when the target blocking lands finer
+than, or off the boundaries of, the source's -- is pinned separately by
+test_second_moment_reblocking_regimes. See _CONTINUE_TOL.
 """
 
 from __future__ import annotations
@@ -239,11 +240,13 @@ def _run(world, checkpoint_dir, mode, *, device_type="cpu", fused=False, timeout
 #
 # This tolerance is therefore NOT a general bound on resharded continuation
 # error. A reshard whose target period differs (a shard size whose block-variance
-# search lands elsewhere) *coarsens* the blocking, and load then averages
-# together source blocks whose per-element second-moment history never existed
-# and cannot be recovered. That aggregation error is bounded only by how much
-# vmean varies across the merged blocks -- unrelated to, and measurably larger
-# than, quantization noise. See test_second_moment_reblocking_regimes.
+# search lands elsewhere) can *refine* the blocking, or land off the source's
+# boundaries; load must then spread one stored vmean across sub-blocks a natively
+# blocked run would have given distinct values, and that detail was never in the
+# checkpoint. Bounded only by how much the second moment varies inside a source
+# block -- unrelated to, and measurably larger than, quantization noise.
+# (Coarsening onto source boundaries is not lossy: block means average into the
+# mean over their union.) See test_second_moment_reblocking_regimes.
 _CONTINUE_TOL = 5e-3
 
 
@@ -1248,7 +1251,9 @@ def test_reblock_relocates_codebook_to_operand_device():
 # --- Finding 5: cross-rank commit agreement --------------------------------
 
 
-def _fail_sync_worker(rank, world, port, checkpoint_dir, mode, result_queue):
+def _fail_sync_worker(
+    rank, world, port, checkpoint_dir, mode, result_queue, failure="reblock"
+):
     try:
         os.environ.update(
             MASTER_ADDR="127.0.0.1",
@@ -1283,24 +1288,39 @@ def _fail_sync_worker(rank, world, port, checkpoint_dir, mode, result_queue):
         import gefen.dcp as dcp_mod
 
         if rank == 0:
-            def _boom(*args, **kwargs):
-                raise RuntimeError("injected one-rank re-block failure")
+            if failure == "reblock":
+                # Fails INSIDE the synchronized staging block.
+                def _boom(*args, **kwargs):
+                    raise RuntimeError("injected one-rank re-block failure")
 
-            dcp_mod._reblock = _boom
+                dcp_mod._reblock = _boom
+            else:
+                # Fails in rank-local validation, which runs BEFORE staging: an
+                # integral tensor LR destination cannot hold the checkpoint's
+                # float lr. Only this rank sees it -- the peers' destinations are
+                # fine -- so the validation must still participate in the success
+                # collective. If it raises outside it, rank 0 exits while rank 1
+                # blocks in the collective forever and this test hangs.
+                optimizer.param_groups[0]["lr"] = torch.tensor(0, dtype=torch.long)
 
         raised = False
+        error = None
         try:
             torch.distributed.checkpoint.load(
                 {"optimizer": GefenDCPState(optimizer)},
                 storage_reader=FileSystemReader(checkpoint_dir),
             )
-        except Exception:
+        except Exception as exc:
             raised = True
+            # Keep the message: "some rank raised" is not the claim under test --
+            # WHICH error, on WHICH rank, is.
+            error = repr(exc)
         after = _live_state_signature(optimizer, parameter)
         result_queue.put(
             {
                 "rank": rank,
                 "raised": raised,
+                "error": error,
                 "state_unchanged": after == before,
             }
         )
@@ -1311,14 +1331,14 @@ def _fail_sync_worker(rank, world, port, checkpoint_dir, mode, result_queue):
             dist.destroy_process_group()
 
 
-def _run_fail_sync(world, checkpoint_dir, mode, timeout=240):
+def _run_fail_sync(world, checkpoint_dir, mode, timeout=240, failure="reblock"):
     context = mp.get_context("spawn")
     result_queue = context.Queue()
     port = _free_port()
     processes = [
         context.Process(
             target=_fail_sync_worker,
-            args=(rank, world, port, checkpoint_dir, mode, result_queue),
+            args=(rank, world, port, checkpoint_dir, mode, result_queue, failure),
         )
         for rank in range(world)
     ]
@@ -1359,6 +1379,42 @@ def test_dcp_one_rank_failure_aborts_every_rank(tmp_path):
     for item in loaded:
         assert item["raised"], item
         assert item["state_unchanged"], item
+
+
+@pytest.mark.skipif(
+    not dist.is_available() or not dist.is_gloo_available(),
+    reason="DCP resharding coverage requires Gloo",
+)
+def test_dcp_one_rank_validation_failure_aborts_every_rank_cleanly(tmp_path):
+    # Rank-local validation (it reads the LIVE optimizer) can fail on ONE rank
+    # and pass on the others, so it has to participate in the success collective.
+    # Hoisted out of the synchronized block it raises while the peers are still
+    # heading into that collective -- which the failing rank then never joins.
+    #
+    # Asserting only "every rank raised" does NOT catch that: with the check
+    # hoisted out, rank 1 still raises, but with
+    #   RuntimeError(gloo ... Connection closed by peer)
+    # -- it escapes the collective only because rank 0 tore its process group
+    # down on the way out. That is the *lucky* end of this bug; a failing rank
+    # that keeps its group alive (a training loop that catches the error, or
+    # NCCL) leaves its peers blocked in the collective instead. So pin the thing
+    # that is actually load-bearing: WHICH error each rank gets.
+    #
+    # The reblock-injection test above cannot cover this -- it fails inside
+    # staging, which is already synchronized.
+    checkpoint_dir = str(tmp_path / "gefen-dcp-fail-sync-validation")
+    saved = _run_fail_sync(2, checkpoint_dir, "save", failure="destination")
+    assert all(item.get("saved") for item in saved), saved
+    loaded = _run_fail_sync(2, checkpoint_dir, "load", timeout=90, failure="destination")
+    assert all("fatal_error" not in item for item in loaded), loaded
+    for item in loaded:
+        assert item["raised"], item
+        assert item["state_unchanged"], item
+    by_rank = {item["rank"]: item for item in loaded}
+    # The rank that actually has the bad destination reports the real cause...
+    assert "cannot represent it" in by_rank[0]["error"], by_rank[0]
+    # ...and its peer gets the group-wide abort, not a transport-level symptom.
+    assert "aborted before commit" in by_rank[1]["error"], by_rank[1]
 
 
 # --- Finding 6: reject inconsistent initialization metadata/counters -------
@@ -1752,45 +1808,77 @@ def test_dcp_rejects_synthesized_name_added_after_construction(tmp_path):
 
 
 def test_second_moment_reblocking_regimes():
-    # Pins the two regimes the resume guarantee rests on (direct unit test, no
-    # distributed needed). The saved dense second moment is only each source
-    # block's vmean repeated per element -- the per-element history never existed.
+    # Pins the two re-blocking regimes the resume guarantee rests on (direct unit
+    # test, no distributed needed), measured against the only baseline that means
+    # anything: what a NATIVE run at the TARGET blocking would hold.
     #
-    #   aligned / refining (target period divides the source period): every target
-    #     block sits inside one source block, so averaging identical repeated
-    #     values returns them unchanged, to fp32 round-off.
-    #   coarsening (target block spans several source blocks): their distinct
-    #     vmeans are averaged together, irreversibly. Bounded only by the spread
-    #     of vmean across the merged blocks, NOT by quantization noise.
+    # Scoring against the *source* values instead inverts the conclusion -- it
+    # credits "gave back the number we started with" as fidelity, which is
+    # precisely what the lossy direction does.
+    #
+    # Gefen never stores a per-element second moment: it keeps one vmean per
+    # block, and that vmean is an EMA of the block's mean grad**2. Save can only
+    # write each source block's vmean repeated across its elements. Both the EMA
+    # and the block mean are linear, so:
+    #
+    #   coarsening onto source boundaries (target block = a union of whole source
+    #     blocks): averaging equal-size source block means IS the mean over their
+    #     union -- exactly what a native coarse run holds, to fp32 round-off.
+    #   refining (target block strictly inside a source block): the one source
+    #     vmean can only be spread flat over the sub-blocks, while a native fine
+    #     run holds a distinct value per sub-block. That detail was never stored,
+    #     so this -- not coarsening -- is the direction that loses history.
     import gefen.dcp as dcp_mod
 
     source_period = 64
     blocks = 16
     numel = source_period * blocks
-    # A vmean that genuinely varies block to block, as a real layer's does.
-    vmean = torch.logspace(-6, 0, blocks).reshape(-1, 1)
-    dense_second = vmean.expand(-1, source_period).reshape(-1).clone()
+    torch.manual_seed(0)
+
+    # Per-element grad**2 carrying BOTH block-to-block spread (6 orders of
+    # magnitude, as a real layer has) and genuine within-block variation. The
+    # latter is what a refine must reconstruct and cannot; a fixture that is
+    # constant within each source block would hide the effect entirely.
+    scale = torch.logspace(-6, 0, blocks).reshape(-1, 1)
+    grad_sq = (scale * torch.rand(blocks, source_period).add(0.5)).reshape(-1)
+
+    def native_vmean(period):
+        # What a run natively blocked at `period` holds: the mean grad**2 per
+        # target block. The EMA drops out -- it is linear and identical on both
+        # sides -- leaving the block mean as the thing re-blocking must match.
+        return grad_sq.reshape(-1, period).mean(dim=1)
+
+    # What save can write: each source block's vmean, repeated per element.
+    dense_second = (
+        native_vmean(source_period)
+        .reshape(-1, 1)
+        .expand(-1, source_period)
+        .reshape(-1)
+        .clone()
+    )
     momentum = torch.linspace(-1.0, 1.0, numel)
     codebook = dcp_mod._learn_codebook(
         [("w", momentum, source_period)], torch.device("cpu")
     )
 
-    def reblocked_second(period):
+    def relative_to_native(period):
         _, _, new_vmean = dcp_mod._reblock(codebook, momentum, dense_second, period)
-        return new_vmean.reshape(-1, 1).expand(-1, period).reshape(-1)
+        # _reblock returns vmean as (nblocks, 1); flatten it or the subtraction
+        # below broadcasts into an (nblocks, nblocks) outer difference.
+        new_vmean = new_vmean.reshape(-1)
+        native = native_vmean(period)
+        return ((new_vmean - native).abs() / native.abs()).max().item()
 
-    # Aligned: recovered to fp32 round-off (the block mean sums then divides).
-    assert torch.allclose(
-        reblocked_second(source_period), dense_second, rtol=1e-6, atol=0
-    )
-    # Refining: still exact -- each sub-block sees one constant value.
-    assert torch.allclose(
-        reblocked_second(source_period // 4), dense_second, rtol=1e-6, atol=0
+    # Aligned, and coarsening onto source boundaries: reproduces a native run at
+    # the target blocking to fp32 round-off. Coarsening is NOT the lossy case.
+    assert relative_to_native(source_period) < 1e-5, relative_to_native(source_period)
+    assert relative_to_native(source_period * 4) < 1e-5, relative_to_native(
+        source_period * 4
     )
 
-    # Coarsening: four source blocks per target block get averaged into one
-    # value. The result is materially wrong, in a way no re-quantization
-    # tolerance covers, and cannot be undone.
-    coarse = reblocked_second(source_period * 4)
-    relative = (coarse - dense_second).abs().max() / dense_second.abs().max()
-    assert relative > 0.1, relative
+    # Refining: materially wrong versus a native fine run, in a way no
+    # re-quantization tolerance covers -- the sub-block detail the target
+    # blocking wants was never in the checkpoint to begin with.
+    assert relative_to_native(source_period // 4) > 0.1, relative_to_native(
+        source_period // 4
+    )
