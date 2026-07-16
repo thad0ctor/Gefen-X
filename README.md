@@ -36,6 +36,7 @@
 >| **Optimizer-step speed** | baseline | ≈2× faster `opt.step()` with fused kernels |
 >| **Peak memory**| large transient spikes | much lower peak — room for bigger models / batches |
 >| **Sharded multi-GPU training (FSDP2)** | breaks with the fast path | works — for plain Gefen *and* Muon |
+>| **CPU-offloaded training** | not supported (GPU-resident) | parameters, gradients & optimizer state can live on CPU — validated for plain Gefen under DeepSpeed ZeRO CPU-offload (optimizer at ZeRO-2/3, parameters at ZeRO-3) and FSDP2 `CPUOffloadPolicy` (single & multi-GPU) — [details](https://github.com/thad0ctor/Gefen-X/blob/main/COMPATIBILITY.md#fsdp2-cpu-offload) |
 >| **Whole-model Muon** | 2D weight matrices only | `GefenMuonHybrid` trains the entire model |
 >| **Muon step efficiency** | generic momentum hack + redundant dequant gather | single-pass bit-exact momentum kernel |
 >| **Save / resume checkpoints** | can corrupt state or lose tuning on resume | native optimizer checkpoints save and resume correctly; distributed checkpoint formats have documented limits |

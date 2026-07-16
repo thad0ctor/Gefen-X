@@ -19,6 +19,7 @@ The pure-CPU cases run on CPU-only CI. The cross-device cases are gated on CUDA.
 
 Run: pytest tests/test_cpu_resident_step.py
 """
+import copy
 import io
 
 import pytest
@@ -336,3 +337,43 @@ def test_tensor_lr_survives_cpu_paging(factored):
     _step_on(torch.device("cpu"))  # lr tensor still on CUDA -> must not strand
     _step_on(torch.device("cuda"))
     assert torch.isfinite(p.detach()).all()
+
+
+@CUDA
+@pytest.mark.parametrize("factored", [False, True])
+def test_resume_after_paging_is_exact(factored):
+    """Checkpoint/resume across a device move: save the optimizer state after it
+    was migrated CUDA->CPU by the colocation helper, reload into a fresh
+    optimizer, and continue -- the resumed run must match the uninterrupted run
+    that follows the same device schedule bit-for-bit. Uses fused=False so every
+    step (CUDA and CPU) takes the deterministic decomposed path."""
+    torch.manual_seed(0)
+    init = torch.randn(16, 24)
+    gen = torch.Generator().manual_seed(1)
+    grads = [torch.randn(16, 24, generator=gen) * 0.1 for _ in range(3)]
+    schedule = [torch.device("cuda"), torch.device("cpu"), torch.device("cpu")]
+
+    def run(interrupt_before):
+        p = nn.Parameter(init.clone())
+        opt = Gefen([("w", p)], lr=1e-2, fused=False, factored_v_2d=factored)
+        for i, (g, dev) in enumerate(zip(grads, schedule)):
+            if i == interrupt_before:
+                # State currently lives on the previous step's device; snapshot
+                # it, rebuild the optimizer, and reload -- exactly what a resume
+                # from checkpoint does.
+                saved_state = copy.deepcopy(opt.state_dict())
+                saved_param = p.detach().clone()
+                p = nn.Parameter(saved_param)
+                opt = Gefen([("w", p)], lr=1e-2, fused=False, factored_v_2d=factored)
+                opt.load_state_dict(saved_state)
+            p.data = p.data.to(dev)
+            p.grad = g.clone().to(dev)
+            opt.step()
+            opt.zero_grad(set_to_none=True)
+        return p.detach().cpu()
+
+    reference = run(interrupt_before=-1)  # never interrupt
+    resumed = run(interrupt_before=1)  # save after the CUDA step, reload, resume
+    assert torch.equal(reference, resumed), (
+        (reference - resumed).abs().max().item()
+    )
