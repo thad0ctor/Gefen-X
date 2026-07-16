@@ -302,6 +302,16 @@ class GefenDCPState:
                     raise RuntimeError(
                         "GefenDCPState supports only a one-dimensional default-world DeviceMesh"
                     )
+                # A reordered full-world mesh (e.g. ranks [1, 0]) passes the size
+                # check but permutes shard->rank ownership, so the replicated
+                # initialized/counter metadata can mis-align with the sharded
+                # momentum. The documented scope is the canonical default world;
+                # reject anything else.
+                if mesh.mesh.flatten().tolist() != list(range(dist.get_world_size())):
+                    raise RuntimeError(
+                        "GefenDCPState supports only the canonical default-world "
+                        "rank order (0..N-1); a reordered mesh is rejected"
+                    )
                 if len(parameter.placements) != 1:
                     raise RuntimeError(
                         "GefenDCPState supports exactly one DTensor placement"

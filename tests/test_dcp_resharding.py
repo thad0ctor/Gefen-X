@@ -440,6 +440,7 @@ def test_dcp_fully_shard_real_model_stays_compact(tmp_path):
         assert item["finite"] and item["restored"]["compact"], item
 
 
+@pytest.mark.skipif(not dist.is_available() or not dist.is_gloo_available(), reason="requires Gloo")
 def test_rejects_non_dtensor_optimizer(tmp_path):
     init_file = tmp_path / "single-rank-init"
     dist.init_process_group(
@@ -459,6 +460,7 @@ def test_rejects_non_dtensor_optimizer(tmp_path):
         dist.destroy_process_group()
 
 
+@pytest.mark.skipif(not dist.is_available() or not dist.is_gloo_available(), reason="requires Gloo")
 def test_rejects_capturable(tmp_path):
     init_file = tmp_path / "capturable-init"
     dist.init_process_group(
@@ -483,6 +485,7 @@ def test_rejects_capturable(tmp_path):
         dist.destroy_process_group()
 
 
+@pytest.mark.skipif(not dist.is_available() or not dist.is_gloo_available(), reason="requires Gloo")
 def test_rejects_factored_v_2d(tmp_path):
     init_file = tmp_path / "factored-init"
     dist.init_process_group(
@@ -506,6 +509,7 @@ def test_rejects_factored_v_2d(tmp_path):
         dist.destroy_process_group()
 
 
+@pytest.mark.skipif(not dist.is_available() or not dist.is_gloo_available(), reason="requires Gloo")
 def test_rejects_non_shard0_placement(tmp_path):
     # The PR advertises that non-Shard(0) placements fail closed.
     init_file = tmp_path / "replicate-init"
@@ -524,6 +528,7 @@ def test_rejects_non_shard0_placement(tmp_path):
         dist.destroy_process_group()
 
 
+@pytest.mark.skipif(not dist.is_available() or not dist.is_gloo_available(), reason="requires Gloo")
 def test_rejects_multidimensional_mesh(tmp_path):
     # Multidimensional meshes fail closed.
     init_file = tmp_path / "mesh2d-init"
@@ -544,6 +549,7 @@ def test_rejects_multidimensional_mesh(tmp_path):
         dist.destroy_process_group()
 
 
+@pytest.mark.skipif(not dist.is_available() or not dist.is_gloo_available(), reason="requires Gloo")
 def test_rejects_muon_sharded_mode(tmp_path):
     # A group carrying a Muon sharded_mode fails closed.
     init_file = tmp_path / "shardedmode-init"
@@ -561,6 +567,71 @@ def test_rejects_muon_sharded_mode(tmp_path):
             GefenDCPState(optimizer)
     finally:
         dist.destroy_process_group()
+
+
+def _reordered_mesh_worker(rank, world, port, result_queue):
+    try:
+        os.environ.update(
+            MASTER_ADDR="127.0.0.1",
+            MASTER_PORT=port,
+            RANK=str(rank),
+            WORLD_SIZE=str(world),
+        )
+        dist.init_process_group(
+            "gloo", rank=rank, world_size=world, timeout=timedelta(seconds=60)
+        )
+        from torch.distributed.device_mesh import DeviceMesh
+
+        # A full-world 1-D mesh whose ranks are reordered ([1, 0] on world 2):
+        # it passes the size check but permutes shard->rank ownership.
+        mesh = DeviceMesh("cpu", torch.tensor([1, 0]))
+        parameter = nn.Parameter(distribute_tensor(_global_param(), mesh, [Shard(0)]))
+        optimizer = Gefen(
+            [("weight", parameter)], lr=1e-3, fused=False, factored_v_2d=False
+        )
+        raised = False
+        try:
+            GefenDCPState(optimizer)
+        except RuntimeError as exc:
+            raised = "reordered" in str(exc) or "canonical" in str(exc)
+        result_queue.put({"rank": rank, "raised": raised})
+    except BaseException:
+        result_queue.put({"rank": rank, "fatal_error": traceback.format_exc()})
+    finally:
+        if dist.is_available() and dist.is_initialized():
+            dist.destroy_process_group()
+
+
+@pytest.mark.skipif(
+    not dist.is_available() or not dist.is_gloo_available(),
+    reason="requires Gloo",
+)
+def test_rejects_reordered_full_world_mesh():
+    # A reordered full-world mesh must fail closed on every rank.
+    context = mp.get_context("spawn")
+    result_queue = context.Queue()
+    port = _free_port()
+    processes = [
+        context.Process(target=_reordered_mesh_worker, args=(rank, 2, port, result_queue))
+        for rank in range(2)
+    ]
+    for process in processes:
+        process.start()
+    results = []
+    try:
+        for _ in processes:
+            results.append(result_queue.get(timeout=120))
+    except queue.Empty:
+        pass
+    finally:
+        for process in processes:
+            process.join(timeout=10)
+        for process in processes:
+            if process.is_alive():
+                process.terminate()
+                process.join(timeout=5)
+    assert all("fatal_error" not in item for item in results), results
+    assert len(results) == 2 and all(item["raised"] for item in results), results
 
 
 # --- Review-finding coverage (Codex PR #83) -------------------------------
