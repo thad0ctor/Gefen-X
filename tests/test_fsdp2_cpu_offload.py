@@ -215,8 +215,12 @@ def _offload_resume_worker(rank, world, port, result_queue):
             step(ref_model, ref_opt)
         reference = _locals(ref_model)
 
-        # Interrupted: 2 steps, DCP-checkpoint model+optimizer, restore into a
-        # separate model/optimizer, 1 more step.
+        # Interrupted: 2 steps, capture model+optimizer state, restore into a
+        # separate model/optimizer, 1 more step. Uses the in-memory
+        # get_state_dict/set_state_dict path (not dcp.save/load): Gefen's FSDP2
+        # optimizer state is a variable-size rank-local payload that DCP's
+        # fixed-shape save/load planner rejects, so the whole suite -- including
+        # test_gefen_fsdp2_checkpoint -- resumes through get/set_state_dict.
         model, opt = build()
         step(model, opt)
         step(model, opt)
@@ -233,10 +237,9 @@ def _offload_resume_worker(rank, world, port, result_queue):
         step(resumed_model, resumed_opt)
         resumed = _locals(resumed_model)
 
-        exact = all(
-            torch.allclose(a, b, rtol=1e-5, atol=1e-6)
-            for a, b in zip(reference, resumed)
-        )
+        # A lossless resume must reproduce the uninterrupted run exactly (both
+        # take the deterministic decomposed CPU path).
+        exact = all(torch.equal(a, b) for a, b in zip(reference, resumed))
         gathered = [None] * world
         dist.all_gather_object(gathered, bool(exact))
         if rank == 0:
