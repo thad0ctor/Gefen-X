@@ -2,6 +2,20 @@
 
 All notable changes to this project are documented here. This project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.5.0] - 2026-07-16
+
+CPU-offloaded training and reshardable FSDP2 checkpoints, both for plain `Gefen`. Additive: nothing is removed from the public API, and the CUDA same-device step path is unchanged.
+
+Compatibility — training with parameters and optimizer state on CPU:
+
+- Plain `Gefen` now trains correctly with its parameters, gradients, and optimizer state resident on CPU, validated end-to-end under DeepSpeed ZeRO-2/3 CPU-offload and FSDP2 `CPUOffloadPolicy` (#80). Per-parameter optimizer state that a framework strands by paging a parameter across devices between steps is migrated on demand, the non-fused non-capturable path scalarizes a tensor learning rate so a CUDA-resident `lr` cannot strand a paged parameter's update, and the pre-mutation preflight now fails fast when a plain tensor's gradient and parameter sit on different devices. Under ZeRO, Gefen stays the client optimizer and steps the CPU-resident fp32 partitions; this requires `zero_allow_untested_optimizer: true` and `zero_force_ds_cpu_optimizer: false`. Activation offloading composes with both. Checkpoint resume across a device move is bit-exact. The Muon family still fails fast under ZeRO, unchanged.
+
+Added — `GefenDCPState` for resharding FSDP2 optimizer state:
+
+- Add `GefenDCPState`, an opt-in `torch.distributed.checkpoint` adapter that makes plain `Gefen`'s FSDP2 optimizer state reshardable: save on N ranks, load and continue on M (#83, closing #81). Save dequantizes quantized momentum against the learned per-rank codebook into dense fp32 `Shard(0)` DTensors so DCP can reshard it. Load re-blocks that dense state back into Gefen's compact form on the target topology, re-running the block-variance period search and re-learning the per-shard codebook, so a restored optimizer keeps Gefen's roughly 1 byte/param profile instead of collapsing to per-element state. The full loaded representation is staged and validated before it replaces the live state, so a rejected load leaves the optimizer untouched.
+- Resharding routes momentum through a dense reshard and a freshly learned per-shard codebook, so a restored optimizer is a correct continuation within 256-level quantization noise rather than bit-exact, including at unchanged topology. For unchanged topology use the native `get_state_dict` / `set_state_dict` path, which stays bit-exact and is unchanged by this release; `GefenDCPState` is for when the topology changes.
+- `GefenDCPState` is scoped to plain `Gefen` on one-dimensional default-world `Shard(0)` DTensors. `GefenMuon`, `GefenMuonHybrid`, `capturable=True`, `factored_v_2d=True`, Muon `sharded_mode`, non-DTensor parameters, multidimensional or non-default-world meshes, subgroups, and non-`Shard(0)` placements all fail closed at construction or validation with an explicit message. Reshardable DCP for the Muon family is tracked in #84 and #85.
+
 ## [0.4.1] - 2026-07-15
 
 Distributed checkpoint-load and step-failure hardening. All changes are backward-compatible; the only public API addition is the opt-in `GefenDCPState` resharding wrapper.
