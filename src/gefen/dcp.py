@@ -7,7 +7,14 @@ from dataclasses import dataclass
 import torch
 
 
-_FORMAT_VERSION = 1
+# Schema history:
+#   v1 -- counters + dense momentum/second-moment slots only.
+#   v2 -- adds per-slot parameter identities (name + group + global shape) and
+#         per-group hyperparameters (lr/betas/eps/weight_decay). Load is
+#         fail-closed on version, identity, topology, and deterministic mismatch.
+_FORMAT_VERSION = 2
+
+_GROUP_HYPER_KEYS = ("lr", "beta1", "beta2", "eps", "weight_decay")
 
 
 def _local(value):
@@ -81,7 +88,7 @@ def _dense_second_moment(parameter, state) -> torch.Tensor:
     )
 
 
-def _choose_period(name: str, parameter, second: torch.Tensor) -> int:
+def _choose_period(optimizer, name: str, parameter, second: torch.Tensor) -> int:
     """Re-derive a compact block period for the resharded local shard.
 
     Runs Gefen's block-variance period search on the dense per-element second
@@ -89,8 +96,25 @@ def _choose_period(name: str, parameter, second: torch.Tensor) -> int:
     exactly as the native first step runs it on grad^2. The result is a divisor
     of the *new* local numel, so the restored state keeps ~1 byte/param instead
     of collapsing to per-element (period one).
+
+    The optimizer's explicit period-one routing gates (``force_1d_period_one``,
+    ``force_2d_period_one``, ``period_one_substrings``) are honored first, exactly
+    as :meth:`Gefen._resolve_automatic_period` applies them before the raw search.
+    Otherwise a checkpoint could restore period>1 into an optimizer configured for
+    period-one, and the frozen restored codebook would keep the next step from
+    correcting it.
     """
     from gefen.partitioning import find_period_by_block_variance
+
+    if getattr(optimizer, "_force_1d_period_one", False) and parameter.ndim == 1:
+        return 1
+    if getattr(optimizer, "_force_2d_period_one", False) and parameter.ndim == 2:
+        return 1
+    substrings = getattr(optimizer, "_period_one_substrings", ())
+    if substrings:
+        lname = str(name).lower()
+        if any(sub in lname for sub in substrings):
+            return 1
 
     flat = second.reshape(-1)
     if flat.numel() < 8:
@@ -168,6 +192,7 @@ def _reblock(codebook, momentum: torch.Tensor, second: torch.Tensor, period: int
 @dataclass(frozen=True)
 class _Slot:
     index: int
+    group_index: int
     name: str
     parameter: torch.Tensor
 
@@ -221,7 +246,7 @@ class GefenDCPState:
 
         slots = []
         index = 0
-        for group in self.optimizer.param_groups:
+        for group_index, group in enumerate(self.optimizer.param_groups):
             if group.get("sharded_mode") is not None:
                 raise RuntimeError("GefenDCPState does not support Muon sharded modes")
             names = group.get("param_names", ())
@@ -246,7 +271,7 @@ class GefenDCPState:
                     raise RuntimeError(
                         "GefenDCPState supports only one-dimensional Shard(0) parameters"
                     )
-                slots.append(_Slot(index, str(name), parameter))
+                slots.append(_Slot(index, group_index, str(name), parameter))
                 index += 1
         if not slots:
             raise RuntimeError("GefenDCPState requires at least one parameter")
@@ -255,6 +280,80 @@ class GefenDCPState:
     @staticmethod
     def _key(slot: _Slot, field: str) -> str:
         return "slot_{:08d}.{}".format(slot.index, field)
+
+    # Required per-parameter Gefen state fields. A slot that carries all of them
+    # is materialized; a slot that carries none is fresh (name-only, pre-first
+    # step); a slot with only some is partial/corrupted and rejected on save.
+    _REQUIRED_STATE_FIELDS = (
+        "automatic_period",
+        "step",
+        "m_codebook",
+        "m_magnitude",
+        "vmean",
+    )
+
+    def _identities(self):
+        """Stable per-slot identity list (replicated, in slot order).
+
+        Persists the Gefen parameter name, its group membership, and the global
+        parameter shape so a load can reject a target whose parameters were
+        registered in a different order (index-only addressing would otherwise
+        cross-assign each same-shaped parameter the other's momentum).
+        """
+        return [
+            {
+                "name": slot.name,
+                "group": slot.group_index,
+                "shape": [int(dim) for dim in slot.parameter.shape],
+            }
+            for slot in self._slots
+        ]
+
+    def _group_hypers(self):
+        """Per-group hyperparameters (replicated, in group order).
+
+        The compact per-block state is only half of an optimizer resume; the
+        native full-state path restores the param-group hyperparameters too. A
+        freshly constructed optimizer resumed after an LR-schedule or hyper change
+        would otherwise silently keep its constructor values, not the checkpoint's.
+        """
+        hypers = []
+        for group in self.optimizer.param_groups:
+            entry = {}
+            for key in _GROUP_HYPER_KEYS:
+                value = group[key]
+                if torch.is_tensor(value):
+                    value = value.item()
+                entry[key] = float(value)
+            hypers.append(entry)
+        return hypers
+
+    def _slot_initialized(self, slot: _Slot) -> bool:
+        """Classify a slot's live state; reject a partial/malformed materialize.
+
+        Returns True for a fully materialized slot and False for a fresh
+        name-only slot. A slot that carries some but not all required fields is a
+        corrupted materialize whose missing history must not be silently
+        zero-filled, so it raises instead.
+        """
+        state = self.optimizer.state.get(slot.parameter)
+        if not state:
+            return False
+        present = [key for key in self._REQUIRED_STATE_FIELDS if key in state]
+        if not present:
+            return False
+        if len(present) != len(self._REQUIRED_STATE_FIELDS):
+            missing = [
+                key for key in self._REQUIRED_STATE_FIELDS if key not in state
+            ]
+            raise ValueError(
+                "Gefen DCP slot {} ({}) has partial optimizer state; missing "
+                "{}. Refusing to save it as uninitialized (which would zero the "
+                "momentum/second-moment history).".format(
+                    slot.index, slot.name, ", ".join(missing)
+                )
+            )
+        return True
 
     def state_dict(self):
         result = {
@@ -267,22 +366,15 @@ class GefenDCPState:
                 int(bool(self.optimizer._deterministic)), dtype=torch.uint8
             ),
             "slot_count": torch.tensor(len(self._slots), dtype=torch.int64),
+            "group_count": torch.tensor(
+                len(self.optimizer.param_groups), dtype=torch.int64
+            ),
+            "param_identities": self._identities(),
+            "param_group_hypers": self._group_hypers(),
         }
         for slot in self._slots:
             state = self.optimizer.state.get(slot.parameter)
-            initialized = bool(
-                state
-                and all(
-                    key in state
-                    for key in (
-                        "automatic_period",
-                        "step",
-                        "m_codebook",
-                        "m_magnitude",
-                        "vmean",
-                    )
-                )
-            )
+            initialized = self._slot_initialized(slot)
             result[self._key(slot, "initialized")] = torch.tensor(
                 int(initialized), dtype=torch.uint8
             )
@@ -316,7 +408,15 @@ class GefenDCPState:
         return result
 
     def load_state_dict(self, state_dict):
-        required = {"format_version", "global_step", "deterministic", "slot_count"}
+        required = {
+            "format_version",
+            "global_step",
+            "deterministic",
+            "slot_count",
+            "group_count",
+            "param_identities",
+            "param_group_hypers",
+        }
         if not required.issubset(state_dict):
             raise ValueError("Gefen DCP checkpoint metadata is incomplete")
         version = _counter(state_dict["format_version"], "format_version")
@@ -326,6 +426,45 @@ class GefenDCPState:
             )
         if _counter(state_dict["slot_count"], "slot_count") != len(self._slots):
             raise ValueError("Gefen DCP checkpoint parameter count differs")
+
+        # Fail closed on a parameter-identity or group-topology mismatch BEFORE
+        # touching live state. Index-only slot addressing would otherwise let a
+        # target that registered its parameters in a different order load
+        # "successfully" while cross-assigning each same-shaped parameter the
+        # other's momentum/second-moment.
+        if _counter(state_dict["group_count"], "group_count") != len(
+            self.optimizer.param_groups
+        ):
+            raise ValueError("Gefen DCP checkpoint parameter-group count differs")
+        if list(state_dict["param_identities"]) != self._identities():
+            raise ValueError(
+                "Gefen DCP checkpoint parameter identities (name/group/shape) do "
+                "not match this optimizer; refusing to load index-addressed state "
+                "that could cross-assign momentum between parameters"
+            )
+        saved_hypers = list(state_dict["param_group_hypers"])
+        if len(saved_hypers) != len(self.optimizer.param_groups):
+            raise ValueError(
+                "Gefen DCP checkpoint parameter-group hyperparameters differ in count"
+            )
+
+        # Reject a deterministic-policy mismatch instead of silently overwriting
+        # it, matching native Gefen.load_state_dict: the flag changes fused-routing
+        # / replica-determinism semantics, so resuming under a different policy
+        # requires an intentional migration, not a checkpoint that flips it.
+        checkpoint_deterministic = bool(
+            _counter(state_dict["deterministic"], "deterministic")
+        )
+        if checkpoint_deterministic != bool(self.optimizer._deterministic):
+            raise ValueError(
+                "Gefen DCP checkpoint deterministic={!r}, but this optimizer was "
+                "constructed with deterministic={!r}. Resuming under a different "
+                "replica-determinism policy requires an intentional state "
+                "migration or a fresh optimizer; refusing to change it "
+                "silently.".format(
+                    checkpoint_deterministic, bool(self.optimizer._deterministic)
+                )
+            )
 
         staged = []
         for slot in self._slots:
@@ -368,9 +507,6 @@ class GefenDCPState:
             staged.append((slot, initialized, step, vmean_step, momentum, second))
 
         global_step = _counter(state_dict["global_step"], "global_step")
-        deterministic = bool(
-            _counter(state_dict["deterministic"], "deterministic")
-        )
 
         # Re-block the resharded dense momentum back into Gefen's compact
         # per-block representation instead of collapsing it to period one. Going
@@ -380,25 +516,36 @@ class GefenDCPState:
         # per new local shard we re-run the block-variance period search, relearn
         # the exact codebook, and re-quantize. All of this happens BEFORE the
         # optimizer state is cleared, preserving the fail-atomic load contract.
+        #
+        # A slot that is initialized in the (replicated) checkpoint metadata but
+        # reshards to an EMPTY local shard on this rank -- N->M where dim-0 < the
+        # target world -- carries no local momentum to quantize. Native Gefen
+        # never materializes state for an empty local shard (the step returns
+        # early on an empty grad), so it is restored as name-only here and left
+        # out of the codebook learning; feeding an empty shard through the learner
+        # would return a None codebook and crash the re-quantize.
+        def _materialized(initialized, momentum):
+            return initialized and momentum.numel() > 0
+
         device = _local(self._slots[0].parameter).device
         periods = {}
         for slot, initialized, step, vmean_step, momentum, second in staged:
-            if initialized:
+            if _materialized(initialized, momentum):
                 periods[slot.index] = _choose_period(
-                    slot.name, slot.parameter, second
+                    self.optimizer, slot.name, slot.parameter, second
                 )
         codebook = _learn_codebook(
             [
                 (slot.name, momentum.reshape(-1), periods[slot.index])
                 for slot, initialized, _, _, momentum, _ in staged
-                if initialized
+                if _materialized(initialized, momentum)
             ],
             device,
         )
 
         new_state = {}
         for slot, initialized, step, vmean_step, momentum, second in staged:
-            if not initialized:
+            if not _materialized(initialized, momentum):
                 new_state[slot.parameter] = {"name": slot.name}
                 continue
             period = periods[slot.index]
@@ -417,8 +564,19 @@ class GefenDCPState:
 
         self.optimizer.state.clear()
         self.optimizer.state.update(new_state)
+        # Restore the checkpoint's per-group hyperparameters so an LR-schedule or
+        # hyperparameter change survives the resume, matching the native full-state
+        # path. A live tensor lr is updated in place to preserve its identity/device
+        # for any fused kernel holding a reference.
+        for group, entry in zip(self.optimizer.param_groups, saved_hypers):
+            for key in _GROUP_HYPER_KEYS:
+                value = float(entry[key])
+                current = group.get(key)
+                if torch.is_tensor(current):
+                    current.fill_(value)
+                else:
+                    group[key] = value
         self.optimizer._gefen_global_step = global_step
-        self.optimizer._deterministic = deterministic
         # A relearned codebook reflects this rank's resharded momentum and is kept
         # by _maybe_refresh_gefen_codebook on the next step (which then also skips
         # re-predicting periods, keeping the restored block geometry consistent).

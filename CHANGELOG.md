@@ -4,7 +4,7 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [0.4.1] - 2026-07-15
 
-Distributed checkpoint-load and step-failure hardening. All fixes are backward-compatible; no public API changes.
+Distributed checkpoint-load and step-failure hardening. All changes are backward-compatible; the only public API addition is the opt-in `GefenDCPState` resharding wrapper.
 
 - Add `GefenDCPState`, a standalone DCP Stateful wrapper for **resharding** plain Gefen on one-dimensional default-world FSDP2 `Shard(0)` parameters (`factored_v_2d=False`, `capturable=False`). Save writes shard-addressable dense optimizer tensors so DCP can reshard N ranks to M without a rank-0 full-state gather; load validates before mutation, then re-blocks the resharded dense momentum back into Gefen's compact ~1 byte/param block state (re-running the period search, relearning the codebook, and re-quantizing on each new shard). Resume is a correct continuation within 256-level quantization noise, not bit-exact — use the unchanged native full-state path for same-topology resumes.
 

@@ -499,3 +499,362 @@ def test_rejects_factored_v_2d(tmp_path):
             GefenDCPState(optimizer)
     finally:
         dist.destroy_process_group()
+
+
+# --- Review-finding coverage (Codex PR #83) -------------------------------
+#
+# The tests below cover the fail-closed / semantics fixes. Findings 1, 2, 3 and 5
+# do not need a real topology change, so they run in-process on a one-rank Gloo
+# group (save, then load into a differently configured optimizer). Finding 4
+# (an N->M reshard whose dim-0 is smaller than the target world) needs multiple
+# ranks and reuses the spawn/worker harness.
+
+
+def _shaped_dparam(shape, mesh, device="cpu"):
+    numel = 1
+    for dim in shape:
+        numel *= dim
+    tensor = torch.linspace(-0.8, 0.7, numel).reshape(shape).to(device)
+    return nn.Parameter(distribute_tensor(tensor, mesh, [Shard(0)]))
+
+
+def _shaped_grad(shape, step):
+    generator = torch.Generator().manual_seed(1000 + step)
+    return torch.randn(shape, generator=generator)
+
+
+def _save_optimizer(optimizer, param, shape, mesh, checkpoint_dir):
+    for step in range(_SAVE_STEPS):
+        param.grad = distribute_tensor(_shaped_grad(shape, step), mesh, [Shard(0)])
+        optimizer.step()
+    torch.distributed.checkpoint.save(
+        {"optimizer": GefenDCPState(optimizer)},
+        storage_writer=FileSystemWriter(checkpoint_dir),
+    )
+
+
+@pytest.mark.skipif(
+    not dist.is_available() or not dist.is_gloo_available(),
+    reason="DCP resharding coverage requires Gloo",
+)
+def test_dcp_restores_checkpoint_group_hyperparameters(tmp_path):
+    init_file = tmp_path / "hyper-init"
+    dist.init_process_group(
+        "gloo", init_method="file://{}".format(init_file), rank=0, world_size=1
+    )
+    try:
+        mesh = init_device_mesh("cpu", (1,), mesh_dim_names=("dp",))
+        param = _shaped_dparam(_SHAPE, mesh)
+        optimizer = Gefen(
+            [("weight", param)],
+            lr=2.5e-3,
+            betas=(0.8, 0.97),
+            eps=2e-8,
+            weight_decay=0.03,
+            fused=False,
+            factored_v_2d=False,
+            deterministic=True,
+        )
+        checkpoint_dir = str(tmp_path / "hyper-ckpt")
+        _save_optimizer(optimizer, param, _SHAPE, mesh, checkpoint_dir)
+
+        # Resume into an optimizer built with DIFFERENT hyperparameters, as if an
+        # LR scheduler had advanced or the run was reconfigured. The restore must
+        # adopt the checkpoint's hyperparameters, not silently keep these.
+        param2 = _shaped_dparam(_SHAPE, mesh)
+        resumed = Gefen(
+            [("weight", param2)],
+            lr=9.9e-9,
+            betas=(0.1, 0.2),
+            eps=7e-7,
+            weight_decay=0.5,
+            fused=False,
+            factored_v_2d=False,
+            deterministic=True,
+        )
+        torch.distributed.checkpoint.load(
+            {"optimizer": GefenDCPState(resumed)},
+            storage_reader=FileSystemReader(checkpoint_dir),
+        )
+        group = resumed.param_groups[0]
+        assert abs(group["lr"] - 2.5e-3) < 1e-12, group["lr"]
+        assert abs(group["beta1"] - 0.8) < 1e-12, group["beta1"]
+        assert abs(group["beta2"] - 0.97) < 1e-12, group["beta2"]
+        assert abs(group["eps"] - 2e-8) < 1e-15, group["eps"]
+        assert abs(group["weight_decay"] - 0.03) < 1e-12, group["weight_decay"]
+    finally:
+        dist.destroy_process_group()
+
+
+@pytest.mark.skipif(
+    not dist.is_available() or not dist.is_gloo_available(),
+    reason="DCP resharding coverage requires Gloo",
+)
+def test_dcp_rejects_swapped_parameter_identities(tmp_path):
+    init_file = tmp_path / "identity-init"
+    dist.init_process_group(
+        "gloo", init_method="file://{}".format(init_file), rank=0, world_size=1
+    )
+    try:
+        mesh = init_device_mesh("cpu", (1,), mesh_dim_names=("dp",))
+        shape = (128, 64)
+        first = _shaped_dparam(shape, mesh)
+        second = _shaped_dparam(shape, mesh)
+        optimizer = Gefen(
+            [("alpha", first), ("beta", second)],
+            lr=1e-3,
+            fused=False,
+            factored_v_2d=False,
+        )
+        for step in range(_SAVE_STEPS):
+            for param in (first, second):
+                param.grad = distribute_tensor(
+                    _shaped_grad(shape, step), mesh, [Shard(0)]
+                )
+            optimizer.step()
+        checkpoint_dir = str(tmp_path / "identity-ckpt")
+        torch.distributed.checkpoint.save(
+            {"optimizer": GefenDCPState(optimizer)},
+            storage_writer=FileSystemWriter(checkpoint_dir),
+        )
+
+        # The same two same-shaped parameters, registered in SWAPPED name order.
+        # Slot-index addressing alone would load "successfully" and hand each
+        # parameter the other's momentum; the identity guard must reject it.
+        first_swapped = _shaped_dparam(shape, mesh)
+        second_swapped = _shaped_dparam(shape, mesh)
+        swapped = Gefen(
+            [("beta", second_swapped), ("alpha", first_swapped)],
+            lr=1e-3,
+            fused=False,
+            factored_v_2d=False,
+        )
+        with pytest.raises(ValueError, match="parameter identities"):
+            torch.distributed.checkpoint.load(
+                {"optimizer": GefenDCPState(swapped)},
+                storage_reader=FileSystemReader(checkpoint_dir),
+            )
+    finally:
+        dist.destroy_process_group()
+
+
+@pytest.mark.skipif(
+    not dist.is_available() or not dist.is_gloo_available(),
+    reason="DCP resharding coverage requires Gloo",
+)
+def test_dcp_rejects_deterministic_mismatch(tmp_path):
+    init_file = tmp_path / "deterministic-init"
+    dist.init_process_group(
+        "gloo", init_method="file://{}".format(init_file), rank=0, world_size=1
+    )
+    try:
+        mesh = init_device_mesh("cpu", (1,), mesh_dim_names=("dp",))
+        param = _shaped_dparam(_SHAPE, mesh)
+        optimizer = Gefen(
+            [("weight", param)],
+            lr=1e-3,
+            fused=False,
+            factored_v_2d=False,
+            deterministic=True,
+        )
+        checkpoint_dir = str(tmp_path / "deterministic-ckpt")
+        _save_optimizer(optimizer, param, _SHAPE, mesh, checkpoint_dir)
+
+        param2 = _shaped_dparam(_SHAPE, mesh)
+        other = Gefen(
+            [("weight", param2)],
+            lr=1e-3,
+            fused=False,
+            factored_v_2d=False,
+            deterministic=False,
+        )
+        with pytest.raises(ValueError, match="deterministic"):
+            torch.distributed.checkpoint.load(
+                {"optimizer": GefenDCPState(other)},
+                storage_reader=FileSystemReader(checkpoint_dir),
+            )
+    finally:
+        dist.destroy_process_group()
+
+
+@pytest.mark.skipif(
+    not dist.is_available() or not dist.is_gloo_available(),
+    reason="DCP resharding coverage requires Gloo",
+)
+def test_dcp_restore_honors_force_2d_period_one(tmp_path):
+    init_file = tmp_path / "period-init"
+    dist.init_process_group(
+        "gloo", init_method="file://{}".format(init_file), rank=0, world_size=1
+    )
+    try:
+        mesh = init_device_mesh("cpu", (1,), mesh_dim_names=("dp",))
+        param = _shaped_dparam(_SHAPE, mesh)
+        optimizer = Gefen(
+            [("weight", param)], lr=1e-3, fused=False, factored_v_2d=False
+        )
+        checkpoint_dir = str(tmp_path / "period-ckpt")
+        _save_optimizer(optimizer, param, _SHAPE, mesh, checkpoint_dir)
+
+        # Control: an unconstrained resume re-derives the compact block period.
+        control_param = _shaped_dparam(_SHAPE, mesh)
+        control = Gefen(
+            [("weight", control_param)], lr=1e-3, fused=False, factored_v_2d=False
+        )
+        torch.distributed.checkpoint.load(
+            {"optimizer": GefenDCPState(control)},
+            storage_reader=FileSystemReader(checkpoint_dir),
+        )
+        assert int(control.state[control_param]["automatic_period"]) > 1
+
+        # A resume that explicitly forces 2D params to period one must honor that
+        # gate rather than running the raw search and restoring period > 1.
+        forced_param = _shaped_dparam(_SHAPE, mesh)
+        forced = Gefen(
+            [("weight", forced_param)],
+            lr=1e-3,
+            fused=False,
+            factored_v_2d=False,
+            force_2d_period_one=True,
+        )
+        torch.distributed.checkpoint.load(
+            {"optimizer": GefenDCPState(forced)},
+            storage_reader=FileSystemReader(checkpoint_dir),
+        )
+        assert int(forced.state[forced_param]["automatic_period"]) == 1, forced.state[
+            forced_param
+        ]["automatic_period"]
+    finally:
+        dist.destroy_process_group()
+
+
+def _empty_shard_worker(rank, world, port, checkpoint_dir, mode, result_queue):
+    try:
+        os.environ.update(
+            MASTER_ADDR="127.0.0.1",
+            MASTER_PORT=port,
+            RANK=str(rank),
+            WORLD_SIZE=str(world),
+        )
+        dist.init_process_group(
+            "gloo", rank=rank, world_size=world, timeout=timedelta(seconds=120)
+        )
+        mesh = init_device_mesh("cpu", (world,), mesh_dim_names=("dp",))
+        # dim-0 == 2: fits two ranks fully, but reshards to empty local shards on
+        # ranks >= 2 of a four-rank target.
+        shape = (2, 128)
+        parameter = nn.Parameter(
+            distribute_tensor(
+                torch.linspace(-0.8, 0.7, shape[0] * shape[1]).reshape(shape),
+                mesh,
+                [Shard(0)],
+            )
+        )
+        optimizer = Gefen(
+            [("weight", parameter)],
+            lr=2.5e-3,
+            betas=(0.8, 0.97),
+            eps=2e-8,
+            fused=False,
+            factored_v_2d=False,
+            deterministic=True,
+        )
+
+        if mode == "save":
+            for step in range(_SAVE_STEPS):
+                parameter.grad = distribute_tensor(
+                    _shaped_grad(shape, step), mesh, [Shard(0)]
+                )
+                optimizer.step()
+            torch.distributed.checkpoint.save(
+                {"optimizer": GefenDCPState(optimizer)},
+                storage_writer=FileSystemWriter(checkpoint_dir),
+            )
+            result_queue.put({"rank": rank, "saved": True})
+            return
+
+        # The load must not crash on ranks whose local shard resharded to empty
+        # (a None per-rank codebook previously dereferenced codebook.device).
+        torch.distributed.checkpoint.load(
+            {"optimizer": GefenDCPState(optimizer)},
+            storage_reader=FileSystemReader(checkpoint_dir),
+        )
+        local_numel = int(_local(parameter).numel())
+        state = optimizer.state.get(parameter, {})
+        materialized = all(
+            key in state
+            for key in ("automatic_period", "m_codebook", "m_magnitude", "vmean")
+        )
+        finite = True
+        if materialized:
+            finite = bool(
+                torch.isfinite(state["m_magnitude"]).all()
+                and torch.isfinite(state["vmean"]).all()
+            )
+        result_queue.put(
+            {
+                "rank": rank,
+                "local_numel": local_numel,
+                "materialized": materialized,
+                "finite": finite,
+            }
+        )
+    except BaseException:
+        result_queue.put({"rank": rank, "fatal_error": traceback.format_exc()})
+    finally:
+        if dist.is_available() and dist.is_initialized():
+            dist.destroy_process_group()
+
+
+def _run_empty(world, checkpoint_dir, mode, timeout=240):
+    context = mp.get_context("spawn")
+    result_queue = context.Queue()
+    port = _free_port()
+    processes = [
+        context.Process(
+            target=_empty_shard_worker,
+            args=(rank, world, port, checkpoint_dir, mode, result_queue),
+        )
+        for rank in range(world)
+    ]
+    for process in processes:
+        process.start()
+    results = []
+    try:
+        for _ in processes:
+            results.append(result_queue.get(timeout=timeout))
+    except queue.Empty:
+        pass
+    finally:
+        for process in processes:
+            process.join(timeout=10)
+        for process in processes:
+            if process.is_alive():
+                process.terminate()
+                process.join(timeout=5)
+        result_queue.close()
+        result_queue.join_thread()
+    assert len(results) == world, (results, [p.exitcode for p in processes])
+    assert all(p.exitcode == 0 for p in processes), [p.exitcode for p in processes]
+    return sorted(results, key=lambda item: item["rank"])
+
+
+@pytest.mark.skipif(
+    not dist.is_available() or not dist.is_gloo_available(),
+    reason="DCP resharding coverage requires Gloo",
+)
+def test_dcp_reshard_to_empty_target_shard_does_not_crash(tmp_path):
+    checkpoint_dir = str(tmp_path / "gefen-dcp-empty-shard")
+    saved = _run_empty(2, checkpoint_dir, "save")
+    assert all(item.get("saved") for item in saved), saved
+    loaded = _run_empty(4, checkpoint_dir, "load")
+    assert all("fatal_error" not in item for item in loaded), loaded
+    by_rank = {item["rank"]: item for item in loaded}
+    # dim-0 == 2 over world 4: ranks 0 and 1 own a row, ranks 2 and 3 reshard to
+    # empty local shards. The empty ranks must load as unmaterialized state (like
+    # native, which never materializes an empty local shard) instead of crashing.
+    assert by_rank[0]["materialized"] and by_rank[1]["materialized"], loaded
+    assert by_rank[0]["local_numel"] == 128 and by_rank[1]["local_numel"] == 128, loaded
+    assert by_rank[2]["local_numel"] == 0 and by_rank[3]["local_numel"] == 0, loaded
+    assert not by_rank[2]["materialized"] and not by_rank[3]["materialized"], loaded
+    for item in loaded:
+        assert item["finite"], item
