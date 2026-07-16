@@ -127,7 +127,7 @@ Gefen drops into standard distributed training like any other PyTorch optimizer,
 | Megatron-LM | All optimizers, including checkpoint resume — [scope](https://github.com/thad0ctor/Gefen-X/blob/main/COMPATIBILITY.md#megatron-lm-integration-scope) |
 
 > **FSDP2 checkpoint scope.** Plain Gefen and Muon `approx` save and resume exactly through PyTorch's standard full-state checkpoint calls, as long as the GPU count and sharding layout are unchanged and every GPU joins the save. Anything outside that scope refuses to load instead of corrupting state — [full details](https://github.com/thad0ctor/Gefen-X/blob/main/COMPATIBILITY.md#optimizer-checkpoint-scope).
-
+>
 > **FSDP2 CPU offload.** Training-time CPU offload via `CPUOffloadPolicy` (`fully_shard(module, offload_policy=CPUOffloadPolicy())`) is validated for plain Gefen on single and multiple GPUs: each rank steps its CPU-resident local shard directly (the codebook is learned rank-locally, with no cross-rank codebook collective), and the multi-GPU run completes on an NCCL-only process group.
 
 Mixed precision works out of the box: BF16 and standard AMP behave exactly as with any PyTorch optimizer, and true-FP16 `GradScaler` training is handled safely — an overflow step changes nothing. FSDP1 FP16 needs `torch.distributed.fsdp.ShardedGradScaler`.

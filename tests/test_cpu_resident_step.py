@@ -326,6 +326,7 @@ def test_tensor_lr_survives_cpu_paging(factored):
         factored_v_2d=factored,
     )
     gen = torch.Generator().manual_seed(0)
+    before = p.detach().cpu().clone()
 
     def _step_on(device):
         p.data = p.data.to(device)
@@ -337,16 +338,22 @@ def test_tensor_lr_survives_cpu_paging(factored):
     _step_on(torch.device("cpu"))  # lr tensor still on CUDA -> must not strand
     _step_on(torch.device("cuda"))
     assert torch.isfinite(p.detach()).all()
+    # The paged steps must actually move the parameter -- a stranded lr that
+    # silently no-ops would still pass the finiteness check above.
+    assert not torch.equal(before, p.detach().cpu())
 
 
 @CUDA
 @pytest.mark.parametrize("factored", [False, True])
 def test_resume_after_paging_is_exact(factored):
-    """Checkpoint/resume across a device move: save the optimizer state after it
-    was migrated CUDA->CPU by the colocation helper, reload into a fresh
+    """Checkpoint/resume across a device move: save the optimizer state *after*
+    the colocation helper has migrated it CUDA->CPU, reload into a fresh
     optimizer, and continue -- the resumed run must match the uninterrupted run
-    that follows the same device schedule bit-for-bit. Uses fused=False so every
-    step (CUDA and CPU) takes the deterministic decomposed path."""
+    that follows the same device schedule bit-for-bit. The schedule steps on CUDA
+    then CPU (which migrates the state to CPU inside step 1), and the checkpoint
+    is taken at step 2, so the snapshot is the already-migrated CPU state. Uses
+    fused=False so every step (CUDA and CPU) takes the deterministic decomposed
+    path."""
     torch.manual_seed(0)
     init = torch.randn(16, 24)
     gen = torch.Generator().manual_seed(1)
@@ -358,10 +365,16 @@ def test_resume_after_paging_is_exact(factored):
         opt = Gefen([("w", p)], lr=1e-2, fused=False, factored_v_2d=factored)
         for i, (g, dev) in enumerate(zip(grads, schedule)):
             if i == interrupt_before:
-                # State currently lives on the previous step's device; snapshot
-                # it, rebuild the optimizer, and reload -- exactly what a resume
-                # from checkpoint does.
+                # Snapshot the state (now migrated to CPU by step 1's colocation),
+                # rebuild the optimizer, and reload -- exactly what a resume from
+                # checkpoint does.
                 saved_state = copy.deepcopy(opt.state_dict())
+                assert all(
+                    v.device.type == "cpu"
+                    for s in saved_state["state"].values()
+                    for v in s.values()
+                    if torch.is_tensor(v)
+                ), "checkpoint should be taken after the state migrated to CPU"
                 saved_param = p.detach().clone()
                 p = nn.Parameter(saved_param)
                 opt = Gefen([("w", p)], lr=1e-2, fused=False, factored_v_2d=factored)
@@ -373,7 +386,7 @@ def test_resume_after_paging_is_exact(factored):
         return p.detach().cpu()
 
     reference = run(interrupt_before=-1)  # never interrupt
-    resumed = run(interrupt_before=1)  # save after the CUDA step, reload, resume
+    resumed = run(interrupt_before=2)  # save the migrated CPU state, reload, resume
     assert torch.equal(reference, resumed), (
         (reference - resumed).abs().max().item()
     )
