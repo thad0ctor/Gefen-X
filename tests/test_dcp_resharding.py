@@ -60,7 +60,7 @@ def _global_grad(step, device):
     return grad.to(device)
 
 
-def _build(mesh, device):
+def _build(mesh, device, fused=False):
     parameter = nn.Parameter(
         distribute_tensor(_global_param().to(device), mesh, [Shard(0)])
     )
@@ -70,7 +70,7 @@ def _build(mesh, device):
         betas=(0.8, 0.97),
         eps=2e-8,
         weight_decay=0.03,
-        fused=False,
+        fused=fused,
         factored_v_2d=False,
         deterministic=True,
     )
@@ -104,7 +104,7 @@ def _period_info(optimizer, parameter):
     }
 
 
-def _worker(rank, world, port, checkpoint_dir, mode, device_type, result_queue):
+def _worker(rank, world, port, checkpoint_dir, mode, device_type, fused, result_queue):
     try:
         os.environ.update(
             MASTER_ADDR="127.0.0.1",
@@ -124,7 +124,7 @@ def _worker(rank, world, port, checkpoint_dir, mode, device_type, result_queue):
             timeout=timedelta(seconds=120),
         )
         mesh = init_device_mesh(device_type, (world,), mesh_dim_names=("dp",))
-        parameter, optimizer = _build(mesh, device)
+        parameter, optimizer = _build(mesh, device, fused)
 
         if mode == "save":
             for step in range(_SAVE_STEPS):
@@ -146,7 +146,7 @@ def _worker(rank, world, port, checkpoint_dir, mode, device_type, result_queue):
         )
         restored = _period_info(optimizer, parameter)
 
-        reference_param, reference = _build(mesh, device)
+        reference_param, reference = _build(mesh, device, fused)
         for step in range(_SAVE_STEPS):
             _step(reference_param, reference, mesh, step, device)
         # Continue both from the identical parameter so the delta isolates the
@@ -179,7 +179,7 @@ def _worker(rank, world, port, checkpoint_dir, mode, device_type, result_queue):
             dist.destroy_process_group()
 
 
-def _run(world, checkpoint_dir, mode, *, device_type="cpu", timeout=240):
+def _run(world, checkpoint_dir, mode, *, device_type="cpu", fused=False, timeout=240):
     context = mp.get_context("spawn")
     result_queue = context.Queue()
     port = _free_port()
@@ -193,6 +193,7 @@ def _run(world, checkpoint_dir, mode, *, device_type="cpu", timeout=240):
                 checkpoint_dir,
                 mode,
                 device_type,
+                fused,
                 result_queue,
             ),
         )
@@ -294,6 +295,26 @@ def test_dcp_save_on_two_gpus_loads_and_continues_on_four(tmp_path):
     saved = _run(2, checkpoint_dir, "save", device_type="cuda")
     assert all(item.get("saved") for item in saved), saved
     loaded = _run(4, checkpoint_dir, "load", device_type="cuda")
+    _assert_loaded(loaded)
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available()
+    or torch.cuda.device_count() < 2
+    or not dist.is_nccl_available(),
+    reason="fused DCP coverage requires two CUDA devices and NCCL",
+)
+def test_dcp_fused_state_reshards_and_stays_compact(tmp_path):
+    # The fused CUDA kernels (fused=True) produce the same optimizer-state layout
+    # as the decomposed path, so GefenDCPState must save/reshard fused-trained
+    # state too. Same-topology (2->2) on CUDA is enough to prove the fused state
+    # round-trips compactly and continues; the reshard math itself is covered by
+    # the non-fused N-to-M tests and is fused-independent.
+    checkpoint_dir = str(tmp_path / "gefen-dcp-fused")
+    saved = _run(2, checkpoint_dir, "save", device_type="cuda", fused=True)
+    assert all(item.get("saved") for item in saved), saved
+    assert all(item["compact"] and item["period"] > 1 for item in saved), saved
+    loaded = _run(2, checkpoint_dir, "load", device_type="cuda", fused=True)
     _assert_loaded(loaded)
 
 
