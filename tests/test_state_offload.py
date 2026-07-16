@@ -336,3 +336,58 @@ def test_offload_activation_colocates_cpu_mapped_codebook():
         not torch.is_tensor(value) or value.device.type == "cpu"
         for value in optimizer.state[parameter].values()
     )
+
+
+@CUDA_REQUIRED
+@pytest.mark.parametrize("factored", [False, True])
+def test_offload_end_to_end_training_loss_matches_baseline(factored):
+    # A real forward/backward/step loop over a small MLP: the CPU-authoritative
+    # offloaded run must track a non-offloaded run's loss bit-for-bit at every
+    # step, and keep per-parameter state on CPU throughout.
+    torch.manual_seed(0)
+    reference_model = torch.nn.Sequential(
+        torch.nn.Linear(8, 16), torch.nn.Tanh(), torch.nn.Linear(16, 4)
+    ).cuda()
+    offloaded_model = copy.deepcopy(reference_model)
+
+    def make_optimizer(model):
+        optimizer = Gefen(
+            model.named_parameters(), lr=3e-3, fused=False, factored_v_2d=factored
+        )
+        optimizer._resolve_automatic_period = lambda *args, **kwargs: 4
+        return optimizer
+
+    reference_optimizer = make_optimizer(reference_model)
+    offloaded_optimizer = make_optimizer(offloaded_model)
+    offloaded_optimizer.offload_state_()
+
+    generator = torch.Generator(device="cuda").manual_seed(7)
+    batches = [
+        (
+            torch.randn(32, 8, generator=generator, device="cuda"),
+            torch.randn(32, 4, generator=generator, device="cuda"),
+        )
+        for _ in range(8)
+    ]
+
+    reference_losses = []
+    offloaded_losses = []
+    for inputs, targets in batches:
+        for model, optimizer, losses in (
+            (reference_model, reference_optimizer, reference_losses),
+            (offloaded_model, offloaded_optimizer, offloaded_losses),
+        ):
+            optimizer.zero_grad(set_to_none=True)
+            loss = ((model(inputs) - targets) ** 2).mean()
+            loss.backward()
+            optimizer.step()
+            losses.append(loss.detach())
+
+    for offloaded_loss, reference_loss in zip(offloaded_losses, reference_losses):
+        torch.testing.assert_close(offloaded_loss, reference_loss, rtol=0, atol=0)
+    assert offloaded_optimizer.state_offload_active
+    assert all(
+        not torch.is_tensor(value) or value.device.type == "cpu"
+        for parameter_state in offloaded_optimizer.state.values()
+        for value in parameter_state.values()
+    )

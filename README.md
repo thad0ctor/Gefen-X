@@ -643,7 +643,7 @@ optimizer.offload_state_()  # enable synchronous CPU-authoritative state
 optimizer.restore_state_()  # atomically return state to parameter devices
 ```
 
-Activation, restoration, and checkpoint loading are fail-atomic: state is staged and validated before the live mapping is replaced. `move_state_(device=None)` is also available on `Gefen` and `GefenMuon`; without an explicit device it co-locates state with each live parameter. Native CPU offload currently supports plain `Gefen` with ordinary replicated CUDA parameters and is incompatible with capturable/CUDA-graph execution, DTensor/FSDP state, custom tensor-valued state extensions, and `torch.compile` execution. Offload is synchronous and transfers each parameter's state to CUDA for its update, then copies it back to CPU; paged and overlapped transfer policies remain future work.
+Activation, restoration, and checkpoint loading are fail-atomic: state is staged and validated before the live mapping is replaced. `move_state_(device=None)` is also available on `Gefen` and `GefenMuon`; without an explicit device it co-locates state with each live parameter. Native CPU offload currently supports plain `Gefen` with ordinary replicated CUDA parameters — including `DistributedDataParallel`, where it is bit-identical to a non-offloaded run stepping the same all-reduced gradients — and is incompatible with capturable/CUDA-graph execution, DTensor/FSDP state, custom tensor-valued state extensions, and `torch.compile` execution. Offload is synchronous and transfers each parameter's state to CUDA for its update, then copies it back to CPU; paged and overlapped transfer policies remain future work.
 
 ## Known limitations
 
