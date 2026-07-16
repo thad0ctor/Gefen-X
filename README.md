@@ -36,6 +36,7 @@
 >| **Optimizer-step speed** | baseline | ≈2× faster `opt.step()` with fused kernels |
 >| **Peak memory**| large transient spikes | much lower peak — room for bigger models / batches |
 >| **Sharded multi-GPU training (FSDP2)** | breaks with the fast path | works — for plain Gefen *and* Muon |
+>| **CPU-offloaded training** | not supported (GPU-resident) | parameters, gradients & optimizer state can live on CPU — validated for plain Gefen under DeepSpeed ZeRO CPU-offload (optimizer at ZeRO-2/3, parameters at ZeRO-3) and FSDP2 `CPUOffloadPolicy` (single & multi-GPU) — [details](https://github.com/thad0ctor/Gefen-X/blob/main/COMPATIBILITY.md#fsdp2-cpu-offload) |
 >| **Whole-model Muon** | 2D weight matrices only | `GefenMuonHybrid` trains the entire model |
 >| **Muon step efficiency** | generic momentum hack + redundant dequant gather | single-pass bit-exact momentum kernel |
 >| **Save / resume checkpoints** | can corrupt state or lose tuning on resume | native optimizer checkpoints save and resume correctly; distributed checkpoint formats have documented limits |
@@ -119,17 +120,19 @@ Gefen drops into standard distributed training like any other PyTorch optimizer,
 | System | Works with |
 |---|---|
 | DDP | All optimizers |
-| FSDP2 | All optimizers |
+| FSDP2 | All optimizers; training-time CPU offload (`CPUOffloadPolicy`) validated for plain Gefen, single and multi-GPU |
 | FSDP2 checkpoints | Plain Gefen and Muon `approx`; resume needs the same GPU count — scope note below |
 | Muon `distributed` checkpoints | Resume on any GPU count, even a single GPU — [details](#experimental-lever-sharded-newton-schulz-under-fsdp2-sharded_mode) |
-| DeepSpeed ZeRO 1-3 | Plain Gefen; use FSDP2 or DDP for the Muon family — config note below |
+| DeepSpeed ZeRO 1-3 | Plain Gefen (client optimizer); optimizer CPU-offload verified at ZeRO-2/3, parameter offload at ZeRO-3 (full fine-tune and LoRA); use FSDP2 or DDP for the Muon family — config note below |
 | Megatron-LM | All optimizers, including checkpoint resume — [scope](https://github.com/thad0ctor/Gefen-X/blob/main/COMPATIBILITY.md#megatron-lm-integration-scope) |
 
 > **FSDP2 checkpoint scope.** Plain Gefen and Muon `approx` save and resume exactly through PyTorch's standard full-state checkpoint calls, as long as the GPU count and sharding layout are unchanged and every GPU joins the save. Anything outside that scope refuses to load instead of corrupting state — [full details](https://github.com/thad0ctor/Gefen-X/blob/main/COMPATIBILITY.md#optimizer-checkpoint-scope).
+>
+> **FSDP2 CPU offload.** Training-time CPU offload via `CPUOffloadPolicy` (`fully_shard(module, offload_policy=CPUOffloadPolicy())`) is validated for plain Gefen on single and multiple GPUs: each rank steps its CPU-resident local shard directly (the codebook is learned rank-locally, with no cross-rank codebook collective), and the multi-GPU run completes on an NCCL-only process group.
 
 Mixed precision works out of the box: BF16 and standard AMP behave exactly as with any PyTorch optimizer, and true-FP16 `GradScaler` training is handled safely — an overflow step changes nothing. FSDP1 FP16 needs `torch.distributed.fsdp.ShardedGradScaler`.
 
-> **DeepSpeed ZeRO config.** Set `"zero_allow_untested_optimizer": true` and leave the config's `optimizer` section unset. With optimizer CPU-offload, also set `"zero_force_ds_cpu_optimizer": false` — otherwise raw DeepSpeed refuses to initialize, and accelerate-based launchers (axolotl) silently swap in DeepSpeed's own CPU Adam.
+> **DeepSpeed ZeRO config.** Set `"zero_allow_untested_optimizer": true` and leave the config's `optimizer` section unset. With optimizer or parameter CPU-offload, also set `"zero_force_ds_cpu_optimizer": false` — otherwise raw DeepSpeed refuses to initialize, and accelerate-based launchers (axolotl) silently swap in DeepSpeed's own CPU Adam. With those two flags, plain Gefen (`optimizer: gefenx`) steps the CPU-resident fp32 partitions directly and trains normally under ZeRO-2 and ZeRO-3 offload, for both full fine-tuning and LoRA. Activation offloading (`activation_offloading: true`) is optimizer-agnostic and composes with `gefenx`, including alongside ZeRO CPU-offload.
 
 ## Determinism (`deterministic`)
 
