@@ -6,6 +6,8 @@ All notable changes to this project are documented here. This project adheres to
 
 Distributed checkpoint-load and step-failure hardening. All fixes are backward-compatible; no public API changes.
 
+- Add `GefenDCPState`, a standalone DCP Stateful wrapper for plain Gefen on one-dimensional default-world FSDP2 `Shard(0)` parameters. It saves shard-addressable dense optimizer tensors, supports N-to-M DCP resharding without a rank-0 full-state gather, validates before mutation, and leaves the existing native checkpoint format unchanged.
+
 Correctness — checkpoint loads are now atomic:
 
 - `Gefen.load_state_dict` and `GefenMuonHybrid.load_state_dict` stage the full restore on an isolated shadow, validate it, then publish through non-throwing dict swaps, so a malformed, truncated, or mismatched checkpoint — or a CUDA OOM while re-staging tensors — leaves the live optimizer untouched instead of half-loaded and corrupted (#69). The hybrid previously committed the Muon child before validating the backup half and recovered a backup rejection with a second full Muon reload that could itself raise and strand a new-Muon/old-backup optimizer; the shadow-then-publish path makes a rejection a true no-op.

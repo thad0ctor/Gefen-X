@@ -11,6 +11,7 @@ __all__ = [
     "Gefen",
     "GefenMuon",
     "GefenMuonHybrid",
+    "GefenDCPState",
     "split_params_for_muon",
     "validate_split",
     "kernels",
@@ -31,6 +32,10 @@ def __getattr__(name):
         from .hybrid import GefenMuonHybrid
 
         return GefenMuonHybrid
+    if name == "GefenDCPState":
+        from .dcp import GefenDCPState
+
+        return GefenDCPState
     if name in ("split_params_for_muon", "validate_split"):
         from . import params
 
