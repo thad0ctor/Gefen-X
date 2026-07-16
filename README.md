@@ -129,7 +129,7 @@ Gefen drops into standard distributed training like any other PyTorch optimizer,
 
 Mixed precision works out of the box: BF16 and standard AMP behave exactly as with any PyTorch optimizer, and true-FP16 `GradScaler` training is handled safely — an overflow step changes nothing. FSDP1 FP16 needs `torch.distributed.fsdp.ShardedGradScaler`.
 
-> **DeepSpeed ZeRO config.** Set `"zero_allow_untested_optimizer": true` and leave the config's `optimizer` section unset. With optimizer or parameter CPU-offload, also set `"zero_force_ds_cpu_optimizer": false` — otherwise raw DeepSpeed refuses to initialize, and accelerate-based launchers (axolotl) silently swap in DeepSpeed's own CPU Adam. With those two flags, plain Gefen (`optimizer: gefenx`) steps the CPU-resident fp32 partitions directly and trains normally under ZeRO-2 and ZeRO-3 offload, for both full fine-tuning and LoRA.
+> **DeepSpeed ZeRO config.** Set `"zero_allow_untested_optimizer": true` and leave the config's `optimizer` section unset. With optimizer or parameter CPU-offload, also set `"zero_force_ds_cpu_optimizer": false` — otherwise raw DeepSpeed refuses to initialize, and accelerate-based launchers (axolotl) silently swap in DeepSpeed's own CPU Adam. With those two flags, plain Gefen (`optimizer: gefenx`) steps the CPU-resident fp32 partitions directly and trains normally under ZeRO-2 and ZeRO-3 offload, for both full fine-tuning and LoRA. Activation offloading (`activation_offloading: true`) is optimizer-agnostic and composes with `gefenx`, including alongside ZeRO CPU-offload.
 
 ## Determinism (`deterministic`)
 
