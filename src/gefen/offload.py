@@ -1,5 +1,6 @@
 """Atomic optimizer-state movement and synchronous CPU offload for Gefen."""
 
+import weakref
 from collections import defaultdict, deque
 
 import torch
@@ -63,9 +64,72 @@ class StateOffloadMixin:
         return bool(getattr(self, "_gefen_state_offload_poisoned", False))
 
     def _assert_state_export_safe(self) -> None:
+        if not self.state_offload_active and not self.state_offload_poisoned:
+            return
+        error = None
         if self.state_offload_poisoned:
-            raise RuntimeError(
+            error = RuntimeError(
                 "Gefen cannot export optimizer state after a failed state-offload copyback; load a known-good checkpoint first"
+            )
+        self._synchronize_state_offload_error(error, "state export preflight")
+
+    def _capture_state_offload_parameter_topology(self) -> None:
+        """Record parameters registered through the optimizer's public path."""
+
+        self._gefen_state_offload_parameter_topology = tuple(
+            tuple(weakref.ref(parameter) for parameter in group["params"])
+            for group in self.param_groups
+        )
+        self._gefen_state_offload_control_device = None
+        try:
+            dtensor_parameters = [
+                parameter
+                for parameter in self._parameters()
+                if self._is_exact_dtensor_parameter(parameter)
+            ]
+            if (
+                dtensor_parameters
+                and self._state_offload_dtensor_context_supported()
+            ):
+                self._gefen_state_offload_control_device = self._parameter_device(
+                    dtensor_parameters[0]
+                )
+        except Exception:
+            # An unsupported or only partially initialized distributed topology
+            # remains ineligible for native offload. Never rediscover a control
+            # group from mutable parameter groups after construction.
+            self._gefen_state_offload_control_device = None
+
+    def _state_offload_parameter_topology_matches(self) -> bool:
+        """Whether wrappers have left registered group ownership unchanged."""
+
+        expected = getattr(self, "_gefen_state_offload_parameter_topology", None)
+        if expected is None:
+            return False
+        try:
+            groups = self.param_groups
+            if len(groups) != len(expected):
+                return False
+            for group, expected_parameters in zip(groups, expected):
+                parameters = group["params"]
+                if len(parameters) != len(expected_parameters):
+                    return False
+                if any(
+                    reference() is not parameter
+                    for reference, parameter in zip(expected_parameters, parameters)
+                ):
+                    return False
+        except (KeyError, TypeError):
+            return False
+        return True
+
+    def _append_state_offload_parameter_group(self, parameters) -> None:
+        """Extend a verified ownership snapshot after ``add_param_group``."""
+
+        expected = getattr(self, "_gefen_state_offload_parameter_topology", None)
+        if expected is not None:
+            self._gefen_state_offload_parameter_topology = expected + (
+                tuple(weakref.ref(parameter) for parameter in parameters),
             )
 
     @staticmethod
@@ -101,13 +165,109 @@ class StateOffloadMixin:
         )
 
     @staticmethod
-    def _parameter_device(parameter) -> torch.device:
+    def _is_exact_dtensor_parameter(parameter) -> bool:
+        try:
+            from torch.distributed.tensor import DTensor
+        except (ImportError, AttributeError):
+            return False
+        return type(parameter) is DTensor
+
+    @staticmethod
+    def _local_parameter_tensor(parameter):
         local = parameter.to_local() if hasattr(parameter, "to_local") else parameter
         if hasattr(local, "wait"):
             local = local.wait()
-        if not torch.is_tensor(local) or local.device.type not in _DEVICE_TYPES:
+        if not torch.is_tensor(local):
+            raise RuntimeError("parameter local storage must be a tensor")
+        return local
+
+    @staticmethod
+    def _parameter_device(parameter) -> torch.device:
+        local = StateOffloadMixin._local_parameter_tensor(parameter)
+        if local.device.type not in _DEVICE_TYPES:
             raise RuntimeError("parameters must use CPU or CUDA local storage")
         return torch.device("cpu") if local.device.type == "cpu" else local.device
+
+    def _state_movement_passthrough_items(self):
+        """Return validated ``(parameter-id, key)`` derived-state items."""
+
+        return frozenset()
+
+    def _state_offload_dtensor_context_supported(self) -> bool:
+        """Whether the optimizer declares its DTensor topology safe for offload."""
+
+        return False
+
+    def _state_offload_collective_context(self):
+        """Return the supported DTensor control group and local control device."""
+
+        if not torch.distributed.is_available() or not torch.distributed.is_initialized():
+            return None
+        import torch.distributed as dist
+
+        stored_device = getattr(self, "_gefen_state_offload_control_device", None)
+        if stored_device is None:
+            stored_device = getattr(
+                self, "_gefen_state_offload_collective_device", None
+            )
+        if stored_device is not None and dist.get_world_size() > 1:
+            return dist.group.WORLD, torch.device(stored_device)
+        try:
+            dtensor_parameters = [
+                parameter
+                for parameter in self._parameters()
+                if self._is_exact_dtensor_parameter(parameter)
+            ]
+            if (
+                not dtensor_parameters
+                or not self._state_offload_dtensor_context_supported()
+            ):
+                return None
+            device = self._parameter_device(dtensor_parameters[0])
+        except Exception:
+            return None
+
+        if dist.get_world_size() < 2:
+            return None
+        return dist.group.WORLD, device
+
+    @torch.no_grad()
+    @torch._dynamo.disable
+    def _synchronize_state_offload_error(self, error, phase: str) -> None:
+        """Make a supported FSDP2 phase succeed or fail on every world rank."""
+
+        context = self._state_offload_collective_context()
+        if context is None:
+            if error is not None:
+                raise error
+            return
+
+        import torch.distributed as dist
+
+        process_group, device = context
+        failed = torch.tensor(
+            int(error is not None), dtype=torch.int32, device=device
+        )
+        dist.all_reduce(failed, op=dist.ReduceOp.MAX, group=process_group)
+        if not bool(failed.item()):
+            return
+        if error is not None:
+            raise RuntimeError(
+                "Gefen FSDP2 {} failed on local rank {}: {}".format(
+                    phase, dist.get_rank(), error
+                )
+            ) from error
+        raise RuntimeError("Gefen FSDP2 {} failed on another rank".format(phase))
+
+    def _run_state_offload_collective_phase(self, phase: str, operation):
+        result = None
+        error = None
+        try:
+            result = operation()
+        except Exception as exc:
+            error = exc
+        self._synchronize_state_offload_error(error, phase)
+        return result
 
     def _parameters(self):
         return [parameter for group in self.param_groups for parameter in group["params"]]
@@ -116,8 +276,13 @@ class StateOffloadMixin:
     def _capturing_on_parameter_device(parameters) -> bool:
         if torch.cuda.is_available() and torch.cuda.is_current_stream_capturing():
             return True
+        parameter_devices = {
+            StateOffloadMixin._parameter_device(parameter)
+            for parameter in parameters
+            if torch.is_tensor(parameter)
+        }
         devices = sorted(
-            {p.device for p in parameters if torch.is_tensor(p) and p.device.type == "cuda"},
+            {device for device in parameter_devices if device.type == "cuda"},
             key=lambda device: -1 if device.index is None else device.index,
         )
         for device in devices:
@@ -137,6 +302,12 @@ class StateOffloadMixin:
             parameters = self._parameters()
         except (KeyError, TypeError):
             return "parameter groups have an invalid structure"
+        try:
+            passthrough_items = self._state_movement_passthrough_items()
+        except Exception:
+            return "derived optimizer state has an invalid schema"
+        if passthrough_items is None:
+            return "derived optimizer state has an invalid schema"
         for parameter in parameters:
             try:
                 self._parameter_device(parameter)
@@ -164,6 +335,8 @@ class StateOffloadMixin:
                             return "authoritative tensor state has an unsupported representation"
                     elif key not in COUNTER_KEYS or type(value) is not int:
                         return "authoritative tensor state has an invalid value"
+                elif (id(parameter), key) in passthrough_items:
+                    continue
                 elif not self._state_value_is_movement_safe_metadata(value):
                     return "undeclared optimizer state is not provably tensor-free metadata"
         if self._gefen_codebook is not None and not self._state_movement_tensor_supported(self._gefen_codebook):
@@ -267,14 +440,27 @@ class StateOffloadMixin:
     def move_state_(self, device=None) -> None:
         """Atomically move authoritative state to live parameter devices or ``device``."""
 
-        reason = self._state_movement_rejection_reason()
-        if reason is not None:
-            raise RuntimeError("Gefen atomic state movement is unavailable: {}".format(reason))
-        if torch.compiler.is_compiling():
-            raise RuntimeError("Gefen state movement cannot run during torch.compile")
-        if torch.cuda.is_available() and self._capturing_on_parameter_device(self._parameters()):
-            raise RuntimeError("Gefen state movement cannot run during CUDA graph capture")
-        state, codebook = self._stage_state_move(device)
+        def validate():
+            reason = self._state_movement_rejection_reason()
+            if reason is not None:
+                raise RuntimeError(
+                    "Gefen atomic state movement is unavailable: {}".format(reason)
+                )
+            if torch.compiler.is_compiling():
+                raise RuntimeError(
+                    "Gefen state movement cannot run during torch.compile"
+                )
+            if torch.cuda.is_available() and self._capturing_on_parameter_device(
+                self._parameters()
+            ):
+                raise RuntimeError(
+                    "Gefen state movement cannot run during CUDA graph capture"
+                )
+
+        self._run_state_offload_collective_phase("state movement preflight", validate)
+        state, codebook = self._run_state_offload_collective_phase(
+            "state movement staging", lambda: self._stage_state_move(device)
+        )
         self.__dict__.update(
             state=state,
             _gefen_codebook=codebook,
@@ -283,20 +469,30 @@ class StateOffloadMixin:
             _static_mark_sig=None,
             _lr_scalar_cache=None,
             _gefen_state_offload_device=None,
+            _gefen_state_offload_collective_device=None,
         )
 
-    @staticmethod
-    def _offload_parameter_supported(parameter) -> bool:
+    @classmethod
+    def _offload_parameter_supported(cls, parameter) -> bool:
+        if (
+            type(parameter) not in {torch.Tensor, nn.Parameter}
+            and not cls._is_exact_dtensor_parameter(parameter)
+        ):
+            return False
+        try:
+            local = cls._local_parameter_tensor(parameter)
+        except Exception:
+            return False
         return (
-            type(parameter) in {torch.Tensor, nn.Parameter}
-            and parameter.layout is torch.strided
-            and parameter.device.type == "cuda"
-            and parameter.dtype in {torch.float16, torch.bfloat16, torch.float32, torch.float64}
-            and not parameter.is_meta
-            and not parameter.is_nested
-            and not parameter.is_quantized
-            and not torch.is_complex(parameter)
-            and not hasattr(parameter, "placements")
+            type(local) in {torch.Tensor, nn.Parameter}
+            and local.layout is torch.strided
+            and local.device.type == "cuda"
+            and local.dtype
+            in {torch.float16, torch.bfloat16, torch.float32, torch.float64}
+            and not local.is_meta
+            and not local.is_nested
+            and not local.is_quantized
+            and not torch.is_complex(local)
         )
 
     @classmethod
@@ -319,21 +515,58 @@ class StateOffloadMixin:
             return "a previous state copyback failed; load a known-good checkpoint"
         if self.capturable:
             return "capturable optimizers have device-authoritative replay state"
+        if not self._state_offload_parameter_topology_matches():
+            return (
+                "optimizer parameter ownership changed outside Gefen's registration path: live parameter groups "
+                "were replaced, reordered, or cleared. Native Gefen state offload does not compose with wrappers "
+                "that take over those groups, including DeepSpeed ZeRO. Under DeepSpeed, leave offload_state_() "
+                "disabled and configure zero_optimization.offload_optimizer instead"
+            )
         parameters = self._parameters()
         if torch.compiler.is_compiling():
             return "state offload cannot run during torch.compile"
         if torch.cuda.is_available() and self._capturing_on_parameter_device(parameters):
             return "state offload cannot run during CUDA graph capture"
+        if not parameters or any(not self._offload_parameter_supported(p) for p in parameters):
+            return "state offload requires plain CUDA parameters or supported FSDP2 DTensor parameters"
+        try:
+            parameter_devices = {
+                self._parameter_device(parameter) for parameter in parameters
+            }
+        except Exception:
+            return "state offload could not resolve the local parameter devices"
+        if len(parameter_devices) != 1:
+            return "state offload requires one local CUDA compute device per optimizer rank"
+        try:
+            passthrough_items = self._state_movement_passthrough_items()
+        except Exception:
+            return "derived optimizer state has an invalid schema"
+        dtensor_parameters = [
+            parameter
+            for parameter in parameters
+            if self._is_exact_dtensor_parameter(parameter)
+        ]
+        if dtensor_parameters:
+            if len(dtensor_parameters) != len(parameters):
+                return "FSDP2 state offload does not support mixed DTensor and plain parameters"
+            if not self._state_offload_dtensor_context_supported():
+                return "FSDP2 state offload requires a supported one-dimensional default-world DTensor topology"
+            if passthrough_items is None:
+                return "FSDP2 state offload requires Gefen's exact rank-local checkpoint transport schema"
+        if passthrough_items is None:
+            passthrough_items = frozenset()
         reason = self._state_movement_rejection_reason()
         if reason is not None:
             return reason
-        if not parameters or any(not self._offload_parameter_supported(p) for p in parameters):
-            return "state offload requires ordinary replicated CUDA parameters"
         if set(self.state) != set(parameters):
             return "state offload requires exactly one state entry per live parameter"
         for parameter in parameters:
             parameter_state = self.state.get(parameter)
-            if type(parameter_state) is not dict or any(key not in ALLOWED_STATE_KEYS for key in parameter_state):
+            if type(parameter_state) is not dict or any(
+                key not in ALLOWED_STATE_KEYS
+                and (id(parameter), key) not in passthrough_items
+                for key in parameter_state
+            ):
                 return "state offload does not support custom per-parameter state"
             if require_cpu_state and any(key in SCRATCH_KEYS for key in parameter_state):
                 return "offloaded state contains device-side runtime scratch"
@@ -355,11 +588,17 @@ class StateOffloadMixin:
             if key in STATE_TENSOR_KEYS and torch.is_tensor(value)
         )
         try:
-            storage_ids = [
-                (str(tensor.device), tensor.untyped_storage().data_ptr())
-                for tensor in persistent_tensors
-                if tensor.numel()
-            ]
+            storage_ids = []
+            for tensor in persistent_tensors:
+                inspected = (
+                    self._local_parameter_tensor(tensor)
+                    if self._is_exact_dtensor_parameter(tensor)
+                    else tensor
+                )
+                if inspected.numel():
+                    storage_ids.append(
+                        (str(inspected.device), inspected.untyped_storage().data_ptr())
+                    )
         except Exception:
             return "persistent optimizer-state storage could not be inspected"
         if len(storage_ids) != len(set(storage_ids)):
@@ -403,16 +642,17 @@ class StateOffloadMixin:
 
     def _stage_offloaded_parameter_state(self, parameter):
         result = {}
+        target = self._parameter_device(parameter)
         for key, value in self.state[parameter].items():
             if key in STATE_TENSOR_KEYS and torch.is_tensor(value):
                 if not self._tight_cpu_tensor(value):
                     raise RuntimeError("offloaded parameter tensors must remain tight CPU tensors")
-                staged = self._copy_state_tensor_for_move(value, parameter.device)
-                self._validate_staged_state_tensor(value, staged, parameter.device)
+                staged = self._copy_state_tensor_for_move(value, target)
+                self._validate_staged_state_tensor(value, staged, target)
                 result[key] = staged
             else:
                 result[key] = value
-        torch.cuda.synchronize(parameter.device)
+        torch.cuda.synchronize(target)
         return result
 
     def _step_with_offloaded_parameter_state(self, update, group, name, parameter, grad):
@@ -435,37 +675,65 @@ class StateOffloadMixin:
             ) from exc
 
     def _assert_state_offload_step_ready(self) -> None:
-        if self.state_offload_poisoned:
-            raise RuntimeError(
-                "Gefen state offload is poisoned after a failed copyback; load a known-good checkpoint before stepping again"
-            )
-        if self.state_offload_active:
-            reason = self._state_offload_rejection_reason(require_cpu_state=True)
-            if reason is not None:
-                raise RuntimeError("Gefen state offload cannot step: {}".format(reason))
+        error = None
+        try:
+            if self.state_offload_poisoned:
+                raise RuntimeError(
+                    "Gefen state offload is poisoned after a failed copyback; load a known-good checkpoint before stepping again"
+                )
+            if self.state_offload_active:
+                reason = self._state_offload_rejection_reason(require_cpu_state=True)
+                if reason is not None:
+                    raise RuntimeError(
+                        "Gefen state offload cannot step: {}".format(reason)
+                    )
+        except Exception as exc:
+            error = exc
+        if self.state_offload_active or error is not None:
+            self._synchronize_state_offload_error(error, "step preflight")
 
     @torch.no_grad()
     def offload_state_(self, device="cpu") -> None:
         """Atomically enable synchronous CPU-authoritative parameter state."""
 
-        if torch.device(device).type != "cpu":
-            raise ValueError("Gefen native state offload currently supports only CPU")
-        reason = self._state_offload_rejection_reason(require_cpu_state=False)
-        if reason is not None:
-            raise RuntimeError("Gefen state offload is unavailable: {}".format(reason))
+        def validate():
+            try:
+                target = torch.device(device)
+            except (TypeError, RuntimeError) as exc:
+                raise TypeError("device must identify the CPU offload target") from exc
+            if target.type != "cpu":
+                raise ValueError(
+                    "Gefen native state offload currently supports only CPU"
+                )
+            reason = self._state_offload_rejection_reason(require_cpu_state=False)
+            if reason is not None:
+                raise RuntimeError(
+                    "Gefen state offload is unavailable: {}".format(reason)
+                )
+
+        self._run_state_offload_collective_phase("activation preflight", validate)
         # Stage everything before mutating self: a failure in either stage
         # leaves the live optimizer untouched. Activation must also restore the
         # CUDA-resident codebook invariant, since an inactive map_location='cpu'
         # load can have left the codebook on CPU while validation (which runs
         # with require_cpu_state=False) still permits it.
-        state = self._stage_all_parameter_state_to_cpu()
-        codebook = self._stage_offload_codebook_on_parameter_device()
+        state, codebook = self._run_state_offload_collective_phase(
+            "activation staging",
+            lambda: (
+                self._stage_all_parameter_state_to_cpu(),
+                self._stage_offload_codebook_on_parameter_device(),
+            ),
+        )
+        collective_context = self._state_offload_collective_context()
         self.__dict__.update(
             state=state,
             _gefen_codebook=codebook,
             _gefen_codebook_by_device={},
             _gefen_codebook_lut_by_device={},
             _gefen_state_offload_device=torch.device("cpu"),
+            _gefen_state_offload_collective_device=(
+                None if collective_context is None else collective_context[1]
+            ),
             _gefen_state_offload_poisoned=False,
             _static_mark_sig=None,
             _lr_scalar_cache=None,

@@ -1144,7 +1144,10 @@ class Gefen(StateOffloadMixin, torch.optim.Optimizer):
         # step tail; state_dict synchronizes the host mirror before serializing.
         self._gefen_global_step_by_device = {}
         self._gefen_state_offload_device = None
+        self._gefen_state_offload_control_device = None
+        self._gefen_state_offload_collective_device = None
         self._gefen_state_offload_poisoned = False
+        self._gefen_state_offload_parameter_topology = None
 
         defaults = dict(
             lr=lr,
@@ -1160,6 +1163,7 @@ class Gefen(StateOffloadMixin, torch.optim.Optimizer):
         # after the base constructor has finished registering every group.
         self._gefen_checkpoint_schema_ready = False
         super().__init__(self._normalize_param_groups(params), defaults)
+        self._capture_state_offload_parameter_topology()
         self._gefen_checkpoint_schema_ready = True
         self._install_rank_local_checkpoint_schema()
 
@@ -1378,7 +1382,13 @@ class Gefen(StateOffloadMixin, torch.optim.Optimizer):
                 "weight_decay": group_weight_decay,
             }
         )
+        extend_offload_topology = (
+            getattr(self, "_gefen_state_offload_parameter_topology", None) is not None
+            and self._state_offload_parameter_topology_matches()
+        )
         super().add_param_group(new_group)
+        if extend_offload_topology:
+            self._append_state_offload_parameter_group(params)
         for param, param_name in zip(params, param_names):
             self._param_names[param] = param_name
             self.state[param]["name"] = param_name
@@ -3808,13 +3818,33 @@ class Gefen(StateOffloadMixin, torch.optim.Optimizer):
         """Run optimizer state-dict hooks around Gefen's complete schema."""
 
         self._assert_state_export_safe()
-        for pre_hook in self._optimizer_state_dict_pre_hooks.values():
-            pre_hook(self)
+
+        def run_pre_hooks():
+            for pre_hook in self._optimizer_state_dict_pre_hooks.values():
+                pre_hook(self)
+
+        if self.state_offload_active:
+            self._run_state_offload_collective_phase(
+                "state export pre-hooks", run_pre_hooks
+            )
+        else:
+            run_pre_hooks()
         state_dict = self._state_dict_impl()
-        for post_hook in self._optimizer_state_dict_post_hooks.values():
-            hook_result = post_hook(self, state_dict)
-            if hook_result is not None:
-                state_dict = hook_result
+
+        def run_post_hooks():
+            result = state_dict
+            for post_hook in self._optimizer_state_dict_post_hooks.values():
+                hook_result = post_hook(self, result)
+                if hook_result is not None:
+                    result = hook_result
+            return result
+
+        if self.state_offload_active:
+            state_dict = self._run_state_offload_collective_phase(
+                "state export post-hooks", run_post_hooks
+            )
+        else:
+            state_dict = run_post_hooks()
         return state_dict
 
     def _base_state_dict_without_hooks(self):
@@ -3853,6 +3883,104 @@ class Gefen(StateOffloadMixin, torch.optim.Optimizer):
             and hasattr(param, "placements")
             and hasattr(param, "device_mesh")
         )
+
+    def _state_offload_dtensor_context_supported(self) -> bool:
+        """Limit native offload to the rank-local topology Gefen checkpoints."""
+
+        try:
+            context = self._rank_local_checkpoint_context(fail=False)
+            import torch.distributed as dist
+            from torch.distributed.tensor import Shard
+        except Exception:
+            return False
+        if context is None or "nccl" not in str(dist.get_backend()).lower():
+            return False
+        parameters = [
+            parameter
+            for group in self.param_groups
+            for parameter in group["params"]
+        ]
+        return bool(parameters) and all(
+            self._is_exact_dtensor_parameter(parameter)
+            and len(parameter.placements) == 1
+            and type(parameter.placements[0]) is Shard
+            and parameter.placements[0].dim == 0
+            for parameter in parameters
+        )
+
+    def _state_movement_passthrough_items(self):
+        """Validate and index live-only rank-local checkpoint transport state."""
+
+        private_items_present = any(
+            key == _RANK_LOCAL_MEMBER_KEY
+            or (
+                isinstance(key, str)
+                and key.startswith(_RANK_LOCAL_PAYLOAD_KEY_PREFIX)
+            )
+            for parameter_state in self.state.values()
+            if type(parameter_state) is dict
+            for key in parameter_state
+        )
+        try:
+            context = self._rank_local_checkpoint_context(fail=False)
+        except Exception:
+            return None if private_items_present else frozenset()
+        if context is None:
+            return None if private_items_present else frozenset()
+        parameters = [
+            parameter for group in self.param_groups for parameter in group["params"]
+        ]
+        if not parameters:
+            return None
+        expected_carrier_keys = {
+            _rank_local_payload_key(global_rank)
+            for global_rank in context["world_ranks"]
+        }
+        passthrough_items = set()
+        for index, parameter in enumerate(parameters):
+            parameter_state = self.state.get(parameter)
+            if type(parameter_state) is not dict:
+                return None
+            transport_keys = {
+                key
+                for key in parameter_state
+                if key == _RANK_LOCAL_MEMBER_KEY
+                or (
+                    isinstance(key, str)
+                    and key.startswith(_RANK_LOCAL_PAYLOAD_KEY_PREFIX)
+                )
+            }
+            expected_keys = (
+                expected_carrier_keys
+                if index == 0
+                else {_RANK_LOCAL_MEMBER_KEY}
+            )
+            if transport_keys != expected_keys:
+                return None
+            for key in transport_keys:
+                value = parameter_state[key]
+                if key == _RANK_LOCAL_MEMBER_KEY:
+                    valid = value is True
+                else:
+                    valid = (
+                        type(value) is torch.Tensor
+                        and value.dtype == torch.uint8
+                        and tuple(value.shape) == (1,)
+                        and self._tight_cpu_tensor(value)
+                    )
+                if not valid:
+                    return None
+                passthrough_items.add((id(parameter), key))
+        if not all(
+            isinstance(group.get("_gefen_checkpoint_metadata"), dict)
+            and group["_gefen_checkpoint_metadata"]
+            .get("rank_local_sharded_state", {})
+            .get("format")
+            == _RANK_LOCAL_FORMAT
+            for group in self.param_groups
+        ):
+            return None
+        return frozenset(passthrough_items)
 
     @staticmethod
     def _placement_checkpoint_signature(placement):
@@ -4211,24 +4339,57 @@ class Gefen(StateOffloadMixin, torch.optim.Optimizer):
         topology/world-size change.
         """
 
-        if not self._uses_rank_local_sharded_state():
+        if not self._uses_rank_local_sharded_state() and not (
+            self.state_offload_active
+            and getattr(self, "_gefen_state_offload_control_device", None) is not None
+        ):
             return
 
         import torch.distributed as dist
 
-        context = self._rank_local_checkpoint_context()
-        world = context["world_size"]
-        rank = context["global_rank"]
-        saved_ids = list(state_dict["state"])
-        local_signature = self._rank_local_sharded_signature(context)
-        local_manifest = self._rank_local_parameter_manifest(local_signature)
-        local_control = {
-            "saved_ids": saved_ids,
-            "manifest": local_manifest,
-            "signature": local_signature,
-            "global_step": self._gefen_global_step,
-            "deterministic": self._deterministic,
-        }
+        def prepare_local_control():
+            context = self._rank_local_checkpoint_context()
+            if context is None:
+                raise RuntimeError(
+                    "Gefen active FSDP2 offload lost its rank-local checkpoint topology"
+                )
+            world = context["world_size"]
+            rank = context["global_rank"]
+            saved_ids = list(state_dict["state"])
+            local_signature = self._rank_local_sharded_signature(context)
+            local_manifest = self._rank_local_parameter_manifest(local_signature)
+            local_control = {
+                "saved_ids": saved_ids,
+                "manifest": local_manifest,
+                "signature": local_signature,
+                "global_step": self._gefen_global_step,
+                "deterministic": self._deterministic,
+            }
+            return (
+                context,
+                world,
+                rank,
+                saved_ids,
+                local_signature,
+                local_manifest,
+                local_control,
+            )
+
+        if self.state_offload_active:
+            prepared = self._run_state_offload_collective_phase(
+                "state export consolidation preparation", prepare_local_control
+            )
+        else:
+            prepared = prepare_local_control()
+        (
+            context,
+            world,
+            rank,
+            saved_ids,
+            local_signature,
+            local_manifest,
+            local_control,
+        ) = prepared
         controls = [None] * world
         dist.all_gather_object(controls, local_control)
         if any(control["saved_ids"] != saved_ids for control in controls):
@@ -4349,6 +4510,34 @@ class Gefen(StateOffloadMixin, torch.optim.Optimizer):
         state_dict["gefen_codebook"] = None
 
     def _state_dict_impl(self, *, consolidate_rank_local: bool = True):
+        if not consolidate_rank_local or not self.state_offload_active:
+            return self._state_dict_local_impl(
+                consolidate_rank_local=consolidate_rank_local
+            )
+
+        state_dict = self._run_state_offload_collective_phase(
+            "state export local preparation",
+            lambda: self._state_dict_local_impl(consolidate_rank_local=False),
+        )
+        if getattr(self, "_gefen_state_offload_control_device", None) is not None:
+
+            def checkpoint_metadata():
+                groups = state_dict.get("param_groups", ())
+                if not groups or not isinstance(
+                    groups[0].get("_gefen_checkpoint_metadata"), dict
+                ):
+                    raise RuntimeError(
+                        "Gefen rank-local checkpoint metadata was not initialized"
+                    )
+                return groups[0]["_gefen_checkpoint_metadata"]
+
+            metadata = self._run_state_offload_collective_phase(
+                "state export metadata preparation", checkpoint_metadata
+            )
+            self._consolidate_rank_local_sharded_state(state_dict, metadata)
+        return state_dict
+
+    def _state_dict_local_impl(self, *, consolidate_rank_local: bool = True):
         """Serialize optimizer state, plus Gefen's run-level extras.
 
         Beyond the base ``torch.optim.Optimizer.state_dict`` contents (per-param
@@ -4578,11 +4767,20 @@ class Gefen(StateOffloadMixin, torch.optim.Optimizer):
         ``_publish_load_state_dict`` for the standalone atomic load.
         """
 
-        state_dict = state_dict.copy()
-        for pre_hook in self._optimizer_load_state_dict_pre_hooks.values():
-            hook_result = pre_hook(self, state_dict)
-            if hook_result is not None:
-                state_dict = hook_result
+        def run_pre_hooks():
+            prepared = state_dict.copy()
+            for pre_hook in self._optimizer_load_state_dict_pre_hooks.values():
+                hook_result = pre_hook(self, prepared)
+                if hook_result is not None:
+                    prepared = hook_result
+            return prepared
+
+        if self.state_offload_active:
+            state_dict = self._run_state_offload_collective_phase(
+                "checkpoint load pre-hooks", run_pre_hooks
+            )
+        else:
+            state_dict = run_pre_hooks()
         return self._stage_load_state_dict(state_dict)
 
     def _publish_load_state_dict(self, staged):
@@ -4629,9 +4827,19 @@ class Gefen(StateOffloadMixin, torch.optim.Optimizer):
         staged._gefen_global_step_by_device = {}
         staged._capt_stacks = None
 
-        staged._load_state_dict_impl(state_dict)
-        staged._validate_loaded_native_state()
-        self._stage_loaded_state_for_offload(staged)
+        staging_error = None
+        try:
+            staged._load_state_dict_impl(state_dict)
+            staged._validate_loaded_native_state()
+            self._stage_loaded_state_for_offload(staged)
+        except Exception as exc:
+            staging_error = exc
+        if self.state_offload_active:
+            self._synchronize_state_offload_error(
+                staging_error, "checkpoint load staging"
+            )
+        elif staging_error is not None:
+            raise staging_error
         return staged
 
     def _commit_staged_load_state_dict(self, staged) -> None:
@@ -5511,12 +5719,43 @@ class Gefen(StateOffloadMixin, torch.optim.Optimizer):
         self._assert_state_offload_step_ready()
         self._assert_capturable_if_capturing()
 
-        loss = None
-        if closure is not None:
+        def evaluate_closure():
+            if closure is None:
+                return None
             with torch.enable_grad():
-                loss = closure()
+                return closure()
+
+        if self.state_offload_active:
+            loss = self._run_state_offload_collective_phase(
+                "step closure", evaluate_closure
+            )
+        else:
+            loss = evaluate_closure()
 
         self._assert_state_offload_step_ready()
+        if not self.state_offload_active:
+            return self._step_body(loss)
+        return self._run_state_offload_step_body(loss)
+
+    def _run_state_offload_step_body(self, loss):
+        active = self.state_offload_active
+        result = None
+        error = None
+        try:
+            result = self._step_body(loss)
+        except Exception as exc:
+            error = exc
+        if active:
+            try:
+                self._synchronize_state_offload_error(error, "step outcome")
+            except Exception:
+                self._gefen_state_offload_poisoned = True
+                raise
+        elif error is not None:
+            raise error
+        return result
+
+    def _step_body(self, loss):
         _assert_optimizer_gradients_structurally_valid(self)
 
         # GradScaler invokes native-AMP optimizers even on overflow. Decide

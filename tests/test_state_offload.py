@@ -95,7 +95,100 @@ def test_cpu_offload_rejects_cpu_parameters_and_muon():
         muon.offload_state_()
 
 
+def _zero_style_flat_swap(optimizer, *, device):
+    """Replace registered parameters the way ZeRO-1/2 replaces client groups."""
+
+    flat_parameters = []
+    for group in optimizer.param_groups:
+        numel = sum(parameter.numel() for parameter in group["params"])
+        flat = torch.zeros(numel, dtype=torch.float32, device=device, requires_grad=True)
+        group["params"] = [flat]
+        flat_parameters.append(flat)
+    return flat_parameters
+
+
 CUDA_REQUIRED = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+
+
+@CUDA_REQUIRED
+def test_offload_rejects_zero_style_parameter_takeover_atomically():
+    optimizer, _ = _initialized(device="cuda")
+    state_before = optimizer.state
+    codebook_before = optimizer._gefen_codebook
+    _zero_style_flat_swap(optimizer, device="cuda")
+
+    with pytest.raises(RuntimeError, match="parameter ownership changed.*DeepSpeed ZeRO"):
+        optimizer.offload_state_()
+
+    assert optimizer.state is state_before
+    assert optimizer._gefen_codebook is codebook_before
+    assert not optimizer.state_offload_active
+
+
+@CUDA_REQUIRED
+def test_offload_rejects_zero_style_takeover_after_inner_optimizer_resume():
+    optimizer, _ = _initialized(device="cuda")
+    (flat_parameter,) = _zero_style_flat_swap(optimizer, device="cuda")
+    flat_parameter.grad = torch.linspace(-0.4, 0.5, flat_parameter.numel(), device="cuda")
+    optimizer.step()
+
+    # Saving a ZeRO-owned flat parameter withholds the unreachable originals;
+    # after load, live-state equality alone cannot identify the takeover.
+    checkpoint = copy.deepcopy(optimizer.state_dict())
+    optimizer.load_state_dict(checkpoint)
+    assert set(optimizer.state) == {flat_parameter}
+
+    with pytest.raises(RuntimeError, match="parameter ownership changed.*DeepSpeed ZeRO"):
+        optimizer.offload_state_()
+    assert not optimizer.state_offload_active
+
+
+@CUDA_REQUIRED
+def test_active_offload_rejects_late_zero_style_takeover_before_mutation():
+    optimizer, original_parameter = _initialized(device="cuda")
+    optimizer.offload_state_()
+    state_before = optimizer.state
+    original_state_before = optimizer.state[original_parameter]
+    global_step_before = optimizer._gefen_global_step
+
+    (flat_parameter,) = _zero_style_flat_swap(optimizer, device="cuda")
+    flat_before = flat_parameter.detach().clone()
+    flat_parameter.grad = torch.linspace(-0.4, 0.5, flat_parameter.numel(), device="cuda")
+
+    with pytest.raises(RuntimeError, match="parameter ownership changed.*DeepSpeed ZeRO"):
+        optimizer.step()
+
+    assert torch.equal(flat_parameter, flat_before)
+    assert optimizer.state is state_before
+    assert optimizer.state[original_parameter] is original_state_before
+    assert optimizer._gefen_global_step == global_step_before
+    assert optimizer.state_offload_active
+
+
+@CUDA_REQUIRED
+def test_offload_rejects_zero3_style_cleared_parameter_groups():
+    optimizer, _ = _initialized(device="cuda")
+    state_before = optimizer.state
+    for group in optimizer.param_groups:
+        group["params"] = []
+
+    with pytest.raises(RuntimeError, match="parameter ownership changed.*DeepSpeed ZeRO"):
+        optimizer.offload_state_()
+
+    assert optimizer.state is state_before
+    assert not optimizer.state_offload_active
+
+
+@CUDA_REQUIRED
+def test_legitimate_add_param_group_extends_offload_ownership():
+    optimizer, _ = _initialized(device="cuda")
+    added = torch.nn.Parameter(torch.linspace(-0.2, 0.3, 6, device="cuda"))
+    optimizer.add_param_group({"params": [("added.weight", added)]})
+
+    optimizer.offload_state_()
+
+    assert optimizer.state_offload_active
+    assert added in optimizer.state
 
 
 @CUDA_REQUIRED
