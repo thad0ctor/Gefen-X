@@ -95,6 +95,10 @@ Plain Gefen runs as the DeepSpeed ZeRO client optimizer at stages 1-3, including
 
 The Muon family (`GefenMuon`, `GefenMuonHybrid` / `optimizer: gefenx_muon`) cannot run under DeepSpeed ZeRO at any stage: ZeRO steps flattened 1-D partitions on which Newton-Schulz orthogonalization cannot apply. Those optimizers fail fast with an explanatory error rather than training incorrectly; use plain Gefen under ZeRO, or FSDP2/DDP for the Muon family.
 
+## FSDP2 CPU offload
+
+Plain Gefen supports FSDP2 training-time CPU offload via `CPUOffloadPolicy` (`fully_shard(module, offload_policy=CPUOffloadPolicy())`), which keeps each sharded parameter and its gradient on CPU and moves them to GPU only for the forward/backward compute. The optimizer then steps the CPU-resident local shards through the decomposed path (the fused CUDA kernels are bypassed per tensor for a CPU shard, so `fused=True` is safe). Verified on a single GPU and on two GPUs; the two-GPU case additionally exercises Gefen's cross-rank codebook-scope collectives against CPU-resident shards, which succeed on an NCCL-only process group as well as a mixed `cuda:nccl,cpu:gloo` group. This is separate from the FSDP2 *checkpoint* `get_optimizer_state_dict(..., cpu_offload=True)` path in the next section.
+
 ## Optimizer checkpoint scope
 
 Native single-process optimizer `state_dict()`/`load_state_dict()` and the explicitly documented GefenMuon `distributed` state path remain separate from the rank-local DCP adapter. For plain Gefen and `GefenMuon(sharded_mode="approx")`, each rank can learn different local codebook and block geometry, so `state_dict()` collectively replaces ordinary rank-local tensors with one tagged, rank-indexed CPU payload that PyTorch full-state DCP preserves. Both optimizers' two-GPU FSDP2 `fully_shard` paths are exercised through `get_optimizer_state_dict(..., full_state_dict=True, cpu_offload=True)` and `set_optimizer_state_dict(..., full_state_dict=True, broadcast_from_rank0=True)`, with exact next-step continuation; the flattened optimizer-state form is also covered.
