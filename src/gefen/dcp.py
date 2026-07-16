@@ -3,8 +3,19 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import math
+import re
 
 import torch
+
+
+# Names Gefen synthesizes positionally when the caller passes no parameter name
+# (``group_<gi>_param_<pi>`` for a multi-param group, ``param_<n>`` for an
+# implicit/single group). Such names encode *registration order*, not stable
+# parameter identity, so two differently ordered reconstructions produce the
+# same identity list and would cross-assign momentum on load. DCP resharding
+# therefore requires caller-provided names and rejects the synthesized pattern.
+_SYNTHESIZED_NAME_RE = re.compile(r"^(group_\d+_param_\d+|param_\d+)$")
 
 
 # Schema history:
@@ -180,6 +191,12 @@ def _reblock(codebook, momentum: torch.Tensor, second: torch.Tensor, period: int
     )
 
     flat = momentum.reshape(-1)
+    # Co-locate the learned codebook with this shard's operand device. When the
+    # default-world DTensors span more than one device (e.g. mixed CPU/CUDA
+    # shards) the codebook was learned on the first slot's device, but
+    # gefen_nearest_codebook_indices rejects a codebook whose device differs from
+    # the operand -- native keeps the codebook on the compute device.
+    codebook = codebook.to(device=flat.device, dtype=torch.float32)
     blocks = automatic_partition_view(flat, period)
     magnitude = automatic_partition_reduce(flat.abs(), period, reduce_op="max")
     nonzero = magnitude > 0
@@ -246,13 +263,36 @@ class GefenDCPState:
 
         slots = []
         index = 0
+        seen_identities = {}
         for group_index, group in enumerate(self.optimizer.param_groups):
             if group.get("sharded_mode") is not None:
                 raise RuntimeError("GefenDCPState does not support Muon sharded modes")
-            names = group.get("param_names", ())
-            if len(names) != len(group["params"]):
-                names = tuple("param_{}".format(index + offset) for offset in range(len(group["params"])))
+            names = group.get("param_names")
+            # Index-addressed slots are only safe to reshard if each carries a
+            # caller-stable, unique identity. A missing/short param_names list or
+            # a positionally synthesized name (Gefen's default for unnamed
+            # parameters) encodes registration order, not identity, so refuse it
+            # rather than silently cross-assigning momentum on a reordered load.
+            if names is None or len(names) != len(group["params"]):
+                raise RuntimeError(
+                    "GefenDCPState requires caller-provided stable param_names on "
+                    "every group (group {} has {} name(s) for {} parameter(s)); "
+                    "pass named parameters so resharded momentum is assigned by "
+                    "identity, not by registration order".format(
+                        group_index,
+                        0 if names is None else len(names),
+                        len(group["params"]),
+                    )
+                )
             for name, parameter in zip(names, group["params"]):
+                if _SYNTHESIZED_NAME_RE.match(str(name)):
+                    raise RuntimeError(
+                        "GefenDCPState requires caller-provided stable parameter "
+                        "names, but slot {} carries the synthesized positional "
+                        "name {!r}. Construct the optimizer with explicit "
+                        "parameter names so resharded state is addressed by "
+                        "identity, not registration order.".format(index, str(name))
+                    )
                 if not _is_dtensor(parameter):
                     raise RuntimeError(
                         "GefenDCPState requires every parameter to be a DTensor"
@@ -271,6 +311,20 @@ class GefenDCPState:
                     raise RuntimeError(
                         "GefenDCPState supports only one-dimensional Shard(0) parameters"
                     )
+                identity = (
+                    str(name),
+                    group_index,
+                    tuple(int(dim) for dim in parameter.shape),
+                )
+                if identity in seen_identities:
+                    raise RuntimeError(
+                        "GefenDCPState requires unique parameter identities, but "
+                        "slots {} and {} share identity (name/group/shape) {!r}; "
+                        "resharding cannot disambiguate their momentum.".format(
+                            seen_identities[identity], index, identity
+                        )
+                    )
+                seen_identities[identity] = index
                 slots.append(_Slot(index, group_index, str(name), parameter))
                 index += 1
         if not slots:
@@ -328,6 +382,82 @@ class GefenDCPState:
             hypers.append(entry)
         return hypers
 
+    @staticmethod
+    def _validate_hyper_entry(group_index, entry):
+        """Parse and range-validate one group's saved hyperparameters.
+
+        Mirrors native ``Gefen._validate_group_options`` (lr>=0, 0<=betas<1,
+        weight_decay>=0, finite eps>0) and additionally rejects NaN/inf so a
+        corrupted checkpoint cannot commit values that silently poison the next
+        update. Returns a fresh ``{key: float}`` dict; raises before any mutation.
+        """
+        if not isinstance(entry, dict):
+            raise ValueError(
+                "Gefen DCP checkpoint group {} hyperparameters must be a mapping".format(
+                    group_index
+                )
+            )
+        parsed = {}
+        for key in _GROUP_HYPER_KEYS:
+            if key not in entry:
+                raise ValueError(
+                    "Gefen DCP checkpoint group {} is missing hyperparameter {!r}".format(
+                        group_index, key
+                    )
+                )
+            value = entry[key]
+            if torch.is_tensor(value):
+                if value.numel() != 1:
+                    raise ValueError(
+                        "Gefen DCP checkpoint group {} hyperparameter {!r} must be "
+                        "scalar".format(group_index, key)
+                    )
+                value = value.item()
+            try:
+                value = float(value)
+            except (TypeError, ValueError):
+                raise ValueError(
+                    "Gefen DCP checkpoint group {} hyperparameter {!r} is "
+                    "non-numeric".format(group_index, key)
+                )
+            if not math.isfinite(value):
+                raise ValueError(
+                    "Gefen DCP checkpoint group {} hyperparameter {!r} is not "
+                    "finite ({})".format(group_index, key, value)
+                )
+            parsed[key] = value
+        if parsed["lr"] < 0.0:
+            raise ValueError(
+                "Gefen DCP checkpoint group {} has invalid lr {}".format(
+                    group_index, parsed["lr"]
+                )
+            )
+        if not 0.0 <= parsed["beta1"] < 1.0:
+            raise ValueError(
+                "Gefen DCP checkpoint group {} has invalid beta1 {}".format(
+                    group_index, parsed["beta1"]
+                )
+            )
+        if not 0.0 <= parsed["beta2"] < 1.0:
+            raise ValueError(
+                "Gefen DCP checkpoint group {} has invalid beta2 {}".format(
+                    group_index, parsed["beta2"]
+                )
+            )
+        if parsed["eps"] <= 0.0:
+            raise ValueError(
+                "Gefen DCP checkpoint group {} has invalid eps {} (must be > 0)".format(
+                    group_index, parsed["eps"]
+                )
+            )
+        if parsed["weight_decay"] < 0.0:
+            raise ValueError(
+                "Gefen DCP checkpoint group {} has invalid weight_decay {}".format(
+                    group_index, parsed["weight_decay"]
+                )
+            )
+        return parsed
+
     def _slot_initialized(self, slot: _Slot) -> bool:
         """Classify a slot's live state; reject a partial/malformed materialize.
 
@@ -356,6 +486,10 @@ class GefenDCPState:
         return True
 
     def state_dict(self):
+        # Re-derive the slot layout (and re-run the fail-closed layout gate) so a
+        # retained wrapper whose optimizer gained parameters via add_param_group
+        # after construction saves the current set, not the stale snapshot.
+        self._slots = self._validate_layout()
         result = {
             "format_version": torch.tensor(_FORMAT_VERSION, dtype=torch.int64),
             "global_step": torch.tensor(
@@ -408,6 +542,10 @@ class GefenDCPState:
         return result
 
     def load_state_dict(self, state_dict):
+        # Re-derive the slot layout (and re-run the fail-closed layout gate) so a
+        # load reflects any add_param_group that ran after construction instead of
+        # clearing+repopulating from a stale construction-time snapshot.
+        self._slots = self._validate_layout()
         required = {
             "format_version",
             "global_step",
@@ -447,6 +585,14 @@ class GefenDCPState:
             raise ValueError(
                 "Gefen DCP checkpoint parameter-group hyperparameters differ in count"
             )
+        # Parse and range-validate every hyperparameter BEFORE any mutation so a
+        # missing/non-numeric key or an out-of-range value (lr=NaN, beta1=1,
+        # negative eps/weight_decay) is rejected fail-atomically instead of being
+        # committed and silently corrupting the next update.
+        staged_hypers = [
+            self._validate_hyper_entry(group_index, entry)
+            for group_index, entry in enumerate(saved_hypers)
+        ]
 
         # Reject a deterministic-policy mismatch instead of silently overwriting
         # it, matching native Gefen.load_state_dict: the flag changes fused-routing
@@ -466,101 +612,175 @@ class GefenDCPState:
                 )
             )
 
-        staged = []
-        for slot in self._slots:
-            keys = {
-                field: self._key(slot, field)
-                for field in (
-                    "initialized",
-                    "step",
-                    "vmean_step",
-                    "momentum",
-                    "second_moment",
-                )
-            }
-            if any(key not in state_dict for key in keys.values()):
-                raise ValueError(
-                    "Gefen DCP checkpoint is missing state for slot {}".format(
-                        slot.index
+        # Stage, validate, and re-block everything locally BEFORE mutating any
+        # live optimizer state. The whole preparation runs inside this helper so a
+        # per-rank failure (a non-finite resharded slice, an allocation failure,
+        # ...) is caught and synchronized across the process group below: either
+        # every rank commits or every rank raises. Without the cross-rank
+        # agreement a slice that only fails on one target rank would leave some
+        # live optimizers restored and others untouched.
+        def _stage():
+            staged = []
+            for slot in self._slots:
+                keys = {
+                    field: self._key(slot, field)
+                    for field in (
+                        "initialized",
+                        "step",
+                        "vmean_step",
+                        "momentum",
+                        "second_moment",
                     )
-                )
-            initialized = bool(
-                _counter(state_dict[keys["initialized"]], "initialized")
-            )
-            step = _counter(state_dict[keys["step"]], "step")
-            vmean_step = _counter(
-                state_dict[keys["vmean_step"]], "vmean_step"
-            )
-            momentum = _local(state_dict[keys["momentum"]]).detach().float()
-            second = _local(state_dict[keys["second_moment"]]).detach().float()
-            local = _local(slot.parameter)
-            if momentum.shape != local.shape or second.shape != local.shape:
-                raise ValueError(
-                    "Gefen DCP checkpoint local shape differs for slot {}".format(
-                        slot.index
+                }
+                if any(key not in state_dict for key in keys.values()):
+                    raise ValueError(
+                        "Gefen DCP checkpoint is missing state for slot {}".format(
+                            slot.index
+                        )
                     )
+                initialized = bool(
+                    _counter(state_dict[keys["initialized"]], "initialized")
                 )
-            if not torch.isfinite(momentum).all() or not torch.isfinite(second).all():
-                raise ValueError("Gefen DCP checkpoint contains non-finite state")
-            if (second < 0).any():
-                raise ValueError("Gefen DCP second moment must be nonnegative")
-            staged.append((slot, initialized, step, vmean_step, momentum, second))
-
-        global_step = _counter(state_dict["global_step"], "global_step")
-
-        # Re-block the resharded dense momentum back into Gefen's compact
-        # per-block representation instead of collapsing it to period one. Going
-        # through a dense DCP reshard is inherently a new blocking (so this is
-        # NOT bit-exact to a native same-topology resume), but it restores the
-        # ~1 byte/param memory profile and is a correct, finite continuation:
-        # per new local shard we re-run the block-variance period search, relearn
-        # the exact codebook, and re-quantize. All of this happens BEFORE the
-        # optimizer state is cleared, preserving the fail-atomic load contract.
-        #
-        # A slot that is initialized in the (replicated) checkpoint metadata but
-        # reshards to an EMPTY local shard on this rank -- N->M where dim-0 < the
-        # target world -- carries no local momentum to quantize. Native Gefen
-        # never materializes state for an empty local shard (the step returns
-        # early on an empty grad), so it is restored as name-only here and left
-        # out of the codebook learning; feeding an empty shard through the learner
-        # would return a None codebook and crash the re-quantize.
-        def _materialized(initialized, momentum):
-            return initialized and momentum.numel() > 0
-
-        device = _local(self._slots[0].parameter).device
-        periods = {}
-        for slot, initialized, step, vmean_step, momentum, second in staged:
-            if _materialized(initialized, momentum):
-                periods[slot.index] = _choose_period(
-                    self.optimizer, slot.name, slot.parameter, second
+                step = _counter(state_dict[keys["step"]], "step")
+                vmean_step = _counter(
+                    state_dict[keys["vmean_step"]], "vmean_step"
                 )
-        codebook = _learn_codebook(
-            [
-                (slot.name, momentum.reshape(-1), periods[slot.index])
-                for slot, initialized, _, _, momentum, _ in staged
-                if _materialized(initialized, momentum)
-            ],
-            device,
-        )
+                momentum = _local(state_dict[keys["momentum"]]).detach().float()
+                second = _local(state_dict[keys["second_moment"]]).detach().float()
+                local = _local(slot.parameter)
+                if momentum.shape != local.shape or second.shape != local.shape:
+                    raise ValueError(
+                        "Gefen DCP checkpoint local shape differs for slot {}".format(
+                            slot.index
+                        )
+                    )
+                if (
+                    not torch.isfinite(momentum).all()
+                    or not torch.isfinite(second).all()
+                ):
+                    raise ValueError("Gefen DCP checkpoint contains non-finite state")
+                if (second < 0).any():
+                    raise ValueError("Gefen DCP second moment must be nonnegative")
+                # Reject incoherent initialization metadata instead of loading it
+                # or silently discarding history, matching native Gefen validation
+                # (an initialized momentum + its second moment must have positive
+                # ages; an uninitialized slot must carry no counters or history).
+                # An initialized slot that reshards to an EMPTY local shard keeps
+                # its replicated positive counters and is materialized as name-only
+                # later, exactly as native never materializes an empty local shard.
+                if initialized:
+                    if step < 1:
+                        raise ValueError(
+                            "Gefen DCP slot {} is initialized but carries step={}; "
+                            "initialized momentum requires step >= 1".format(
+                                slot.index, step
+                            )
+                        )
+                    if vmean_step < 1:
+                        raise ValueError(
+                            "Gefen DCP slot {} is initialized but carries vmean_step"
+                            "={}; initialized second moment requires vmean_step >= "
+                            "1".format(slot.index, vmean_step)
+                        )
+                else:
+                    if step != 0 or vmean_step != 0:
+                        raise ValueError(
+                            "Gefen DCP slot {} is uninitialized but carries nonzero "
+                            "counters (step={}, vmean_step={})".format(
+                                slot.index, step, vmean_step
+                            )
+                        )
+                    if momentum.numel() and (
+                        bool(momentum.any()) or bool(second.any())
+                    ):
+                        raise ValueError(
+                            "Gefen DCP slot {} is uninitialized but carries nonzero "
+                            "momentum/second-moment history that would be silently "
+                            "discarded".format(slot.index)
+                        )
+                staged.append((slot, initialized, step, vmean_step, momentum, second))
 
-        new_state = {}
-        for slot, initialized, step, vmean_step, momentum, second in staged:
-            if not _materialized(initialized, momentum):
-                new_state[slot.parameter] = {"name": slot.name}
-                continue
-            period = periods[slot.index]
-            m_codebook, m_magnitude, vmean = _reblock(
-                codebook, momentum, second, period
+            global_step = _counter(state_dict["global_step"], "global_step")
+
+            # Re-block the resharded dense momentum back into Gefen's compact
+            # per-block representation instead of collapsing it to period one.
+            # Going through a dense DCP reshard is inherently a new blocking (so
+            # this is NOT bit-exact to a native same-topology resume), but it
+            # restores the ~1 byte/param memory profile and is a correct, finite
+            # continuation: per new local shard we re-run the block-variance
+            # period search, relearn the exact codebook, and re-quantize. All of
+            # this happens BEFORE the optimizer state is cleared, preserving the
+            # fail-atomic load contract.
+            #
+            # A slot that is initialized in the (replicated) checkpoint metadata
+            # but reshards to an EMPTY local shard on this rank -- N->M where dim-0
+            # < the target world -- carries no local momentum to quantize. Native
+            # Gefen never materializes state for an empty local shard (the step
+            # returns early on an empty grad), so it is restored as name-only here
+            # and left out of the codebook learning; feeding an empty shard through
+            # the learner would return a None codebook and crash the re-quantize.
+            def _materialized(initialized, momentum):
+                return initialized and momentum.numel() > 0
+
+            device = _local(self._slots[0].parameter).device
+            periods = {}
+            for slot, initialized, step, vmean_step, momentum, second in staged:
+                if _materialized(initialized, momentum):
+                    periods[slot.index] = _choose_period(
+                        self.optimizer, slot.name, slot.parameter, second
+                    )
+            codebook = _learn_codebook(
+                [
+                    (slot.name, momentum.reshape(-1), periods[slot.index])
+                    for slot, initialized, _, _, momentum, _ in staged
+                    if _materialized(initialized, momentum)
+                ],
+                device,
             )
-            new_state[slot.parameter] = {
-                "name": slot.name,
-                "automatic_period": period,
-                "step": step,
-                "m_codebook": m_codebook,
-                "m_magnitude": m_magnitude,
-                "vmean": vmean,
-                "vmean_step": vmean_step,
-            }
+
+            new_state = {}
+            for slot, initialized, step, vmean_step, momentum, second in staged:
+                if not _materialized(initialized, momentum):
+                    new_state[slot.parameter] = {"name": slot.name}
+                    continue
+                period = periods[slot.index]
+                m_codebook, m_magnitude, vmean = _reblock(
+                    codebook, momentum, second, period
+                )
+                new_state[slot.parameter] = {
+                    "name": slot.name,
+                    "automatic_period": period,
+                    "step": step,
+                    "m_codebook": m_codebook,
+                    "m_magnitude": m_magnitude,
+                    "vmean": vmean,
+                    "vmean_step": vmean_step,
+                }
+            return new_state, global_step, codebook
+
+        import torch.distributed as dist
+        from gefen.gefen import _synchronize_step_failure
+
+        local_error = None
+        prepared = None
+        try:
+            prepared = _stage()
+        except Exception as exc:  # resynchronized across the group below
+            local_error = exc
+        # Agree on success across the process group before publishing so a
+        # one-rank failure aborts every rank rather than committing a partial,
+        # cross-rank-inconsistent restore. The plain-Gefen DTensors live on the
+        # default world (validated in _validate_layout), so the WORLD group is the
+        # right scope; _synchronize_step_failure keeps the flag on CPU for
+        # gloo/CPU-resident state and no-ops for a single-rank group.
+        if _synchronize_step_failure(local_error is not None, dist.group.WORLD):
+            if local_error is not None:
+                raise local_error
+            raise RuntimeError(
+                "Gefen DCP load aborted before commit: another rank failed "
+                "staging/validation/re-block, so no rank commits its restore."
+            )
+        new_state, global_step, codebook = prepared
 
         self.optimizer.state.clear()
         self.optimizer.state.update(new_state)
@@ -568,9 +788,9 @@ class GefenDCPState:
         # hyperparameter change survives the resume, matching the native full-state
         # path. A live tensor lr is updated in place to preserve its identity/device
         # for any fused kernel holding a reference.
-        for group, entry in zip(self.optimizer.param_groups, saved_hypers):
+        for group, entry in zip(self.optimizer.param_groups, staged_hypers):
             for key in _GROUP_HYPER_KEYS:
-                value = float(entry[key])
+                value = entry[key]
                 current = group.get(key)
                 if torch.is_tensor(current):
                     current.fill_(value)

@@ -858,3 +858,428 @@ def test_dcp_reshard_to_empty_target_shard_does_not_crash(tmp_path):
     assert not by_rank[2]["materialized"] and not by_rank[3]["materialized"], loaded
     for item in loaded:
         assert item["finite"], item
+
+
+# --- Second review round (CodeRabbit + Codex on 7ea3f52) -------------------
+#
+# These harden the v2 additions themselves: unique/caller-stable identities
+# (finding 1), pre-commit hyperparameter validation (finding 2), stale-slot
+# refresh after add_param_group (finding 3), mixed-device codebook co-location
+# (finding 4), cross-rank commit agreement (finding 5), and coherent
+# initialization metadata (finding 6). Most run on a single-rank Gloo group and,
+# where a full distributed repro is impractical, exercise the validation via a
+# direct GefenDCPState.state_dict() -> mutate -> load_state_dict() round trip
+# (which is the exact code path DCP drives per rank).
+
+
+def _single_rank_group(init_file):
+    dist.init_process_group(
+        "gloo", init_method="file://{}".format(init_file), rank=0, world_size=1
+    )
+
+
+def _live_state_signature(optimizer, param):
+    state = optimizer.state.get(param, {})
+    return {
+        "period": int(state["automatic_period"]) if "automatic_period" in state else None,
+        "step": int(state["step"]) if "step" in state else None,
+        "vmean_step": int(state["vmean_step"]) if "vmean_step" in state else None,
+        "m_magnitude_sum": (
+            float(state["m_magnitude"].double().sum())
+            if "m_magnitude" in state
+            else None
+        ),
+    }
+
+
+def _group_hyper_signature(optimizer):
+    return [
+        {
+            key: float(
+                group[key].item()
+                if torch.is_tensor(group[key])
+                else group[key]
+            )
+            for key in ("lr", "beta1", "beta2", "eps", "weight_decay")
+        }
+        for group in optimizer.param_groups
+    ]
+
+
+# --- Finding 1: caller-stable, UNIQUE parameter identities -----------------
+
+
+@pytest.mark.skipif(
+    not dist.is_available() or not dist.is_gloo_available(),
+    reason="DCP resharding coverage requires Gloo",
+)
+def test_dcp_rejects_unnamed_synthesized_identities(tmp_path):
+    _single_rank_group(tmp_path / "unnamed-init")
+    try:
+        mesh = init_device_mesh("cpu", (1,), mesh_dim_names=("dp",))
+        # Bare (unnamed) parameters: Gefen synthesizes positional names
+        # (group_0_param_0/1) that encode registration order, not identity, so
+        # two reorderings would cross-assign momentum. Construction must refuse.
+        first = _shaped_dparam((128, 64), mesh)
+        second = _shaped_dparam((128, 64), mesh)
+        optimizer = Gefen(
+            [first, second], lr=1e-3, fused=False, factored_v_2d=False
+        )
+        with pytest.raises(RuntimeError, match="synthesized"):
+            GefenDCPState(optimizer)
+    finally:
+        dist.destroy_process_group()
+
+
+@pytest.mark.skipif(
+    not dist.is_available() or not dist.is_gloo_available(),
+    reason="DCP resharding coverage requires Gloo",
+)
+def test_dcp_rejects_duplicate_identities(tmp_path):
+    _single_rank_group(tmp_path / "dup-init")
+    try:
+        mesh = init_device_mesh("cpu", (1,), mesh_dim_names=("dp",))
+        first = _shaped_dparam((128, 64), mesh)
+        second = _shaped_dparam((128, 64), mesh)
+        optimizer = Gefen(
+            [("alpha", first), ("beta", second)],
+            lr=1e-3,
+            fused=False,
+            factored_v_2d=False,
+        )
+        # Force two identical (name, group, shape) identities, as a corrupted or
+        # adversarial caller could. Same-shaped same-group same-named slots cannot
+        # be disambiguated on a resharded load, so construction must reject them.
+        optimizer.param_groups[0]["param_names"] = ["dup", "dup"]
+        with pytest.raises(RuntimeError, match="unique parameter identities"):
+            GefenDCPState(optimizer)
+    finally:
+        dist.destroy_process_group()
+
+
+# --- Finding 2: validate group hyperparameters BEFORE committing -----------
+
+
+@pytest.mark.skipif(
+    not dist.is_available() or not dist.is_gloo_available(),
+    reason="DCP resharding coverage requires Gloo",
+)
+@pytest.mark.parametrize(
+    "key,bad_value,match",
+    [
+        ("lr", float("nan"), "not\\s+finite"),
+        ("beta1", 1.0, "invalid beta1"),
+        ("eps", -1e-8, "invalid eps"),
+        ("weight_decay", -0.1, "invalid weight_decay"),
+    ],
+)
+def test_dcp_rejects_corrupt_hyper_fail_atomic(tmp_path, key, bad_value, match):
+    _single_rank_group(tmp_path / "corrupt-hyper-init")
+    try:
+        mesh = init_device_mesh("cpu", (1,), mesh_dim_names=("dp",))
+        param = _shaped_dparam(_SHAPE, mesh)
+        optimizer = Gefen(
+            [("weight", param)],
+            lr=2.5e-3,
+            betas=(0.8, 0.97),
+            eps=2e-8,
+            weight_decay=0.03,
+            fused=False,
+            factored_v_2d=False,
+            deterministic=True,
+        )
+        for step in range(_SAVE_STEPS):
+            param.grad = distribute_tensor(_shaped_grad(_SHAPE, step), mesh, [Shard(0)])
+            optimizer.step()
+
+        saved = GefenDCPState(optimizer).state_dict()
+        # Corrupt one committed-in hyper. It is finite-but-invalid or NaN, and it
+        # would silently poison the next update if committed.
+        saved["param_group_hypers"][0][key] = bad_value
+
+        state_before = _live_state_signature(optimizer, param)
+        hypers_before = _group_hyper_signature(optimizer)
+        with pytest.raises(ValueError, match=match):
+            GefenDCPState(optimizer).load_state_dict(saved)
+        # Fail-atomic: neither optimizer state nor param-group hypers moved.
+        assert _live_state_signature(optimizer, param) == state_before
+        assert _group_hyper_signature(optimizer) == hypers_before
+    finally:
+        dist.destroy_process_group()
+
+
+# --- Finding 3: refresh cached _slots before save/load ---------------------
+
+
+@pytest.mark.skipif(
+    not dist.is_available() or not dist.is_gloo_available(),
+    reason="DCP resharding coverage requires Gloo",
+)
+def test_dcp_retained_wrapper_saves_added_param_group(tmp_path):
+    _single_rank_group(tmp_path / "addgroup-init")
+    try:
+        mesh = init_device_mesh("cpu", (1,), mesh_dim_names=("dp",))
+        shape = (128, 64)
+        first = _shaped_dparam(shape, mesh)
+        optimizer = Gefen(
+            [("alpha", first)], lr=1e-3, fused=False, factored_v_2d=False
+        )
+        # Retain the wrapper (as a training loop would), THEN grow the optimizer.
+        wrapper = GefenDCPState(optimizer)
+        second = _shaped_dparam(shape, mesh)
+        optimizer.add_param_group({"params": [("beta", second)]})
+        for step in range(_SAVE_STEPS):
+            for param in (first, second):
+                param.grad = distribute_tensor(
+                    _shaped_grad(shape, step), mesh, [Shard(0)]
+                )
+            optimizer.step()
+
+        checkpoint_dir = str(tmp_path / "addgroup-ckpt")
+        # Saving through the RETAINED wrapper must include the added parameter,
+        # not the construction-time single-slot snapshot.
+        saved = wrapper.state_dict()
+        assert int(saved["slot_count"]) == 2, saved["slot_count"]
+        torch.distributed.checkpoint.save(
+            {"optimizer": wrapper},
+            storage_writer=FileSystemWriter(checkpoint_dir),
+        )
+
+        # The resumed optimizer must mirror the saved group topology (alpha in
+        # group 0, beta added as group 1) for the identity/group guard to accept.
+        first2 = _shaped_dparam(shape, mesh)
+        second2 = _shaped_dparam(shape, mesh)
+        resumed = Gefen(
+            [("alpha", first2)], lr=1e-3, fused=False, factored_v_2d=False
+        )
+        resumed.add_param_group({"params": [("beta", second2)]})
+        torch.distributed.checkpoint.load(
+            {"optimizer": GefenDCPState(resumed)},
+            storage_reader=FileSystemReader(checkpoint_dir),
+        )
+        for param in (first2, second2):
+            assert "automatic_period" in resumed.state[param], resumed.state[param]
+            assert int(resumed.state[param]["automatic_period"]) >= 1
+    finally:
+        dist.destroy_process_group()
+
+
+# --- Finding 4: co-locate the codebook with each slot's device -------------
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available(),
+    reason="mixed-device codebook coverage requires CUDA",
+)
+def test_reblock_relocates_codebook_to_operand_device():
+    # Direct unit test (no distributed needed): a codebook learned on CUDA must
+    # re-quantize a CPU-resident momentum shard. gefen_nearest_codebook_indices
+    # rejects a codebook whose device differs from the operand, so without the
+    # per-slot co-location _reblock would abort on mixed CPU/CUDA shards.
+    import gefen.dcp as dcp_mod
+
+    torch.manual_seed(0)
+    period = 4
+    cuda_momentum = torch.randn(256, device="cuda")
+    codebook = dcp_mod._learn_codebook(
+        [("w", cuda_momentum.reshape(-1), period)], torch.device("cuda")
+    )
+    assert codebook is not None and codebook.is_cuda
+
+    cpu_momentum = torch.randn(256)
+    cpu_second = torch.rand(256)
+    m_codebook, m_magnitude, vmean = dcp_mod._reblock(
+        codebook, cpu_momentum, cpu_second, period
+    )
+    assert m_codebook.device.type == "cpu"
+    assert m_magnitude.device.type == "cpu" and vmean.device.type == "cpu"
+    assert bool(torch.isfinite(m_magnitude).all())
+    assert bool(torch.isfinite(vmean).all())
+    # The original CUDA codebook must be untouched (co-location returns a copy).
+    assert codebook.is_cuda
+
+
+# --- Finding 5: cross-rank commit agreement --------------------------------
+
+
+def _fail_sync_worker(rank, world, port, checkpoint_dir, mode, result_queue):
+    try:
+        os.environ.update(
+            MASTER_ADDR="127.0.0.1",
+            MASTER_PORT=port,
+            RANK=str(rank),
+            WORLD_SIZE=str(world),
+        )
+        dist.init_process_group(
+            "gloo", rank=rank, world_size=world, timeout=timedelta(seconds=120)
+        )
+        mesh = init_device_mesh("cpu", (world,), mesh_dim_names=("dp",))
+        device = torch.device("cpu")
+        parameter, optimizer = _build(mesh, device)
+
+        if mode == "save":
+            for step in range(_SAVE_STEPS):
+                _step(parameter, optimizer, mesh, step, device)
+            torch.distributed.checkpoint.save(
+                {"optimizer": GefenDCPState(optimizer)},
+                storage_writer=FileSystemWriter(checkpoint_dir),
+            )
+            result_queue.put({"rank": rank, "saved": True})
+            return
+
+        # Give the live optimizer real state, then inject a one-rank re-block
+        # failure. The cross-rank success sync must make EVERY rank raise and
+        # leave EVERY rank's live state untouched (fail-atomic, no partial
+        # restore) rather than committing on the ranks that did not fail.
+        _step(parameter, optimizer, mesh, 0, device)
+        before = _live_state_signature(optimizer, parameter)
+
+        import gefen.dcp as dcp_mod
+
+        if rank == 0:
+            def _boom(*args, **kwargs):
+                raise RuntimeError("injected one-rank re-block failure")
+
+            dcp_mod._reblock = _boom
+
+        raised = False
+        try:
+            torch.distributed.checkpoint.load(
+                {"optimizer": GefenDCPState(optimizer)},
+                storage_reader=FileSystemReader(checkpoint_dir),
+            )
+        except Exception:
+            raised = True
+        after = _live_state_signature(optimizer, parameter)
+        result_queue.put(
+            {
+                "rank": rank,
+                "raised": raised,
+                "state_unchanged": after == before,
+            }
+        )
+    except BaseException:
+        result_queue.put({"rank": rank, "fatal_error": traceback.format_exc()})
+    finally:
+        if dist.is_available() and dist.is_initialized():
+            dist.destroy_process_group()
+
+
+def _run_fail_sync(world, checkpoint_dir, mode, timeout=240):
+    context = mp.get_context("spawn")
+    result_queue = context.Queue()
+    port = _free_port()
+    processes = [
+        context.Process(
+            target=_fail_sync_worker,
+            args=(rank, world, port, checkpoint_dir, mode, result_queue),
+        )
+        for rank in range(world)
+    ]
+    for process in processes:
+        process.start()
+    results = []
+    try:
+        for _ in processes:
+            results.append(result_queue.get(timeout=timeout))
+    except queue.Empty:
+        pass
+    finally:
+        for process in processes:
+            process.join(timeout=10)
+        for process in processes:
+            if process.is_alive():
+                process.terminate()
+                process.join(timeout=5)
+        result_queue.close()
+        result_queue.join_thread()
+    assert len(results) == world, (results, [p.exitcode for p in processes])
+    assert all(p.exitcode == 0 for p in processes), [p.exitcode for p in processes]
+    return sorted(results, key=lambda item: item["rank"])
+
+
+@pytest.mark.skipif(
+    not dist.is_available() or not dist.is_gloo_available(),
+    reason="DCP resharding coverage requires Gloo",
+)
+def test_dcp_one_rank_failure_aborts_every_rank(tmp_path):
+    checkpoint_dir = str(tmp_path / "gefen-dcp-fail-sync")
+    saved = _run_fail_sync(2, checkpoint_dir, "save")
+    assert all(item.get("saved") for item in saved), saved
+    loaded = _run_fail_sync(2, checkpoint_dir, "load")
+    assert all("fatal_error" not in item for item in loaded), loaded
+    # A failure injected only on rank 0 must abort BOTH ranks and commit on
+    # neither: every rank raised and every rank's live state is unchanged.
+    for item in loaded:
+        assert item["raised"], item
+        assert item["state_unchanged"], item
+
+
+# --- Finding 6: reject inconsistent initialization metadata/counters -------
+
+
+@pytest.mark.skipif(
+    not dist.is_available() or not dist.is_gloo_available(),
+    reason="DCP resharding coverage requires Gloo",
+)
+def test_dcp_rejects_initialized_slot_with_zero_step(tmp_path):
+    _single_rank_group(tmp_path / "coherent-step-init")
+    try:
+        mesh = init_device_mesh("cpu", (1,), mesh_dim_names=("dp",))
+        param = _shaped_dparam(_SHAPE, mesh)
+        optimizer = Gefen(
+            [("weight", param)],
+            lr=1e-3,
+            fused=False,
+            factored_v_2d=False,
+            deterministic=True,
+        )
+        for step in range(_SAVE_STEPS):
+            param.grad = distribute_tensor(_shaped_grad(_SHAPE, step), mesh, [Shard(0)])
+            optimizer.step()
+
+        saved = GefenDCPState(optimizer).state_dict()
+        # An initialized slot whose age counter collapsed to zero is incoherent
+        # (native requires initialized momentum to carry a positive step).
+        saved["slot_00000000.step"] = torch.tensor(0, dtype=torch.int64)
+
+        before = _live_state_signature(optimizer, param)
+        with pytest.raises(ValueError, match="initialized momentum requires step"):
+            GefenDCPState(optimizer).load_state_dict(saved)
+        assert _live_state_signature(optimizer, param) == before
+    finally:
+        dist.destroy_process_group()
+
+
+@pytest.mark.skipif(
+    not dist.is_available() or not dist.is_gloo_available(),
+    reason="DCP resharding coverage requires Gloo",
+)
+def test_dcp_rejects_uninitialized_slot_with_nonzero_counters(tmp_path):
+    _single_rank_group(tmp_path / "coherent-uninit-init")
+    try:
+        mesh = init_device_mesh("cpu", (1,), mesh_dim_names=("dp",))
+        param = _shaped_dparam(_SHAPE, mesh)
+        optimizer = Gefen(
+            [("weight", param)],
+            lr=1e-3,
+            fused=False,
+            factored_v_2d=False,
+            deterministic=True,
+        )
+        for step in range(_SAVE_STEPS):
+            param.grad = distribute_tensor(_shaped_grad(_SHAPE, step), mesh, [Shard(0)])
+            optimizer.step()
+
+        saved = GefenDCPState(optimizer).state_dict()
+        # Flip the slot to uninitialized while it still carries a nonzero step and
+        # dense momentum: native never materializes an uninitialized slot with
+        # history, so the load must reject rather than silently discard it.
+        saved["slot_00000000.initialized"] = torch.tensor(0, dtype=torch.uint8)
+
+        before = _live_state_signature(optimizer, param)
+        with pytest.raises(ValueError, match="uninitialized"):
+            GefenDCPState(optimizer).load_state_dict(saved)
+        assert _live_state_signature(optimizer, param) == before
+    finally:
+        dist.destroy_process_group()
