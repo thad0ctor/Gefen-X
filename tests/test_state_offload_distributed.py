@@ -41,9 +41,11 @@ def _ddp_offload_worker(rank, world, port, factored, result_queue):
     os.environ["MASTER_PORT"] = port
     os.environ["RANK"] = str(rank)
     os.environ["WORLD_SIZE"] = str(world)
-    torch.cuda.set_device(rank)
-    dist.init_process_group("nccl", rank=rank, world_size=world)
     try:
+        # Inside the try so a set_device/init failure still reaches the
+        # result_queue reporting path instead of surfacing as a bare timeout.
+        torch.cuda.set_device(rank)
+        dist.init_process_group("nccl", rank=rank, world_size=world)
         reference_model = _build_model()
         offloaded_model = copy.deepcopy(reference_model)
         reference_ddp = DDP(reference_model, device_ids=[rank])
@@ -105,7 +107,8 @@ def _ddp_offload_worker(rank, world, port, factored, result_queue):
             result_queue.put(traceback.format_exc())
         raise
     finally:
-        dist.destroy_process_group()
+        if dist.is_initialized():
+            dist.destroy_process_group()
 
 
 @pytest.mark.skipif(
