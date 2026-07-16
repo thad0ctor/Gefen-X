@@ -4,11 +4,13 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [0.5.0] - 2026-07-16
 
-CPU-offloaded training and reshardable FSDP2 checkpoints, both for plain `Gefen`. Additive: nothing is removed from the public API, and the CUDA same-device step path is unchanged.
+CPU-offloaded training and reshardable FSDP2 checkpoints, both for plain `Gefen`. Additive: nothing is removed from the public API, and every same-device CUDA update stays numerically bit-identical to 0.4.1. One same-device behavior change is documented below, under CPU-offloaded training.
 
 Compatibility — training with parameters and optimizer state on CPU:
 
-- Plain `Gefen` now trains correctly with its parameters, gradients, and optimizer state resident on CPU, validated end-to-end under DeepSpeed ZeRO-2/3 CPU-offload and FSDP2 `CPUOffloadPolicy` (#80). Per-parameter optimizer state that a framework strands by paging a parameter across devices between steps is migrated on demand, the non-fused non-capturable path scalarizes a tensor learning rate so a CUDA-resident `lr` cannot strand a paged parameter's update, and the pre-mutation preflight now fails fast when a plain tensor's gradient and parameter sit on different devices. Under ZeRO, Gefen stays the client optimizer and steps the CPU-resident fp32 partitions; this requires `zero_allow_untested_optimizer: true` and `zero_force_ds_cpu_optimizer: false`. Activation offloading composes with both. Checkpoint resume across a device move is bit-exact. The Muon family still fails fast under ZeRO, unchanged.
+- Plain `Gefen` now trains correctly with its parameters, gradients, and optimizer state resident on CPU, validated end-to-end under DeepSpeed ZeRO-2/3 CPU-offload and FSDP2 `CPUOffloadPolicy` (#80). Per-parameter optimizer state that a framework strands by paging a parameter across devices between steps is migrated onto the parameter's current device on demand, and the pre-mutation preflight now fails fast when a plain tensor's gradient and parameter sit on different devices. Under ZeRO, Gefen stays the client optimizer and steps the CPU-resident fp32 partitions; this requires `zero_allow_untested_optimizer: true` and `zero_force_ds_cpu_optimizer: false`. Activation offloading composes with both. A checkpoint saved on one device loads onto another with its state intact and co-located, and continues correctly; note that a run resumed on a different device type is a numerically close continuation, not a bit-exact one, because CPU and CUDA reductions use different accumulation orders.
+- Behavior change, non-fused path only: a **tensor** learning rate is now resolved to a host scalar on the non-fused, non-capturable path, so a CUDA-resident `lr` cannot strand the update of a parameter that has been paged to CPU (#80). The resulting update is bit-identical (the scalar equals `lr.item()`), but the value is read back from the device whenever the `lr` tensor's identity or version changes — so an in-place LR scheduler (`lr.mul_`) driving a CUDA tensor `lr` now costs one device-to-host sync per step on that path, even when the parameter never leaves CUDA. Float learning rates, the fused path, and `capturable=True` are unaffected; pass `lr` as a plain float to avoid the sync.
+- The Muon family still fails fast under ZeRO, unchanged.
 
 Added — `GefenDCPState` for resharding FSDP2 optimizer state:
 
@@ -18,9 +20,7 @@ Added — `GefenDCPState` for resharding FSDP2 optimizer state:
 
 ## [0.4.1] - 2026-07-15
 
-Distributed checkpoint-load and step-failure hardening. All changes are backward-compatible; the only public API addition is the opt-in `GefenDCPState` resharding wrapper.
-
-- Add `GefenDCPState`, a standalone DCP Stateful wrapper for **resharding** plain Gefen on one-dimensional default-world FSDP2 `Shard(0)` parameters (`factored_v_2d=False`, `capturable=False`). Save writes shard-addressable dense optimizer tensors so DCP can reshard N ranks to M without a rank-0 full-state gather; load validates before mutation, then re-blocks the resharded dense momentum back into Gefen's compact ~1 byte/param block state (re-running the period search, relearning the codebook, and re-quantizing on each new shard). Resume is a correct continuation within 256-level quantization noise, not bit-exact — use the unchanged native full-state path for same-topology resumes.
+Distributed checkpoint-load and step-failure hardening. All fixes are backward-compatible; no public API changes.
 
 Correctness — checkpoint loads are now atomic:
 
