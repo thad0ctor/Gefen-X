@@ -339,6 +339,8 @@ def _mixed_cpu_checkpoint_worker(rank, world, port, result_queue):
     import torch.distributed as dist
     from torch.distributed.tensor import Shard, distribute_tensor, init_device_mesh
 
+    from gefen import ParameterLayout, ParameterStateRole, StateExtent, StateScope
+
     try:
         os.environ["MASTER_ADDR"] = "127.0.0.1"
         os.environ["MASTER_PORT"] = port
@@ -434,6 +436,38 @@ def _mixed_cpu_checkpoint_worker(rank, world, port, result_queue):
         assign(source_params[0], full(922) * 0.01)
         source_params[1].grad = full(923) * 0.01
         source.step()
+        contract = source.optimizer_contract()
+        if rank == 0:
+            parallel_variant = next(
+                item
+                for item in contract.state_layout.parameter_variants
+                if item.name == "quantized_muon_owner"
+            )
+            assert "m_codebook" in source.state[source_params[0]]
+            assert (
+                source.state[source_params[0]]["m_codebook"].numel()
+                == initial_parallel.numel()
+            )
+            assert parallel_variant.role is ParameterStateRole.OWNER
+            assert parallel_variant.extent is StateExtent.OWNER_PARAMETER
+        else:
+            parallel_variant = next(
+                item
+                for item in contract.state_layout.parameter_variants
+                if item.name == "distributed_non_owner"
+            )
+            authoritative_keys = {
+                key
+                for key in source.state[source_params[0]]
+                if contract.state_layout.field(key).scope is StateScope.PARAMETER
+            }
+            assert authoritative_keys == {"name", "automatic_period"}
+            assert parallel_variant.role is ParameterStateRole.NON_OWNER
+            assert parallel_variant.extent is StateExtent.METADATA_ONLY
+        assert parallel_variant.layouts == frozenset(
+            {ParameterLayout.DTENSOR_1D_DEFAULT_WORLD}
+        )
+        assert parallel_variant.sharded_mode == "distributed"
         checkpoint = _clone(source.state_dict())
         saved_ids = checkpoint["param_groups"][0]["params"]
         marker = checkpoint["gefen_muon_distributed"]

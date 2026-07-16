@@ -43,6 +43,7 @@ def _worker(rank, world, case, port, q):
     import torch.distributed as dist
     from torch.distributed.tensor import Shard, distribute_tensor, init_device_mesh
 
+    from gefen import ParameterLayout, StateExtent
     from gefen.gefen_muon import GefenMuon
 
     os.environ["MASTER_ADDR"] = "127.0.0.1"
@@ -64,6 +65,24 @@ def _worker(rank, world, case, port, q):
             p.grad = distribute_tensor(full_grad.clone(), mesh, [Shard(0)])
             opt.step()
         local_rows = p.to_local().shape[0]
+        contract = opt.optimizer_contract()
+        if p.to_local().numel() == 0:
+            variant_name = "name_only_dtensor_approx"
+            expected_extent = StateExtent.METADATA_ONLY
+        else:
+            variant_name = "quantized_muon_local"
+            expected_extent = StateExtent.LOCAL_STORAGE
+            assert opt.state[p]["m_codebook"].numel() == p.to_local().numel()
+        variant = next(
+            item
+            for item in contract.state_layout.parameter_variants
+            if item.name == variant_name
+        )
+        assert variant.layouts == frozenset(
+            {ParameterLayout.DTENSOR_1D_DEFAULT_WORLD}
+        )
+        assert variant.sharded_mode == "approx"
+        assert variant.extent is expected_extent
         gathered = p.detach().full_tensor()  # collective; all ranks must call
 
         if rank == 0:
