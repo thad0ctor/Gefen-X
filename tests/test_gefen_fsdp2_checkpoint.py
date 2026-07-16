@@ -141,8 +141,11 @@ def _worker(
     os.environ["MASTER_PORT"] = port
     os.environ["RANK"] = str(rank)
     os.environ["WORLD_SIZE"] = str(world)
-    dist.init_process_group("gloo", rank=rank, world_size=world)
     try:
+        # Init inside the try: a rendezvous/init failure -- a real possibility on
+        # a loaded CI runner -- must surface its traceback, not merely exit
+        # nonzero with no explanation.
+        dist.init_process_group("gloo", rank=rank, world_size=world)
         mesh = init_device_mesh("cpu", (world,), mesh_dim_names=("dp",))
 
         def make_model(full_values):
@@ -539,13 +542,19 @@ def _worker(
                 **rejection_checks,
             },
         )
-        if rank == 0:
-            result_queue.put(rank_checks)
+        # Every rank reports. Previously only rank 0 put a result, so a failure
+        # on any other rank was invisible: the parent took rank 0's success off
+        # the queue and left the failing rank's traceback unread, surfacing the
+        # whole thing as a bare nonzero exit code.
+        result_queue.put(
+            {"rank": rank, "checks": rank_checks if rank == 0 else None}
+        )
     except BaseException:
         result_queue.put({"rank": rank, "traceback": traceback.format_exc()})
         raise
     finally:
-        dist.destroy_process_group()
+        if dist.is_initialized():
+            dist.destroy_process_group()
 
 
 @pytest.mark.skipif(
@@ -567,18 +576,42 @@ def test_full_dcp_handoff_is_exact_on_same_dtensor_topology(optimizer_kind):
     ]
     for process in processes:
         process.start()
+    # Drain one result per rank: every worker reports, so a failure on a non-zero
+    # rank surfaces its traceback here instead of being masked by rank 0's
+    # success and reduced to an unexplained nonzero exit code.
+    results = []
+    terminated = []
     try:
-        rank_checks = result_queue.get(timeout=180)
+        for _ in processes:
+            results.append(result_queue.get(timeout=180))
     except queue.Empty:
-        rank_checks = None
-    for process in processes:
-        process.join(timeout=180)
-    for process in processes:
-        if process.is_alive():
-            process.terminate()
-            process.join(timeout=10)
-    assert rank_checks is not None, "distributed checkpoint workers timed out"
-    assert all(process.exitcode == 0 for process in processes)
+        pass
+    finally:
+        for process in processes:
+            process.join(timeout=60)
+        for process in processes:
+            if process.is_alive():
+                terminated.append(process.pid)
+                process.terminate()
+                process.join(timeout=10)
+    tracebacks = [item["traceback"] for item in results if "traceback" in item]
+    assert not tracebacks, "distributed checkpoint worker raised:\n" + "\n".join(
+        tracebacks
+    )
+    assert len(results) == len(processes), (
+        "distributed checkpoint workers timed out: got {}/{} results, "
+        "terminated={}, exitcodes={}".format(
+            len(results), len(processes), terminated, [p.exitcode for p in processes]
+        )
+    )
+    assert all(process.exitcode == 0 for process in processes), (
+        "worker exited nonzero (terminated={}): exitcodes={}".format(
+            terminated, [p.exitcode for p in processes]
+        )
+    )
+    rank_checks = next(
+        (item["checks"] for item in results if item.get("checks") is not None), None
+    )
     assert isinstance(rank_checks, list), rank_checks
     failures = [
         {name: value for name, value in checks.items() if not value}
