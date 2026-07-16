@@ -630,6 +630,21 @@ Measured (Qwen3-0.6B, 2 and 4 GPUs): `"distributed"` matched `"exact"` in the re
 
 `Gefen`, `GefenMuon`, and `GefenMuonHybrid` preserve the parameter groups you pass to the optimizer, so list-indexed layer-wise LR recipes, per-group LR logging, and `state_dict()["param_groups"]` see the same group boundaries as conventional `torch.optim` optimizers. Per-parameter names are stored in optimizer state and mirrored as each group's `param_names` list for integrations that need name-level routing. Checkpoints from the older one-group-per-parameter layout are migrated on load when the total parameter order still matches and the old per-param hyperparameters can be represented by the new group layout.
 
+## CPU optimizer-state offload
+
+Plain `Gefen` can keep its persistent per-parameter optimizer state on CPU between updates while parameters and the small shared codebook remain on CUDA:
+
+```python
+optimizer = Gefen(model.named_parameters())
+optimizer.offload_state_()  # enable synchronous CPU-authoritative state
+
+# Training continues through optimizer.step().
+
+optimizer.restore_state_()  # atomically return state to parameter devices
+```
+
+Activation, restoration, and checkpoint loading are fail-atomic: state is staged and validated before the live mapping is replaced. `move_state_(device=None)` is also available on `Gefen` and `GefenMuon`; without an explicit device it co-locates state with each live parameter. Native CPU offload currently supports plain `Gefen` with ordinary replicated CUDA parameters and is incompatible with capturable/CUDA-graph execution, DTensor/FSDP state, custom tensor-valued state extensions, and `torch.compile` execution. Offload is synchronous and transfers each parameter's state to CUDA for its update, then copies it back to CPU; paged and overlapped transfer policies remain future work.
+
 ## Known limitations
 
 - **Hybrid checkpoint schema.** `GefenMuonHybrid`'s `state_dict()` uses its own nested `{"muon": ..., "backup": ..., "backup_optimizer": "gefen" | "adamw"}` layout. Resume from a checkpoint the hybrid itself saved—not one consolidated or converted to the flat torch `{state, param_groups}` layout. Cross-backend loads are rejected before either child is mutated; legacy untagged hybrid checkpoints are interpreted as Gefen-backed.

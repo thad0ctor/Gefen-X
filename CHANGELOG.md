@@ -2,6 +2,10 @@
 
 All notable changes to this project are documented here. This project adheres to [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+- Add fail-atomic `move_state_()` for `Gefen` and `GefenMuon`, plus synchronous CPU-authoritative optimizer-state offload for plain replicated-CUDA `Gefen` through `offload_state_()` and `restore_state_()`. Active offload is preserved across atomic checkpoint loads, validates its state on every step, and fails closed after an unsuccessful post-update CPU copyback. Loading a known-good checkpoint always recovers a poisoned optimizer: the copyback-poison flag is cleared on any committed `load_state_dict()` regardless of whether offload is still active, and a `map_location='cpu'` codebook is co-located back onto the parameter device so the next step keeps the codebook CUDA-resident.
+
 ## [0.4.1] - 2026-07-15
 
 Distributed checkpoint-load and step-failure hardening. All fixes are backward-compatible; no public API changes.
