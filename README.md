@@ -130,11 +130,14 @@ Gefen drops into standard distributed training like any other PyTorch optimizer,
 
 Opt in by wrapping plain Gefen in `GefenDCPState`. Save on 2 ranks, load on 4 — or on 1.
 
-FSDP2 resharding needs torch **2.6+**, where `fully_shard` is public (on 2.5 it lives at `torch.distributed._composable.fsdp`).
+Works on the declared torch **2.5+** floor. `fully_shard`'s public import below is torch 2.6+; on 2.5 it lives at `torch.distributed._composable.fsdp`, so import it with a fallback there.
 
 ```python
 from gefen import Gefen, GefenDCPState, GefenFileSystemWriter, GefenSavePlanner
-from torch.distributed.fsdp import fully_shard
+try:
+    from torch.distributed.fsdp import fully_shard          # torch 2.6+
+except ImportError:
+    from torch.distributed._composable.fsdp import fully_shard  # torch 2.5
 import torch.distributed.checkpoint as dcp
 
 fully_shard(model)                            # params must be Shard(0) DTensors
