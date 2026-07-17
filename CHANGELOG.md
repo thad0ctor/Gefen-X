@@ -2,7 +2,7 @@
 
 All notable changes to this project are documented here. This project adheres to [Semantic Versioning](https://semver.org/).
 
-## [0.5.0] - 2026-07-16
+## [0.5.0] - 2026-07-17
 
 CPU-offloaded training and reshardable FSDP2 checkpoints, both for plain `Gefen`. Additive: nothing is removed from the public API, and every same-device CUDA update stays numerically bit-identical to 0.4.1. One same-device behavior change is documented below, under CPU-offloaded training.
 
