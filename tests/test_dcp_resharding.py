@@ -355,7 +355,10 @@ def _fully_shard_worker(rank, world, port, checkpoint_dir, mode, result_queue):
             world_size=world,
             timeout=timedelta(seconds=120),
         )
-        from torch.distributed.fsdp import fully_shard
+        try:
+            from torch.distributed.fsdp import fully_shard  # torch >= 2.6
+        except ImportError:
+            from torch.distributed._composable.fsdp import fully_shard  # 2.5
 
         torch.manual_seed(0)
         model = nn.Linear(128, 64, bias=False).to(device)
@@ -1790,6 +1793,91 @@ def test_dcp_save_peak_is_bounded_by_one_slot(tmp_path):
         dist.destroy_process_group()
 
 
+def _stepped_multislot_optimizer(mesh, slots, shape):
+    """A stepped optimizer with `slots` equal CUDA slots; returns (opt, numel)."""
+    named = [
+        ("w{}".format(i), _shaped_dparam(shape, mesh, device="cuda"))
+        for i in range(slots)
+    ]
+    optimizer = Gefen(
+        named, lr=1e-3, fused=False, factored_v_2d=False, deterministic=True
+    )
+    for step in range(_SAVE_STEPS):
+        for _, param in named:
+            param.grad = distribute_tensor(
+                _shaped_grad(shape, step).cuda(), mesh, [Shard(0)]
+            )
+        optimizer.step()
+    for _, param in named:
+        param.grad = None
+    return optimizer, sum(param.numel() for _, param in named)
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or not dist.is_available() or not dist.is_gloo_available(),
+    reason="peak-allocation measurement requires CUDA and Gloo",
+)
+def test_dcp_async_save_peak_is_bounded_by_one_slot(tmp_path):
+    # async_save's whole point is that GefenFileSystemWriter keeps the same
+    # one-slot bound while staging to CPU. Correctness tests would still pass if
+    # staging regressed to materializing every slot, so the memory bound needs
+    # its own guard. 8 equal slots -> eager staging is ~8x this bound; 4
+    # separates the regimes (one slot's dense pair = 1, gather scratch ~1.5).
+    from gefen import GefenFileSystemWriter
+
+    _single_rank_group(tmp_path / "async-peak-init")
+    try:
+        mesh = init_device_mesh("cuda", (1,), mesh_dim_names=("dp",))
+        optimizer, numel = _stepped_multislot_optimizer(mesh, 8, (2048, 1024))
+
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()
+        torch.cuda.reset_peak_memory_stats()
+        base = torch.cuda.memory_allocated()
+        _async_saved(
+            {"optimizer": GefenDCPState(optimizer)},
+            str(tmp_path / "async-peak-ckpt"),
+            GefenFileSystemWriter(str(tmp_path / "async-peak-ckpt")),
+            planner=GefenSavePlanner(),
+        )
+        torch.cuda.synchronize()
+        peak = (torch.cuda.max_memory_allocated() - base) / numel
+        assert peak < 4.0, peak
+    finally:
+        dist.destroy_process_group()
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or not dist.is_available() or not dist.is_gloo_available(),
+    reason="peak-allocation measurement requires CUDA and Gloo",
+)
+def test_dcp_save_without_planner_pays_the_eager_cost(tmp_path):
+    # The mirror of the bound tests: omitting GefenSavePlanner is correct but
+    # unbounded, so the planner is genuinely what buys the win. Without it the
+    # stand-ins fall back to retaining their dense form, so all 8 slots stay live
+    # -- >= 8 bytes/param. Asserting a floor here is what keeps the one-slot
+    # tests honest: it proves they measure the planner, not some other effect.
+    _single_rank_group(tmp_path / "eager-peak-init")
+    try:
+        mesh = init_device_mesh("cuda", (1,), mesh_dim_names=("dp",))
+        optimizer, numel = _stepped_multislot_optimizer(mesh, 8, (2048, 1024))
+
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()
+        torch.cuda.reset_peak_memory_stats()
+        base = torch.cuda.memory_allocated()
+        torch.distributed.checkpoint.save(
+            {"optimizer": GefenDCPState(optimizer)},
+            storage_writer=FileSystemWriter(str(tmp_path / "eager-peak-ckpt")),
+        )
+        torch.cuda.synchronize()
+        peak = (torch.cuda.max_memory_allocated() - base) / numel
+        # Well above the planner's <4.0 bound and safely below the true ~8.
+        assert peak > 6.0, peak
+    finally:
+        dist.destroy_process_group()
+
+
 @pytest.mark.skipif(
     not torch.cuda.is_available() or not dist.is_available() or not dist.is_gloo_available(),
     reason="peak-allocation measurement requires CUDA and Gloo",
@@ -1906,6 +1994,11 @@ def test_dcp_save_page_locks_one_slot_at_a_time(tmp_path):
         torch.cuda.synchronize()
         torch.cuda.empty_cache()
         torch.cuda.reset_peak_host_memory_stats()
+        # Measure the delta over the pinned memory already live in the process:
+        # torch's writer retains pinned buffers in a global pool across tests, so
+        # the absolute peak is contaminated by any earlier save. What this test
+        # owns is the growth its own save adds.
+        base_pinned = torch.cuda.host_memory_stats().get("allocated_bytes.current", 0)
         torch.distributed.checkpoint.save(
             {"optimizer": GefenDCPState(optimizer)},
             storage_writer=FileSystemWriter(
@@ -1915,7 +2008,7 @@ def test_dcp_save_page_locks_one_slot_at_a_time(tmp_path):
         )
         torch.cuda.synchronize()
         pinned_peak = torch.cuda.host_memory_stats().get("allocated_bytes.peak", 0)
-        pinned_bytes_per_elem = pinned_peak / numel
+        pinned_bytes_per_elem = (pinned_peak - base_pinned) / numel
 
         # One slot's dense form is 4 bytes/param over that slot, which is 0.5
         # bytes/param spread over this 8-slot model; page-locking every slot's
