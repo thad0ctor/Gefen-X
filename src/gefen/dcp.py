@@ -534,11 +534,18 @@ class GefenDCPState:
     default-world DTensors, and one ``Shard(0)`` placement.
 
     Save must be the *synchronous* :func:`torch.distributed.checkpoint.save`;
-    ``async_save`` is not supported and fails loudly. Its CPU staging copies the
-    whole state dict up front, which is exactly the all-slots-live
-    materialization this save path is built to avoid, so it is refused rather
-    than silently staging empty tensors. Pass :class:`GefenSavePlanner` to that
-    synchronous save to keep its peak bounded.
+    ``async_save`` is not supported. Its CPU staging copies the whole state dict
+    up front, which is exactly the all-slots-live materialization this save path
+    is built to avoid, so a stand-in refuses the copy and the call fails loudly
+    rather than staging empty tensors. That refusal is what every save of
+    CUDA-resident state gets, and every save on the torch versions whose staging
+    builds its CPU copy with ``zeros_like``. Torch 2.5 staging state already on
+    the CPU is the exception: ``tensor.to(cpu)`` short-circuits to the same
+    object, nothing is copied, and the stand-ins reach the writer intact, so the
+    call is not refused and writes a correct checkpoint -- but it stages nothing,
+    so the write is not asynchronous with respect to the optimizer and races any
+    concurrent step. Use the synchronous save, and pass
+    :class:`GefenSavePlanner` to it to keep its peak bounded.
     """
 
     def __init__(self, optimizer):

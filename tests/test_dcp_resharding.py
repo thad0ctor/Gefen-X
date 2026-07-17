@@ -1803,18 +1803,61 @@ def _has_checkpoint_bytes(checkpoint_dir):
     )
 
 
+def _restored_signature(mesh, checkpoint_dir):
+    """Load ``checkpoint_dir`` into a fresh optimizer and snapshot its state."""
+    target_param = _shaped_dparam(_SHAPE, mesh)
+    target = Gefen(
+        [("weight", target_param)], lr=1e-3, fused=False, factored_v_2d=False
+    )
+    torch.distributed.checkpoint.load(
+        {"optimizer": GefenDCPState(target)},
+        storage_reader=FileSystemReader(checkpoint_dir),
+    )
+    restored = target.state[target_param]
+    return (
+        int(restored["automatic_period"]),
+        int(restored["step"]),
+        restored["m_codebook"].clone(),
+        restored["m_magnitude"].clone(),
+        restored["vmean"].clone(),
+    )
+
+
+def _await_async_save(response):
+    # torch 2.5 returns a bare Future; newer torch returns an AsyncSaveResponse
+    # holding one. Wait on whichever it is, so a writer-thread failure surfaces
+    # here instead of after the test has moved on.
+    future = getattr(response, "upload_completion", response)
+    future.result()
+
+
 @pytest.mark.skipif(
     not dist.is_available() or not dist.is_gloo_available(),
     reason="DCP resharding coverage requires Gloo",
 )
-def test_dcp_async_save_is_refused_and_writes_nothing(tmp_path):
-    # async_save is NOT supported with GefenDCPState: its CPU staging
-    # (_create_cpu_state_dict -> zeros_like over the whole state dict) is exactly
-    # the all-slots-live materialization the stand-ins exist to avoid. It must
-    # fail loudly and leave no checkpoint behind -- a half-written or
-    # empty-tensor checkpoint that only fails at restore time would be far worse.
-    # Pinned here because this is a deliberate scope limit, not an accident: the
-    # refusal is what a caller reaching for async_save has to be told.
+def test_dcp_async_save_never_writes_a_wrong_checkpoint(tmp_path):
+    # async_save is not a supported way to write GefenDCPState, but what that
+    # means concretely is decided by torch's staging, not by us -- so this pins
+    # the data-integrity invariant rather than a refusal that only some versions
+    # produce. Whether the stand-ins are touched during staging depends on the
+    # torch version *and* on where the state lives:
+    #
+    #   * When staging materializes the state dict, a stand-in is asked to
+    #     execute a real operator, refuses, and async_save raises before writing
+    #     anything. That covers newer torch on any device (staging builds the CPU
+    #     copy with zeros_like) and torch 2.5 with non-CPU state (staging is a
+    #     genuine device-to-host copy).
+    #   * On torch 2.5 with CPU-resident state -- what this Gloo test builds --
+    #     staging is `tensor.to(cpu)` on tensors already on the CPU, which torch
+    #     short-circuits to the *same objects*. Nothing is copied, so the
+    #     stand-ins pass through untouched and the writer resolves them through
+    #     the ordinary save protocol. The checkpoint that lands is a correct one,
+    #     so there is nothing to refuse.
+    #
+    # Either outcome is safe. The invariant that must hold on every version is
+    # that async_save never leaves behind a checkpoint that looks complete and
+    # restores wrong -- so require a refusal to write nothing, and require a
+    # checkpoint that does land to restore exactly like the synchronous save.
     _single_rank_group(tmp_path / "async-init")
     try:
         mesh = init_device_mesh("cpu", (1,), mesh_dim_names=("dp",))
@@ -1829,23 +1872,51 @@ def test_dcp_async_save_is_refused_and_writes_nothing(tmp_path):
             optimizer.step()
         param.grad = None
 
-        checkpoint_dir = str(tmp_path / "async-ckpt")
-        with pytest.raises(RuntimeError) as excinfo:
-            torch.distributed.checkpoint.async_save(
-                {"optimizer": GefenDCPState(optimizer)},
-                storage_writer=FileSystemWriter(checkpoint_dir),
-                planner=GefenSavePlanner(),
-            )
+        # The baseline: what the supported synchronous save restores to.
+        sync_dir = str(tmp_path / "sync-ckpt")
+        torch.distributed.checkpoint.save(
+            {"optimizer": GefenDCPState(optimizer)},
+            storage_writer=FileSystemWriter(sync_dir),
+            planner=GefenSavePlanner(),
+        )
 
-        message = str(excinfo.value)
-        # The message must send the caller to the synchronous save...
-        assert "async_save" in message, message
-        assert "not supported" in message, message
-        assert "synchronous" in message, message
-        # ...and must NOT tell them to pass a planner. This call already passes
-        # one, so advice to pass it is advice to redo what just failed.
-        assert "GefenSavePlanner" not in message, message
-        assert not _has_checkpoint_bytes(checkpoint_dir), os.listdir(checkpoint_dir)
+        checkpoint_dir = str(tmp_path / "async-ckpt")
+        refusal = None
+        try:
+            _await_async_save(
+                torch.distributed.checkpoint.async_save(
+                    {"optimizer": GefenDCPState(optimizer)},
+                    storage_writer=FileSystemWriter(checkpoint_dir),
+                    planner=GefenSavePlanner(),
+                )
+            )
+        except RuntimeError as error:
+            # Only the stand-in's own refusal is an expected outcome; anything
+            # else propagates as the failure it is.
+            refusal = error
+
+        if refusal is not None:
+            message = str(refusal)
+            # The message must send the caller to the synchronous save...
+            assert "async_save" in message, message
+            assert "not supported" in message, message
+            assert "synchronous" in message, message
+            # ...and must NOT tell them to pass a planner. This call already
+            # passes one, so advice to pass it is advice to redo what just
+            # failed.
+            assert "GefenSavePlanner" not in message, message
+            assert not _has_checkpoint_bytes(checkpoint_dir), os.listdir(
+                checkpoint_dir
+            )
+        else:
+            # It got through staging untouched, so a real checkpoint must be
+            # what landed -- not empty buffers standing in for one.
+            assert _has_checkpoint_bytes(checkpoint_dir), checkpoint_dir
+            expected = _restored_signature(mesh, sync_dir)
+            actual = _restored_signature(mesh, checkpoint_dir)
+            assert actual[:2] == expected[:2], (actual[:2], expected[:2])
+            for left, right in zip(expected[2:], actual[2:]):
+                assert torch.equal(left, right), (left - right).abs().max()
     finally:
         dist.destroy_process_group()
 
