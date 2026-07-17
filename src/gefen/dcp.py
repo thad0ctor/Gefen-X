@@ -546,6 +546,11 @@ class GefenDCPState:
             raise TypeError("GefenDCPState supports plain Gefen only")
         self.optimizer = optimizer
         self._slots = self._validate_layout()
+        # Eager, replicated at construction (same caller args on every rank), so
+        # a genuine duplicate is a clean group-wide error. A one-rank
+        # add_param_group can desync it later, so state_dict/load re-check it
+        # inside their synchronized regions -- see _reject_duplicate_slots.
+        self._reject_duplicate_slots()
 
     def _validate_layout(self):
         if not torch.distributed.is_available() or not torch.distributed.is_initialized():
@@ -570,8 +575,6 @@ class GefenDCPState:
 
         slots = []
         index = 0
-        seen_names = set()
-        seen_identities = {}
         for group_index, group in enumerate(self.optimizer.param_groups):
             if group.get("sharded_mode") is not None:
                 raise RuntimeError("GefenDCPState does not support Muon sharded modes")
@@ -605,20 +608,6 @@ class GefenDCPState:
                         "state is addressed by identity, not registration "
                         "order.".format(index, str(name))
                     )
-                # The identity is (name, group, shape) with a positional group
-                # index, so two same-shaped parameters sharing a name survive a
-                # group reorder unchanged and each slot's state lands on the other.
-                if name in seen_names:
-                    raise RuntimeError(
-                        "GefenDCPState requires parameter names to be unique "
-                        "across every group, but {!r} names more than one "
-                        "parameter. A repeated name is not an identity: it is "
-                        "told apart only by the positional group index, so "
-                        "rebuilding the groups in a different order would "
-                        "validate and still assign each parameter the other's "
-                        "state.".format(str(name))
-                    )
-                seen_names.add(name)
                 if not _is_dtensor(parameter):
                     raise RuntimeError(
                         "GefenDCPState requires every parameter to be a DTensor"
@@ -645,25 +634,52 @@ class GefenDCPState:
                     raise RuntimeError(
                         "GefenDCPState supports only one-dimensional Shard(0) parameters"
                     )
-                identity = (
-                    str(name),
-                    group_index,
-                    tuple(int(dim) for dim in parameter.shape),
-                )
-                if identity in seen_identities:
-                    raise RuntimeError(
-                        "GefenDCPState requires unique parameter identities, but "
-                        "slots {} and {} share identity (name/group/shape) {!r}; "
-                        "resharding cannot disambiguate their momentum.".format(
-                            seen_identities[identity], index, identity
-                        )
-                    )
-                seen_identities[identity] = index
                 slots.append(_Slot(index, group_index, str(name), parameter))
                 index += 1
         if not slots:
             raise RuntimeError("GefenDCPState requires at least one parameter")
         return tuple(slots)
+
+    def _reject_duplicate_slots(self):
+        """Reject two slots sharing a name (or a full identity). RANK-LOCAL.
+
+        The names come from what each rank's optimizer currently holds, which a
+        one-rank add_param_group can desync, so a collective state_dict/load must
+        run this INSIDE its synchronized region: a lone raise before the sync
+        would strand the peers in the following collective. __init__ runs it
+        eagerly because construction is replicated.
+        """
+        seen_names = {}
+        seen_identities = {}
+        for slot in self._slots:
+            # A name must identify a parameter by itself: the saved identity is
+            # (name, group, shape) with a positional group index, so two
+            # same-shaped parameters sharing a name survive a group reorder and
+            # each slot's state lands on the other.
+            if slot.name in seen_names:
+                raise RuntimeError(
+                    "GefenDCPState requires parameter names to be unique across "
+                    "every group, but {!r} names more than one parameter. A "
+                    "repeated name is not an identity: it is told apart only by "
+                    "the positional group index, so rebuilding the groups in a "
+                    "different order would validate and still assign each "
+                    "parameter the other's state.".format(slot.name)
+                )
+            seen_names[slot.name] = slot.index
+            identity = (
+                slot.name,
+                slot.group_index,
+                tuple(int(dim) for dim in slot.parameter.shape),
+            )
+            if identity in seen_identities:
+                raise RuntimeError(
+                    "GefenDCPState requires unique parameter identities, but slots "
+                    "{} and {} share identity (name/group/shape) {!r}; resharding "
+                    "cannot disambiguate their momentum.".format(
+                        seen_identities[identity], slot.index, identity
+                    )
+                )
+            seen_identities[identity] = slot.index
 
     @staticmethod
     def _key(slot: _Slot, field: str) -> str:
@@ -802,18 +818,38 @@ class GefenDCPState:
         The commit fills a tensor hyperparameter in place (preserving identity for
         any fused kernel holding a reference), and ``fill_`` casts to the
         destination dtype: a fractional lr into an *integral* lr tensor truncates
-        to 0 and freezes every update, while overflow makes ``fill_`` raise only
-        after the state was swapped in. Both are rejected during staging.
+        to 0 and freezes every update, a finite value larger than a *float*
+        tensor's dtype can hold overflows to inf, and either casts the value only
+        after the state was swapped in. All are rejected during staging. Complex
+        is skipped -- the constructor rejects a complex lr.
         """
         for key in _GROUP_HYPER_KEYS:
             current = group.get(key)
-            if (
-                not torch.is_tensor(current)
-                or current.is_floating_point()
-                or current.is_complex()
-            ):
+            if not torch.is_tensor(current) or current.is_complex():
                 continue
             value = entry[key]
+            if current.is_floating_point():
+                # Ordinary rounding (fp64 python float into fp32/bf16) is fine;
+                # only a magnitude past the dtype's finite range overflows to inf.
+                finfo = torch.finfo(current.dtype)
+                if abs(float(value)) > finfo.max:
+                    raise ValueError(
+                        "Gefen DCP checkpoint group {} restores {}={!r}, but this "
+                        "optimizer holds it in a {} tensor that cannot represent it "
+                        "(outside the representable range [{}, {}]; the in-place "
+                        "fill would overflow to inf). Rebuild the optimizer with a "
+                        "wider floating-point {} tensor (or a plain float) before "
+                        "resuming; refusing to commit an overflowed restore.".format(
+                            group_index,
+                            key,
+                            value,
+                            current.dtype,
+                            -finfo.max,
+                            finfo.max,
+                            key,
+                        )
+                    )
+                continue
             if float(value) != float(int(value)):
                 raise ValueError(
                     "Gefen DCP checkpoint group {} restores {}={!r}, but this "
@@ -864,6 +900,9 @@ class GefenDCPState:
         block, where a raise becomes a group-wide abort; raising it outside would
         deadlock the peers in the collective. All checks precede the commit.
         """
+        # A one-rank add_param_group can make names collide on this rank alone;
+        # re-check here (not in _validate_layout, which runs before the sync).
+        self._reject_duplicate_slots()
         for group_index, (group, entry) in enumerate(
             zip(self.optimizer.param_groups, staged_hypers)
         ):
@@ -958,6 +997,10 @@ class GefenDCPState:
 
     def _build_state_dict(self):
         """Rank-local half of :meth:`state_dict`; every raise here is synchronized."""
+        # Re-check inside the synchronized region: a one-rank add_param_group can
+        # make names collide on a single rank, and raising that in _validate_layout
+        # (before the sync) would strand the peers.
+        self._reject_duplicate_slots()
         result = {
             "format_version": torch.tensor(_FORMAT_VERSION, dtype=torch.int64),
             "global_step": torch.tensor(

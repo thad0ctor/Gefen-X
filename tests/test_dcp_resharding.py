@@ -295,6 +295,21 @@ def test_dcp_save_on_two_ranks_loads_and_continues_on_four(tmp_path):
     not dist.is_available() or not dist.is_gloo_available(),
     reason="DCP resharding coverage requires Gloo",
 )
+def test_dcp_save_on_two_ranks_loads_and_continues_on_one(tmp_path):
+    # The "load on a single GPU" claim: collapsing the world to 1 is a different
+    # reshard from 4->2, since the whole global tensor lands on one shard and its
+    # block geometry is re-derived from scratch. Continuation still has to hold.
+    checkpoint_dir = str(tmp_path / "gefen-dcp-2-to-1")
+    saved = _run(2, checkpoint_dir, "save")
+    assert all(item.get("saved") for item in saved), saved
+    loaded = _run(1, checkpoint_dir, "load")
+    _assert_loaded(loaded, expected_shapes=[_SHAPE])
+
+
+@pytest.mark.skipif(
+    not dist.is_available() or not dist.is_gloo_available(),
+    reason="DCP resharding coverage requires Gloo",
+)
 def test_dcp_save_on_four_ranks_loads_and_continues_on_two(tmp_path):
     checkpoint_dir = str(tmp_path / "gefen-dcp-4-to-2")
     saved = _run(4, checkpoint_dir, "save")
@@ -1484,6 +1499,126 @@ def test_dcp_one_rank_save_validation_failure_aborts_every_rank_cleanly(
         else "block geometry is invalid"
     )
     assert expected in by_rank[0]["error"], by_rank[0]
+    # ...and its peer gets the group-wide abort, not a transport-level symptom.
+    assert "aborted before any rank proceeds" in by_rank[1]["error"], by_rank[1]
+
+
+def _dup_name_desync_worker(rank, world, port, checkpoint_dir, result_queue):
+    try:
+        os.environ.update(
+            MASTER_ADDR="127.0.0.1",
+            MASTER_PORT=port,
+            RANK=str(rank),
+            WORLD_SIZE=str(world),
+        )
+        dist.init_process_group(
+            "gloo", rank=rank, world_size=world, timeout=timedelta(seconds=60)
+        )
+        mesh = init_device_mesh("cpu", (world,), mesh_dim_names=("dp",))
+        device = torch.device("cpu")
+        first = nn.Parameter(distribute_tensor(_global_param(), mesh, [Shard(0)]))
+        second = nn.Parameter(distribute_tensor(_global_param(), mesh, [Shard(0)]))
+        optimizer = Gefen(
+            [
+                {"params": [("encoder.weight", first)]},
+                {"params": [("decoder.weight", second)]},
+            ],
+            lr=2.5e-3,
+            fused=False,
+            factored_v_2d=False,
+        )
+        for step in range(_SAVE_STEPS):
+            for param in (first, second):
+                param.grad = distribute_tensor(_global_grad(step, device), mesh, [Shard(0)])
+            optimizer.step()
+        for param in (first, second):
+            param.grad = None
+
+        # Retain the wrapper (constructed while the layout is replicated and
+        # valid), as a training loop would, THEN desync ONE rank: a rank-local
+        # rename makes decoder.weight collide with encoder.weight on rank 0 only.
+        # The duplicate-name re-check must run INSIDE state_dict()'s synchronized
+        # region -- raised in _validate_layout (before the sync) it would strand
+        # the peer in dcp.save's planning collectives.
+        state = GefenDCPState(optimizer)
+        if rank == 0:
+            optimizer.param_groups[1]["param_names"] = ["encoder.weight"]
+
+        raised = False
+        error = None
+        try:
+            torch.distributed.checkpoint.save(
+                {"optimizer": state},
+                storage_writer=FileSystemWriter(checkpoint_dir),
+            )
+        except Exception as exc:
+            raised = True
+            # WHICH error, on WHICH rank, is the claim under test: "every rank
+            # raised" also holds with the bug present (the peer sees a transport
+            # error when rank 0 tears its group down on the way out).
+            error = repr(exc)
+        result_queue.put({"rank": rank, "raised": raised, "error": error})
+    except BaseException:
+        result_queue.put({"rank": rank, "fatal_error": traceback.format_exc()})
+    finally:
+        if dist.is_available() and dist.is_initialized():
+            dist.destroy_process_group()
+
+
+def _run_dup_name_desync(world, checkpoint_dir, timeout=90):
+    context = mp.get_context("spawn")
+    result_queue = context.Queue()
+    port = _free_port()
+    processes = [
+        context.Process(
+            target=_dup_name_desync_worker,
+            args=(rank, world, port, checkpoint_dir, result_queue),
+        )
+        for rank in range(world)
+    ]
+    for process in processes:
+        process.start()
+    results = []
+    try:
+        for _ in processes:
+            results.append(result_queue.get(timeout=timeout))
+    except queue.Empty:
+        pass
+    finally:
+        for process in processes:
+            process.join(timeout=10)
+        for process in processes:
+            if process.is_alive():
+                process.terminate()
+                process.join(timeout=5)
+        result_queue.close()
+        result_queue.join_thread()
+    assert len(results) == world, (results, [p.exitcode for p in processes])
+    assert all(p.exitcode == 0 for p in processes), [p.exitcode for p in processes]
+    return sorted(results, key=lambda item: item["rank"])
+
+
+@pytest.mark.skipif(
+    not dist.is_available() or not dist.is_gloo_available(),
+    reason="DCP resharding coverage requires Gloo",
+)
+def test_dcp_one_rank_duplicate_name_aborts_every_rank_cleanly(tmp_path):
+    # A one-rank add_param_group/rename can make caller names collide on a single
+    # rank. That check reads per-rank-mutable state, so it belongs inside the
+    # synchronized region, not in _validate_layout (which state_dict() runs
+    # BEFORE the sync, to establish the group). Hoisted out, rank 0 raises the
+    # duplicate before the sync and leaves; rank 1's layout is fine, so it walks
+    # into dcp.save's planning collectives rank 0 never joins -- a hang, or (with
+    # the process teardown here) a gloo transport error on the peer. So pin WHICH
+    # error each rank gets, not merely that both raised.
+    checkpoint_dir = str(tmp_path / "gefen-dcp-dup-name-desync")
+    results = _run_dup_name_desync(2, checkpoint_dir)
+    assert all("fatal_error" not in item for item in results), results
+    for item in results:
+        assert item["raised"], item
+    by_rank = {item["rank"]: item for item in results}
+    # The rank that actually holds the duplicate reports the real cause...
+    assert "unique across every group" in by_rank[0]["error"], by_rank[0]
     # ...and its peer gets the group-wide abort, not a transport-level symptom.
     assert "aborted before any rank proceeds" in by_rank[1]["error"], by_rank[1]
 
@@ -2863,6 +2998,73 @@ def test_dcp_accepts_float_tensor_lr(tmp_path):
         GefenDCPState(optimizer).load_state_dict(saved)
         assert optimizer.param_groups[0]["lr"] is live_lr
         assert abs(float(live_lr) - 2.5e-3) < 1e-9, float(live_lr)
+    finally:
+        dist.destroy_process_group()
+
+
+@pytest.mark.skipif(
+    not dist.is_available() or not dist.is_gloo_available(),
+    reason="DCP resharding coverage requires Gloo",
+)
+def test_dcp_rejects_overflowing_float_tensor_lr_before_commit(tmp_path):
+    _single_rank_group(tmp_path / "float-overflow-lr-init")
+    try:
+        mesh = init_device_mesh("cpu", (1,), mesh_dim_names=("dp",))
+        param = _shaped_dparam(_SHAPE, mesh)
+        optimizer = Gefen(
+            [("weight", param)], lr=1e-3, fused=False, factored_v_2d=False
+        )
+        for step in range(_SAVE_STEPS):
+            param.grad = distribute_tensor(_shaped_grad(_SHAPE, step), mesh, [Shard(0)])
+            optimizer.step()
+        saved = GefenDCPState(optimizer).state_dict()
+        saved["param_group_hypers"][0]["lr"] = 1e10
+
+        # 1e10 is finite and passes _validate_hyper_entry, but it is past
+        # float16's 65504 max: the in-place fill_ would cast it to inf, and only
+        # AFTER the state was swapped in. A float destination used to skip the
+        # range check entirely, so this committed a half-applied inf lr.
+        optimizer.param_groups[0]["lr"] = torch.tensor(1.0, dtype=torch.float16)
+        state_before = _live_state_signature(optimizer, param)
+        hypers_before = _group_hyper_signature(optimizer)
+
+        with pytest.raises(ValueError, match="overflow to inf"):
+            GefenDCPState(optimizer).load_state_dict(saved)
+
+        assert _live_state_signature(optimizer, param) == state_before
+        assert _group_hyper_signature(optimizer) == hypers_before
+        assert float(optimizer.param_groups[0]["lr"]) == 1.0
+    finally:
+        dist.destroy_process_group()
+
+
+@pytest.mark.skipif(
+    not dist.is_available() or not dist.is_gloo_available(),
+    reason="DCP resharding coverage requires Gloo",
+)
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_dcp_accepts_low_precision_tensor_lr(tmp_path, dtype):
+    _single_rank_group(tmp_path / "low-precision-lr-init")
+    try:
+        mesh = init_device_mesh("cpu", (1,), mesh_dim_names=("dp",))
+        param = _shaped_dparam(_SHAPE, mesh)
+        optimizer = Gefen(
+            [("weight", param)], lr=3e-5, fused=False, factored_v_2d=False
+        )
+        for step in range(_SAVE_STEPS):
+            param.grad = distribute_tensor(_shaped_grad(_SHAPE, step), mesh, [Shard(0)])
+            optimizer.step()
+        saved = GefenDCPState(optimizer).state_dict()
+
+        # An ordinary LR is representable in float16/bf16 (only rounded), so the
+        # overflow guard must not reject it: the fill still restores in place,
+        # tensor identity preserved.
+        live_lr = torch.tensor(0.0, dtype=dtype)
+        optimizer.param_groups[0]["lr"] = live_lr
+        GefenDCPState(optimizer).load_state_dict(saved)
+        assert optimizer.param_groups[0]["lr"] is live_lr
+        assert not torch.isinf(live_lr).item()
+        assert abs(float(live_lr) - 3e-5) < 1e-6, float(live_lr)
     finally:
         dist.destroy_process_group()
 
