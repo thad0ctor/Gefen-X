@@ -22,6 +22,7 @@ import multiprocessing as mp
 import os
 import queue
 import socket
+import time
 import traceback
 
 import pytest
@@ -50,6 +51,62 @@ def _free_port():
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
         sock.bind(("127.0.0.1", 0))
         return str(sock.getsockname()[1])
+
+
+# Spawn-drain budgets, shared across workers rather than spent per worker so the
+# wall clock cannot exceed the deadline by a per-worker multiple. Kept in step
+# with tests/test_gefen_fsdp2_checkpoint.py. _DRAIN_POLL only sets the liveness
+# re-check cadence; _DRAIN_FLUSH_GRACE lets a dead worker's queued traceback
+# cross before we give up; _REAP_GRACE lets reported workers exit on their own.
+_DRAIN_TIMEOUT = 180
+_DRAIN_POLL = 0.5
+_DRAIN_FLUSH_GRACE = 5.0
+_REAP_GRACE = 10.0
+_TERMINATE_GRACE = 10.0
+
+
+def _drain_workers(processes, result_queue, timeout=_DRAIN_TIMEOUT):
+    """Collect one result per worker without reaping a slow-but-live reporter.
+
+    A worker that finished its collective but is slow to flush its result on a
+    loaded runner must NOT be terminated before it reports. So poll against a
+    shared deadline; only a NONZERO early exit short-circuits (a worker still
+    running, exitcode None, keeps the full budget), and even then a flush grace
+    lets its queued traceback arrive. Reap and terminate budgets are shared, and
+    every straggler is signalled before any is joined. Returns
+    ``(results, terminated_pids)``; a pid in ``terminated`` that still reported
+    was merely slow to exit, not a failure.
+    """
+    results = []
+    terminated = []
+    deadline = time.monotonic() + timeout
+    flush_deadline = None
+    try:
+        while len(results) < len(processes):
+            try:
+                results.append(result_queue.get(timeout=_DRAIN_POLL))
+                continue
+            except queue.Empty:
+                pass
+            now = time.monotonic()
+            if now >= deadline:
+                break
+            if any(p.exitcode not in (None, 0) for p in processes):
+                if flush_deadline is None:
+                    flush_deadline = now + _DRAIN_FLUSH_GRACE
+                elif now >= flush_deadline:
+                    break
+    finally:
+        reap_deadline = time.monotonic() + _REAP_GRACE
+        for p in processes:
+            p.join(timeout=max(0.0, reap_deadline - time.monotonic()))
+        for p in processes:
+            if p.is_alive():
+                terminated.append(p.pid)
+                p.terminate()
+        for p in processes:
+            p.join(timeout=_TERMINATE_GRACE)
+    return results, terminated
 
 
 def _local(value):
@@ -211,23 +268,20 @@ def _run(world, checkpoint_dir, mode, *, device_type="cpu", fused=False, timeout
     ]
     for process in processes:
         process.start()
-    results = []
-    try:
-        for _ in processes:
-            results.append(result_queue.get(timeout=timeout))
-    except queue.Empty:
-        pass
-    finally:
-        for process in processes:
-            process.join(timeout=10)
-        for process in processes:
-            if process.is_alive():
-                process.terminate()
-                process.join(timeout=5)
-        result_queue.close()
-        result_queue.join_thread()
-    assert len(results) == world, (results, [p.exitcode for p in processes])
-    assert all(p.exitcode == 0 for p in processes), [p.exitcode for p in processes]
+    results, terminated = _drain_workers(processes, result_queue, timeout)
+    assert len(results) == world, (
+        "DCP workers did not all report: got {}/{} results, terminated={}, "
+        "exitcodes={}".format(
+            len(results), world, terminated, [p.exitcode for p in processes]
+        )
+    )
+    # len == world proves every worker reported; a reported worker that was slow
+    # to exit and got SIGTERMed (pid in terminated) is slow, not failed.
+    assert all(p.exitcode == 0 or p.pid in terminated for p in processes), (
+        "worker exited nonzero (terminated={}): exitcodes={}".format(
+            terminated, [p.exitcode for p in processes]
+        )
+    )
     return sorted(results, key=lambda item: item["rank"])
 
 
@@ -457,23 +511,20 @@ def _run_fully_shard(world, checkpoint_dir, mode, timeout=240, policy=""):
     ]
     for process in processes:
         process.start()
-    results = []
-    try:
-        for _ in processes:
-            results.append(result_queue.get(timeout=timeout))
-    except queue.Empty:
-        pass
-    finally:
-        for process in processes:
-            process.join(timeout=10)
-        for process in processes:
-            if process.is_alive():
-                process.terminate()
-                process.join(timeout=5)
-        result_queue.close()
-        result_queue.join_thread()
-    assert len(results) == world, (results, [p.exitcode for p in processes])
-    assert all(p.exitcode == 0 for p in processes), [p.exitcode for p in processes]
+    results, terminated = _drain_workers(processes, result_queue, timeout)
+    assert len(results) == world, (
+        "DCP workers did not all report: got {}/{} results, terminated={}, "
+        "exitcodes={}".format(
+            len(results), world, terminated, [p.exitcode for p in processes]
+        )
+    )
+    # len == world proves every worker reported; a reported worker that was slow
+    # to exit and got SIGTERMed (pid in terminated) is slow, not failed.
+    assert all(p.exitcode == 0 or p.pid in terminated for p in processes), (
+        "worker exited nonzero (terminated={}): exitcodes={}".format(
+            terminated, [p.exitcode for p in processes]
+        )
+    )
     return sorted(results, key=lambda item: item["rank"])
 
 
@@ -666,9 +717,14 @@ def _reordered_mesh_worker(rank, world, port, result_queue):
         optimizer = Gefen(
             [("weight", parameter)], lr=1e-3, fused=False, factored_v_2d=False
         )
+        # At world > 1, __init__ defers the desyncable layout check to the
+        # synchronized save/load paths, so the reordered-mesh rejection surfaces
+        # from the collective state_dict(). The reorder is symmetric here, so
+        # every rank raises it together.
+        state = GefenDCPState(optimizer)
         raised = False
         try:
-            GefenDCPState(optimizer)
+            state.state_dict()
         except RuntimeError as exc:
             raised = "reordered" in str(exc) or "canonical" in str(exc)
         result_queue.put({"rank": rank, "raised": raised})
@@ -694,21 +750,12 @@ def test_rejects_reordered_full_world_mesh():
     ]
     for process in processes:
         process.start()
-    results = []
-    try:
-        for _ in processes:
-            results.append(result_queue.get(timeout=120))
-    except queue.Empty:
-        pass
-    finally:
-        for process in processes:
-            process.join(timeout=10)
-        for process in processes:
-            if process.is_alive():
-                process.terminate()
-                process.join(timeout=5)
+    results, terminated = _drain_workers(processes, result_queue)
     assert all("fatal_error" not in item for item in results), results
-    assert len(results) == 2 and all(item["raised"] for item in results), results
+    assert len(results) == 2 and all(item["raised"] for item in results), (
+        results,
+        terminated,
+    )
 
 
 # --- Review-finding coverage (Codex PR #83) -------------------------------
@@ -1028,23 +1075,20 @@ def _run_empty(world, checkpoint_dir, mode, timeout=240):
     ]
     for process in processes:
         process.start()
-    results = []
-    try:
-        for _ in processes:
-            results.append(result_queue.get(timeout=timeout))
-    except queue.Empty:
-        pass
-    finally:
-        for process in processes:
-            process.join(timeout=10)
-        for process in processes:
-            if process.is_alive():
-                process.terminate()
-                process.join(timeout=5)
-        result_queue.close()
-        result_queue.join_thread()
-    assert len(results) == world, (results, [p.exitcode for p in processes])
-    assert all(p.exitcode == 0 for p in processes), [p.exitcode for p in processes]
+    results, terminated = _drain_workers(processes, result_queue, timeout)
+    assert len(results) == world, (
+        "DCP workers did not all report: got {}/{} results, terminated={}, "
+        "exitcodes={}".format(
+            len(results), world, terminated, [p.exitcode for p in processes]
+        )
+    )
+    # len == world proves every worker reported; a reported worker that was slow
+    # to exit and got SIGTERMed (pid in terminated) is slow, not failed.
+    assert all(p.exitcode == 0 or p.pid in terminated for p in processes), (
+        "worker exited nonzero (terminated={}): exitcodes={}".format(
+            terminated, [p.exitcode for p in processes]
+        )
+    )
     return sorted(results, key=lambda item: item["rank"])
 
 
@@ -1434,23 +1478,20 @@ def _run_fail_sync(world, checkpoint_dir, mode, timeout=240, failure="reblock"):
     ]
     for process in processes:
         process.start()
-    results = []
-    try:
-        for _ in processes:
-            results.append(result_queue.get(timeout=timeout))
-    except queue.Empty:
-        pass
-    finally:
-        for process in processes:
-            process.join(timeout=10)
-        for process in processes:
-            if process.is_alive():
-                process.terminate()
-                process.join(timeout=5)
-        result_queue.close()
-        result_queue.join_thread()
-    assert len(results) == world, (results, [p.exitcode for p in processes])
-    assert all(p.exitcode == 0 for p in processes), [p.exitcode for p in processes]
+    results, terminated = _drain_workers(processes, result_queue, timeout)
+    assert len(results) == world, (
+        "DCP workers did not all report: got {}/{} results, terminated={}, "
+        "exitcodes={}".format(
+            len(results), world, terminated, [p.exitcode for p in processes]
+        )
+    )
+    # len == world proves every worker reported; a reported worker that was slow
+    # to exit and got SIGTERMed (pid in terminated) is slow, not failed.
+    assert all(p.exitcode == 0 or p.pid in terminated for p in processes), (
+        "worker exited nonzero (terminated={}): exitcodes={}".format(
+            terminated, [p.exitcode for p in processes]
+        )
+    )
     return sorted(results, key=lambda item: item["rank"])
 
 
@@ -1608,7 +1649,7 @@ def _dup_name_desync_worker(rank, world, port, checkpoint_dir, result_queue):
             dist.destroy_process_group()
 
 
-def _run_dup_name_desync(world, checkpoint_dir, timeout=90):
+def _run_dup_name_desync(world, checkpoint_dir, timeout=_DRAIN_TIMEOUT):
     context = mp.get_context("spawn")
     result_queue = context.Queue()
     port = _free_port()
@@ -1621,23 +1662,20 @@ def _run_dup_name_desync(world, checkpoint_dir, timeout=90):
     ]
     for process in processes:
         process.start()
-    results = []
-    try:
-        for _ in processes:
-            results.append(result_queue.get(timeout=timeout))
-    except queue.Empty:
-        pass
-    finally:
-        for process in processes:
-            process.join(timeout=10)
-        for process in processes:
-            if process.is_alive():
-                process.terminate()
-                process.join(timeout=5)
-        result_queue.close()
-        result_queue.join_thread()
-    assert len(results) == world, (results, [p.exitcode for p in processes])
-    assert all(p.exitcode == 0 for p in processes), [p.exitcode for p in processes]
+    results, terminated = _drain_workers(processes, result_queue, timeout)
+    assert len(results) == world, (
+        "DCP workers did not all report: got {}/{} results, terminated={}, "
+        "exitcodes={}".format(
+            len(results), world, terminated, [p.exitcode for p in processes]
+        )
+    )
+    # len == world proves every worker reported; a reported worker that was slow
+    # to exit and got SIGTERMed (pid in terminated) is slow, not failed.
+    assert all(p.exitcode == 0 or p.pid in terminated for p in processes), (
+        "worker exited nonzero (terminated={}): exitcodes={}".format(
+            terminated, [p.exitcode for p in processes]
+        )
+    )
     return sorted(results, key=lambda item: item["rank"])
 
 
@@ -1725,7 +1763,7 @@ def _layout_desync_worker(rank, world, port, checkpoint_dir, result_queue):
             dist.destroy_process_group()
 
 
-def _run_layout_desync(world, checkpoint_dir, timeout=90):
+def _run_layout_desync(world, checkpoint_dir, timeout=_DRAIN_TIMEOUT):
     context = mp.get_context("spawn")
     result_queue = context.Queue()
     port = _free_port()
@@ -1738,23 +1776,20 @@ def _run_layout_desync(world, checkpoint_dir, timeout=90):
     ]
     for process in processes:
         process.start()
-    results = []
-    try:
-        for _ in processes:
-            results.append(result_queue.get(timeout=timeout))
-    except queue.Empty:
-        pass
-    finally:
-        for process in processes:
-            process.join(timeout=10)
-        for process in processes:
-            if process.is_alive():
-                process.terminate()
-                process.join(timeout=5)
-        result_queue.close()
-        result_queue.join_thread()
-    assert len(results) == world, (results, [p.exitcode for p in processes])
-    assert all(p.exitcode == 0 for p in processes), [p.exitcode for p in processes]
+    results, terminated = _drain_workers(processes, result_queue, timeout)
+    assert len(results) == world, (
+        "DCP workers did not all report: got {}/{} results, terminated={}, "
+        "exitcodes={}".format(
+            len(results), world, terminated, [p.exitcode for p in processes]
+        )
+    )
+    # len == world proves every worker reported; a reported worker that was slow
+    # to exit and got SIGTERMed (pid in terminated) is slow, not failed.
+    assert all(p.exitcode == 0 or p.pid in terminated for p in processes), (
+        "worker exited nonzero (terminated={}): exitcodes={}".format(
+            terminated, [p.exitcode for p in processes]
+        )
+    )
     return sorted(results, key=lambda item: item["rank"])
 
 
@@ -2344,6 +2379,11 @@ def test_dcp_save_page_locks_one_slot_with_ascending_slot_sizes(tmp_path):
     # deterministic.
     import gefen.dcp as dcp_mod
 
+    # The process-wide pin bound is fixed by the first staged save in the process;
+    # clear it so this save sizes it to its own largest slot rather than inheriting
+    # an earlier test's cap (which would send the bigger slots down the pageable
+    # path and defeat the one-allocation assertion below).
+    dcp_mod._PinnedStaging._max_pinned_bytes = 0
     _single_rank_group(tmp_path / "save-pinned-ascending-init")
     try:
         mesh = init_device_mesh("cuda", (1,), mesh_dim_names=("dp",))
@@ -2408,6 +2448,73 @@ def test_dcp_save_page_locks_one_slot_with_ascending_slot_sizes(tmp_path):
         assert pinned_peak - before_pinned <= largest_slot_bytes, (
             pinned_peak - before_pinned,
             largest_slot_bytes,
+        )
+    finally:
+        dist.destroy_process_group()
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available()
+    or not dist.is_available()
+    or not dist.is_gloo_available()
+    or not hasattr(torch.cuda, "host_memory_stats"),
+    reason="page-locked accounting requires CUDA, Gloo, and torch.cuda.host_memory_stats",
+)
+def test_dcp_page_locked_stays_bounded_across_growing_saves(tmp_path):
+    # Each save reserves one slot's worth of pinned staging, so a single save is
+    # bounded. But successive saves whose largest slot GROWS (a training loop that
+    # adds ever-larger param groups and checkpoints) each pin a new maximum, and
+    # torch's CachingHostAllocator never returns the smaller freed blocks to the
+    # OS -- so without the process-wide bound the page-locked footprint climbs
+    # toward the SUM of the historical maxima (here 4+8+16+32 = 60 MiB) instead of
+    # staying at one slot. Fresh planner per save, exactly as dcp.save creates.
+    import gefen.dcp as dcp_mod
+
+    dcp_mod._PinnedStaging._max_pinned_bytes = 0
+    _single_rank_group(tmp_path / "save-pinned-growing-init")
+    try:
+        mesh = init_device_mesh("cuda", (1,), mesh_dim_names=("dp",))
+        shapes = [(1024, 1024), (2048, 1024), (4096, 1024), (8192, 1024)]
+        first_slot_bytes = shapes[0][0] * shapes[0][1] * 4
+        sum_of_maxima = sum(shape[0] * shape[1] * 4 for shape in shapes)
+        named = []
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()
+        torch.cuda.reset_peak_host_memory_stats()
+        before_pinned = torch.cuda.host_memory_stats().get("allocated_bytes.current", 0)
+        for index, shape in enumerate(shapes):
+            named.append(
+                ("w{}".format(index), _shaped_dparam(shape, mesh, device="cuda"))
+            )
+            optimizer = Gefen(
+                named, lr=1e-3, fused=False, factored_v_2d=False, deterministic=True
+            )
+            for step in range(_SAVE_STEPS):
+                for (_, param), pshape in zip(named, shapes):
+                    param.grad = distribute_tensor(
+                        _shaped_grad(pshape, step).cuda(), mesh, [Shard(0)]
+                    )
+                optimizer.step()
+            for _, param in named:
+                param.grad = None
+            torch.cuda.synchronize()
+            torch.distributed.checkpoint.save(
+                {"optimizer": GefenDCPState(optimizer)},
+                storage_writer=FileSystemWriter(
+                    str(tmp_path / "save-pinned-growing-ckpt-{}".format(index)),
+                    thread_count=1,
+                ),
+                planner=GefenSavePlanner(),
+            )
+            torch.cuda.synchronize()
+
+        pinned_peak = torch.cuda.host_memory_stats().get("allocated_bytes.peak", 0)
+        # Bounded at the first staged save's slot, not the sum of the maxima: the
+        # later, larger slots stage pageable rather than pinning a growing block.
+        assert pinned_peak - before_pinned <= 2 * first_slot_bytes, (
+            pinned_peak - before_pinned,
+            first_slot_bytes,
+            sum_of_maxima,
         )
     finally:
         dist.destroy_process_group()
