@@ -2310,6 +2310,54 @@ def test_dcp_save_rejects_codebook_that_does_not_tile_the_shard(tmp_path):
 
 
 @pytest.mark.skipif(
+    not torch.cuda.is_available(),
+    reason="a device mismatch needs a second device to straddle",
+)
+@pytest.mark.skipif(
+    not dist.is_available() or not dist.is_gloo_available(),
+    reason="DCP resharding coverage requires Gloo",
+)
+def test_dcp_save_rejects_state_straddling_devices(tmp_path):
+    # Counts and dtypes say nothing about WHERE the block state lives, and the
+    # expansion is deferred to write time: _dense_momentum scales the gathered
+    # values by m_magnitude in place, so a slot whose tensors straddle devices
+    # raises from inside the write, after part of the checkpoint is on disk.
+    # The check cannot cost a valid save -- that same multiply would fail on any
+    # mismatch it rejects -- so it only moves the failure ahead of the first byte.
+    _single_rank_group(tmp_path / "device-init")
+    try:
+        mesh = init_device_mesh("cpu", (1,), mesh_dim_names=("dp",))
+        param = _shaped_dparam(_SHAPE, mesh)
+        optimizer = Gefen(
+            [("weight", param)], lr=1e-3, fused=False, factored_v_2d=False
+        )
+        for step in range(_SAVE_STEPS):
+            param.grad = distribute_tensor(
+                _shaped_grad(_SHAPE, step), mesh, [Shard(0)]
+            )
+            optimizer.step()
+        param.grad = None
+
+        # Strand one tensor on the GPU while the shard and its peers stay on CPU.
+        state = optimizer.state[param]
+        state["m_magnitude"] = state["m_magnitude"].cuda()
+
+        with pytest.raises(ValueError, match="state device is inconsistent"):
+            GefenDCPState(optimizer).state_dict()
+
+        checkpoint_dir = str(tmp_path / "device-ckpt")
+        with pytest.raises(ValueError, match="state device is inconsistent"):
+            torch.distributed.checkpoint.save(
+                {"optimizer": GefenDCPState(optimizer)},
+                storage_writer=FileSystemWriter(checkpoint_dir),
+                planner=GefenSavePlanner(),
+            )
+        assert not _has_checkpoint_bytes(checkpoint_dir)
+    finally:
+        dist.destroy_process_group()
+
+
+@pytest.mark.skipif(
     not dist.is_available() or not dist.is_gloo_available(),
     reason="DCP resharding coverage requires Gloo",
 )

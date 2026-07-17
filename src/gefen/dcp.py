@@ -158,8 +158,23 @@ def _validate_dense_geometry(optimizer, parameter, state) -> None:
         raise ValueError("Gefen momentum codebook geometry is invalid")
     if state["m_codebook"].dtype != torch.uint8:
         raise ValueError("Gefen momentum index dtype is invalid")
+    # Whether the block state agrees with itself about where it lives, which the
+    # counts say nothing about either. _dense_momentum scales the gathered values
+    # by m_magnitude in place, and _dense_second_moment fills a buffer on vmean's
+    # device that is then wrapped against the parameter's mesh, so a slot whose
+    # tensors straddle devices raises from inside the write. This cannot reject a
+    # save that would otherwise have worked: those same operations would fail on
+    # any mismatch it catches, so the check only moves the failure ahead of the
+    # first byte. Device identity, not just type -- cuda:0 and cuda:1 are as
+    # mismatched here as cuda and cpu.
+    local = _local(parameter)
+    if any(
+        state[key].device != local.device
+        for key in ("m_codebook", "m_magnitude", "vmean")
+    ):
+        raise ValueError("Gefen optimizer state device is inconsistent")
     period = _counter(state["automatic_period"], "automatic_period")
-    local_numel = _local(parameter).numel()
+    local_numel = local.numel()
     codebook_numel = state["m_codebook"].reshape(-1).numel()
     if (
         period < 1
