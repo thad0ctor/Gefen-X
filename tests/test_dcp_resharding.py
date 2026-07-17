@@ -1927,6 +1927,105 @@ def test_dcp_save_page_locks_one_slot_at_a_time(tmp_path):
 
 
 @pytest.mark.skipif(
+    not torch.cuda.is_available()
+    or not dist.is_available()
+    or not dist.is_gloo_available()
+    or not hasattr(torch.cuda, "host_memory_stats"),
+    reason="page-locked accounting requires CUDA, Gloo, and torch.cuda.host_memory_stats",
+)
+def test_dcp_save_page_locks_one_slot_with_ascending_slot_sizes(tmp_path):
+    # The one-slot page-locked bound must not depend on the slots happening to be
+    # the same size. Sizing the staging buffer on demand does depend on it: torch's
+    # CachingHostAllocator keeps freed pinned blocks in its own cache rather than
+    # returning them to the OS, so every fresh maximum ADDS a page-locked block and
+    # the footprint climbs toward the sum of the successive maxima.
+    #
+    # Ascending is not a contrived order -- it is the only order this writer uses.
+    # At the default thread_count=1 torch loads through _OverlappingCpuLoader, which
+    # sorts every write item by size and resolves them smallest first, so a model
+    # with N distinct parameter sizes walks the maxima in exactly the order that
+    # allocates all N of them. (Above 1 thread, _split_by_size_and_type sorts
+    # DESCENDING into per-thread buckets, so the largest slot lands first and sizes
+    # the buffer immediately -- which is why the uniform, thread_count=8 test above
+    # cannot see this, and why this one pins thread_count=1.)
+    #
+    # Asserts the allocation count, not just the high-water: the pinned high-water
+    # alone is measured against an allocator whose cached blocks are shared with
+    # every other test in this process, so it can be satisfied by reuse. "Exactly
+    # one buffer, sized to the largest slot" is the property itself, and is
+    # deterministic.
+    import gefen.dcp as dcp_mod
+
+    _single_rank_group(tmp_path / "save-pinned-ascending-init")
+    try:
+        mesh = init_device_mesh("cuda", (1,), mesh_dim_names=("dp",))
+        # Dense fp32 slots of 4, 8, 16 and 32 MiB: strictly ascending, so growth
+        # on demand pins 4+8+16+32 = 60 MiB against a 32 MiB largest slot.
+        shapes = [(1024, 1024), (2048, 1024), (4096, 1024), (8192, 1024)]
+        named = [
+            ("w{}".format(index), _shaped_dparam(shape, mesh, device="cuda"))
+            for index, shape in enumerate(shapes)
+        ]
+        optimizer = Gefen(
+            named, lr=1e-3, fused=False, factored_v_2d=False, deterministic=True
+        )
+        for step in range(_SAVE_STEPS):
+            for (_, param), shape in zip(named, shapes):
+                param.grad = distribute_tensor(
+                    _shaped_grad(shape, step).cuda(), mesh, [Shard(0)]
+                )
+            optimizer.step()
+        for _, param in named:
+            param.grad = None
+
+        largest_slot_bytes = max(param.numel() for _, param in named) * 4
+
+        # Record every pinned block the staging buffer allocates during the save.
+        pinned_blocks = []
+        real_expand = dcp_mod._PinnedStaging.expand
+
+        def traced_expand(self, dense):
+            before = self._buffer.data_ptr() if self._buffer is not None else None
+            result = real_expand(self, dense)
+            if self._buffer is not None and self._buffer.data_ptr() != before:
+                pinned_blocks.append(self._buffer.numel())
+            return result
+
+        dcp_mod._PinnedStaging.expand = traced_expand
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()
+        torch.cuda.reset_peak_host_memory_stats()
+        before_pinned = torch.cuda.host_memory_stats().get("allocated_bytes.current", 0)
+        try:
+            torch.distributed.checkpoint.save(
+                {"optimizer": GefenDCPState(optimizer)},
+                storage_writer=FileSystemWriter(
+                    str(tmp_path / "save-pinned-ascending-ckpt"), thread_count=1
+                ),
+                planner=GefenSavePlanner(),
+            )
+        finally:
+            dcp_mod._PinnedStaging.expand = real_expand
+        torch.cuda.synchronize()
+
+        # One buffer for the whole save, sized to the largest slot -- not one per
+        # new maximum. Growth on demand allocates [4, 8, 16, 32] MiB here.
+        assert pinned_blocks == [largest_slot_bytes], [
+            block // 1024**2 for block in pinned_blocks
+        ]
+
+        # And the allocator agrees: the page-locked high-water over the save is one
+        # slot's dense form, not the 60 MiB sum of the maxima.
+        pinned_peak = torch.cuda.host_memory_stats().get("allocated_bytes.peak", 0)
+        assert pinned_peak - before_pinned <= largest_slot_bytes, (
+            pinned_peak - before_pinned,
+            largest_slot_bytes,
+        )
+    finally:
+        dist.destroy_process_group()
+
+
+@pytest.mark.skipif(
     not dist.is_available() or not dist.is_gloo_available(),
     reason="DCP resharding coverage requires Gloo",
 )
@@ -2200,6 +2299,75 @@ def test_dcp_save_rejects_codebook_that_does_not_tile_the_shard(tmp_path):
         # ...and the save that would have consumed it stops before writing a byte.
         checkpoint_dir = str(tmp_path / "tile-ckpt")
         with pytest.raises(ValueError, match="momentum block geometry is invalid"):
+            torch.distributed.checkpoint.save(
+                {"optimizer": GefenDCPState(optimizer)},
+                storage_writer=FileSystemWriter(checkpoint_dir),
+                planner=GefenSavePlanner(),
+            )
+        assert not _has_checkpoint_bytes(checkpoint_dir)
+    finally:
+        dist.destroy_process_group()
+
+
+@pytest.mark.skipif(
+    not dist.is_available() or not dist.is_gloo_available(),
+    reason="DCP resharding coverage requires Gloo",
+)
+@pytest.mark.parametrize(
+    "malformation, message",
+    [
+        ("short_codebook", "momentum codebook geometry is invalid"),
+        ("codebook_2d", "momentum codebook geometry is invalid"),
+        ("index_dtype", "momentum index dtype is invalid"),
+    ],
+)
+def test_dcp_save_rejects_indices_the_codebook_cannot_address(
+    tmp_path, malformation, message
+):
+    # The block-count checks say the arrays TILE the shard; they say nothing about
+    # whether the indices can ADDRESS the codebook. _dense_momentum gathers with
+    # index_select, so a codebook too short for an index the shard holds raises
+    # IndexError -- and because the expansion is deferred to write time, that
+    # arrives from inside the write, leaving a partial .distcp and no .metadata,
+    # rather than as an up-front rejection.
+    #
+    # The checks this exercises are O(1) metadata, deliberately not a max() over
+    # the indices: they are uint8, so a 1-D codebook of at least 256 rows covers
+    # every index that can exist, whatever the shard holds.
+    _single_rank_group(tmp_path / "address-init")
+    try:
+        mesh = init_device_mesh("cpu", (1,), mesh_dim_names=("dp",))
+        param = _shaped_dparam(_SHAPE, mesh)
+        optimizer = Gefen(
+            [("weight", param)], lr=1e-3, fused=False, factored_v_2d=False
+        )
+        for step in range(_SAVE_STEPS):
+            param.grad = distribute_tensor(
+                _shaped_grad(_SHAPE, step), mesh, [Shard(0)]
+            )
+            optimizer.step()
+        param.grad = None
+
+        state = optimizer.state[param]
+        if malformation == "short_codebook":
+            # Truncated below the largest index the shard actually holds.
+            highest = int(state["m_codebook"].max())
+            assert highest > 1, highest
+            optimizer._gefen_codebook = optimizer._gefen_codebook[:highest].clone()
+        elif malformation == "codebook_2d":
+            # Still 256 values, so a numel check alone would pass it, but
+            # index_select(0) now addresses 128 rows.
+            optimizer._gefen_codebook = optimizer._gefen_codebook.reshape(128, 2)
+        else:
+            # Indices outside uint8's range are no longer bounded by construction.
+            state["m_codebook"] = state["m_codebook"].long() * 1000
+
+        with pytest.raises(ValueError, match=message):
+            GefenDCPState(optimizer).state_dict()
+
+        # ...and the save that would have consumed it stops before writing a byte.
+        checkpoint_dir = str(tmp_path / "address-ckpt")
+        with pytest.raises(ValueError, match=message):
             torch.distributed.checkpoint.save(
                 {"optimizer": GefenDCPState(optimizer)},
                 storage_writer=FileSystemWriter(checkpoint_dir),

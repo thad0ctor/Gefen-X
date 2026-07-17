@@ -130,17 +130,34 @@ def _validate_dense_geometry(optimizer, parameter, state) -> None:
     The dense momentum/second moment are materialized lazily, one at a time, at
     DCP write time (see :class:`_LazyDenseShard`). Their guards would therefore
     fire in the middle of a write, once part of the checkpoint is already on
-    disk. These are pure scalar/metadata checks -- a missing codebook, a
-    nonpositive period, a block count that does not divide the local shard -- so
-    running them up front in ``state_dict`` costs nothing and keeps a malformed
-    optimizer fail-closed *before* the first byte is written, matching the
-    fail-before-mutation contract the load path holds itself to. The lazy
-    materializers keep their own copies of these guards: they are the real
-    correctness barrier, and this is only an early, cheaper report of the same
-    conditions.
+    disk. These are pure scalar/metadata checks -- a missing codebook, one the
+    indices cannot address, a nonpositive period, a block count that does not
+    divide the local shard -- so running them up front in ``state_dict`` costs
+    nothing and keeps a malformed optimizer fail-closed *before* the first byte
+    is written, matching the fail-before-mutation contract the load path holds
+    itself to. The write path enforces every one of these conditions again --
+    the materializers re-check the geometry, and ``index_select`` bounds-checks
+    the gather itself -- so those remain the real correctness barrier; this is
+    only an early, cheaper report of the same conditions, before a partial
+    checkpoint exists.
     """
-    if optimizer._gefen_codebook is None:
+    codebook = optimizer._gefen_codebook
+    if codebook is None:
         raise RuntimeError("Gefen DCP save requires an initialized codebook")
+    # Whether the indices ADDRESS that codebook, which the size checks below say
+    # nothing about: _dense_momentum gathers with index_select, so a codebook too
+    # short for an index present in the shard raises IndexError from inside the
+    # write. Checking the dtype and the row count settles it in O(1), without
+    # reducing over the indices: they are uint8 (_init_gefen_state allocates them
+    # so), which bounds every index to [0, 255] by construction, and a 1-D
+    # codebook with at least 256 rows covers that range whatever the shard holds.
+    # A max() here would instead cost a full pass plus a device sync per slot on
+    # every save, and would still pass a truncated codebook whose live indices
+    # happened to be small -- leaving the same failure latent for the next step.
+    if codebook.dim() != 1 or codebook.numel() < 256:
+        raise ValueError("Gefen momentum codebook geometry is invalid")
+    if state["m_codebook"].dtype != torch.uint8:
+        raise ValueError("Gefen momentum index dtype is invalid")
     period = _counter(state["automatic_period"], "automatic_period")
     local_numel = _local(parameter).numel()
     codebook_numel = state["m_codebook"].reshape(-1).numel()
@@ -357,6 +374,15 @@ class _LazyDenseShard(torch.Tensor):
         own helper keeps the two from drifting apart.
         """
         return self._gefen_parameter.__create_chunk_list__()[0]
+
+    def _gefen_dense_nbytes(self) -> int:
+        """Size of this slot's dense shard, from metadata alone.
+
+        Reads the LOCAL shard's element count, not this stand-in's own numel:
+        the stand-in reports the parameter's global shape (see ``__new__``), so
+        its numel is the whole tensor's, not this rank's share of it.
+        """
+        return _local(self._gefen_parameter).numel() * self.element_size()
 
     def _gefen_expand_to_cpu(
         self, staging: "_PinnedStaging | None" = None
@@ -1463,10 +1489,34 @@ class _PinnedStaging:
     copy is still page-locked, while the page-locked footprint stays at a single
     slot's dense form no matter how many shards the writer accumulates or how
     many threads it runs. The cost is a host-to-host copy per slot.
+
+    The buffer is sized ONCE, from the largest slot the save will stage, rather
+    than grown as bigger slots arrive -- see :meth:`reserve`.
     """
 
     def __init__(self) -> None:
         self._buffer: torch.Tensor | None = None
+        self._capacity = 0
+
+    def reserve(self, nbytes: int) -> None:
+        """Declare the largest slot this save will stage, before it starts.
+
+        Growing the buffer on demand would not hold the one-slot bound, because
+        replacing ``self._buffer`` does not give the old block back: torch's
+        CachingHostAllocator keeps freed pinned blocks in its own cache and never
+        returns them to the OS (a free does not even reach cudaHostFree). Each
+        new maximum therefore ADDS a page-locked block, and the footprint climbs
+        toward the sum of the successive maxima rather than settling at the
+        largest one.
+
+        That is not a corner case for this writer: ``FileSystemWriter`` sorts its
+        write items by size and resolves them smallest first, so a save with N
+        distinct slot sizes walks the maxima in exactly the order that allocates
+        every one of them -- pinning the sum of all N. Sizing up front costs one
+        pass over the stand-ins' metadata and makes the first expansion the only
+        allocation.
+        """
+        self._capacity = nbytes
 
     def expand(self, dense: torch.Tensor) -> torch.Tensor:
         """Copy ``dense`` to pageable CPU memory via the page-locked buffer."""
@@ -1480,11 +1530,19 @@ class _PinnedStaging:
         out = torch.empty_like(dense, device="cpu")
         nbytes = out.numel() * out.element_size()
         if self._buffer is None or self._buffer.numel() < nbytes:
-            # Grows to the largest slot seen and stays there: one slot's dense
-            # form is the advertised bound, and re-pinning per slot is the cost
-            # this exists to avoid -- cudaHostAlloc runs milliseconds, so paying
-            # it per slot dominates the copy it is meant to accelerate.
-            self._buffer = torch.empty(nbytes, dtype=torch.uint8, pin_memory=True)
+            # Allocated once, at the reserved size: re-pinning per slot is the
+            # cost this exists to avoid (cudaHostAlloc runs milliseconds, so
+            # paying it per slot dominates the copy it is meant to accelerate),
+            # and re-pinning per new maximum silently accumulates page-locked
+            # blocks, which is what reserve() exists to prevent.
+            #
+            # max(): reserve() covers every slot this planner will stage, so the
+            # capacity normally wins and this runs exactly once. Falling back to
+            # the request keeps a stand-in that reserve() never saw correct --
+            # merely unbounded, as it was before -- rather than overflowing.
+            self._buffer = torch.empty(
+                max(nbytes, self._capacity), dtype=torch.uint8, pin_memory=True
+            )
         pinned = torch.empty(0, dtype=out.dtype, device="cpu")
         pinned.set_(self._buffer.untyped_storage(), 0, out.shape, out.stride())
         pinned.copy_(dense)
@@ -1572,6 +1630,35 @@ class GefenSavePlanner(DefaultSavePlanner):
                 "state dict, or use the optimizer's native state_dict() if you "
                 "need an unflattened layout."
             )
+
+    def set_up_planner(self, state_dict, storage_meta=None, is_coordinator=False):
+        """Override of ``SavePlanner.set_up_planner``: size the staging buffer.
+
+        The arguments are named out in full, and forwarded positionally, rather
+        than taken as ``*args``: ``dcp.save`` inspects this signature and, when it
+        does not find ``storage_meta`` in it, falls back to calling the planner
+        the pre-2.3 way -- ``set_up_planner(state_dict, is_coordinator)`` -- which
+        would bind this rank's ``is_coordinator`` to ``storage_meta`` and silently
+        leave ``is_coordinator`` False on every rank, including the one that has
+        to build the global plan. A ``*args`` passthrough is invisible to that
+        check and takes the legacy path.
+        """
+        super().set_up_planner(state_dict, storage_meta, is_coordinator)
+        # The whole save's slots are known here, before the writer starts, so the
+        # page-locked buffer can be sized to the largest of them in one pass over
+        # metadata -- no expansion, no allocation. Growing it as bigger slots
+        # arrive would pin the sum of the successive maxima instead; see
+        # _PinnedStaging.reserve.
+        #
+        # Only CUDA slots stage: _gefen_expand_to_cpu hands back a CPU-resident
+        # dense form untouched, so a CPU-resident optimizer (and an async save,
+        # whose slots reach the writer already snapshotted to the CPU) reserves
+        # nothing and page-locks nothing, as before.
+        largest = 0
+        for entry in self.state_dict.values():
+            if isinstance(entry, _LazyDenseShard) and entry.device.type == "cuda":
+                largest = max(largest, entry._gefen_dense_nbytes())
+        self._gefen_staging.reserve(largest)
 
     def resolve_data(self, write_item):
         # Deliberately NOT via lookup_object(): that resolves through
