@@ -744,6 +744,7 @@ class GefenDCPState:
 
         slots = []
         index = 0
+        seen_names = set()
         seen_identities = {}
         for group_index, group in enumerate(self.optimizer.param_groups):
             if group.get("sharded_mode") is not None:
@@ -780,6 +781,26 @@ class GefenDCPState:
                         "state is addressed by identity, not registration "
                         "order.".format(index, str(name))
                     )
+                # A name has to identify a parameter on its own. The saved
+                # identity is (name, group, shape), and the group is a positional
+                # index -- so two same-shaped parameters sharing a name across
+                # groups produce an identity list that is unchanged when those
+                # groups are rebuilt in the opposite order. Validation would pass
+                # and each slot's state would land on the other parameter, which
+                # is the silent cross-assignment identities exist to prevent. The
+                # index cannot disambiguate them precisely because it is the thing
+                # a reorder changes.
+                if name in seen_names:
+                    raise RuntimeError(
+                        "GefenDCPState requires parameter names to be unique "
+                        "across every group, but {!r} names more than one "
+                        "parameter. A repeated name is not an identity: it is "
+                        "told apart only by the positional group index, so "
+                        "rebuilding the groups in a different order would "
+                        "validate and still assign each parameter the other's "
+                        "state.".format(str(name))
+                    )
+                seen_names.add(name)
                 if not _is_dtensor(parameter):
                     raise RuntimeError(
                         "GefenDCPState requires every parameter to be a DTensor"

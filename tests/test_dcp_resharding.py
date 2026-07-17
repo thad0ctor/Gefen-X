@@ -1097,10 +1097,10 @@ def test_dcp_rejects_duplicate_identities(tmp_path):
             factored_v_2d=False,
         )
         # Force two identical (name, group, shape) identities, as a corrupted or
-        # adversarial caller could. Same-shaped same-group same-named slots cannot
-        # be disambiguated on a resharded load, so construction must reject them.
+        # adversarial caller could. The global name rule catches this first: a
+        # duplicate identity implies a duplicate name, so it reports the name.
         optimizer.param_groups[0]["param_names"] = ["dup", "dup"]
-        with pytest.raises(RuntimeError, match="unique parameter identities"):
+        with pytest.raises(RuntimeError, match="unique across every group"):
             GefenDCPState(optimizer)
     finally:
         dist.destroy_process_group()
@@ -2305,6 +2305,84 @@ def test_dcp_save_rejects_codebook_that_does_not_tile_the_shard(tmp_path):
                 planner=GefenSavePlanner(),
             )
         assert not _has_checkpoint_bytes(checkpoint_dir)
+    finally:
+        dist.destroy_process_group()
+
+
+@pytest.mark.skipif(
+    not dist.is_available() or not dist.is_gloo_available(),
+    reason="DCP resharding coverage requires Gloo",
+)
+def test_dcp_rejects_one_name_shared_by_two_parameters(tmp_path):
+    # A name has to identify a parameter by itself. The saved identity is
+    # (name, group, shape) and the group is a positional index, so two
+    # same-shaped parameters sharing a name produce an identity list that does
+    # not change when their groups are rebuilt in the opposite order: validation
+    # passes and each slot's state lands on the other parameter. The index cannot
+    # break the tie precisely because a reorder is what changes it.
+    #
+    # Both names here are caller-provided, so the synthesized-provenance guard
+    # does not fire -- this is a distinct hole from the collision-suffix one, and
+    # `param_0` being a legitimate caller name is what makes it reachable.
+    _single_rank_group(tmp_path / "dupe-init")
+    try:
+        mesh = init_device_mesh("cpu", (1,), mesh_dim_names=("dp",))
+        first = _shaped_dparam(_SHAPE, mesh)
+        second = _shaped_dparam(_SHAPE, mesh)
+        optimizer = Gefen(
+            [{"params": [("weight", first)]}, {"params": [("weight", second)]}],
+            lr=1e-3,
+            fused=False,
+            factored_v_2d=False,
+        )
+        for step in range(_SAVE_STEPS):
+            for param in (first, second):
+                param.grad = distribute_tensor(
+                    _shaped_grad(_SHAPE, step), mesh, [Shard(0)]
+                )
+            optimizer.step()
+        for param in (first, second):
+            param.grad = None
+
+        with pytest.raises(RuntimeError, match="unique across every group"):
+            GefenDCPState(optimizer)
+    finally:
+        dist.destroy_process_group()
+
+
+@pytest.mark.skipif(
+    not dist.is_available() or not dist.is_gloo_available(),
+    reason="DCP resharding coverage requires Gloo",
+)
+def test_dcp_accepts_distinct_names_in_separate_groups(tmp_path):
+    # The guard above must not cost the ordinary case: distinct caller names in
+    # separate groups are exactly how a real model arrives, and rejecting them
+    # would lock legitimate optimizers out of resharding entirely.
+    _single_rank_group(tmp_path / "distinct-init")
+    try:
+        mesh = init_device_mesh("cpu", (1,), mesh_dim_names=("dp",))
+        first = _shaped_dparam(_SHAPE, mesh)
+        second = _shaped_dparam(_SHAPE, mesh)
+        optimizer = Gefen(
+            [
+                {"params": [("encoder.weight", first)]},
+                {"params": [("decoder.weight", second)]},
+            ],
+            lr=1e-3,
+            fused=False,
+            factored_v_2d=False,
+        )
+        for step in range(_SAVE_STEPS):
+            for param in (first, second):
+                param.grad = distribute_tensor(
+                    _shaped_grad(_SHAPE, step), mesh, [Shard(0)]
+                )
+            optimizer.step()
+        for param in (first, second):
+            param.grad = None
+
+        names = [slot["name"] for slot in GefenDCPState(optimizer)._identities()]
+        assert names == ["encoder.weight", "decoder.weight"], names
     finally:
         dist.destroy_process_group()
 
