@@ -18,6 +18,12 @@ Added — `GefenDCPState` for resharding FSDP2 optimizer state:
 - Resharding routes momentum through a dense reshard and a freshly learned per-shard codebook, so a restored optimizer is a correct continuation within 256-level quantization noise rather than bit-exact, including at unchanged topology. For unchanged topology use the native `get_state_dict` / `set_state_dict` path, which stays bit-exact and is unchanged by this release; `GefenDCPState` is for when the topology changes.
 - `GefenDCPState` is scoped to plain `Gefen` on one-dimensional default-world `Shard(0)` DTensors. `GefenMuon`, `GefenMuonHybrid`, `capturable=True`, `factored_v_2d=True`, Muon `sharded_mode`, non-DTensor parameters, multidimensional or non-default-world meshes, subgroups, and non-`Shard(0)` placements all fail closed at construction or validation with an explicit message. Reshardable DCP for the Muon family is tracked in #84 and #85.
 
+Added — bounded and async reshardable saves, plus hardening (#90):
+
+- `GefenSavePlanner`, passed to `dcp.save`, bounds a reshardable save's peak memory to one parameter's dense form instead of the whole optimizer's — about 0.5 bytes/param on a many-parameter model, down from roughly 8 — so a save no longer peaks higher than a training step. The checkpoint bytes are unchanged; omitting the planner still writes the same checkpoint at the old cost.
+- `GefenFileSystemWriter` extends the same one-slot bound to `dcp.async_save`, staging each slot to the CPU one at a time and snapshotting so a resumed step cannot tear the checkpoint.
+- Hardening of the resharding path: a hyperparameter restore that would overflow, underflow, truncate, or round a beta to 1.0 in a narrow tensor is rejected before the state is swapped; non-finite optimizer state is refused before a byte is written; rank-local layout validation is synchronized so a one-rank failure aborts the group instead of stranding it; and divergent slot layouts across ranks are rejected rather than silently merged into one tensor. `fully_shard` imports fall back to the torch 2.5 path.
+
 ## [0.4.1] - 2026-07-15
 
 Distributed checkpoint-load and step-failure hardening. All fixes are backward-compatible; no public API changes.
