@@ -2379,11 +2379,6 @@ def test_dcp_save_page_locks_one_slot_with_ascending_slot_sizes(tmp_path):
     # deterministic.
     import gefen.dcp as dcp_mod
 
-    # The process-wide pin bound is fixed by the first staged save in the process;
-    # clear it so this save sizes it to its own largest slot rather than inheriting
-    # an earlier test's cap (which would send the bigger slots down the pageable
-    # path and defeat the one-allocation assertion below).
-    dcp_mod._PinnedStaging._max_pinned_bytes = 0
     _single_rank_group(tmp_path / "save-pinned-ascending-init")
     try:
         mesh = init_device_mesh("cuda", (1,), mesh_dim_names=("dp",))
@@ -2451,74 +2446,6 @@ def test_dcp_save_page_locks_one_slot_with_ascending_slot_sizes(tmp_path):
         )
     finally:
         dist.destroy_process_group()
-
-
-@pytest.mark.skipif(
-    not torch.cuda.is_available()
-    or not dist.is_available()
-    or not dist.is_gloo_available()
-    or not hasattr(torch.cuda, "host_memory_stats"),
-    reason="page-locked accounting requires CUDA, Gloo, and torch.cuda.host_memory_stats",
-)
-def test_dcp_page_locked_stays_bounded_across_growing_saves(tmp_path):
-    # Each save reserves one slot's worth of pinned staging, so a single save is
-    # bounded. But successive saves whose largest slot GROWS (a training loop that
-    # adds ever-larger param groups and checkpoints) each pin a new maximum, and
-    # torch's CachingHostAllocator never returns the smaller freed blocks to the
-    # OS -- so without the process-wide bound the page-locked footprint climbs
-    # toward the SUM of the historical maxima (here 4+8+16+32 = 60 MiB) instead of
-    # staying at one slot. Fresh planner per save, exactly as dcp.save creates.
-    import gefen.dcp as dcp_mod
-
-    dcp_mod._PinnedStaging._max_pinned_bytes = 0
-    _single_rank_group(tmp_path / "save-pinned-growing-init")
-    try:
-        mesh = init_device_mesh("cuda", (1,), mesh_dim_names=("dp",))
-        shapes = [(1024, 1024), (2048, 1024), (4096, 1024), (8192, 1024)]
-        first_slot_bytes = shapes[0][0] * shapes[0][1] * 4
-        sum_of_maxima = sum(shape[0] * shape[1] * 4 for shape in shapes)
-        named = []
-        torch.cuda.synchronize()
-        torch.cuda.empty_cache()
-        torch.cuda.reset_peak_host_memory_stats()
-        before_pinned = torch.cuda.host_memory_stats().get("allocated_bytes.current", 0)
-        for index, shape in enumerate(shapes):
-            named.append(
-                ("w{}".format(index), _shaped_dparam(shape, mesh, device="cuda"))
-            )
-            optimizer = Gefen(
-                named, lr=1e-3, fused=False, factored_v_2d=False, deterministic=True
-            )
-            for step in range(_SAVE_STEPS):
-                for (_, param), pshape in zip(named, shapes):
-                    param.grad = distribute_tensor(
-                        _shaped_grad(pshape, step).cuda(), mesh, [Shard(0)]
-                    )
-                optimizer.step()
-            for _, param in named:
-                param.grad = None
-            torch.cuda.synchronize()
-            torch.distributed.checkpoint.save(
-                {"optimizer": GefenDCPState(optimizer)},
-                storage_writer=FileSystemWriter(
-                    str(tmp_path / "save-pinned-growing-ckpt-{}".format(index)),
-                    thread_count=1,
-                ),
-                planner=GefenSavePlanner(),
-            )
-            torch.cuda.synchronize()
-
-        pinned_peak = torch.cuda.host_memory_stats().get("allocated_bytes.peak", 0)
-        # Bounded at the first staged save's slot, not the sum of the maxima: the
-        # later, larger slots stage pageable rather than pinning a growing block.
-        assert pinned_peak - before_pinned <= 2 * first_slot_bytes, (
-            pinned_peak - before_pinned,
-            first_slot_bytes,
-            sum_of_maxima,
-        )
-    finally:
-        dist.destroy_process_group()
-
 
 @pytest.mark.skipif(
     not dist.is_available() or not dist.is_gloo_available(),

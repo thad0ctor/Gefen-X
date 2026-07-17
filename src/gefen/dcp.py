@@ -1327,17 +1327,12 @@ class _PinnedStaging:
     through one buffer and handing back pageable memory keeps the bandwidth at a
     one-slot page-locked footprint per save.
 
-    Across saves the same allocator retention is a trap: a later save whose largest
-    slot grew would pin a new, larger block while the smaller ones stay cached, so
-    the page-locked footprint climbs toward the sum of the historical maxima. A
-    process-wide cap fixes it -- the first staged save sizes the bound, and a later
-    slot past the bound stages pageable (a slower copy only on growth) rather than
-    pinning an ever-larger block that never comes back.
+    Bounds one save to a single slot. Across saves whose largest slot grows, the
+    page-locked footprint can still climb toward the sum of the historical maxima,
+    because a D2H copy into pageable memory itself uses a pinned bounce buffer that
+    torch's caching host allocator retains -- allocator behavior below this layer,
+    not the staging buffer, so it is not bounded here.
     """
-
-    # Process-wide page-locked bound in bytes, set once by the first staged save.
-    _max_pinned_bytes = 0
-    _lock = threading.Lock()
 
     def __init__(self) -> None:
         self._buffer: torch.Tensor | None = None
@@ -1346,37 +1341,30 @@ class _PinnedStaging:
     def reserve(self, nbytes: int) -> None:
         """Declare the largest slot this save will stage, before it starts.
 
-        Recorded so the first staged save can size the process bound to its
-        largest slot; every save then pins one block of that bound (see
-        :meth:`expand`), so a save's own slots never grow it.
+        Growing the buffer on demand would not hold the one-slot bound: torch's
+        CachingHostAllocator never returns freed pinned blocks to the OS, so each
+        new maximum ADDS a page-locked block. ``FileSystemWriter`` resolves write
+        items smallest first, so a save with N distinct slot sizes walks the maxima
+        in exactly the order that allocates every one of them, pinning their sum.
         """
         self._capacity = nbytes
 
     def expand(self, dense: torch.Tensor) -> torch.Tensor:
-        """Copy ``dense`` to pageable CPU memory: through the page-locked buffer
-        when the slot fits the process-wide pin bound, else pageable-direct."""
+        """Copy ``dense`` to pageable CPU memory via the page-locked buffer."""
         # empty_like preserves the source's memory format (the writer serializes
         # strides, so contiguous would change a channels_last slot's saved bytes)
         # and fixes the strides the staging view below must match.
         out = torch.empty_like(dense, device="cpu")
         nbytes = out.numel() * out.element_size()
-        cls = _PinnedStaging
-        with cls._lock:
-            if cls._max_pinned_bytes == 0:
-                # First staged save fixes the bound to its largest slot.
-                cls._max_pinned_bytes = max(nbytes, self._capacity)
-            cap = cls._max_pinned_bytes
-        if nbytes > cap:
-            # Pinning this would grow the buffer past the bound and strand the
-            # smaller block in torch's host cache; take the slower pageable D2H.
-            out.copy_(dense)
-            return out
-        if self._buffer is None:
-            # Every save pins exactly `cap` bytes (cudaHostAlloc runs
-            # milliseconds, so per-slot re-pinning would dominate the copy it
-            # accelerates), so the freed block is reused across saves instead of
-            # each new maximum adding a page-locked block.
-            self._buffer = torch.empty(cap, dtype=torch.uint8, pin_memory=True)
+        if self._buffer is None or self._buffer.numel() < nbytes:
+            # Allocated once, at the reserved size: cudaHostAlloc runs
+            # milliseconds, so re-pinning per slot would dominate the copy it
+            # accelerates. max(): reserve() covers every slot this planner
+            # stages, so the capacity normally wins; falling back to the request
+            # keeps a stand-in reserve() never saw correct, merely unbounded.
+            self._buffer = torch.empty(
+                max(nbytes, self._capacity), dtype=torch.uint8, pin_memory=True
+            )
         pinned = torch.empty(0, dtype=out.dtype, device="cpu")
         pinned.set_(self._buffer.untyped_storage(), 0, out.shape, out.stride())
         pinned.copy_(dense)
