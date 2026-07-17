@@ -133,6 +133,8 @@ dcp.load(                                 # load needs no planner
 
 On a 64M-param local shard the peak over the optimizer's resident state falls from 12.0 to 6.0 bytes/param for one large tensor, and from 8.25 to 0.50 bytes/param for a 32-tensor model; the checkpoint bytes are unchanged. The bound is per *slot*, so the win grows as the state is split across more parameters, and the remaining transient is a single slot's dense form plus up to ~128 MiB of dequantize scratch. That scratch is a ceiling, not a fixed cost: it is bounded by the dequantize gather chunk (`GEFEN_DEQUANT_GATHER_CHUNK`, 8M elements), so only slots larger than the chunk pay the full ~128 MiB, and a smaller slot pays proportionally less — ~24 MiB per 2M-param slot in the 32-tensor case above, which is what makes 0.50 bytes/param reachable there. Omitting the planner is not a correctness bug — the save still writes exactly the same checkpoint — it only costs the old 8 bytes/param. `GefenSavePlanner` subclasses `DefaultSavePlanner` and defers to it for everything that is not Gefen optimizer state, so the model and any other Stateful items in the same state dict are unaffected.
 
+The bound holds at any `FileSystemWriter(thread_count=N)`. N writer threads ask for N write items at once, so the planner serializes slot expansion and hands each thread its shard already on the CPU, keeping one slot's dense form on the device rather than one per thread. Expanding slots therefore does not run in parallel across writer threads; their file writes still do, and a threaded save stays faster than a single-threaded one.
+
 `dcp.async_save` writes a `GefenDCPState` when given `storage_writer=GefenFileSystemWriter(path)`:
 
 ```python

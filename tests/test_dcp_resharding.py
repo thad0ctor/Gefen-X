@@ -1791,6 +1791,71 @@ def test_dcp_save_peak_is_bounded_by_one_slot(tmp_path):
 
 
 @pytest.mark.skipif(
+    not torch.cuda.is_available() or not dist.is_available() or not dist.is_gloo_available(),
+    reason="peak-allocation measurement requires CUDA and Gloo",
+)
+def test_dcp_save_peak_is_bounded_under_a_multi_threaded_writer(tmp_path):
+    # thread_count is a public FileSystemWriter option, and it splits the plan
+    # into one file bucket per thread, so N threads call resolve_data at once.
+    # Resolving is what expands a slot, so without serialization the bound is one
+    # slot's dense form PER THREAD: at thread_count=8 this same model peaked at
+    # ~8 bytes/param, the full eager cost the planner exists to avoid, silently
+    # undoing the bound for anyone who set a throughput option.
+    #
+    # Serializing alone would not fix it -- the writer keeps what resolve_data
+    # returns until it has written that item, so a device-side return outlives
+    # any lock. resolve_data returns the shard already on the CPU, which is what
+    # makes the device-side expansion dead before the next thread's begins.
+    #
+    # Deliberately thread_count=8 rather than 2: whether two threads overlap in
+    # resolve_data at all is a race, so a small count measures the scheduler. At
+    # 8 the unbounded peak is unambiguous, while the bounded one stays flat.
+    _single_rank_group(tmp_path / "save-peak-threads-init")
+    try:
+        mesh = init_device_mesh("cuda", (1,), mesh_dim_names=("dp",))
+        slots = 8
+        shape = (2048, 1024)  # 2M params per slot; 16M total
+        named = []
+        for index in range(slots):
+            named.append(
+                ("w{}".format(index), _shaped_dparam(shape, mesh, device="cuda"))
+            )
+        optimizer = Gefen(
+            named, lr=1e-3, fused=False, factored_v_2d=False, deterministic=True
+        )
+        numel = sum(param.numel() for _, param in named)
+        for step in range(_SAVE_STEPS):
+            for _, param in named:
+                param.grad = distribute_tensor(
+                    _shaped_grad(shape, step).cuda(), mesh, [Shard(0)]
+                )
+            optimizer.step()
+        for _, param in named:
+            param.grad = None
+
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()
+        torch.cuda.reset_peak_memory_stats()
+        base = torch.cuda.memory_allocated()
+        torch.distributed.checkpoint.save(
+            {"optimizer": GefenDCPState(optimizer)},
+            storage_writer=FileSystemWriter(
+                str(tmp_path / "save-peak-threads-ckpt"), thread_count=8
+            ),
+            planner=GefenSavePlanner(),
+        )
+        torch.cuda.synchronize()
+        peak_bytes_per_elem = (torch.cuda.max_memory_allocated() - base) / numel
+
+        # The same threshold the single-threaded bound is held to above: it
+        # separates "one slot's dense form plus gather scratch" from any regime
+        # that keeps more than one slot live.
+        assert peak_bytes_per_elem < 4.0, peak_bytes_per_elem
+    finally:
+        dist.destroy_process_group()
+
+
+@pytest.mark.skipif(
     not dist.is_available() or not dist.is_gloo_available(),
     reason="DCP resharding coverage requires Gloo",
 )

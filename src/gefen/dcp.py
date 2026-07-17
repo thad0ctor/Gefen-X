@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import math
+import threading
 
 import torch
 
@@ -172,10 +173,11 @@ class _LazyDenseShard(torch.Tensor):
     DCP never needs those tensors simultaneously. It plans from *metadata* and
     then asks for one write item's data at a time, so this stands in for the
     dense tensor during planning and materializes it only when the writer asks.
-    The writer drops its reference as soon as the shard is copied to CPU (and
-    bounds how far it copies ahead), so exactly one dense tensor is live at a
-    time and the save peak falls to the resident state plus a single slot's dense
-    form.
+    :meth:`GefenSavePlanner.resolve_data` expands one at a time and hands the
+    writer the result already on the CPU, so no device-side dense form outlives
+    the call that built it: exactly one is live at a time, whatever the writer's
+    thread count, and the save peak falls to the resident state plus a single
+    slot's dense form.
 
     The instance is a ``torch.Tensor`` subclass rather than a plain descriptor
     object because DCP resolves data through ``find_state_dict_object`` ->
@@ -356,9 +358,56 @@ class _LazyDenseShard(torch.Tensor):
         """
         return self._gefen_parameter.__create_chunk_list__()[0]
 
+    def _gefen_expand_to_cpu(self, pin: bool) -> torch.Tensor:
+        """Expand this slot's dense shard onto the CPU, dropping the device copy.
+
+        ``pin`` page-locks the destination, which roughly doubles the D2H
+        bandwidth of the copy below. Worth it only where the result is
+        short-lived: page-locked pages cannot be swapped, so pinning something
+        held for a whole write costs the host that memory for the duration.
+        """
+        dense = self._gefen_materialize()
+        if dense.device.type == "cpu":
+            # Already where the caller wants it -- a CPU-resident optimizer, or
+            # a slot GefenFileSystemWriter.stage() has already snapshotted.
+            # Copying again would double the CPU cost to no purpose. It is still
+            # a private snapshot: materialize expands the block state into a
+            # fresh tensor rather than viewing the optimizer's own.
+            return dense
+        # empty_like rather than empty: it preserves the source's memory format,
+        # as `.to("cpu")` would. An uninitialized slot expands with zeros_like,
+        # which keeps a channels_last parameter channels_last, and the writer
+        # serializes strides -- so allocating contiguous here would quietly
+        # change the saved bytes for those slots.
+        staged = torch.empty_like(
+            dense, device="cpu", pin_memory=pin and dense.device.type == "cuda"
+        )
+        staged.copy_(dense)
+        # Explicit: the device-side expansion must be unreachable before the
+        # next one begins, or the bound is one slot per concurrent expansion.
+        del dense
+        return staged
+
     def _gefen_resolve_uncached(self) -> torch.Tensor:
-        """Expand the dense shard without retaining it (the bounded save path)."""
-        return self._gefen_materialize()
+        """Expand the dense shard for the writer, without retaining it.
+
+        Returns the shard *on the CPU*, which is where the writer needs it and
+        the only way :meth:`GefenSavePlanner.resolve_data`'s lock can bound
+        anything: the writer holds what this returns until it has finished
+        writing that item, so a dense form returned on the device outlives any
+        lock held across this call, and N writer threads would hold N of them.
+        Landing on the CPU here means the device-side expansion is dead before
+        the lock is released.
+
+        Pinned because the copy is necessarily synchronous -- the writer may
+        write this tensor the moment it is returned, so the copy cannot still be
+        in flight -- which gives up the copy/expand overlap torch's
+        single-threaded loader gets from its own non_blocking copy. The
+        bandwidth pinning buys back covers that. The writer frees each shard as
+        soon as it is written, and bounds how many it holds at once, so this
+        pins one slot's dense form at a time rather than the whole state dict.
+        """
+        return self._gefen_expand_to_cpu(pin=True)
 
     def _gefen_stage_to_cpu(self) -> "_LazyDenseShard":
         """Snapshot this slot's dense form to the CPU (the bounded async path).
@@ -379,13 +428,17 @@ class _LazyDenseShard(torch.Tensor):
         The staged shard reads its geometry from the same live parameter as this
         one, which is metadata only (shape/mesh/placements) and does not change
         under a concurrent step. The snapshot itself -- the dense values -- is
-        fully detached from the optimizer once this returns.
+        fully detached from the optimizer once this returns, because
+        :meth:`_gefen_expand_to_cpu` builds it by expanding the block state into
+        a fresh tensor rather than by viewing the optimizer's own.
+
+        Unpinned, unlike the synchronous path's expansion: staging keeps every
+        slot's snapshot until the background write drains it, so pinning here
+        would page-lock the entire dense state dict -- 8 bytes/param of host
+        memory that cannot be swapped -- for the whole write, rather than one
+        slot's worth at a time.
         """
-        dense = self._gefen_materialize()
-        staged = dense.to("cpu", copy=True)
-        # Explicit: the device-side expansion must be unreachable before the next
-        # slot expands, or the bound is one slot per parameter rather than one.
-        del dense
+        staged = self._gefen_expand_to_cpu(pin=False)
         return _LazyDenseShard(
             self._gefen_parameter, lambda: staged, device=staged.device
         )
@@ -1407,10 +1460,17 @@ class GefenSavePlanner(DefaultSavePlanner):
     owning rank). :class:`GefenDCPState` therefore hands DCP zero-storage
     stand-ins instead of finished tensors, and this planner expands exactly one
     of them at a time, at the moment the writer asks for that write item, without
-    keeping it afterwards. The writer drops its own reference once the shard is
-    copied to CPU and bounds how far it copies ahead, so the save peaks at the
-    optimizer's resident state plus a single slot's dense form rather than
-    holding 8 bytes/param for every parameter across the whole write.
+    keeping it afterwards. So the save peaks at the optimizer's resident state
+    plus a single slot's dense form rather than holding 8 bytes/param for every
+    parameter across the whole write.
+
+    That bound holds at any ``FileSystemWriter(thread_count=N)``. N writer
+    threads ask for N write items at once, so expansion is serialized, and the
+    expanded shard is copied to the CPU before the next expansion begins --
+    returning it on the device instead would leave it live until the writer had
+    finished writing it, which is past the point where serializing could bound
+    anything. Slot expansion therefore does not run in parallel across writer
+    threads; their file writes still do.
 
     Without this planner the save is still *correct* -- the stand-ins fall back to
     allocating and retaining their dense form, which is what the load path needs
@@ -1424,6 +1484,7 @@ class GefenSavePlanner(DefaultSavePlanner):
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
+        self._gefen_expand_lock = threading.Lock()
         # Rejected up front rather than at write time, where it surfaces as an
         # opaque "stand-in cannot be pickled" TypeError from deep inside the
         # writer, after the save has already begun.
@@ -1459,7 +1520,16 @@ class GefenSavePlanner(DefaultSavePlanner):
         # default for anything that is not a Gefen stand-in.
         entry = self.state_dict.get(write_item.index.fqn)
         if isinstance(entry, _LazyDenseShard):
-            return entry._gefen_resolve_uncached()
+            # FileSystemWriter(thread_count=N) runs N of these concurrently, one
+            # per file bucket, so without this lock N slots expand at once and
+            # the bound below becomes N slots' dense form rather than one.
+            # _gefen_resolve_uncached returns the shard already on the CPU, which
+            # is what lets a lock held only across this call bound anything at
+            # all: the writer keeps the returned tensor until its write finishes,
+            # so a device-side return would outlive the lock and serializing
+            # would buy nothing.
+            with self._gefen_expand_lock:
+                return entry._gefen_resolve_uncached()
         return super().resolve_data(write_item)
 
 
