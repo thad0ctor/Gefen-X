@@ -1447,8 +1447,19 @@ class Gefen(torch.optim.Optimizer):
                     # The caller named the group; that name identifies the single
                     # parameter it holds, so this is caller-provided, not
                     # positionally synthesized.
-                    param_name = group_name
-                    param_name = self._unique_name(param_name, existing_names)
+                    base_name = str(group_name).lower()
+                    param_name = self._unique_name(base_name, existing_names)
+                    if param_name != base_name:
+                        # ...unless a collision forced a suffix, because which of
+                        # the colliding groups gets which suffix is decided by
+                        # registration order alone. That makes the name
+                        # positional, not caller-provided: build the same groups
+                        # in a different order and the names swap. Recording it as
+                        # synthesized keeps DCP from resharding against an
+                        # identity it cannot rely on -- the failure it prevents is
+                        # a checkpoint that validates cleanly and cross-assigns
+                        # momentum between the colliding parameters.
+                        synthesized = True
                 elif implicit_group:
                     param_name = self._unique_name(
                         "param_{}".format(len(self._param_names) + param_index),

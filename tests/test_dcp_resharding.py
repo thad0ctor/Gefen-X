@@ -2150,6 +2150,75 @@ def test_dcp_rejects_integral_tensor_lr_before_commit(tmp_path):
     not dist.is_available() or not dist.is_gloo_available(),
     reason="DCP resharding coverage requires Gloo",
 )
+def test_dcp_rejects_overflowing_tensor_lr_before_commit(tmp_path):
+    _single_rank_group(tmp_path / "overflow-lr-init")
+    try:
+        mesh = init_device_mesh("cpu", (1,), mesh_dim_names=("dp",))
+        param = _shaped_dparam(_SHAPE, mesh)
+        optimizer = Gefen(
+            [("weight", param)], lr=1e-3, fused=False, factored_v_2d=False
+        )
+        for step in range(_SAVE_STEPS):
+            param.grad = distribute_tensor(_shaped_grad(_SHAPE, step), mesh, [Shard(0)])
+            optimizer.step()
+        saved = GefenDCPState(optimizer).state_dict()
+        saved["param_group_hypers"][0]["lr"] = 128.0
+
+        # 128.0 is integral, so the truncation check passes it -- but it overflows
+        # int8. fill_ raises on that overflow, and it runs only AFTER the state was
+        # swapped in, which is the half-applied restore staging exists to prevent.
+        optimizer.param_groups[0]["lr"] = torch.tensor(1, dtype=torch.int8)
+        state_before = _live_state_signature(optimizer, param)
+        hypers_before = _group_hyper_signature(optimizer)
+
+        with pytest.raises(ValueError, match="representable range"):
+            GefenDCPState(optimizer).load_state_dict(saved)
+
+        assert _live_state_signature(optimizer, param) == state_before
+        assert _group_hyper_signature(optimizer) == hypers_before
+        assert int(optimizer.param_groups[0]["lr"]) == 1
+    finally:
+        dist.destroy_process_group()
+
+
+@pytest.mark.skipif(
+    not dist.is_available() or not dist.is_gloo_available(),
+    reason="DCP resharding coverage requires Gloo",
+)
+def test_dcp_rejects_out_of_range_bool_tensor_lr_before_commit(tmp_path):
+    _single_rank_group(tmp_path / "bool-lr-init")
+    try:
+        mesh = init_device_mesh("cpu", (1,), mesh_dim_names=("dp",))
+        param = _shaped_dparam(_SHAPE, mesh)
+        optimizer = Gefen(
+            [("weight", param)], lr=1e-3, fused=False, factored_v_2d=False
+        )
+        for step in range(_SAVE_STEPS):
+            param.grad = distribute_tensor(_shaped_grad(_SHAPE, step), mesh, [Shard(0)])
+            optimizer.step()
+        saved = GefenDCPState(optimizer).state_dict()
+        saved["param_group_hypers"][0]["lr"] = 128.0
+
+        # bool is the one integral destination whose fill_ never raises: it would
+        # coerce 128.0 to True and commit lr=1.0, a silently wrong value rather
+        # than a loud one. The range check is what catches it.
+        optimizer.param_groups[0]["lr"] = torch.tensor(True)
+        state_before = _live_state_signature(optimizer, param)
+        hypers_before = _group_hyper_signature(optimizer)
+
+        with pytest.raises(ValueError, match="representable range"):
+            GefenDCPState(optimizer).load_state_dict(saved)
+
+        assert _live_state_signature(optimizer, param) == state_before
+        assert _group_hyper_signature(optimizer) == hypers_before
+    finally:
+        dist.destroy_process_group()
+
+
+@pytest.mark.skipif(
+    not dist.is_available() or not dist.is_gloo_available(),
+    reason="DCP resharding coverage requires Gloo",
+)
 def test_dcp_accepts_float_tensor_lr(tmp_path):
     _single_rank_group(tmp_path / "float-lr-init")
     try:
@@ -2235,6 +2304,88 @@ def test_dcp_still_rejects_genuinely_synthesized_names_in_named_group(tmp_path):
         ]
         with pytest.raises(RuntimeError, match="synthesized"):
             GefenDCPState(optimizer)
+    finally:
+        dist.destroy_process_group()
+
+
+@pytest.mark.skipif(
+    not dist.is_available() or not dist.is_gloo_available(),
+    reason="DCP resharding coverage requires Gloo",
+)
+def test_dcp_rejects_collision_suffixed_group_name(tmp_path):
+    _single_rank_group(tmp_path / "collide-group-init")
+    try:
+        mesh = init_device_mesh("cpu", (1,), mesh_dim_names=("dp",))
+        shape = (128, 64)
+        first = _shaped_dparam(shape, mesh)
+        second = _shaped_dparam(shape, mesh)
+        # Two unnamed single-parameter groups given the SAME group name. The
+        # first keeps it; the second is disambiguated to "weight_1" -- and which
+        # group gets the suffix is decided by registration order alone. That
+        # makes the suffixed name positional despite descending from a caller's
+        # name, so it must be refused: it would otherwise validate cleanly on
+        # spelling and cross-assign the two parameters' momentum on a reordered
+        # load.
+        optimizer = Gefen(
+            [
+                {"params": [first], "name": "weight"},
+                {"params": [second], "name": "weight"},
+            ],
+            lr=1e-3,
+            fused=False,
+            factored_v_2d=False,
+        )
+        assert [group["param_names"] for group in optimizer.param_groups] == [
+            ["weight"],
+            ["weight_1"],
+        ]
+        assert not optimizer._param_name_is_synthesized(first)
+        assert optimizer._param_name_is_synthesized(second)
+        with pytest.raises(RuntimeError, match="synthesized"):
+            GefenDCPState(optimizer)
+    finally:
+        dist.destroy_process_group()
+
+
+@pytest.mark.skipif(
+    not dist.is_available() or not dist.is_gloo_available(),
+    reason="DCP resharding coverage requires Gloo",
+)
+def test_dcp_accepts_distinct_group_names(tmp_path):
+    _single_rank_group(tmp_path / "distinct-group-init")
+    try:
+        mesh = init_device_mesh("cpu", (1,), mesh_dim_names=("dp",))
+        shape = (128, 64)
+        first = _shaped_dparam(shape, mesh)
+        second = _shaped_dparam(shape, mesh)
+        # The companion to the collision case: a caller's group name that needed
+        # no suffix is still caller-provided and still resharding-safe. Rejecting
+        # these would lock every named-group optimizer out of GefenDCPState.
+        optimizer = Gefen(
+            [
+                {"params": [first], "name": "encoder"},
+                {"params": [second], "name": "decoder"},
+            ],
+            lr=1e-3,
+            fused=False,
+            factored_v_2d=False,
+        )
+        assert not optimizer._param_name_is_synthesized(first)
+        assert not optimizer._param_name_is_synthesized(second)
+        wrapper = GefenDCPState(optimizer)
+        assert [slot.name for slot in wrapper._slots] == ["encoder", "decoder"]
+
+        for step in range(_SAVE_STEPS):
+            for param in (first, second):
+                param.grad = distribute_tensor(
+                    _shaped_grad(shape, step), mesh, [Shard(0)]
+                )
+            optimizer.step()
+        # It must round-trip, not merely construct.
+        saved = wrapper.state_dict()
+        GefenDCPState(optimizer).load_state_dict(saved)
+        for param in (first, second):
+            assert "automatic_period" in optimizer.state[param]
     finally:
         dist.destroy_process_group()
 

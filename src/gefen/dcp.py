@@ -811,13 +811,24 @@ class GefenDCPState:
         freezes every subsequent update. Checking representability here -- during
         staging, before anything is committed -- keeps that failure fail-atomic
         instead of discovering it after the state was already replaced.
-        Floating-point destinations are accepted: rounding an fp64 python float
-        into an fp32/bf16 lr tensor is ordinary, pre-existing behavior that
-        matches the native path.
+        Floating-point (and complex) destinations are accepted: rounding an fp64
+        python float into an fp32/bf16 lr tensor is ordinary, pre-existing
+        behavior that matches the native path.
+
+        Range is checked alongside truncation because the two failures differ
+        only in which side of the commit they land on. An integral value that
+        overflows the destination (lr=128.0 into int8) makes ``fill_`` itself
+        raise -- but that raise happens after the state was swapped in, leaving
+        exactly the half-applied restore this check exists to prevent. Both are
+        rejected here, during staging, so neither can.
         """
         for key in _GROUP_HYPER_KEYS:
             current = group.get(key)
-            if not torch.is_tensor(current) or current.is_floating_point():
+            if (
+                not torch.is_tensor(current)
+                or current.is_floating_point()
+                or current.is_complex()
+            ):
                 continue
             value = entry[key]
             if float(value) != float(int(value)):
@@ -833,6 +844,32 @@ class GefenDCPState:
                         value,
                         current.dtype,
                         int(value),
+                        key,
+                    )
+                )
+            if current.dtype is torch.bool:
+                # A bool destination represents exactly {0, 1}, and torch.iinfo
+                # has no entry for it. It needs the range check most: bool is the
+                # one integral dtype whose fill_ never raises, so an out-of-range
+                # value would coerce to True and commit a silently wrong lr.
+                low, high = 0, 1
+            else:
+                info = torch.iinfo(current.dtype)
+                low, high = info.min, info.max
+            if not low <= int(value) <= high:
+                raise ValueError(
+                    "Gefen DCP checkpoint group {} restores {}={!r}, but this "
+                    "optimizer holds it in a {} tensor that cannot represent it "
+                    "(outside the representable range [{}, {}]). Rebuild the "
+                    "optimizer with a floating-point {} tensor (or a plain "
+                    "float) before resuming; refusing to commit a partially "
+                    "applied restore.".format(
+                        group_index,
+                        key,
+                        value,
+                        current.dtype,
+                        low,
+                        high,
                         key,
                     )
                 )

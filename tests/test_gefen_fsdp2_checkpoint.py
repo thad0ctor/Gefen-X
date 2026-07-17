@@ -6,6 +6,7 @@ import copy
 import os
 import queue
 import socket
+import time
 import traceback
 
 import pytest
@@ -15,6 +16,14 @@ import torch
 _CARRIER_PREFIX = "_gefen_rank_local_payload_"
 _MEMBER = "_gefen_rank_local_member"
 _FORMAT = "rank_local_dtensor_v2"
+
+# Overall budget for a healthy spawn+init+checkpoint round trip on a loaded CI
+# box. _DRAIN_POLL only sets how often the drain re-checks worker liveness, and
+# _DRAIN_FLUSH_GRACE how long a dead worker's traceback gets to cross the queue
+# before the drain gives up on it -- neither shortens the budget above.
+_DRAIN_TIMEOUT = 180
+_DRAIN_POLL = 0.5
+_DRAIN_FLUSH_GRACE = 5.0
 
 
 def _carrier_key(rank: int) -> str:
@@ -581,11 +590,34 @@ def test_full_dcp_handoff_is_exact_on_same_dtensor_topology(optimizer_kind):
     # success and reduced to an unexplained nonzero exit code.
     results = []
     terminated = []
+    deadline = time.monotonic() + _DRAIN_TIMEOUT
+    flush_deadline = None
     try:
-        for _ in processes:
-            results.append(result_queue.get(timeout=180))
-    except queue.Empty:
-        pass
+        while len(results) < len(processes):
+            try:
+                results.append(result_queue.get(timeout=_DRAIN_POLL))
+                continue
+            except queue.Empty:
+                pass
+            now = time.monotonic()
+            if now >= deadline:
+                break
+            # A worker that dies without reporting -- killed, or failing before it
+            # can put -- leaves its peers blocked in a collective, and get() alone
+            # cannot see it: the drain would burn the whole timeout to report a
+            # failure the exitcodes already prove. Only a NONZERO exit
+            # short-circuits; a worker that exits 0 has reported or is still
+            # flushing its queue feeder thread, so treating "exited" as failure
+            # would race a legitimate pass. Even a nonzero exit gets a grace
+            # period first, because the failing rank puts its traceback (the
+            # diagnosable part) immediately before exiting.
+            if any(
+                process.exitcode not in (None, 0) for process in processes
+            ):
+                if flush_deadline is None:
+                    flush_deadline = now + _DRAIN_FLUSH_GRACE
+                elif now >= flush_deadline:
+                    break
     finally:
         for process in processes:
             process.join(timeout=60)
@@ -598,8 +630,11 @@ def test_full_dcp_handoff_is_exact_on_same_dtensor_topology(optimizer_kind):
     assert not tracebacks, "distributed checkpoint worker raised:\n" + "\n".join(
         tracebacks
     )
+    # A worker that died before reporting has no traceback to show, so the
+    # exitcodes are the whole diagnosis: name them rather than calling every
+    # short-drain a timeout.
     assert len(results) == len(processes), (
-        "distributed checkpoint workers timed out: got {}/{} results, "
+        "distributed checkpoint workers did not all report: got {}/{} results, "
         "terminated={}, exitcodes={}".format(
             len(results), len(processes), terminated, [p.exitcode for p in processes]
         )
