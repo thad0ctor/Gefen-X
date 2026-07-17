@@ -1818,6 +1818,100 @@ def test_dcp_one_rank_layout_failure_aborts_every_rank_cleanly(tmp_path):
     assert "aborted before any rank proceeds" in by_rank[1]["error"], by_rank[1]
 
 
+def _divergent_layout_worker(rank, world, port, checkpoint_dir, result_queue):
+    try:
+        os.environ.update(
+            MASTER_ADDR="127.0.0.1",
+            MASTER_PORT=port,
+            RANK=str(rank),
+            WORLD_SIZE=str(world),
+        )
+        dist.init_process_group(
+            "gloo", rank=rank, world_size=world, timeout=timedelta(seconds=60)
+        )
+        mesh = init_device_mesh("cpu", (world,), mesh_dim_names=("dp",))
+        device = torch.device("cpu")
+        param = nn.Parameter(distribute_tensor(_global_param(), mesh, [Shard(0)]))
+        # DIFFERENT but individually-valid name for the same positional slot 0:
+        # rank 0 names it weight_a, rank 1 weight_b, same shape/group. Each passes
+        # its own _validate_layout, but both would publish slot_00000000.* and DCP
+        # would assemble one global tensor from two different parameters. Only a
+        # cross-rank identity comparison inside the sync region catches it.
+        name = "encoder.weight_a" if rank == 0 else "encoder.weight_b"
+        optimizer = Gefen(
+            [(name, param)], lr=2.5e-3, fused=False, factored_v_2d=False
+        )
+        for step in range(_SAVE_STEPS):
+            param.grad = distribute_tensor(_global_grad(step, device), mesh, [Shard(0)])
+            optimizer.step()
+        param.grad = None
+
+        raised = False
+        error = None
+        try:
+            torch.distributed.checkpoint.save(
+                {"optimizer": GefenDCPState(optimizer)},
+                storage_writer=FileSystemWriter(checkpoint_dir),
+            )
+        except Exception as exc:
+            raised = True
+            error = repr(exc)
+        result_queue.put({"rank": rank, "raised": raised, "error": error})
+    except BaseException:
+        result_queue.put({"rank": rank, "fatal_error": traceback.format_exc()})
+    finally:
+        if dist.is_available() and dist.is_initialized():
+            dist.destroy_process_group()
+
+
+def _run_divergent_layout(world, checkpoint_dir, timeout=_DRAIN_TIMEOUT):
+    context = mp.get_context("spawn")
+    result_queue = context.Queue()
+    port = _free_port()
+    processes = [
+        context.Process(
+            target=_divergent_layout_worker,
+            args=(rank, world, port, checkpoint_dir, result_queue),
+        )
+        for rank in range(world)
+    ]
+    for process in processes:
+        process.start()
+    results, terminated = _drain_workers(processes, result_queue, timeout)
+    assert len(results) == world, (
+        "DCP workers did not all report: got {}/{} results, terminated={}, "
+        "exitcodes={}".format(
+            len(results), world, terminated, [p.exitcode for p in processes]
+        )
+    )
+    assert all(p.exitcode == 0 or p.pid in terminated for p in processes), (
+        "worker exited nonzero (terminated={}): exitcodes={}".format(
+            terminated, [p.exitcode for p in processes]
+        )
+    )
+    return sorted(results, key=lambda item: item["rank"])
+
+
+@pytest.mark.skipif(
+    not dist.is_available() or not dist.is_gloo_available(),
+    reason="DCP resharding coverage requires Gloo",
+)
+def test_dcp_divergent_cross_rank_layout_aborts_every_rank(tmp_path):
+    # Per-rank _validate_layout cannot see two ranks holding DIFFERENT but each
+    # individually-valid layouts for the same positional slot (weight_a on rank 0,
+    # weight_b on rank 1). Both pass their own checks, neither sets local_error, so
+    # the boolean failure sync reports success and DCP silently merges two
+    # different parameters into one global tensor. The cross-rank identity digest
+    # comparison must reject the whole group instead. Every rank sees the same
+    # reduced verdict, so both raise the real cause -- no strand, no corruption.
+    checkpoint_dir = str(tmp_path / "gefen-dcp-divergent-layout")
+    results = _run_divergent_layout(2, checkpoint_dir)
+    assert all("fatal_error" not in item for item in results), results
+    for item in results:
+        assert item["raised"], item
+        assert "different parameter layouts" in item["error"], item
+
+
 # --- Finding 6: reject inconsistent initialization metadata/counters -------
 
 
@@ -2735,6 +2829,50 @@ def test_dcp_save_rejects_codebook_that_does_not_tile_the_shard(tmp_path):
     not dist.is_available() or not dist.is_gloo_available(),
     reason="DCP resharding coverage requires Gloo",
 )
+@pytest.mark.parametrize("bad", [float("nan"), float("inf")])
+def test_dcp_save_rejects_non_finite_block_state(tmp_path, bad):
+    # A NaN/Inf in the live block state passes the geometry preflight (shapes and
+    # dtypes are intact) but the deferred dense expansion writes it straight out,
+    # completing a checkpoint this adapter's own load side (torch.isfinite) later
+    # rejects -- an unloadable checkpoint. The preflight must catch it before the
+    # first byte, matching the fail-before-write contract.
+    _single_rank_group(tmp_path / "nonfinite-init")
+    try:
+        mesh = init_device_mesh("cpu", (1,), mesh_dim_names=("dp",))
+        param = _shaped_dparam(_SHAPE, mesh)
+        optimizer = Gefen(
+            [("weight", param)], lr=1e-3, fused=False, factored_v_2d=False
+        )
+        for step in range(_SAVE_STEPS):
+            param.grad = distribute_tensor(
+                _shaped_grad(_SHAPE, step), mesh, [Shard(0)]
+            )
+            optimizer.step()
+        param.grad = None
+
+        state = optimizer.state[param]
+        state["vmean"].reshape(-1)[0] = bad
+
+        with pytest.raises(ValueError, match="non-finite"):
+            GefenDCPState(optimizer).state_dict()
+
+        # ...and the save that would have consumed it stops before writing a byte.
+        checkpoint_dir = str(tmp_path / "nonfinite-ckpt")
+        with pytest.raises(ValueError, match="non-finite"):
+            torch.distributed.checkpoint.save(
+                {"optimizer": GefenDCPState(optimizer)},
+                storage_writer=FileSystemWriter(checkpoint_dir),
+                planner=GefenSavePlanner(),
+            )
+        assert not _has_checkpoint_bytes(checkpoint_dir)
+    finally:
+        dist.destroy_process_group()
+
+
+@pytest.mark.skipif(
+    not dist.is_available() or not dist.is_gloo_available(),
+    reason="DCP resharding coverage requires Gloo",
+)
 def test_dcp_rejects_one_name_shared_by_two_parameters(tmp_path):
     # A name has to identify a parameter by itself. The saved identity is
     # (name, group, shape) and the group is a positional index, so two
@@ -3295,6 +3433,85 @@ def test_dcp_accepts_low_precision_tensor_lr(tmp_path, dtype):
         assert optimizer.param_groups[0]["lr"] is live_lr
         assert not torch.isinf(live_lr).item()
         assert abs(float(live_lr) - 3e-5) < 1e-6, float(live_lr)
+    finally:
+        dist.destroy_process_group()
+
+
+@pytest.mark.skipif(
+    not dist.is_available() or not dist.is_gloo_available(),
+    reason="DCP resharding coverage requires Gloo",
+)
+def test_dcp_rejects_beta_that_rounds_up_to_one_before_commit(tmp_path):
+    # A valid beta near the excluded upper bound can ROUND onto it: 0.9999 into a
+    # float16 tensor becomes exactly 1.0. It neither overflows nor underflows, so
+    # the range checks pass and fill_ would commit beta=1.0 -- making the next
+    # step's bias correction 1 - beta**t zero and dividing by zero. Reject in
+    # staging, before the state swap.
+    _single_rank_group(tmp_path / "beta-round-init")
+    try:
+        mesh = init_device_mesh("cpu", (1,), mesh_dim_names=("dp",))
+        param = _shaped_dparam(_SHAPE, mesh)
+        optimizer = Gefen(
+            [("weight", param)],
+            lr=1e-3,
+            betas=(0.9, 0.9999),
+            fused=False,
+            factored_v_2d=False,
+        )
+        for step in range(_SAVE_STEPS):
+            param.grad = distribute_tensor(_shaped_grad(_SHAPE, step), mesh, [Shard(0)])
+            optimizer.step()
+        saved = GefenDCPState(optimizer).state_dict()
+        assert abs(saved["param_group_hypers"][0]["beta2"] - 0.9999) < 1e-6
+
+        # beta2=0.9999 is < 1 (so _validate_hyper_entry passes it), but casting it
+        # into this float16 tensor rounds it to exactly 1.0.
+        optimizer.param_groups[0]["beta2"] = torch.tensor(0.9, dtype=torch.float16)
+        state_before = _live_state_signature(optimizer, param)
+        hypers_before = _group_hyper_signature(optimizer)
+
+        with pytest.raises(ValueError, match="divide by zero"):
+            GefenDCPState(optimizer).load_state_dict(saved)
+
+        # Fail-atomic: rejected during staging, so nothing moved.
+        assert _live_state_signature(optimizer, param) == state_before
+        assert _group_hyper_signature(optimizer) == hypers_before
+        assert float(optimizer.param_groups[0]["beta2"]) < 1.0
+    finally:
+        dist.destroy_process_group()
+
+
+@pytest.mark.skipif(
+    not dist.is_available() or not dist.is_gloo_available(),
+    reason="DCP resharding coverage requires Gloo",
+)
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_dcp_accepts_normal_beta_into_low_precision_tensor(tmp_path, dtype):
+    # The upper-boundary check must NOT over-reject: an ordinary beta stays < 1
+    # after the cast (0.9 -> 0.8999.. in float16/bf16), so it restores in place,
+    # tensor identity preserved.
+    _single_rank_group(tmp_path / "beta-ok-init")
+    try:
+        mesh = init_device_mesh("cpu", (1,), mesh_dim_names=("dp",))
+        param = _shaped_dparam(_SHAPE, mesh)
+        optimizer = Gefen(
+            [("weight", param)],
+            lr=1e-3,
+            betas=(0.9, 0.9),
+            fused=False,
+            factored_v_2d=False,
+        )
+        for step in range(_SAVE_STEPS):
+            param.grad = distribute_tensor(_shaped_grad(_SHAPE, step), mesh, [Shard(0)])
+            optimizer.step()
+        saved = GefenDCPState(optimizer).state_dict()
+
+        live_beta2 = torch.tensor(0.0, dtype=dtype)
+        optimizer.param_groups[0]["beta2"] = live_beta2
+        GefenDCPState(optimizer).load_state_dict(saved)
+        assert optimizer.param_groups[0]["beta2"] is live_beta2
+        assert 0.0 <= float(live_beta2) < 1.0
+        assert abs(float(live_beta2) - 0.9) < 1e-2, float(live_beta2)
     finally:
         dist.destroy_process_group()
 

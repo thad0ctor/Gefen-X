@@ -145,6 +145,18 @@ def _validate_dense_geometry(optimizer, parameter, state) -> None:
         raise ValueError("Gefen momentum block geometry is invalid")
     if period < 1 or state["vmean"].reshape(-1).numel() * period != local_numel:
         raise ValueError("Gefen second-moment block geometry is invalid")
+    # The dense expansion casts codebook/m_magnitude/vmean through .float() and
+    # writes them straight out, so a NaN/Inf (or an fp64 value that overflows to
+    # inf under .float()) would complete a checkpoint this adapter's own load side
+    # rejects. isfinite on the COMPACT block state is cheap -- .float() is a no-op
+    # on the usual fp32 state, the dense form is never built here, and m_codebook
+    # is integral indices, always finite.
+    if not (
+        torch.isfinite(codebook.float()).all()
+        and torch.isfinite(state["m_magnitude"].float()).all()
+        and torch.isfinite(state["vmean"].float()).all()
+    ):
+        raise ValueError("Gefen optimizer state is non-finite; refusing to write")
 
 
 class _LazyDenseShard(torch.Tensor):
@@ -735,6 +747,55 @@ class GefenDCPState:
             for slot in self._slots
         ]
 
+    def _reject_divergent_layout_across_ranks(self, process_group):
+        """Reject ranks whose slot identity lists differ. **Collective.**
+
+        Per-rank ``_validate_layout`` cannot see that rank A's slot 0 and rank B's
+        slot 0 name DIFFERENT parameters of the same shape: each is individually
+        valid, yet both publish the same positional FQN, so DCP would assemble one
+        global tensor from two different parameters. Only a cross-rank comparison
+        catches it. Every rank hashes its identity list and the group agrees the
+        digests match; the reduced verdict is identical on every rank, so a lone
+        raise is impossible. Callers run this only after the healthy-path sync, so
+        every rank participates.
+        """
+        import torch.distributed as dist
+
+        if not dist.is_available() or not dist.is_initialized():
+            return
+        if dist.get_world_size(process_group) < 2:
+            return
+        import hashlib
+
+        from gefen.gefen import _step_failure_collective_device
+
+        canonical = repr(
+            [(d["name"], d["group"], tuple(d["shape"])) for d in self._identities()]
+        ).encode("utf-8")
+        digest = hashlib.sha256(canonical).digest()[:16]
+        words = [int.from_bytes(digest[i : i + 8], "big", signed=True) for i in (0, 8)]
+        # One collective: min of (words, -words) recovers a group-wide min and max
+        # (mirrors _synchronize_step_control_range). Equal iff every rank's digest
+        # matched -- a 128-bit collision is the only escape, negligible here.
+        packed = torch.tensor(
+            words + [-word for word in words],
+            dtype=torch.int64,
+            device=_step_failure_collective_device(process_group),
+        )
+        dist.all_reduce(packed, op=dist.ReduceOp.MIN, group=process_group)
+        values = packed.tolist()
+        mins = values[: len(words)]
+        maxs = [-value for value in values[len(words) :]]
+        if mins != maxs:
+            raise RuntimeError(
+                "Gefen DCP save aborted: ranks hold different parameter layouts "
+                "(name/group/shape) for the same positional slots, so DCP would "
+                "assemble one global tensor from different parameters. Every rank "
+                "must present an identical, identically-ordered named parameter "
+                "set for resharding; rebuild each rank's optimizer with the same "
+                "named parameters in the same group order."
+            )
+
     def _group_hypers(self):
         """Per-group hyperparameters (replicated, in group order).
 
@@ -883,6 +944,26 @@ class GefenDCPState:
                             group_index, key, value, current.dtype, key
                         )
                     )
+                # A beta near the excluded upper bound can ROUND onto it: 0.9999
+                # into float16 becomes exactly 1.0. That neither overflows nor
+                # underflows, so the checks above pass -- but the next step's bias
+                # correction 1 - beta**t is then 0 and divides by zero. Betas must
+                # stay in [0, 1) AFTER the destination cast; lr/eps/weight_decay
+                # carry no upper bound, so this is beta-only.
+                if key in ("beta1", "beta2"):
+                    cast = float(torch.tensor(float(value), dtype=current.dtype))
+                    if not 0.0 <= cast < 1.0:
+                        raise ValueError(
+                            "Gefen DCP checkpoint group {} restores {}={!r}, but "
+                            "this optimizer holds it in a {} tensor that rounds it "
+                            "to {}, outside the required half-open range [0, 1). A "
+                            "beta that casts to 1.0 makes the next bias correction "
+                            "1 - beta**t divide by zero. Rebuild the optimizer with "
+                            "a wider floating-point {} tensor (or a plain float) "
+                            "before resuming.".format(
+                                group_index, key, value, current.dtype, cast, key
+                            )
+                        )
                 continue
             if float(value) != float(int(value)):
                 raise ValueError(
@@ -1028,6 +1109,11 @@ class GefenDCPState:
                 "rank's optimizer state failed validation, so no rank continues "
                 "into the save or load."
             )
+        # Every rank passed its own layout validation, but two ranks can each hold
+        # a VALID yet DIFFERENT layout for the same positional slots. Only a
+        # cross-rank comparison catches that; run it here, where every healthy rank
+        # participates and sees the same reduced verdict.
+        self._reject_divergent_layout_across_ranks(dist.group.WORLD)
         return result
 
     def _build_state_dict(self):
