@@ -1856,6 +1856,77 @@ def test_dcp_save_peak_is_bounded_under_a_multi_threaded_writer(tmp_path):
 
 
 @pytest.mark.skipif(
+    not torch.cuda.is_available()
+    or not dist.is_available()
+    or not dist.is_gloo_available()
+    or not hasattr(torch.cuda, "host_memory_stats"),
+    # host_memory_stats lands after the 2.5.0 floor, and it is the only way to
+    # read page-locked bytes: cudaHostAlloc'd pages are not accounted in
+    # /proc VmLck or VmPin, so there is nothing to fall back to.
+    reason="page-locked accounting requires CUDA, Gloo, and torch.cuda.host_memory_stats",
+)
+def test_dcp_save_page_locks_one_slot_at_a_time(tmp_path):
+    # The writer decides how long it keeps what resolve_data returns, and torch's
+    # keeps every tensor it has written until it closes the file. So whatever the
+    # save hands back is held for the whole write, and handing back page-locked
+    # memory page-locks the entire dense state dict -- 8 bytes/param the host
+    # cannot swap, and cannot reclaim afterwards either, since the caching host
+    # allocator never returns blocks to the OS. Copies go through one reusable
+    # page-locked buffer instead and come back pageable, which keeps the
+    # page-locked high-water at a single slot's dense form.
+    #
+    # thread_count=8 rather than the default 1 because torch pins on its own at
+    # thread_count == 1: _OverlappingCpuLoader copies with
+    # `.to("cpu", non_blocking=True)`, whose destination is page-locked, so the
+    # measurement could not tell torch's page-locking from Gefen's. Above 1 torch
+    # uses _SerialCpuLoader, whose `.cpu()` is pageable and leaves this
+    # attributable to the save path alone.
+    _single_rank_group(tmp_path / "save-pinned-init")
+    try:
+        mesh = init_device_mesh("cuda", (1,), mesh_dim_names=("dp",))
+        slots = 8
+        shape = (2048, 1024)  # 2M params per slot; 16M total
+        named = [
+            ("w{}".format(index), _shaped_dparam(shape, mesh, device="cuda"))
+            for index in range(slots)
+        ]
+        optimizer = Gefen(
+            named, lr=1e-3, fused=False, factored_v_2d=False, deterministic=True
+        )
+        numel = sum(param.numel() for _, param in named)
+        for step in range(_SAVE_STEPS):
+            for _, param in named:
+                param.grad = distribute_tensor(
+                    _shaped_grad(shape, step).cuda(), mesh, [Shard(0)]
+                )
+            optimizer.step()
+        for _, param in named:
+            param.grad = None
+
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()
+        torch.cuda.reset_peak_host_memory_stats()
+        torch.distributed.checkpoint.save(
+            {"optimizer": GefenDCPState(optimizer)},
+            storage_writer=FileSystemWriter(
+                str(tmp_path / "save-pinned-ckpt"), thread_count=8
+            ),
+            planner=GefenSavePlanner(),
+        )
+        torch.cuda.synchronize()
+        pinned_peak = torch.cuda.host_memory_stats().get("allocated_bytes.peak", 0)
+        pinned_bytes_per_elem = pinned_peak / numel
+
+        # One slot's dense form is 4 bytes/param over that slot, which is 0.5
+        # bytes/param spread over this 8-slot model; page-locking every slot's
+        # instead is the full 8. The threshold separates the two regimes without
+        # pinning the exact staging buffer size.
+        assert pinned_bytes_per_elem < 4.0, pinned_bytes_per_elem
+    finally:
+        dist.destroy_process_group()
+
+
+@pytest.mark.skipif(
     not dist.is_available() or not dist.is_gloo_available(),
     reason="DCP resharding coverage requires Gloo",
 )
