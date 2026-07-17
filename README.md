@@ -153,7 +153,7 @@ Requires `factored_v_2d=False` and `capturable=False`.
 **`dcp.async_save` needs `GefenFileSystemWriter`.** Async save returns as soon as the state is staged and writes from a background thread, so it has to snapshot the state dict to CPU first. `GefenFileSystemWriter` is what stages Gefen's slots — expanding each one's dense form, copying it to CPU, and releasing it before the next — so training can resume immediately and the checkpoint still reflects the moment of the call.
 
 ```python
-future = dcp.async_save(
+response = dcp.async_save(
     state,
     storage_writer=GefenFileSystemWriter(path),
     planner=GefenSavePlanner(),
@@ -161,7 +161,9 @@ future = dcp.async_save(
 
 # ... keep training; the checkpoint holds the state as of the call above ...
 
-future.result()
+# torch 2.5 returns a bare Future; newer torch wraps it in an AsyncSaveResponse.
+# Waiting is what surfaces a background write failure.
+getattr(response, "upload_completion", response).result()
 ```
 
 **`GefenSavePlanner` is optional and recommended.** Resharding has to expand Gefen's compact state to dense fp32 to be portable across world sizes. Without the planner, every parameter's dense form is held for the whole write; with it, one is expanded at a time. On a 32-tensor model that is the difference between **8.25 and 0.50 bytes/param** of peak memory over the optimizer's resident state — enough that a model which trains fine could otherwise OOM while saving.
