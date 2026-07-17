@@ -24,6 +24,12 @@ _FORMAT = "rank_local_dtensor_v2"
 _DRAIN_TIMEOUT = 180
 _DRAIN_POLL = 0.5
 _DRAIN_FLUSH_GRACE = 5.0
+# Reaping budgets, shared across workers rather than spent per worker, so the
+# world size cannot multiply them into a longer wall clock than _DRAIN_TIMEOUT
+# suggests. _REAP_GRACE lets reported workers exit on their own; _TERMINATE_GRACE
+# is how long a SIGTERMed straggler gets before we stop caring.
+_REAP_GRACE = 10.0
+_TERMINATE_GRACE = 10.0
 
 
 def _carrier_key(rank: int) -> str:
@@ -619,13 +625,23 @@ def test_full_dcp_handoff_is_exact_on_same_dtensor_topology(optimizer_kind):
                 elif now >= flush_deadline:
                     break
     finally:
+        # One shared budget, not one per worker. A per-worker join multiplies the
+        # wait by the world size, so two hung ranks turned a 180s drain into ~300s
+        # of CI and made _DRAIN_TIMEOUT not the overall budget it advertises. By
+        # the time we get here either every worker reported -- in which case they
+        # exit promptly -- or the drain already spent its whole deadline on
+        # workers that are not going to report, and waiting longer buys nothing.
+        reap_deadline = time.monotonic() + _REAP_GRACE
         for process in processes:
-            process.join(timeout=60)
+            process.join(timeout=max(0.0, reap_deadline - time.monotonic()))
+        # Signal every straggler before joining any of them, so the terminate
+        # grace is shared too rather than paid once per worker.
         for process in processes:
             if process.is_alive():
                 terminated.append(process.pid)
                 process.terminate()
-                process.join(timeout=10)
+        for process in processes:
+            process.join(timeout=_TERMINATE_GRACE)
     tracebacks = [item["traceback"] for item in results if "traceback" in item]
     assert not tracebacks, "distributed checkpoint worker raised:\n" + "\n".join(
         tracebacks

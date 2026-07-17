@@ -1732,11 +1732,15 @@ class GefenFileSystemWriter(FileSystemWriter):
     Pass this to ``torch.distributed.checkpoint.async_save`` whenever the state
     dict contains a :class:`GefenDCPState`::
 
-        dcp.async_save(
+        response = dcp.async_save(
             {"model": model, "optimizer": GefenDCPState(optimizer)},
             storage_writer=GefenFileSystemWriter(path),
             planner=GefenSavePlanner(),
         )
+        # ... training continues ...
+        # torch 2.5 returns a bare Future; newer torch wraps it in an
+        # AsyncSaveResponse. Waiting is what surfaces a background write failure.
+        getattr(response, "upload_completion", response).result()
 
     ``async_save`` returns once the state dict has been *staged* -- copied to the
     CPU -- and writes it from a background thread, so training may resume

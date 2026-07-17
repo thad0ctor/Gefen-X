@@ -142,13 +142,15 @@ That bound is on GPU memory. Host memory during a save belongs to the writer, an
 ```python
 from gefen import GefenFileSystemWriter
 
-future = dcp.async_save(
+response = dcp.async_save(
     {"model": model, "optimizer": GefenDCPState(optimizer)},
     storage_writer=GefenFileSystemWriter(path),
     planner=GefenSavePlanner(),
 )
 # ... training continues ...
-future.result()
+# torch 2.5 returns a bare Future; newer torch wraps it in an AsyncSaveResponse.
+# Waiting is what surfaces a background write failure.
+getattr(response, "upload_completion", response).result()
 ```
 
 Async save returns once the state dict has been *staged* — copied to CPU — and writes it from a background thread, which is what lets training resume against a checkpoint that still reflects the moment of the call. `GefenFileSystemWriter` stages Gefen's slots one at a time: it expands a slot's dense form, copies it to CPU, and releases it before expanding the next, so the device holds one slot's dense form during staging rather than every slot's at once. On the 32-tensor model above that is a **0.50 bytes/param** GPU peak over the optimizer's resident state — the same bound `GefenSavePlanner` gives the synchronous save. CPU RAM holds the full dense snapshot for the duration of the write, which is what async staging costs for any optimizer. Everything that is not Gefen optimizer state is staged by `FileSystemWriter` unchanged.
