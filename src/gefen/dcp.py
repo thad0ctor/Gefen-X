@@ -936,10 +936,77 @@ class GefenDCPState:
         return True
 
     def state_dict(self):
+        """Build the checkpoint dict for this rank. **Collective.**
+
+        Every rank in the default process group must call this together, and no
+        rank may call it alone -- this is a collective, like ``load_state_dict``.
+        ``dcp.save`` and ``dcp.load`` both satisfy that (each calls it on every
+        rank when converting Stateful objects), so the documented usage needs no
+        care; a lone rank-0 call with a multi-rank group initialized will block in
+        the agreement collective below.
+
+        That contract is the price of the alternative. The checks below read
+        rank-local state -- the live codebook, each slot's block geometry, its
+        counters -- so they can fail on ONE rank while the others pass, and
+        ``dcp.save`` runs this while converting Stateful objects, BEFORE it enters
+        its own planning collectives. A bare raise here therefore drops the
+        failing rank out while its peers walk into collectives it will never join:
+        a silent, indefinite hang on the main save path. Agreeing on failure
+        across the group first converts that into a clean group-wide abort, the
+        same trade load_state_dict already makes.
+
+        The cost is narrow: a lone rank-0 call is not a use this object supports
+        anyway. The dict it returns holds _LazyDenseShard stand-ins that carry no
+        data, cannot be pickled, and resolve only through DCP's save/load
+        protocol, so inspecting it outside a collective save/load yields nothing
+        usable. Use the optimizer's own state_dict() for an ordinary dict.
+
+        Making the collective conditional was considered and rejected: a rank
+        cannot detect locally whether its peers are also calling (any probe for
+        that is itself a collective), so there is no safe no-op to fall back to.
+        """
         # Re-derive the slot layout (and re-run the fail-closed layout gate) so a
         # retained wrapper whose optimizer gained parameters via add_param_group
         # after construction saves the current set, not the stale snapshot.
+        #
+        # Deliberately OUTSIDE the synchronized region below, mirroring
+        # load_state_dict: every check it makes is replicated (group topology,
+        # parameter names, DTensor placements, global shapes, constructor flags),
+        # so it fails on every rank together or none. It also has to run first --
+        # it is what establishes that a process group exists at all, without which
+        # the agreement collective could not run.
         self._slots = self._validate_layout()
+
+        import torch.distributed as dist
+
+        from gefen.gefen import _synchronize_step_failure
+
+        local_error = None
+        result = None
+        try:
+            result = self._build_state_dict()
+        except Exception as exc:  # resynchronized across the group below
+            local_error = exc
+        # Agree across the group before any rank returns, so a one-rank failure
+        # aborts every rank instead of stranding the healthy ones in the planning
+        # collectives that follow. Same scope and rationale as the load path: the
+        # plain-Gefen DTensors live on the default world (validated above), and
+        # _synchronize_step_failure keeps the flag on CPU for gloo/CPU-resident
+        # state and no-ops for a single-rank group.
+        if _synchronize_step_failure(local_error is not None, dist.group.WORLD):
+            if local_error is not None:
+                raise local_error
+            # Deliberately neutral about save vs load: dcp.load calls state_dict()
+            # too, to build its destination.
+            raise RuntimeError(
+                "Gefen DCP state_dict aborted before any rank proceeds: another "
+                "rank's optimizer state failed validation, so no rank continues "
+                "into the save or load."
+            )
+        return result
+
+    def _build_state_dict(self):
+        """Rank-local half of :meth:`state_dict`; every raise here is synchronized."""
         result = {
             "format_version": torch.tensor(_FORMAT_VERSION, dtype=torch.int64),
             "global_step": torch.tensor(
@@ -1284,7 +1351,39 @@ class GefenSavePlanner(DefaultSavePlanner):
     them to do anyway -- but it costs the same 8 bytes/param the eager
     implementation did. Everything that is not a Gefen stand-in (the model, other
     Stateful items) is handled entirely by ``DefaultSavePlanner``.
+
+    ``flatten_state_dict=False`` (inherited from ``DefaultSavePlanner``) is
+    rejected -- see :meth:`__init__`.
     """
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        # Rejected up front rather than at write time, where it surfaces as an
+        # opaque "stand-in cannot be pickled" TypeError from deep inside the
+        # writer, after the save has already begun.
+        #
+        # This is a GefenDCPState constraint, not merely this planner's: DCP only
+        # descends into a nested mapping when it flattens it. Unflattened, the
+        # whole {"optimizer": ...} mapping becomes a SINGLE BYTE_IO write item
+        # that DCP pickles wholesale -- the per-slot write items the stand-ins
+        # publish via __create_write_items__ are never created, so there is
+        # nothing for resolve_data to intercept and the stand-ins are pickled
+        # instead (they carry no data of their own and refuse). Teaching this
+        # planner to walk the nested mapping could not fix that: the write items
+        # do not exist to be resolved. DefaultSavePlanner(flatten_state_dict=
+        # False) fails the same way for the same reason; this constructor can only
+        # police the planner Gefen owns.
+        if not self.flatten_state_dict:
+            raise ValueError(
+                "GefenSavePlanner requires flatten_state_dict=True (the default), "
+                "but got flatten_state_dict=False. A GefenDCPState hands DCP "
+                "zero-storage stand-ins that are addressed by their flattened "
+                "dotted FQN; without flattening DCP never creates their write "
+                "items and pickles the whole optimizer mapping instead, which a "
+                "stand-in cannot satisfy. Save a GefenDCPState with a flattened "
+                "state dict, or use the optimizer's native state_dict() if you "
+                "need an unflattened layout."
+            )
 
     def resolve_data(self, write_item):
         # Deliberately NOT via lookup_object(): that resolves through

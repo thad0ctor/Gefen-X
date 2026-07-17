@@ -210,9 +210,21 @@ GEFEN_CODEBOOK_SEARCH_CHUNK = 1 << 23
 # passed unnamed (``group_<gi>_param_<pi>`` for a multi-param group, ``param_<n>``
 # for an implicit/single group). Such a name encodes registration order, not
 # stable identity. Matching this pattern is NOT proof Gefen generated the name --
-# a caller may declare a real parameter called "param_0" -- so it is only used to
-# classify a name of unknown provenance; see _param_name_is_synthesized.
+# a caller may declare a real parameter called "param_0" -- and NOT matching it is
+# not proof Gefen did not: a collision-suffixed "weight_1" is just as positional.
+# The spelling therefore decides nothing on its own; provenance is recorded at
+# registration and carried through checkpoints (see _SYNTHESIZED_PARAM_NAMES_KEY).
+# This pattern is only a last-resort guess for a parameter that has neither, which
+# no registered parameter can be; see _param_name_is_synthesized.
 _SYNTHESIZED_PARAM_NAME_RE = re.compile(r"^(group_\d+_param_\d+|param_\d+)$")
+
+# Serialized mirror of the registration-time provenance flags, parallel to a
+# group's "param_names" (see Gefen.add_param_group). Provenance cannot be
+# recovered from a name's spelling -- a positional collision name like
+# "weight_1" is indistinguishable from a caller's own "layer_1" -- so it travels
+# WITH the name through a checkpoint instead. Additive: a checkpoint written
+# before this key existed simply lacks it, and load treats that as unknowable.
+_SYNTHESIZED_PARAM_NAMES_KEY = "param_names_synthesized"
 
 
 # Dequantize the stored uint8 indices into codebook coefficients in element
@@ -1304,10 +1316,13 @@ class Gefen(torch.optim.Optimizer):
         Recorded at registration (``add_param_group``), where the distinction is
         known for certain, rather than inferred from the name's spelling: the
         synthesized forms are ordinary identifiers a caller may legitimately use
-        for a real parameter. Falls back to the spelling only for a parameter with
-        no registration record, or one renamed after registration (a legacy
-        checkpoint migration synthesizes positional names of the same shape), so
-        an unknown-provenance name stays conservatively rejected.
+        for a real parameter. A native load re-establishes the flag from the
+        checkpoint's own provenance (``_sync_param_names_to_state``), so a rename
+        cannot launder a positional name into a caller-provided one.
+
+        The spelling fallback covers only a parameter with no registration record
+        at all -- every parameter in a param group has one, from either of those
+        two paths -- and stays as a last-resort conservative check.
         """
         if param in self._synthesized_param_names:
             return self._synthesized_param_names[param]
@@ -1332,6 +1347,32 @@ class Gefen(torch.optim.Optimizer):
         return "{}_{}".format(name, suffix)
 
     def _sync_param_names_to_state(self) -> None:
+        """Re-derive per-parameter names and their provenance after a native load.
+
+        Provenance (did Gefen synthesize this name positionally?) decides whether
+        GefenDCPState will reshard against the name, so a load that CHANGES a
+        name must re-establish it rather than inherit the live optimizer's stale
+        flag. Three cases, in order:
+
+        1. The name is unchanged -- keep the registration-time flag, which is
+           authoritative for a name this optimizer assigned itself.
+        2. The name changed and the checkpoint carried provenance -- use it. The
+           flag describes the name, and the name came from the checkpoint, so
+           they travel together and stay exact across a rename.
+        3. The name changed and the checkpoint carried no provenance (written
+           before the key existed) -- fail closed: mark it synthesized.
+
+        Case 3 must NOT fall back to the name's spelling. A checkpoint from two
+        unnamed single-parameter groups both called "weight" holds the positional
+        collision result "weight"/"weight_1"; no regex can separate that from a
+        caller's legitimate "layer_1", so a spelling check silently accepts
+        "weight_1" as caller-provided and lets DCP reshard against an identity
+        that depends on registration order -- cross-assigning momentum between the
+        colliding parameters on a reload. The cost of failing closed is that a
+        legacy checkpoint whose names legitimately changed is refused for
+        resharding until it is re-saved with provenance; that is recoverable,
+        cross-assigned momentum is not.
+        """
         previous_names = self._param_names
         previous_flags = self._synthesized_param_names
         self._param_names = {}
@@ -1341,24 +1382,30 @@ class Gefen(torch.optim.Optimizer):
             names = list(group.get("param_names", ()))
             if len(names) != len(params):
                 names = [self._param_name(p) for p in params]
+            # A short/absent/malformed list is unusable rather than partially
+            # trusted: provenance is positional against param_names, so a
+            # length mismatch means we cannot say which flag describes which name.
+            checkpoint_flags = group.get(_SYNTHESIZED_PARAM_NAMES_KEY)
+            if not isinstance(checkpoint_flags, (list, tuple)) or len(
+                checkpoint_flags
+            ) != len(params):
+                checkpoint_flags = None
             normalized_names = []
-            for param, name in zip(params, names):
+            for index, (param, name) in enumerate(zip(params, names)):
                 name = str(name).lower()
                 normalized_names.append(name)
                 self._param_names[param] = name
-                # Carry the registration-time provenance for a parameter whose
-                # name is unchanged. A name that arrived from somewhere else (a
-                # legacy checkpoint migration renames single-param groups
-                # positionally) has no recorded provenance, so fall back to the
-                # conservative spelling check rather than inheriting a stale flag.
                 if param in previous_flags and previous_names.get(param) == name:
                     synthesized_flags[param] = previous_flags[param]
+                elif checkpoint_flags is not None:
+                    synthesized_flags[param] = bool(checkpoint_flags[index])
                 else:
-                    synthesized_flags[param] = bool(
-                        _SYNTHESIZED_PARAM_NAME_RE.match(name)
-                    )
+                    synthesized_flags[param] = True
                 self.state[param]["name"] = name
             group["param_names"] = normalized_names
+            group[_SYNTHESIZED_PARAM_NAMES_KEY] = [
+                synthesized_flags[param] for param in params
+            ]
         self._synthesized_param_names = synthesized_flags
 
     def add_param_group(self, param_group):
@@ -1409,6 +1456,7 @@ class Gefen(torch.optim.Optimizer):
             "eps",
             "weight_decay",
             "param_names",
+            _SYNTHESIZED_PARAM_NAMES_KEY,
             "_gefen_implicit_group",
         )
         extra = {k: v for k, v in param_group.items() if k not in consumed}
@@ -1487,6 +1535,10 @@ class Gefen(torch.optim.Optimizer):
             {
                 "params": params,
                 "param_names": param_names,
+                # Mirrored into the public group (like param_names) so
+                # Optimizer.state_dict carries provenance to the checkpoint
+                # alongside the names it describes.
+                _SYNTHESIZED_PARAM_NAMES_KEY: synthesized_flags,
                 "lr": group_lr,
                 "beta1": group_betas[0],
                 "beta2": group_betas[1],
@@ -4712,7 +4764,11 @@ class Gefen(torch.optim.Optimizer):
 
         packed_groups = []
         cursor = 0
-        ignored = {"params", "name", "param_names"}
+        # Provenance is dropped with the names it describes: packing rewrites the
+        # names positionally from the legacy groups, so a flag saved against the
+        # OLD one-param-per-group layout does not describe the packed name. Absent
+        # here means unknowable, which _sync_param_names_to_state fails closed on.
+        ignored = {"params", "name", "param_names", _SYNTHESIZED_PARAM_NAMES_KEY}
         for live_group, size in zip(self.param_groups, live_sizes):
             chunk = saved_groups[cursor : cursor + size]
             cursor += size

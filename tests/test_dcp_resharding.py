@@ -1278,6 +1278,35 @@ def _fail_sync_worker(
             result_queue.put({"rank": rank, "saved": True})
             return
 
+        if mode == "save_fail":
+            # Malform ONE rank's rank-local state, then save. state_dict() runs
+            # while dcp.save is still converting Stateful objects -- before its
+            # planning collectives -- so an unsynchronized raise here drops rank 0
+            # out while rank 1 walks into collectives rank 0 will never join.
+            for step in range(_SAVE_STEPS):
+                _step(parameter, optimizer, mesh, step, device)
+            if rank == 0:
+                if failure == "geometry":
+                    # Block geometry that no longer tiles the local shard.
+                    state = optimizer.state[parameter]
+                    state["m_magnitude"] = state["m_magnitude"][:-1].clone()
+                else:
+                    optimizer._gefen_codebook = None
+            raised = False
+            error = None
+            try:
+                torch.distributed.checkpoint.save(
+                    {"optimizer": GefenDCPState(optimizer)},
+                    storage_writer=FileSystemWriter(checkpoint_dir),
+                )
+            except Exception as exc:
+                raised = True
+                # Keep the message: "some rank raised" is not the claim under
+                # test -- WHICH error, on WHICH rank, is.
+                error = repr(exc)
+            result_queue.put({"rank": rank, "raised": raised, "error": error})
+            return
+
         # Give the live optimizer real state, then inject a one-rank re-block
         # failure. The cross-rank success sync must make EVERY rank raise and
         # leave EVERY rank's live state untouched (fail-atomic, no partial
@@ -1415,6 +1444,45 @@ def test_dcp_one_rank_validation_failure_aborts_every_rank_cleanly(tmp_path):
     assert "cannot represent it" in by_rank[0]["error"], by_rank[0]
     # ...and its peer gets the group-wide abort, not a transport-level symptom.
     assert "aborted before commit" in by_rank[1]["error"], by_rank[1]
+
+
+@pytest.mark.skipif(
+    not dist.is_available() or not dist.is_gloo_available(),
+    reason="DCP resharding coverage requires Gloo",
+)
+@pytest.mark.parametrize("failure", ["codebook", "geometry"])
+def test_dcp_one_rank_save_validation_failure_aborts_every_rank_cleanly(
+    tmp_path, failure
+):
+    # The SAVE mirror of the load-side test above. state_dict()'s checks read
+    # rank-local state (the live codebook, each slot's block geometry), so they
+    # can fail on one rank and pass on the others -- and dcp.save calls
+    # state_dict() while converting Stateful objects, BEFORE entering its own
+    # planning collectives. Unsynchronized, rank 0 raises and leaves; rank 1
+    # proceeds into planning collectives that rank 0 will never join.
+    #
+    # Asserting only "every rank raised" does NOT catch that. Unsynchronized,
+    # rank 1 still raises here -- but with
+    #   RuntimeError(gloo ... Connection closed by peer)
+    # because this worker's `finally` tears rank 0's process group down on the
+    # way out. That teardown is an artifact of the test, not a guarantee: a
+    # training loop that catches the error and keeps its group alive leaves the
+    # peers blocked in the collective instead. So pin WHICH error each rank gets.
+    checkpoint_dir = str(tmp_path / "gefen-dcp-save-fail-sync")
+    saved = _run_fail_sync(2, checkpoint_dir, "save_fail", timeout=90, failure=failure)
+    assert all("fatal_error" not in item for item in saved), saved
+    for item in saved:
+        assert item["raised"], item
+    by_rank = {item["rank"]: item for item in saved}
+    # The rank that actually holds the malformed state reports the real cause...
+    expected = (
+        "requires an initialized codebook"
+        if failure == "codebook"
+        else "block geometry is invalid"
+    )
+    assert expected in by_rank[0]["error"], by_rank[0]
+    # ...and its peer gets the group-wide abort, not a transport-level symptom.
+    assert "aborted before any rank proceeds" in by_rank[1]["error"], by_rank[1]
 
 
 # --- Finding 6: reject inconsistent initialization metadata/counters -------
@@ -1789,6 +1857,30 @@ def test_dcp_save_without_planner_is_still_correct(tmp_path):
             assert torch.equal(left, right), (left - right).abs().max()
     finally:
         dist.destroy_process_group()
+
+
+def test_dcp_save_planner_rejects_unflattened_state_dict():
+    # flatten_state_dict is a public DefaultSavePlanner option GefenSavePlanner
+    # inherits, but a GefenDCPState cannot be saved without flattening: DCP only
+    # descends into a nested mapping when it flattens it, so unflattened the whole
+    # {"optimizer": ...} mapping becomes ONE BYTE_IO write item that DCP pickles
+    # wholesale. The stand-ins' own write items are never created, and pickling
+    # reaches _LazyDenseShard.__reduce_ex__, which refuses. Reject at construction
+    # rather than let that surface as an opaque TypeError mid-write.
+    with pytest.raises(ValueError) as excinfo:
+        GefenSavePlanner(flatten_state_dict=False)
+    message = str(excinfo.value)
+    # The error has to name the real constraint, not just restate the flag.
+    assert "flatten_state_dict=True" in message, message
+    assert "stand-in" in message, message
+
+    # Positional passing is the same option and must be rejected identically.
+    with pytest.raises(ValueError):
+        GefenSavePlanner(False)
+
+    # The default, and an explicit True, must both still construct.
+    assert GefenSavePlanner().flatten_state_dict is True
+    assert GefenSavePlanner(flatten_state_dict=True).flatten_state_dict is True
 
 
 def _has_checkpoint_bytes(checkpoint_dir):
@@ -2343,6 +2435,163 @@ def test_dcp_rejects_collision_suffixed_group_name(tmp_path):
         assert optimizer._param_name_is_synthesized(second)
         with pytest.raises(RuntimeError, match="synthesized"):
             GefenDCPState(optimizer)
+    finally:
+        dist.destroy_process_group()
+
+
+def _named_pair(names, make_param):
+    first = make_param()
+    second = make_param()
+    optimizer = Gefen(
+        [
+            {"params": [first], "name": names[0]},
+            {"params": [second], "name": names[1]},
+        ],
+        lr=1e-3,
+        fused=False,
+        factored_v_2d=False,
+    )
+    return first, second, optimizer
+
+
+def _rename_source_checkpoint(shape):
+    """A checkpoint whose two colliding groups spell out "weight"/"weight_1".
+
+    Saved from PLAIN (non-DTensor) parameters on purpose: that is the path a
+    rename can actually travel. A checkpoint saved from DTensor parameters
+    carries a rank-local topology marker, and load rejects any rename against it
+    ("topology differs") long before provenance is consulted. Without that marker
+    -- a single-device run whose checkpoint is being resumed into a sharded one,
+    which is exactly when a caller then reaches for DCP resharding -- the rename
+    goes through and provenance is all that stands between the checkpoint and a
+    cross-assigned reshard.
+    """
+    _, _, source = _named_pair(
+        ("weight", "weight"), lambda: nn.Parameter(torch.randn(*shape))
+    )
+    assert [group["param_names"] for group in source.param_groups] == [
+        ["weight"],
+        ["weight_1"],
+    ]
+    return source.state_dict()
+
+
+@pytest.mark.skipif(
+    not dist.is_available() or not dist.is_gloo_available(),
+    reason="DCP resharding coverage requires Gloo",
+)
+def test_native_load_rename_preserves_collision_provenance(tmp_path):
+    # A native load that CHANGES a live parameter's name drops the flag recorded
+    # at registration -- that flag describes the OLD name. Provenance therefore
+    # travels with the name, in the checkpoint.
+    #
+    # Without it, this is silent momentum cross-assignment: a checkpoint from two
+    # unnamed single-parameter groups both called "weight" holds the positional
+    # collision result "weight"/"weight_1"; loaded into an optimizer named
+    # alpha/beta, neither new name matches the group_N_param_N / param_N spelling,
+    # so both are taken as caller-provided. GefenDCPState then accepts "weight_1"
+    # as a stable identity, and a later DCP load with the colliding groups
+    # reconstructed in the other order validates cleanly while handing each
+    # parameter the other's momentum. Widening the spelling regex cannot fix this:
+    # no regex separates a positional "weight_1" from a legitimate "layer_1".
+    _single_rank_group(tmp_path / "rename-provenance-init")
+    try:
+        mesh = init_device_mesh("cpu", (1,), mesh_dim_names=("dp",))
+        shape = (128, 64)
+        checkpoint = _rename_source_checkpoint(shape)
+
+        # The target's own names are legitimate and caller-provided...
+        alpha, beta, target = _named_pair(
+            ("alpha", "beta"), lambda: _shaped_dparam(shape, mesh)
+        )
+        assert not target._param_name_is_synthesized(alpha)
+        assert not target._param_name_is_synthesized(beta)
+
+        # ...until the checkpoint renames them to the colliding pair.
+        target.load_state_dict(checkpoint)
+        assert [group["param_names"] for group in target.param_groups] == [
+            ["weight"],
+            ["weight_1"],
+        ]
+        # Provenance is restored exactly, not guessed: "weight" was the caller's
+        # own group name and stays resharding-safe; only the order-dependent
+        # "weight_1" is refused.
+        assert not target._param_name_is_synthesized(alpha)
+        assert target._param_name_is_synthesized(beta)
+        with pytest.raises(RuntimeError, match="synthesized"):
+            GefenDCPState(target)
+    finally:
+        dist.destroy_process_group()
+
+
+@pytest.mark.skipif(
+    not dist.is_available() or not dist.is_gloo_available(),
+    reason="DCP resharding coverage requires Gloo",
+)
+def test_native_load_rename_without_provenance_fails_closed(tmp_path):
+    # A checkpoint written before provenance was serialized carries names but no
+    # flags. Their provenance is then genuinely unknowable, and the old spelling
+    # fallback is exactly the hole above -- so fail closed instead: a refused
+    # reshard is recoverable (re-save the checkpoint), cross-assigned momentum is
+    # not. The cost is narrow, and bounded by the companion test below: only a
+    # legacy checkpoint that also CHANGES a name is affected.
+    _single_rank_group(tmp_path / "legacy-provenance-init")
+    try:
+        from gefen.gefen import _SYNTHESIZED_PARAM_NAMES_KEY
+
+        mesh = init_device_mesh("cpu", (1,), mesh_dim_names=("dp",))
+        shape = (128, 64)
+        checkpoint = _rename_source_checkpoint(shape)
+        for group in checkpoint["param_groups"]:
+            group.pop(_SYNTHESIZED_PARAM_NAMES_KEY, None)
+
+        alpha, beta, target = _named_pair(
+            ("alpha", "beta"), lambda: _shaped_dparam(shape, mesh)
+        )
+        target.load_state_dict(checkpoint)
+        # Both renamed names are unknowable, so both are refused -- including
+        # "weight", which really was caller-provided. That over-refusal is the
+        # deliberate price of a legacy checkpoint carrying no provenance.
+        assert target._param_name_is_synthesized(alpha)
+        assert target._param_name_is_synthesized(beta)
+        with pytest.raises(RuntimeError, match="synthesized"):
+            GefenDCPState(target)
+    finally:
+        dist.destroy_process_group()
+
+
+@pytest.mark.skipif(
+    not dist.is_available() or not dist.is_gloo_available(),
+    reason="DCP resharding coverage requires Gloo",
+)
+def test_legacy_load_without_rename_keeps_registration_provenance(tmp_path):
+    # The bound on the fail-closed rule above: it triggers on a CHANGED name, not
+    # on a missing provenance key. A legacy checkpoint loaded into an optimizer
+    # with the same names leaves every name exactly where registration put it, so
+    # the registration-time flags remain authoritative and resharding still works.
+    _single_rank_group(tmp_path / "legacy-no-rename-init")
+    try:
+        from gefen.gefen import _SYNTHESIZED_PARAM_NAMES_KEY
+
+        mesh = init_device_mesh("cpu", (1,), mesh_dim_names=("dp",))
+        shape = (128, 64)
+        _, _, source = _named_pair(
+            ("encoder", "decoder"), lambda: nn.Parameter(torch.randn(*shape))
+        )
+        checkpoint = source.state_dict()
+        for group in checkpoint["param_groups"]:
+            group.pop(_SYNTHESIZED_PARAM_NAMES_KEY, None)
+
+        target_first, target_second, target = _named_pair(
+            ("encoder", "decoder"), lambda: _shaped_dparam(shape, mesh)
+        )
+        target.load_state_dict(checkpoint)
+        assert not target._param_name_is_synthesized(target_first)
+        assert not target._param_name_is_synthesized(target_second)
+        assert [slot.name for slot in GefenDCPState(target)._slots] == [
+            "encoder",
+            "decoder",
+        ]
     finally:
         dist.destroy_process_group()
 
