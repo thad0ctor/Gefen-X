@@ -6,6 +6,7 @@ import copy
 import os
 import queue
 import socket
+import time
 import traceback
 
 import pytest
@@ -15,6 +16,20 @@ import torch
 _CARRIER_PREFIX = "_gefen_rank_local_payload_"
 _MEMBER = "_gefen_rank_local_member"
 _FORMAT = "rank_local_dtensor_v2"
+
+# Overall budget for a healthy spawn+init+checkpoint round trip on a loaded CI
+# box. _DRAIN_POLL only sets how often the drain re-checks worker liveness, and
+# _DRAIN_FLUSH_GRACE how long a dead worker's traceback gets to cross the queue
+# before the drain gives up on it -- neither shortens the budget above.
+_DRAIN_TIMEOUT = 180
+_DRAIN_POLL = 0.5
+_DRAIN_FLUSH_GRACE = 5.0
+# Reaping budgets, shared across workers rather than spent per worker, so the
+# world size cannot multiply them into a longer wall clock than _DRAIN_TIMEOUT
+# suggests. _REAP_GRACE lets reported workers exit on their own; _TERMINATE_GRACE
+# is how long a SIGTERMed straggler gets before we stop caring.
+_REAP_GRACE = 10.0
+_TERMINATE_GRACE = 10.0
 
 
 def _carrier_key(rank: int) -> str:
@@ -141,8 +156,11 @@ def _worker(
     os.environ["MASTER_PORT"] = port
     os.environ["RANK"] = str(rank)
     os.environ["WORLD_SIZE"] = str(world)
-    dist.init_process_group("gloo", rank=rank, world_size=world)
     try:
+        # Init inside the try: a rendezvous/init failure -- a real possibility on
+        # a loaded CI runner -- must surface its traceback, not merely exit
+        # nonzero with no explanation.
+        dist.init_process_group("gloo", rank=rank, world_size=world)
         mesh = init_device_mesh("cpu", (world,), mesh_dim_names=("dp",))
 
         def make_model(full_values):
@@ -539,13 +557,19 @@ def _worker(
                 **rejection_checks,
             },
         )
-        if rank == 0:
-            result_queue.put(rank_checks)
+        # Every rank reports. Previously only rank 0 put a result, so a failure
+        # on any other rank was invisible: the parent took rank 0's success off
+        # the queue and left the failing rank's traceback unread, surfacing the
+        # whole thing as a bare nonzero exit code.
+        result_queue.put(
+            {"rank": rank, "checks": rank_checks if rank == 0 else None}
+        )
     except BaseException:
         result_queue.put({"rank": rank, "traceback": traceback.format_exc()})
         raise
     finally:
-        dist.destroy_process_group()
+        if dist.is_initialized():
+            dist.destroy_process_group()
 
 
 @pytest.mark.skipif(
@@ -567,18 +591,78 @@ def test_full_dcp_handoff_is_exact_on_same_dtensor_topology(optimizer_kind):
     ]
     for process in processes:
         process.start()
+    # Drain one result per rank: every worker reports, so a failure on a non-zero
+    # rank surfaces its traceback here instead of being masked by rank 0's
+    # success and reduced to an unexplained nonzero exit code.
+    results = []
+    terminated = []
+    deadline = time.monotonic() + _DRAIN_TIMEOUT
+    flush_deadline = None
     try:
-        rank_checks = result_queue.get(timeout=180)
-    except queue.Empty:
-        rank_checks = None
-    for process in processes:
-        process.join(timeout=180)
-    for process in processes:
-        if process.is_alive():
-            process.terminate()
-            process.join(timeout=10)
-    assert rank_checks is not None, "distributed checkpoint workers timed out"
-    assert all(process.exitcode == 0 for process in processes)
+        while len(results) < len(processes):
+            try:
+                results.append(result_queue.get(timeout=_DRAIN_POLL))
+                continue
+            except queue.Empty:
+                pass
+            now = time.monotonic()
+            if now >= deadline:
+                break
+            # A worker that dies without reporting -- killed, or failing before it
+            # can put -- leaves its peers blocked in a collective, and get() alone
+            # cannot see it: the drain would burn the whole timeout to report a
+            # failure the exitcodes already prove. Only a NONZERO exit
+            # short-circuits; a worker that exits 0 has reported or is still
+            # flushing its queue feeder thread, so treating "exited" as failure
+            # would race a legitimate pass. Even a nonzero exit gets a grace
+            # period first, because the failing rank puts its traceback (the
+            # diagnosable part) immediately before exiting.
+            if any(
+                process.exitcode not in (None, 0) for process in processes
+            ):
+                if flush_deadline is None:
+                    flush_deadline = now + _DRAIN_FLUSH_GRACE
+                elif now >= flush_deadline:
+                    break
+    finally:
+        # One shared budget, not one per worker. A per-worker join multiplies the
+        # wait by the world size, so two hung ranks turned a 180s drain into ~300s
+        # of CI and made _DRAIN_TIMEOUT not the overall budget it advertises. By
+        # the time we get here either every worker reported -- in which case they
+        # exit promptly -- or the drain already spent its whole deadline on
+        # workers that are not going to report, and waiting longer buys nothing.
+        reap_deadline = time.monotonic() + _REAP_GRACE
+        for process in processes:
+            process.join(timeout=max(0.0, reap_deadline - time.monotonic()))
+        # Signal every straggler before joining any of them, so the terminate
+        # grace is shared too rather than paid once per worker.
+        for process in processes:
+            if process.is_alive():
+                terminated.append(process.pid)
+                process.terminate()
+        for process in processes:
+            process.join(timeout=_TERMINATE_GRACE)
+    tracebacks = [item["traceback"] for item in results if "traceback" in item]
+    assert not tracebacks, "distributed checkpoint worker raised:\n" + "\n".join(
+        tracebacks
+    )
+    # A worker that died before reporting has no traceback to show, so the
+    # exitcodes are the whole diagnosis: name them rather than calling every
+    # short-drain a timeout.
+    assert len(results) == len(processes), (
+        "distributed checkpoint workers did not all report: got {}/{} results, "
+        "terminated={}, exitcodes={}".format(
+            len(results), len(processes), terminated, [p.exitcode for p in processes]
+        )
+    )
+    assert all(process.exitcode == 0 for process in processes), (
+        "worker exited nonzero (terminated={}): exitcodes={}".format(
+            terminated, [p.exitcode for p in processes]
+        )
+    )
+    rank_checks = next(
+        (item["checks"] for item in results if item.get("checks") is not None), None
+    )
     assert isinstance(rank_checks, list), rank_checks
     failures = [
         {name: value for name, value in checks.items() if not value}
@@ -598,7 +682,10 @@ def _fully_shard_worker(
         set_optimizer_state_dict,
     )
     from torch.distributed.device_mesh import init_device_mesh
-    from torch.distributed.fsdp import fully_shard
+    try:
+        from torch.distributed.fsdp import fully_shard  # torch >= 2.6
+    except ImportError:
+        from torch.distributed._composable.fsdp import fully_shard  # 2.5
     from torch.distributed.tensor import Shard, distribute_tensor
 
     from gefen import Gefen, GefenMuon
