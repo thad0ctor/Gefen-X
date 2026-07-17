@@ -3236,6 +3236,42 @@ def test_dcp_rejects_overflowing_float_tensor_lr_before_commit(tmp_path):
     not dist.is_available() or not dist.is_gloo_available(),
     reason="DCP resharding coverage requires Gloo",
 )
+def test_dcp_rejects_underflowing_float_tensor_lr_before_commit(tmp_path):
+    # The mirror of overflow-to-inf: a nonzero value below the destination's
+    # smallest subnormal (1e-10 into float16) casts to 0, freezing updates as
+    # silently as an integral truncation -- and, before this check, after the
+    # state was already swapped in.
+    _single_rank_group(tmp_path / "float-underflow-lr-init")
+    try:
+        mesh = init_device_mesh("cpu", (1,), mesh_dim_names=("dp",))
+        param = _shaped_dparam(_SHAPE, mesh)
+        optimizer = Gefen(
+            [("weight", param)], lr=1e-3, fused=False, factored_v_2d=False
+        )
+        for step in range(_SAVE_STEPS):
+            param.grad = distribute_tensor(_shaped_grad(_SHAPE, step), mesh, [Shard(0)])
+            optimizer.step()
+        saved = GefenDCPState(optimizer).state_dict()
+        saved["param_group_hypers"][0]["lr"] = 1e-10
+
+        optimizer.param_groups[0]["lr"] = torch.tensor(1.0, dtype=torch.float16)
+        state_before = _live_state_signature(optimizer, param)
+        hypers_before = _group_hyper_signature(optimizer)
+
+        with pytest.raises(ValueError, match="underflow to 0"):
+            GefenDCPState(optimizer).load_state_dict(saved)
+
+        assert _live_state_signature(optimizer, param) == state_before
+        assert _group_hyper_signature(optimizer) == hypers_before
+        assert float(optimizer.param_groups[0]["lr"]) == 1.0
+    finally:
+        dist.destroy_process_group()
+
+
+@pytest.mark.skipif(
+    not dist.is_available() or not dist.is_gloo_available(),
+    reason="DCP resharding coverage requires Gloo",
+)
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 def test_dcp_accepts_low_precision_tensor_lr(tmp_path, dtype):
     _single_rank_group(tmp_path / "low-precision-lr-init")

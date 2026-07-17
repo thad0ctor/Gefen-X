@@ -866,6 +866,23 @@ class GefenDCPState:
                             key,
                         )
                     )
+                # A nonzero value that rounds to zero in the destination dtype
+                # (lr=1e-10 into float16) freezes updates just as an integral
+                # truncation does, and just as silently -- reject it too.
+                if float(value) != 0.0 and float(
+                    torch.tensor(float(value), dtype=current.dtype)
+                ) == 0.0:
+                    raise ValueError(
+                        "Gefen DCP checkpoint group {} restores {}={!r}, but this "
+                        "optimizer holds it in a {} tensor too narrow to represent "
+                        "it (the in-place fill would underflow to 0 and freeze "
+                        "updates). Rebuild the optimizer with a wider "
+                        "floating-point {} tensor (or a plain float) before "
+                        "resuming; refusing to commit a silently zeroed "
+                        "restore.".format(
+                            group_index, key, value, current.dtype, key
+                        )
+                    )
                 continue
             if float(value) != float(int(value)):
                 raise ValueError(
