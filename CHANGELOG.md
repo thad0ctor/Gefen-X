@@ -2,11 +2,31 @@
 
 All notable changes to this project are documented here. This project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.5.0] - 2026-07-17
+
+CPU-offloaded training and reshardable FSDP2 checkpoints, both for plain `Gefen`. Additive: nothing is removed from the public API, and every same-device CUDA update stays numerically equivalent to 0.4.1 — bit-identical except for the one documented tensor-LR behavior change below, under CPU-offloaded training.
+
+Compatibility — training with parameters and optimizer state on CPU:
+
+- Plain `Gefen` now trains correctly with its parameters, gradients, and optimizer state resident on CPU, validated end-to-end under DeepSpeed ZeRO-2/3 CPU-offload and FSDP2 `CPUOffloadPolicy` (#80). Per-parameter optimizer state that a framework strands by paging a parameter across devices between steps is migrated onto the parameter's current device on demand, and the pre-mutation preflight now fails fast when a plain tensor's gradient and parameter sit on different devices. Under ZeRO, Gefen stays the client optimizer and steps the CPU-resident fp32 partitions; this requires `zero_allow_untested_optimizer: true` and `zero_force_ds_cpu_optimizer: false`. Activation offloading composes with both. A checkpoint saved on one device loads onto another with its state intact and co-located, and continues correctly; note that a run resumed on a different device type is a numerically close continuation, not a bit-exact one, because CPU and CUDA reductions use different accumulation orders.
+- Behavior change, non-fused path only: a **tensor** learning rate is now resolved to a host scalar on the non-fused, non-capturable path, so a CUDA-resident `lr` cannot strand the update of a parameter that has been paged to CPU (#80). The LR value itself is preserved exactly (the scalar equals `lr.item()`), and with zero weight decay the update is bit-identical; with nonzero weight decay it is numerically equivalent but not bit-identical, because the decay factor `1 - lr·weight_decay` is now computed on the host in double precision rather than as tensor arithmetic in the LR tensor's dtype, which can round differently for a narrow LR tensor. The scalar is also read back from the device whenever the `lr` tensor's identity or version changes — so an in-place LR scheduler (`lr.mul_`) driving a CUDA tensor `lr` now costs one device-to-host sync per step on that path, even when the parameter never leaves CUDA. Float learning rates, the fused path, and `capturable=True` are unaffected; pass `lr` as a plain float to avoid the sync.
+- The Muon family still fails fast under ZeRO, unchanged.
+
+Added — `GefenDCPState` for resharding FSDP2 optimizer state:
+
+- Add `GefenDCPState`, an opt-in `torch.distributed.checkpoint` adapter that makes plain `Gefen`'s FSDP2 optimizer state reshardable: save on N ranks, load and continue on M (#83, closing #81). Save dequantizes quantized momentum against the learned per-rank codebook into dense fp32 `Shard(0)` DTensors so DCP can reshard it. Load re-blocks that dense state back into Gefen's compact form on the target topology, re-running the block-variance period search and re-learning the per-shard codebook, so a restored optimizer keeps Gefen's roughly 1 byte/param profile instead of collapsing to per-element state. The full loaded representation is staged and validated before it replaces the live state, so a rejected load leaves the optimizer untouched.
+- Resharding routes momentum through a dense reshard and a freshly learned per-shard codebook, so a restored optimizer is a correct continuation within 256-level quantization noise rather than bit-exact, including at unchanged topology. For unchanged topology use the native `get_state_dict` / `set_state_dict` path, which stays bit-exact and is unchanged by this release; `GefenDCPState` is for when the topology changes.
+- `GefenDCPState` is scoped to plain `Gefen` on one-dimensional default-world `Shard(0)` DTensors. `GefenMuon`, `GefenMuonHybrid`, `capturable=True`, `factored_v_2d=True`, Muon `sharded_mode`, non-DTensor parameters, multidimensional or non-default-world meshes, subgroups, and non-`Shard(0)` placements all fail closed at construction or validation with an explicit message. Reshardable DCP for the Muon family is tracked in #84 and #85.
+
+Added — bounded and async reshardable saves, plus hardening (#90):
+
+- `GefenSavePlanner`, passed to `dcp.save`, bounds a reshardable save's peak memory to one parameter's dense form instead of the whole optimizer's — about 0.5 bytes/param on a many-parameter model, down from roughly 8 — so a save no longer peaks higher than a training step. The checkpoint bytes are unchanged; omitting the planner still writes the same checkpoint at the old cost.
+- `GefenFileSystemWriter` extends the same one-slot bound to `dcp.async_save`, staging each slot to the CPU one at a time and snapshotting so a resumed step cannot tear the checkpoint.
+- Hardening of the resharding path: a hyperparameter restore that would overflow, underflow, truncate, or round a beta to 1.0 in a narrow tensor is rejected before the state is swapped; non-finite optimizer state is refused before a byte is written; rank-local layout validation is synchronized so a one-rank failure aborts the group instead of stranding it; and divergent slot layouts across ranks are rejected rather than silently merged into one tensor. `fully_shard` imports fall back to the torch 2.5 path.
+
 ## [0.4.1] - 2026-07-15
 
-Distributed checkpoint-load and step-failure hardening. All changes are backward-compatible; the only public API addition is the opt-in `GefenDCPState` resharding wrapper.
-
-- Add `GefenDCPState`, a standalone DCP Stateful wrapper for **resharding** plain Gefen on one-dimensional default-world FSDP2 `Shard(0)` parameters (`factored_v_2d=False`, `capturable=False`). Save writes shard-addressable dense optimizer tensors so DCP can reshard N ranks to M without a rank-0 full-state gather; load validates before mutation, then re-blocks the resharded dense momentum back into Gefen's compact ~1 byte/param block state (re-running the period search, relearning the codebook, and re-quantizing on each new shard). Resume is a correct continuation within 256-level quantization noise, not bit-exact — use the unchanged native full-state path for same-topology resumes.
+Distributed checkpoint-load and step-failure hardening. All fixes are backward-compatible; no public API changes.
 
 Correctness — checkpoint loads are now atomic:
 
