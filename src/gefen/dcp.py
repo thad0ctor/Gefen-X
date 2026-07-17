@@ -545,18 +545,28 @@ class GefenDCPState:
         if type(optimizer) is not Gefen:
             raise TypeError("GefenDCPState supports plain Gefen only")
         self.optimizer = optimizer
+        # Construction is replicated (same caller args on every rank), so eager
+        # validation here is a clean group-wide error and cannot strand (no
+        # collective yet). A one-rank add_param_group can desync the layout
+        # later, so state_dict/load re-validate inside their synchronized regions.
+        self._require_process_group()
         self._slots = self._validate_layout()
-        # Eager, replicated at construction (same caller args on every rank), so
-        # a genuine duplicate is a clean group-wide error. A one-rank
-        # add_param_group can desync it later, so state_dict/load re-check it
-        # inside their synchronized regions -- see _reject_duplicate_slots.
         self._reject_duplicate_slots()
 
-    def _validate_layout(self):
+    def _require_process_group(self):
+        """Assert an initialized PG. Must precede the sync (chicken-and-egg):
+        _synchronize_step_failure needs the group this check proves exists, so
+        it cannot live inside the synchronized region."""
         if not torch.distributed.is_available() or not torch.distributed.is_initialized():
             raise RuntimeError(
                 "GefenDCPState requires an initialized distributed process group"
             )
+
+    def _validate_layout(self):
+        # Rank-local: reads live param_groups a one-rank add_param_group can
+        # desync, so callers run it inside their sync region (except __init__,
+        # which is replicated). The PG must already exist -- see
+        # _require_process_group.
         import torch.distributed as dist
 
         if getattr(self.optimizer, "capturable", False):
@@ -901,7 +911,7 @@ class GefenDCPState:
         deadlock the peers in the collective. All checks precede the commit.
         """
         # A one-rank add_param_group can make names collide on this rank alone;
-        # re-check here (not in _validate_layout, which runs before the sync).
+        # re-check inside the sync region so a lone raise aborts the group.
         self._reject_duplicate_slots()
         for group_index, (group, entry) in enumerate(
             zip(self.optimizer.param_groups, staged_hypers)
@@ -961,12 +971,10 @@ class GefenDCPState:
         walk into collectives it never joins. Making the collective conditional is
         not possible: detecting whether peers participate is itself a collective.
         """
-        # Re-derive the slot layout so a retained wrapper whose optimizer gained
-        # parameters via add_param_group saves the current set. OUTSIDE the
-        # synchronized region below: every check it makes is replicated, so it
-        # fails on every rank together or none, and it is what establishes that a
-        # process group exists at all.
-        self._slots = self._validate_layout()
+        # Only the PG check precedes the sync (it establishes the group the sync
+        # needs). Layout validation reads rank-local state a one-rank
+        # add_param_group can desync, so it runs INSIDE the sync below.
+        self._require_process_group()
 
         import torch.distributed as dist
 
@@ -975,6 +983,9 @@ class GefenDCPState:
         local_error = None
         result = None
         try:
+            # Re-derive the slot layout so a retained wrapper whose optimizer
+            # gained parameters via add_param_group saves the current set.
+            self._slots = self._validate_layout()
             result = self._build_state_dict()
         except Exception as exc:  # resynchronized across the group below
             local_error = exc
@@ -998,8 +1009,7 @@ class GefenDCPState:
     def _build_state_dict(self):
         """Rank-local half of :meth:`state_dict`; every raise here is synchronized."""
         # Re-check inside the synchronized region: a one-rank add_param_group can
-        # make names collide on a single rank, and raising that in _validate_layout
-        # (before the sync) would strand the peers.
+        # make names collide on a single rank, so a lone raise must abort the group.
         self._reject_duplicate_slots()
         result = {
             "format_version": torch.tensor(_FORMAT_VERSION, dtype=torch.int64),
@@ -1048,7 +1058,11 @@ class GefenDCPState:
             )
         return result
 
-    def load_state_dict(self, state_dict):
+    def _validate_load_metadata(self, state_dict):
+        """Rank-local layout + checkpoint-metadata validation; returns the staged
+        per-group hypers. RANK-LOCAL (reads live param_groups/slots a one-rank
+        add_param_group can desync), so callers run it inside the sync region --
+        a lone raise would strand the peers in the following collective."""
         # Re-derive the slot layout so a load reflects any add_param_group that
         # ran after construction, rather than a stale construction-time snapshot.
         self._slots = self._validate_layout()
@@ -1092,14 +1106,18 @@ class GefenDCPState:
         # Parse and range-validate every hyperparameter BEFORE any mutation, so a
         # missing/non-numeric key or an out-of-range value is rejected
         # fail-atomically rather than committed.
-        staged_hypers = [
+        return [
             self._validate_hyper_entry(group_index, entry)
             for group_index, entry in enumerate(saved_hypers)
         ]
-        # Validation that reads the LIVE optimizer is deliberately NOT done here:
-        # it is rank-local, so raising it outside the synchronized block below
-        # would let the failing rank exit while its peers block forever in the
-        # collective. It runs inside that block (_validate_rank_local).
+
+    def load_state_dict(self, state_dict):
+        # Only the PG check precedes the sync (it establishes the group the sync
+        # needs). Layout and checkpoint-metadata validation read rank-local state
+        # a one-rank add_param_group can desync, so they run INSIDE the sync below
+        # (_validate_load_metadata / _validate_rank_local) -- a lone raise there
+        # would strand the peers in the collective.
+        self._require_process_group()
 
         # Stage, validate, and re-block everything locally BEFORE mutating any
         # live optimizer state, inside this helper so a per-rank failure is caught
@@ -1248,6 +1266,7 @@ class GefenDCPState:
         local_error = None
         prepared = None
         try:
+            staged_hypers = self._validate_load_metadata(state_dict)
             self._validate_rank_local(state_dict, staged_hypers)
             prepared = _stage()
         except Exception as exc:  # resynchronized across the group below

@@ -1666,6 +1666,123 @@ def test_dcp_one_rank_duplicate_name_aborts_every_rank_cleanly(tmp_path):
     assert "aborted before any rank proceeds" in by_rank[1]["error"], by_rank[1]
 
 
+def _layout_desync_worker(rank, world, port, checkpoint_dir, result_queue):
+    try:
+        os.environ.update(
+            MASTER_ADDR="127.0.0.1",
+            MASTER_PORT=port,
+            RANK=str(rank),
+            WORLD_SIZE=str(world),
+        )
+        dist.init_process_group(
+            "gloo", rank=rank, world_size=world, timeout=timedelta(seconds=60)
+        )
+        mesh = init_device_mesh("cpu", (world,), mesh_dim_names=("dp",))
+        device = torch.device("cpu")
+        first = nn.Parameter(distribute_tensor(_global_param(), mesh, [Shard(0)]))
+        second = nn.Parameter(distribute_tensor(_global_param(), mesh, [Shard(0)]))
+        optimizer = Gefen(
+            [
+                {"params": [("encoder.weight", first)]},
+                {"params": [("decoder.weight", second)]},
+            ],
+            lr=2.5e-3,
+            fused=False,
+            factored_v_2d=False,
+        )
+        for step in range(_SAVE_STEPS):
+            for param in (first, second):
+                param.grad = distribute_tensor(_global_grad(step, device), mesh, [Shard(0)])
+            optimizer.step()
+        for param in (first, second):
+            param.grad = None
+
+        # Retain the wrapper (constructed while the layout is valid), then desync
+        # ONE rank's LAYOUT -- a check that lives in _validate_layout, not the
+        # duplicate re-check: rank 0's param_names goes short, so its slot count
+        # no longer matches its params. _validate_layout must run INSIDE
+        # state_dict()'s sync region; hoisted out, rank 0 raises before the sync
+        # and strands rank 1 in dcp.save's planning collectives.
+        state = GefenDCPState(optimizer)
+        if rank == 0:
+            optimizer.param_groups[1]["param_names"] = []
+
+        raised = False
+        error = None
+        try:
+            torch.distributed.checkpoint.save(
+                {"optimizer": state},
+                storage_writer=FileSystemWriter(checkpoint_dir),
+            )
+        except Exception as exc:
+            raised = True
+            error = repr(exc)
+        result_queue.put({"rank": rank, "raised": raised, "error": error})
+    except BaseException:
+        result_queue.put({"rank": rank, "fatal_error": traceback.format_exc()})
+    finally:
+        if dist.is_available() and dist.is_initialized():
+            dist.destroy_process_group()
+
+
+def _run_layout_desync(world, checkpoint_dir, timeout=90):
+    context = mp.get_context("spawn")
+    result_queue = context.Queue()
+    port = _free_port()
+    processes = [
+        context.Process(
+            target=_layout_desync_worker,
+            args=(rank, world, port, checkpoint_dir, result_queue),
+        )
+        for rank in range(world)
+    ]
+    for process in processes:
+        process.start()
+    results = []
+    try:
+        for _ in processes:
+            results.append(result_queue.get(timeout=timeout))
+    except queue.Empty:
+        pass
+    finally:
+        for process in processes:
+            process.join(timeout=10)
+        for process in processes:
+            if process.is_alive():
+                process.terminate()
+                process.join(timeout=5)
+        result_queue.close()
+        result_queue.join_thread()
+    assert len(results) == world, (results, [p.exitcode for p in processes])
+    assert all(p.exitcode == 0 for p in processes), [p.exitcode for p in processes]
+    return sorted(results, key=lambda item: item["rank"])
+
+
+@pytest.mark.skipif(
+    not dist.is_available() or not dist.is_gloo_available(),
+    reason="DCP resharding coverage requires Gloo",
+)
+def test_dcp_one_rank_layout_failure_aborts_every_rank_cleanly(tmp_path):
+    # Third instance of the pre-sync-strand class: the SIBLING _validate_layout
+    # checks (short param_names, non-DTensor, bad mesh) also read rank-local state
+    # a one-rank add_param_group can desync, so the whole of _validate_layout has
+    # to run inside state_dict()'s sync region -- not just the duplicate re-check.
+    # Hoisted out, rank 0 raises the layout error before the sync and leaves;
+    # rank 1's layout is fine, so it walks into dcp.save's planning collectives
+    # rank 0 never joins -- a hang, or a gloo transport error on the peer. Pin
+    # WHICH error each rank gets, not merely that both raised.
+    checkpoint_dir = str(tmp_path / "gefen-dcp-layout-desync")
+    results = _run_layout_desync(2, checkpoint_dir)
+    assert all("fatal_error" not in item for item in results), results
+    for item in results:
+        assert item["raised"], item
+    by_rank = {item["rank"]: item for item in results}
+    # The rank that actually has the bad layout reports the real cause...
+    assert "stable param_names" in by_rank[0]["error"], by_rank[0]
+    # ...and its peer gets the group-wide abort, not a transport-level symptom.
+    assert "aborted before any rank proceeds" in by_rank[1]["error"], by_rank[1]
+
+
 # --- Finding 6: reject inconsistent initialization metadata/counters -------
 
 
