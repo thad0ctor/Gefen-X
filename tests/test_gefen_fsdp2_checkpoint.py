@@ -682,7 +682,10 @@ def _fully_shard_worker(
         set_optimizer_state_dict,
     )
     from torch.distributed.device_mesh import init_device_mesh
-    from torch.distributed.fsdp import fully_shard
+    try:
+        from torch.distributed.fsdp import fully_shard  # torch >= 2.6
+    except ImportError:
+        from torch.distributed._composable.fsdp import fully_shard  # 2.5
     from torch.distributed.tensor import Shard, distribute_tensor
 
     from gefen import Gefen, GefenMuon

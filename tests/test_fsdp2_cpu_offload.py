@@ -53,7 +53,13 @@ def _build_offloaded(d=64):
     """A tiny model fully_sharded under CPUOffloadPolicy + a plain Gefen. Seeded
     so independent builds get identical initial weights."""
     import torch.nn as nn
-    from torch.distributed.fsdp import fully_shard, CPUOffloadPolicy
+    try:
+        from torch.distributed.fsdp import fully_shard, CPUOffloadPolicy  # >= 2.6
+    except ImportError:
+        from torch.distributed._composable.fsdp import (  # torch 2.5
+            fully_shard,
+            CPUOffloadPolicy,
+        )
 
     from gefen import Gefen
 
@@ -173,7 +179,13 @@ def _offload_resume_worker(rank, world, port, result_queue):
         set_state_dict,
     )
     from torch.distributed.device_mesh import init_device_mesh
-    from torch.distributed.fsdp import fully_shard, CPUOffloadPolicy
+    try:
+        from torch.distributed.fsdp import fully_shard, CPUOffloadPolicy  # >= 2.6
+    except ImportError:
+        from torch.distributed._composable.fsdp import (  # torch 2.5
+            fully_shard,
+            CPUOffloadPolicy,
+        )
 
     from gefen import Gefen
 

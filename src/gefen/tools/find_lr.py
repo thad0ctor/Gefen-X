@@ -495,7 +495,10 @@ def _shard_worker(rank: int, world: int, lr: float, cfg: dict, port: str, q) -> 
         import torch as _torch
         import torch.distributed as dist
         from torch.distributed.device_mesh import init_device_mesh
-        from torch.distributed.fsdp import fully_shard
+        try:
+            from torch.distributed.fsdp import fully_shard  # torch >= 2.6
+        except ImportError:
+            from torch.distributed._composable.fsdp import fully_shard  # 2.5
 
         _os.environ["MASTER_ADDR"] = "127.0.0.1"
         _os.environ["MASTER_PORT"] = port
