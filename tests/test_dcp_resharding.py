@@ -354,7 +354,7 @@ def test_dcp_fused_state_reshards_and_stays_compact(tmp_path):
     _assert_loaded(loaded)
 
 
-def _fully_shard_worker(rank, world, port, checkpoint_dir, mode, result_queue):
+def _fully_shard_worker(rank, world, port, checkpoint_dir, mode, result_queue, policy=""):
     try:
         os.environ.update(
             MASTER_ADDR="127.0.0.1",
@@ -371,13 +371,33 @@ def _fully_shard_worker(rank, world, port, checkpoint_dir, mode, result_queue):
             timeout=timedelta(seconds=120),
         )
         try:
-            from torch.distributed.fsdp import fully_shard  # torch >= 2.6
+            from torch.distributed.fsdp import (  # torch >= 2.6
+                fully_shard,
+                CPUOffloadPolicy,
+                MixedPrecisionPolicy,
+            )
         except ImportError:
-            from torch.distributed._composable.fsdp import fully_shard  # 2.5
+            from torch.distributed._composable.fsdp import (  # torch 2.5
+                fully_shard,
+                CPUOffloadPolicy,
+                MixedPrecisionPolicy,
+            )
+
+        # A policy string keeps the spawn args picklable; the objects are built
+        # rank-side. These are the two FSDP2 levers a reshard must survive
+        # beyond the plain sharded case: params staged on the host, and a reduced
+        # compute/reduce dtype.
+        kwargs = {}
+        if policy == "cpu_offload":
+            kwargs["offload_policy"] = CPUOffloadPolicy()
+        elif policy == "mixed_precision":
+            kwargs["mp_policy"] = MixedPrecisionPolicy(
+                param_dtype=torch.bfloat16, reduce_dtype=torch.float32
+            )
 
         torch.manual_seed(0)
         model = nn.Linear(128, 64, bias=False).to(device)
-        fully_shard(model)
+        fully_shard(model, **kwargs)
         parameter = model.weight
         optimizer = Gefen(
             [("weight", parameter)],
@@ -424,14 +444,14 @@ def _fully_shard_worker(rank, world, port, checkpoint_dir, mode, result_queue):
             dist.destroy_process_group()
 
 
-def _run_fully_shard(world, checkpoint_dir, mode, timeout=240):
+def _run_fully_shard(world, checkpoint_dir, mode, timeout=240, policy=""):
     context = mp.get_context("spawn")
     result_queue = context.Queue()
     port = _free_port()
     processes = [
         context.Process(
             target=_fully_shard_worker,
-            args=(rank, world, port, checkpoint_dir, mode, result_queue),
+            args=(rank, world, port, checkpoint_dir, mode, result_queue, policy),
         )
         for rank in range(world)
     ]
@@ -469,6 +489,29 @@ def test_dcp_fully_shard_real_model_stays_compact(tmp_path):
     assert all(item.get("saved") for item in saved), saved
     assert all(item["compact"] and item["period"] > 1 for item in saved), saved
     loaded = _run_fully_shard(2, checkpoint_dir, "load")
+    assert all("fatal_error" not in item for item in loaded), loaded
+    for item in loaded:
+        assert item["finite"] and item["restored"]["compact"], item
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available()
+    or torch.cuda.device_count() < 2
+    or not dist.is_nccl_available(),
+    reason="fully_shard DCP coverage requires two CUDA devices and NCCL",
+)
+@pytest.mark.parametrize("policy", ["cpu_offload", "mixed_precision"])
+def test_dcp_fully_shard_reshards_under_fsdp2_policies(tmp_path, policy):
+    # Resharding and these FSDP2 levers are each covered alone; this crosses
+    # them. CPUOffloadPolicy stages params on the host (so save/load read the
+    # optimizer state through a host-resident shard), and MixedPrecisionPolicy
+    # runs a reduced compute/reduce dtype -- both must still round-trip compact
+    # and continue finitely.
+    checkpoint_dir = str(tmp_path / "gefen-dcp-fs-{}".format(policy))
+    saved = _run_fully_shard(2, checkpoint_dir, "save", policy=policy)
+    assert all(item.get("saved") for item in saved), saved
+    assert all(item["compact"] and item["period"] > 1 for item in saved), saved
+    loaded = _run_fully_shard(2, checkpoint_dir, "load", policy=policy)
     assert all("fatal_error" not in item for item in loaded), loaded
     for item in loaded:
         assert item["finite"] and item["restored"]["compact"], item
