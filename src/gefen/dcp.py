@@ -8,11 +8,12 @@ import math
 import torch
 
 # Imported at module scope (unlike the rest of this file's deferred imports)
-# because GefenSavePlanner subclasses it, so it must resolve at class-creation
-# time. This module is the DCP adapter and is itself only imported on demand
-# (gefen/__init__.py exposes it lazily), so nothing pays for it unless DCP is
-# actually being used.
+# because GefenSavePlanner and GefenFileSystemWriter subclass them, so they must
+# resolve at class-creation time. This module is the DCP adapter and is itself
+# only imported on demand (gefen/__init__.py exposes it lazily), so nothing pays
+# for it unless DCP is actually being used.
 from torch.distributed.checkpoint.default_planner import DefaultSavePlanner
+from torch.distributed.checkpoint.filesystem import FileSystemWriter
 
 
 # Schema history:
@@ -218,18 +219,23 @@ class _LazyDenseShard(torch.Tensor):
     """
 
     @staticmethod
-    def __new__(cls, parameter, materialize):
+    def __new__(cls, parameter, materialize, device=None):
         """Build the stand-in for ``parameter``'s dense fp32 shard.
 
         ``materialize`` is a zero-argument callable returning the dense *local*
         tensor, mirroring ``DTensor.__get_tensor_shard__`` -> ``to_local()``:
         the reported shape is global, the resolved data is this rank's shard.
+
+        ``device`` defaults to the parameter's own device -- where the dense form
+        would be expanded. :meth:`_gefen_stage_to_cpu` overrides it to build the
+        CPU-resident stand-in that async staging leaves in the staged dict, whose
+        dense form is already on the CPU.
         """
         shard = torch.Tensor._make_wrapper_subclass(
             cls,
             parameter.shape,
             dtype=torch.float32,
-            device=_local(parameter).device,
+            device=_local(parameter).device if device is None else device,
             requires_grad=False,
         )
         shard._gefen_parameter = parameter
@@ -237,9 +243,44 @@ class _LazyDenseShard(torch.Tensor):
         shard._gefen_cache = None
         return shard
 
-    def __init__(self, parameter, materialize):
+    def __init__(self, parameter, materialize, device=None):
         # torch.Tensor.__init__ takes no arguments; __new__ did the work.
         pass
+
+    @classmethod
+    def __torch_function__(cls, func, types, args=(), kwargs=None):
+        # Refuses the device movement that a stand-in must never undergo, and is
+        # the ONLY layer that can: `t.to(cpu)` on a stand-in already on the CPU
+        # short-circuits to `self` inside torch's Python binding and never
+        # dispatches an operator, so __torch_dispatch__ below cannot see it.
+        #
+        # That silent pass-through is not hypothetical. Torch 2.5's async staging
+        # copies with `.to(cpu_device)`, so CPU-resident state staged that way
+        # left the stand-ins in the "staged" dict by reference: nothing was
+        # copied, and the writer thread then expanded them against LIVE optimizer
+        # state while training continued -- a torn snapshot racing step(), which
+        # is precisely the guarantee async_save exists to provide. It only looked
+        # like it worked because the state happened to be quiescent. Refusing
+        # here converts that into the same loud failure every other torch/device
+        # combination already gives, and points at the writer that stages these
+        # correctly.
+        #
+        # Everything else falls through to the default, which routes real
+        # operators to __torch_dispatch__ (is_pinned is answered there, and the
+        # rest are refused with the message below).
+        if func in (torch.Tensor.to, torch.Tensor.cpu, torch.Tensor.cuda):
+            raise RuntimeError(
+                "Gefen DCP stand-in cannot be moved between devices: it carries "
+                "no data of its own, so copying it copies nothing and leaves a "
+                "reference to live optimizer state behind. This usually means "
+                "torch.distributed.checkpoint.async_save was called without "
+                "GefenFileSystemWriter -- async staging must expand each slot's "
+                "dense form as it copies it to the CPU, which only that writer "
+                "does. Pass storage_writer=GefenFileSystemWriter(path) to "
+                "async_save, or use the synchronous "
+                "torch.distributed.checkpoint.save."
+            )
+        return super().__torch_function__(func, types, args, kwargs or {})
 
     @classmethod
     def __torch_dispatch__(cls, func, types, args=(), kwargs=None):
@@ -250,22 +291,21 @@ class _LazyDenseShard(torch.Tensor):
             return False
         # Names both ways an operator can reach here, because the two are not
         # distinguishable from `func` alone: a stand-in escaping into ordinary
-        # tensor code, and dcp.async_save (whose CPU staging zeros_like's the
-        # whole state dict up front). Deliberately does NOT suggest passing a
-        # planner: the planner bounds the save's peak, it is not what resolves
-        # the stand-in, and a caller who already passed one is told to do again
-        # the thing that did not help.
+        # tensor code, and an async_save staging the dict with the wrong writer
+        # (torch >= 2.6 builds its CPU copy with zeros_like, which lands here).
+        # Deliberately does NOT suggest passing a planner: the planner bounds the
+        # save's peak, it is not what resolves the stand-in, and a caller who
+        # already passed one is told to do again the thing that did not help.
         raise RuntimeError(
             "Gefen DCP stand-in cannot execute {}: it carries no data of its "
             "own. It stands in for one slot's dense fp32 shard, which is "
-            "expanded only through torch.distributed.checkpoint's synchronous "
-            "save/load protocol, so an operator reaching here means a "
-            "GefenDCPState state_dict() is being used as a dict of ordinary "
-            "tensors. In particular, torch.distributed.checkpoint.async_save is "
-            "not supported with GefenDCPState -- its CPU staging copies the "
-            "whole state dict up front, which is the materialization the "
-            "stand-in exists to avoid -- so use the synchronous "
-            "torch.distributed.checkpoint.save instead. To hold real tensors "
+            "expanded only through torch.distributed.checkpoint's save/load "
+            "protocol, so an operator reaching here means a GefenDCPState "
+            "state_dict() is being used as a dict of ordinary tensors. In "
+            "particular, torch.distributed.checkpoint.async_save must be given "
+            "storage_writer=GefenFileSystemWriter(path): the default writer's "
+            "CPU staging copies the whole state dict up front, which is the "
+            "materialization the stand-in exists to avoid. To hold real tensors "
             "outside DCP, use the optimizer's own state_dict().".format(func)
         )
 
@@ -319,6 +359,36 @@ class _LazyDenseShard(torch.Tensor):
     def _gefen_resolve_uncached(self) -> torch.Tensor:
         """Expand the dense shard without retaining it (the bounded save path)."""
         return self._gefen_materialize()
+
+    def _gefen_stage_to_cpu(self) -> "_LazyDenseShard":
+        """Snapshot this slot's dense form to the CPU (the bounded async path).
+
+        Expands the dense shard, copies it to the CPU, and drops the device-side
+        tensor before returning, so staging a whole state dict holds one slot's
+        dense form on the device at a time rather than every slot's at once --
+        the same bound the synchronous save gets from
+        :meth:`GefenSavePlanner.resolve_data`, applied to the copy that makes the
+        write asynchronous.
+
+        The result is another stand-in rather than the plain CPU tensor because
+        the staged dict is what DCP then plans and writes from: it has to keep
+        publishing this slot's *global* shape and chunk offsets, which a plain
+        local tensor no longer describes. Its dense form is already resolved, so
+        it holds real data and expands nothing further.
+
+        The staged shard reads its geometry from the same live parameter as this
+        one, which is metadata only (shape/mesh/placements) and does not change
+        under a concurrent step. The snapshot itself -- the dense values -- is
+        fully detached from the optimizer once this returns.
+        """
+        dense = self._gefen_materialize()
+        staged = dense.to("cpu", copy=True)
+        # Explicit: the device-side expansion must be unreachable before the next
+        # slot expands, or the bound is one slot per parameter rather than one.
+        del dense
+        return _LazyDenseShard(
+            self._gefen_parameter, lambda: staged, device=staged.device
+        )
 
     def __create_write_items__(self, fqn, obj):
         from torch.distributed.checkpoint.metadata import (
@@ -533,19 +603,15 @@ class GefenDCPState:
     ``factored_v_2d=False`` and ``capturable=False``, one-dimensional
     default-world DTensors, and one ``Shard(0)`` placement.
 
-    Save must be the *synchronous* :func:`torch.distributed.checkpoint.save`;
-    ``async_save`` is not supported. Its CPU staging copies the whole state dict
-    up front, which is exactly the all-slots-live materialization this save path
-    is built to avoid, so a stand-in refuses the copy and the call fails loudly
-    rather than staging empty tensors. That refusal is what every save of
-    CUDA-resident state gets, and every save on the torch versions whose staging
-    builds its CPU copy with ``zeros_like``. Torch 2.5 staging state already on
-    the CPU is the exception: ``tensor.to(cpu)`` short-circuits to the same
-    object, nothing is copied, and the stand-ins reach the writer intact, so the
-    call is not refused and writes a correct checkpoint -- but it stages nothing,
-    so the write is not asynchronous with respect to the optimizer and races any
-    concurrent step. Use the synchronous save, and pass
-    :class:`GefenSavePlanner` to it to keep its peak bounded.
+    Both :func:`torch.distributed.checkpoint.save` and
+    :func:`torch.distributed.checkpoint.async_save` write this state, and each
+    takes one Gefen-specific argument to keep its peak bounded to a single slot's
+    dense form: the synchronous save takes ``planner=GefenSavePlanner()``, and
+    ``async_save`` takes ``storage_writer=GefenFileSystemWriter(path)`` (see
+    :class:`GefenFileSystemWriter`, which stages the dense slots to the CPU one
+    at a time so training can resume against a snapshot taken at the moment of
+    the call). Given anything else, ``async_save`` raises rather than stage a
+    dict it cannot copy.
     """
 
     def __init__(self, optimizer):
@@ -1395,3 +1461,87 @@ class GefenSavePlanner(DefaultSavePlanner):
         if isinstance(entry, _LazyDenseShard):
             return entry._gefen_resolve_uncached()
         return super().resolve_data(write_item)
+
+
+def _stage_lazy_shards(state_dict, staged, prefix=()):
+    """Copy ``state_dict`` without its stand-ins, snapshotting each to the CPU.
+
+    Records ``path -> CPU-resident stand-in`` in ``staged`` and returns a copy of
+    the tree with those entries removed, so torch's own staging never sees them.
+    Copies rather than mutates: the dict belongs to the caller of ``async_save``.
+    """
+    import copy
+
+    stripped = copy.copy(state_dict)
+    for key, value in state_dict.items():
+        path = prefix + (key,)
+        if isinstance(value, _LazyDenseShard):
+            staged[path] = value._gefen_stage_to_cpu()
+            del stripped[key]
+        elif isinstance(value, dict):
+            stripped[key] = _stage_lazy_shards(value, staged, path)
+    return stripped
+
+
+def _restore_staged_shards(state_dict, staged):
+    """Put the CPU-resident stand-ins back at their paths in the staged tree.
+
+    Rebuilds the dicts along those paths instead of mutating them, because what
+    torch's staging returns may be a buffer it caches and reuses across saves.
+    """
+    import copy
+
+    result = copy.copy(state_dict)
+    rebuilt = {(): result}
+    for path, shard in staged.items():
+        node = result
+        for depth, key in enumerate(path[:-1]):
+            branch = path[: depth + 1]
+            if branch not in rebuilt:
+                rebuilt[branch] = copy.copy(node[key])
+                node[key] = rebuilt[branch]
+            node = rebuilt[branch]
+        node[path[-1]] = shard
+    return result
+
+
+class GefenFileSystemWriter(FileSystemWriter):
+    """``FileSystemWriter`` that stages a :class:`GefenDCPState` for async save.
+
+    Pass this to ``torch.distributed.checkpoint.async_save`` whenever the state
+    dict contains a :class:`GefenDCPState`::
+
+        dcp.async_save(
+            {"model": model, "optimizer": GefenDCPState(optimizer)},
+            storage_writer=GefenFileSystemWriter(path),
+            planner=GefenSavePlanner(),
+        )
+
+    ``async_save`` returns once the state dict has been *staged* -- copied to the
+    CPU -- and writes it from a background thread, so training may resume
+    immediately and the checkpoint still reflects the state at the moment of the
+    call. Staging is what makes that true, and it is the whole reason the default
+    writer cannot be used here: it copies the state dict by asking each entry for
+    a CPU copy of itself, and a :class:`GefenDCPState` hands DCP zero-storage
+    stand-ins for the dense fp32 shards resharding requires (the momentum
+    codebook is learned per rank, so the compact block state cannot be written as
+    is). A stand-in has nothing to copy; it refuses, and the save fails.
+
+    This writer stages those slots itself, one at a time -- expanding a slot's
+    dense form, copying it to the CPU, and releasing it before expanding the next
+    -- so the device holds a single slot's dense form during staging rather than
+    every slot's at once, the same bound :class:`GefenSavePlanner` gives the
+    synchronous save. The CPU then holds the full dense snapshot, which is what
+    async staging costs for any optimizer. Everything that is not a Gefen stand-in
+    is staged by ``FileSystemWriter`` unchanged.
+
+    The synchronous :func:`torch.distributed.checkpoint.save` does not stage and
+    does not need this writer; use ``FileSystemWriter`` with
+    :class:`GefenSavePlanner` there.
+    """
+
+    def stage(self, state_dict):
+        """Override of ``AsyncStager.stage``."""
+        staged_shards: dict = {}
+        stripped = _stage_lazy_shards(state_dict, staged_shards)
+        return _restore_staged_shards(super().stage(stripped), staged_shards)

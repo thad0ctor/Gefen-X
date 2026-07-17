@@ -1927,29 +1927,27 @@ def _await_async_save(response):
     not dist.is_available() or not dist.is_gloo_available(),
     reason="DCP resharding coverage requires Gloo",
 )
-def test_dcp_async_save_never_writes_a_wrong_checkpoint(tmp_path):
-    # async_save is not a supported way to write GefenDCPState, but what that
-    # means concretely is decided by torch's staging, not by us -- so this pins
-    # the data-integrity invariant rather than a refusal that only some versions
-    # produce. Whether the stand-ins are touched during staging depends on the
-    # torch version *and* on where the state lives:
+def test_dcp_async_save_without_the_gefen_writer_is_refused(tmp_path):
+    # async_save stages the state dict to the CPU and returns, then writes from a
+    # background thread; GefenFileSystemWriter is what stages a GefenDCPState
+    # correctly (test_dcp_async_save_with_gefen_writer_restores_like_the_sync_save
+    # and ..._snapshots_the_state_a_later_step_mutates cover that path). This
+    # pins the other half of the contract: the DEFAULT writer must fail loudly
+    # and leave nothing behind, on every torch version and every device.
     #
-    #   * When staging materializes the state dict, a stand-in is asked to
-    #     execute a real operator, refuses, and async_save raises before writing
-    #     anything. That covers newer torch on any device (staging builds the CPU
-    #     copy with zeros_like) and torch 2.5 with non-CPU state (staging is a
-    #     genuine device-to-host copy).
-    #   * On torch 2.5 with CPU-resident state -- what this Gloo test builds --
-    #     staging is `tensor.to(cpu)` on tensors already on the CPU, which torch
-    #     short-circuits to the *same objects*. Nothing is copied, so the
-    #     stand-ins pass through untouched and the writer resolves them through
-    #     the ordinary save protocol. The checkpoint that lands is a correct one,
-    #     so there is nothing to refuse.
+    # It has to be a refusal rather than "either outcome is safe", because the
+    # one combination that used to get through staging untouched was the
+    # dangerous one, not the benign one. Torch 2.5 stages with `.to(cpu_device)`,
+    # which short-circuits to the same object for CPU-resident state -- so the
+    # stand-ins entered the "staged" dict by reference, nothing was copied, and
+    # the writer thread expanded them against LIVE optimizer state while training
+    # continued. That writes a tear: save-time counters beside post-step
+    # momentum, silently. It looked correct only while the state was quiescent,
+    # which is exactly the condition async_save exists to lift.
     #
-    # Either outcome is safe. The invariant that must hold on every version is
-    # that async_save never leaves behind a checkpoint that looks complete and
-    # restores wrong -- so require a refusal to write nothing, and require a
-    # checkpoint that does land to restore exactly like the synchronous save.
+    # __torch_dispatch__ cannot catch it (a same-device `.to()` never dispatches
+    # an operator), so the refusal lives in __torch_function__ and this test
+    # holds it there.
     _single_rank_group(tmp_path / "async-init")
     try:
         mesh = init_device_mesh("cpu", (1,), mesh_dim_names=("dp",))
@@ -1987,28 +1985,39 @@ def test_dcp_async_save_never_writes_a_wrong_checkpoint(tmp_path):
             # else propagates as the failure it is.
             refusal = error
 
-        if refusal is not None:
-            message = str(refusal)
-            # The message must send the caller to the synchronous save...
-            assert "async_save" in message, message
-            assert "not supported" in message, message
-            assert "synchronous" in message, message
-            # ...and must NOT tell them to pass a planner. This call already
-            # passes one, so advice to pass it is advice to redo what just
-            # failed.
-            assert "GefenSavePlanner" not in message, message
-            assert not _has_checkpoint_bytes(checkpoint_dir), os.listdir(
-                checkpoint_dir
+        # Getting through staging is the failure, not an alternative outcome:
+        # nothing would have been copied, and the writer would race step().
+        assert refusal is not None, (
+            "async_save accepted the default writer; the stand-ins passed "
+            "through staging by reference and the write would read live state"
+        )
+        message = str(refusal)
+        # The message must name the writer that stages these correctly...
+        assert "GefenFileSystemWriter" in message, message
+        # ...and must NOT tell them to pass a planner. This call already passes
+        # one, so advice to pass it is advice to redo what just failed.
+        assert "GefenSavePlanner" not in message, message
+        # Refusing is only worth anything if it refused *before* writing.
+        assert not _has_checkpoint_bytes(checkpoint_dir), os.listdir(
+            checkpoint_dir
+        )
+        # The supported path must still land the same checkpoint the sync save
+        # would, so the refusal above is a routing error and not a dead end.
+        from gefen import GefenFileSystemWriter
+
+        good_dir = str(tmp_path / "async-ok-ckpt")
+        _await_async_save(
+            torch.distributed.checkpoint.async_save(
+                {"optimizer": GefenDCPState(optimizer)},
+                storage_writer=GefenFileSystemWriter(good_dir),
+                planner=GefenSavePlanner(),
             )
-        else:
-            # It got through staging untouched, so a real checkpoint must be
-            # what landed -- not empty buffers standing in for one.
-            assert _has_checkpoint_bytes(checkpoint_dir), checkpoint_dir
-            expected = _restored_signature(mesh, sync_dir)
-            actual = _restored_signature(mesh, checkpoint_dir)
-            assert actual[:2] == expected[:2], (actual[:2], expected[:2])
-            for left, right in zip(expected[2:], actual[2:]):
-                assert torch.equal(left, right), (left - right).abs().max()
+        )
+        expected = _restored_signature(mesh, sync_dir)
+        actual = _restored_signature(mesh, good_dir)
+        assert actual[:2] == expected[:2], (actual[:2], expected[:2])
+        for left, right in zip(expected[2:], actual[2:]):
+            assert torch.equal(left, right), (left - right).abs().max()
     finally:
         dist.destroy_process_group()
 
@@ -2739,3 +2748,165 @@ def test_second_moment_reblocking_regimes():
     assert relative_to_native(source_period // 4) > 0.1, relative_to_native(
         source_period // 4
     )
+
+
+def _same_signature(left, right):
+    """Compare two :func:`_restored_signature` tuples."""
+    return (
+        left[0] == right[0]
+        and left[1] == right[1]
+        and torch.equal(left[2], right[2])
+        and torch.equal(left[3], right[3])
+        and torch.equal(left[4], right[4])
+    )
+
+
+def _async_saved(state, checkpoint_dir, storage_writer, planner=None):
+    """Run an async_save to completion, whatever shape the future takes."""
+    _await_async_save(
+        torch.distributed.checkpoint.async_save(
+            state,
+            storage_writer=storage_writer,
+            planner=planner,
+        )
+    )
+    return checkpoint_dir
+
+
+@pytest.mark.skipif(
+    not dist.is_available() or not dist.is_gloo_available(),
+    reason="DCP resharding coverage requires Gloo",
+)
+def test_dcp_async_save_with_gefen_writer_restores_like_the_sync_save(tmp_path):
+    # The checkpoint an async save lands must be worth the same as the one the
+    # synchronous save lands. Not the same *bytes*: staging sets the writer's
+    # per_thread_copy_ahead to 0, which sorts the write items differently, so the
+    # file layout legitimately differs. What must match is what comes back out.
+    from gefen import GefenFileSystemWriter
+
+    _single_rank_group(tmp_path / "async-ok-init")
+    try:
+        mesh = init_device_mesh("cpu", (1,), mesh_dim_names=("dp",))
+        param = _shaped_dparam(_SHAPE, mesh)
+        optimizer = Gefen(
+            [("weight", param)], lr=1e-3, fused=False, factored_v_2d=False
+        )
+        for step in range(_SAVE_STEPS):
+            param.grad = distribute_tensor(
+                _shaped_grad(_SHAPE, step), mesh, [Shard(0)]
+            )
+            optimizer.step()
+        param.grad = None
+
+        sync_dir = str(tmp_path / "sync-ckpt")
+        torch.distributed.checkpoint.save(
+            {"optimizer": GefenDCPState(optimizer)},
+            storage_writer=FileSystemWriter(sync_dir),
+            planner=GefenSavePlanner(),
+        )
+
+        async_dir = str(tmp_path / "async-ckpt")
+        _async_saved(
+            {"optimizer": GefenDCPState(optimizer)},
+            async_dir,
+            GefenFileSystemWriter(async_dir),
+            GefenSavePlanner(),
+        )
+        assert _has_checkpoint_bytes(async_dir), async_dir
+
+        expected = _restored_signature(mesh, sync_dir)
+        actual = _restored_signature(mesh, async_dir)
+        assert _same_signature(actual, expected), (actual[:2], expected[:2])
+    finally:
+        dist.destroy_process_group()
+
+
+@pytest.mark.skipif(
+    not dist.is_available() or not dist.is_gloo_available(),
+    reason="DCP resharding coverage requires Gloo",
+)
+def test_dcp_async_save_snapshots_the_state_a_later_step_mutates(tmp_path):
+    # The property async_save exists to provide: it returns once the state is
+    # staged, and training may resume immediately without changing what lands on
+    # disk. That is only true if staging *copies* the dense form; a save that
+    # expanded the stand-ins in the writer thread would read whatever the
+    # optimizer holds by then and write a checkpoint that is neither the state at
+    # save time nor the state after the step, but a tear across both.
+    #
+    # Gating the writer is what makes this deterministic rather than a race the
+    # test usually wins: the background write is parked until the step has
+    # already landed, so an unstaged save could not accidentally pass.
+    import threading
+
+    from gefen import GefenFileSystemWriter
+
+    class _GatedWriter(GefenFileSystemWriter):
+        def __init__(self, path):
+            super().__init__(path)
+            self.entered = threading.Event()
+            self.release = threading.Event()
+
+        def write_data(self, plan, planner):
+            self.entered.set()
+            if not self.release.wait(timeout=120):
+                raise RuntimeError("gated write was never released")
+            return super().write_data(plan, planner)
+
+    _single_rank_group(tmp_path / "async-snap-init")
+    try:
+        mesh = init_device_mesh("cpu", (1,), mesh_dim_names=("dp",))
+        param = _shaped_dparam(_SHAPE, mesh)
+        optimizer = Gefen(
+            [("weight", param)], lr=1e-3, fused=False, factored_v_2d=False
+        )
+        for step in range(_SAVE_STEPS):
+            param.grad = distribute_tensor(
+                _shaped_grad(_SHAPE, step), mesh, [Shard(0)]
+            )
+            optimizer.step()
+        param.grad = None
+
+        # What the optimizer holds at the moment of the async_save call.
+        before_dir = str(tmp_path / "before-ckpt")
+        torch.distributed.checkpoint.save(
+            {"optimizer": GefenDCPState(optimizer)},
+            storage_writer=FileSystemWriter(before_dir),
+            planner=GefenSavePlanner(),
+        )
+
+        async_dir = str(tmp_path / "async-ckpt")
+        writer = _GatedWriter(async_dir)
+        response = torch.distributed.checkpoint.async_save(
+            {"optimizer": GefenDCPState(optimizer)},
+            storage_writer=writer,
+            planner=GefenSavePlanner(),
+        )
+        # async_save has returned, so staging is done and the write is parked.
+        assert writer.entered.wait(timeout=120)
+
+        # Resume training while the checkpoint is still unwritten.
+        param.grad = distribute_tensor(
+            _shaped_grad(_SHAPE, _SAVE_STEPS + 7), mesh, [Shard(0)]
+        )
+        optimizer.step()
+        param.grad = None
+        after_dir = str(tmp_path / "after-ckpt")
+        torch.distributed.checkpoint.save(
+            {"optimizer": GefenDCPState(optimizer)},
+            storage_writer=FileSystemWriter(after_dir),
+            planner=GefenSavePlanner(),
+        )
+
+        writer.release.set()
+        _await_async_save(response)
+
+        at_save = _restored_signature(mesh, before_dir)
+        after_step = _restored_signature(mesh, after_dir)
+        # The step has to have moved the state, or the assertions below are vacuous.
+        assert not _same_signature(at_save, after_step)
+
+        landed = _restored_signature(mesh, async_dir)
+        assert _same_signature(landed, at_save), (landed[:2], at_save[:2])
+        assert not _same_signature(landed, after_step)
+    finally:
+        dist.destroy_process_group()
