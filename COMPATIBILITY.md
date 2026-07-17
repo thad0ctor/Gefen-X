@@ -114,6 +114,27 @@ Block geometry is re-derived per shard, so a world-size change that moves a shar
 
 `GefenDCPState` requires `factored_v_2d=False` and `capturable=False` (the factored row/column second moment is not shard-addressable, and capturable/compiled counter and seed semantics are not host-serializable); Muon, Hybrid, `sharded_mode`, multidimensional meshes, subgroups, non-`Shard(0)` placements, and the native full-state format remain same-topology and fail closed.
 
+Pass `GefenSavePlanner` to `dcp.save` so the save stays memory-bounded. Resharding forces the dense expansion above — 4 bytes/param of momentum plus 4 bytes/param of second moment, eight times what the optimizer actually holds — and without the planner every slot's dense pair is expanded up front and kept live for the whole write, peaking higher than a training step. The planner expands one slot at a time, at the moment the writer asks for it, so the save peaks at the resident state plus a single slot's dense form:
+
+```python
+from gefen import Gefen, GefenDCPState, GefenSavePlanner
+import torch.distributed.checkpoint as dcp
+
+dcp.save(
+    {"model": model, "optimizer": GefenDCPState(optimizer)},
+    storage_writer=dcp.FileSystemWriter(path),
+    planner=GefenSavePlanner(),          # required for the memory bound
+)
+dcp.load(                                 # load needs no planner
+    {"model": model, "optimizer": GefenDCPState(optimizer)},
+    storage_reader=dcp.FileSystemReader(path),
+)
+```
+
+On a 64M-param local shard the peak over the optimizer's resident state falls from 12.0 to 6.0 bytes/param for one large tensor, and from 8.25 to 0.50 bytes/param for a 32-tensor model; the checkpoint bytes are unchanged. The bound is per *slot*, so the win grows as the state is split across more parameters, and the remaining transient is a single slot's dense form plus up to ~128 MiB of dequantize scratch. That scratch is a ceiling, not a fixed cost: it is bounded by the dequantize gather chunk (`GEFEN_DEQUANT_GATHER_CHUNK`, 8M elements), so only slots larger than the chunk pay the full ~128 MiB, and a smaller slot pays proportionally less — ~24 MiB per 2M-param slot in the 32-tensor case above, which is what makes 0.50 bytes/param reachable there. Omitting the planner is not a correctness bug — the save still writes exactly the same checkpoint — it only costs the old 8 bytes/param. `GefenSavePlanner` subclasses `DefaultSavePlanner` and defers to it for everything that is not Gefen optimizer state, so the model and any other Stateful items in the same state dict are unaffected.
+
+Save through `GefenDCPState` must be the synchronous `dcp.save`. `dcp.async_save` is **not supported** and fails loudly with a `RuntimeError`, writing nothing: its CPU staging copies the whole state dict up front, which is the all-slots-live dense expansion the save bound exists to avoid. Use `dcp.save`, or the native full-state path for a same-topology resume.
+
 ## Transformers Trainer DDP
 
 The `benchmarks.trainer_resume` gate exercises plain Gefen, GefenMuon+AdamW, and GefenMuon+Gefen through Trainer's internal Accelerate wrapper with tied weights, gradient accumulation, a changing scheduler, native Trainer checkpoint files, BF16 fused updates, and two-rank DDP replica hashes. All three recipes have passed its deterministic fused-BF16 two-rank configuration on homogeneous GPUs, which requires exact model, optimizer, scheduler, LR, and logged-loss agreement between uninterrupted and resumed runs. Run the gate with:

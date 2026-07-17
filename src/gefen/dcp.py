@@ -7,6 +7,13 @@ import math
 
 import torch
 
+# Imported at module scope (unlike the rest of this file's deferred imports)
+# because GefenSavePlanner subclasses it, so it must resolve at class-creation
+# time. This module is the DCP adapter and is itself only imported on demand
+# (gefen/__init__.py exposes it lazily), so nothing pays for it unless DCP is
+# actually being used.
+from torch.distributed.checkpoint.default_planner import DefaultSavePlanner
+
 
 # Schema history:
 #   v1 -- counters + dense momentum/second-moment slots only.
@@ -42,19 +49,6 @@ def _counter(value, name: str) -> int:
     if type(value) not in (int, float) or int(value) != value or value < 0:
         raise ValueError("{} must be a nonnegative integer".format(name))
     return int(value)
-
-
-def _dtensor_from_local(local: torch.Tensor, parameter):
-    from torch.distributed.tensor import DTensor
-
-    return DTensor.from_local(
-        local,
-        device_mesh=parameter.device_mesh,
-        placements=parameter.placements,
-        shape=parameter.shape,
-        stride=parameter.stride(),
-        run_check=False,
-    )
 
 
 def _dense_momentum(optimizer, parameter, state) -> torch.Tensor:
@@ -98,24 +92,310 @@ def _dense_second_moment(parameter, state) -> torch.Tensor:
 
     This is a *repeat*, not a reconstruction: Gefen keeps one second-moment value
     per block, so the per-element history this dense form implies never existed.
-    Load averages these repeated values into the target blocks, which is exact
-    (to fp32 round-off) only while each target block stays inside one source
-    block -- i.e. when the target blocking matches or refines the source's. A
-    coarser target block averages several source blocks' distinct vmeans
-    together, and that loss is irreversible. See the resume-error note in
-    COMPATIBILITY.md.
+    Load re-averages these repeated values onto the target blocks. Because vmean
+    is an EMA of the block's mean grad^2 and both are linear, a target block that
+    is a union of whole source blocks recovers exactly what a natively
+    target-blocked run holds (to fp32 round-off) -- coarsening onto source
+    boundaries is not the lossy direction. The loss is the other way: a target
+    block inside a source block (or straddling one) can only be handed the single
+    stored vmean, where a native run would hold a distinct value per sub-block.
+    See the resume-error note in COMPATIBILITY.md.
+
+    Broadcasting into one preallocated output rather than
+    ``expand(...).reshape(...).clone()``: reshaping a stride-0 expand cannot
+    return a view, so it already materialized a full 4 byte/param copy that the
+    clone then copied a *second* time -- 8 bytes/param live for a 4 byte/param
+    result, which is the whole transient this save path is trying to bound. The
+    clone could not simply be dropped, because at ``period == 1`` the expand is a
+    no-op and the reshape *does* return a view aliasing the live ``vmean`` state.
+    Filling an owned buffer is single-copy at every period and never aliases, and
+    copying values is bit-identical to repeating them.
     """
     period = _counter(state["automatic_period"], "automatic_period")
     vmean = state["vmean"].reshape(-1).float()
-    local_numel = _local(parameter).numel()
+    local = _local(parameter)
+    local_numel = local.numel()
     if period < 1 or vmean.numel() * period != local_numel:
         raise ValueError("Gefen second-moment block geometry is invalid")
-    return (
-        vmean.reshape(-1, 1)
-        .expand(-1, period)
-        .reshape(_local(parameter).shape)
-        .clone()
-    )
+    dense = torch.empty(local_numel, dtype=torch.float32, device=vmean.device)
+    dense.view(-1, period).copy_(vmean.reshape(-1, 1))
+    return dense.reshape(local.shape)
+
+
+def _validate_dense_geometry(optimizer, parameter, state) -> None:
+    """Re-check the dense-expansion invariants without allocating anything.
+
+    The dense momentum/second moment are materialized lazily, one at a time, at
+    DCP write time (see :class:`_LazyDenseShard`). Their guards would therefore
+    fire in the middle of a write, once part of the checkpoint is already on
+    disk. These are pure scalar/metadata checks -- a missing codebook, a
+    nonpositive period, a block count that does not divide the local shard -- so
+    running them up front in ``state_dict`` costs nothing and keeps a malformed
+    optimizer fail-closed *before* the first byte is written, matching the
+    fail-before-mutation contract the load path holds itself to. The lazy
+    materializers keep their own copies of these guards: they are the real
+    correctness barrier, and this is only an early, cheaper report of the same
+    conditions.
+    """
+    if optimizer._gefen_codebook is None:
+        raise RuntimeError("Gefen DCP save requires an initialized codebook")
+    period = _counter(state["automatic_period"], "automatic_period")
+    local_numel = _local(parameter).numel()
+    codebook_numel = state["m_codebook"].reshape(-1).numel()
+    if (
+        period < 1
+        or codebook_numel != state["m_magnitude"].reshape(-1).numel() * period
+        # The index/magnitude ratio holding says nothing about whether the blocks
+        # tile the shard: _dense_momentum reshapes the dequantized indices to the
+        # local shape, so a block count that is self-consistent but short (both
+        # arrays scaled down together) still fails there, mid-write.
+        or codebook_numel != local_numel
+    ):
+        raise ValueError("Gefen momentum block geometry is invalid")
+    if period < 1 or state["vmean"].reshape(-1).numel() * period != local_numel:
+        raise ValueError("Gefen second-moment block geometry is invalid")
+
+
+class _LazyDenseShard(torch.Tensor):
+    """A zero-storage stand-in for one slot's dense fp32 shard.
+
+    Resharding forces the save to expand Gefen's ~1 byte/param block state into a
+    dense 4 byte/param momentum plus a dense 4 byte/param second moment, because
+    the momentum codebook is learned *per rank* (rank 3's index 47 is not rank
+    5's index 47), so the indices are meaningless off their owning rank. Building
+    every slot's dense pair up front and handing DCP a finished dict held 8
+    bytes/param for the whole write -- eight times the optimizer's resident state,
+    and a higher peak than a training step -- which defeats the one optimizer
+    whose premise is memory efficiency.
+
+    DCP never needs those tensors simultaneously. It plans from *metadata* and
+    then asks for one write item's data at a time, so this stands in for the
+    dense tensor during planning and materializes it only when the writer asks.
+    The writer drops its reference as soon as the shard is copied to CPU (and
+    bounds how far it copies ahead), so exactly one dense tensor is live at a
+    time and the save peak falls to the resident state plus a single slot's dense
+    form.
+
+    The instance is a ``torch.Tensor`` subclass rather than a plain descriptor
+    object because DCP resolves data through ``find_state_dict_object`` ->
+    ``find_tensor_shard``, which routes to the ``__get_tensor_shard__`` hook
+    below only for values that pass ``isinstance(obj, torch.Tensor)``; a
+    non-tensor descriptor is rejected there instead. The three dunders implement
+    torch's ``_Checkpointable`` protocol -- the same interface DTensor itself
+    hooks into DCP with -- so planning reads this stand-in's metadata natively and
+    composes with the model and any other Stateful items in the caller's state
+    dict.
+
+    It is built with ``_make_wrapper_subclass``, which yields a tensor that
+    reports a real shape/dtype/device but owns no allocated storage (its data
+    pointer is null), so a slot costs nothing until it is expanded. Three
+    properties of that construction are load-bearing:
+
+    * The shape is the parameter's *global* shape, matching what the eager
+      DTensor reported. DCP's load planner compares ``obj.size()` against the
+      checkpoint's recorded global size and rejects a mismatch, so a stand-in
+      that described only its local shard would fail every load.
+    * The device must NOT be ``meta``. DCP's load planner runs
+      ``_init_state_dict`` over the destination and rebuilds every meta tensor
+      with ``empty_like``, which preserves this subclass but drops the attributes
+      below, replacing a stand-in with a plain non-DTensor buffer whose geometry
+      no longer describes a shard.
+    * ``__torch_dispatch__`` refuses every real operation. The stand-in has no
+      data, so anything that tries to compute with it is a bug; failing loudly
+      there is what keeps a bypassed expansion from quietly writing uninitialized
+      bytes into a checkpoint.
+
+    ``state_dict`` is the *same* method DCP calls to build the destination of a
+    ``load``, so a stand-in must also work as a load destination. That is why
+    ``__get_tensor_shard__`` allocates once and keeps the buffer: DCP reads the
+    checkpoint into whatever that hook returns, so handing back a fresh tensor
+    per call would let the load copy into a temporary that is dropped on the
+    floor -- a silent no-op restore. Caching makes the default path behave
+    exactly like the eager dense tensor the pre-fix save handed DCP: correct for
+    load, and correct (if still 8 bytes/param) for a save that does not pass
+    :class:`GefenSavePlanner`. Only that planner bypasses the cache, which is
+    what makes the save bound opt-in rather than automatic.
+    """
+
+    @staticmethod
+    def __new__(cls, parameter, materialize):
+        """Build the stand-in for ``parameter``'s dense fp32 shard.
+
+        ``materialize`` is a zero-argument callable returning the dense *local*
+        tensor, mirroring ``DTensor.__get_tensor_shard__`` -> ``to_local()``:
+        the reported shape is global, the resolved data is this rank's shard.
+        """
+        shard = torch.Tensor._make_wrapper_subclass(
+            cls,
+            parameter.shape,
+            dtype=torch.float32,
+            device=_local(parameter).device,
+            requires_grad=False,
+        )
+        shard._gefen_parameter = parameter
+        shard._gefen_materialize = materialize
+        shard._gefen_cache = None
+        return shard
+
+    def __init__(self, parameter, materialize):
+        # torch.Tensor.__init__ takes no arguments; __new__ did the work.
+        pass
+
+    @classmethod
+    def __torch_dispatch__(cls, func, types, args=(), kwargs=None):
+        # is_pinned is pure metadata and is the one operator DCP genuinely needs
+        # (TensorProperties.create_from_tensor reads it while planning); the
+        # dense form this stands in for is never pinned.
+        if func is torch.ops.aten.is_pinned.default:
+            return False
+        # Names both ways an operator can reach here, because the two are not
+        # distinguishable from `func` alone: a stand-in escaping into ordinary
+        # tensor code, and dcp.async_save (whose CPU staging zeros_like's the
+        # whole state dict up front). Deliberately does NOT suggest passing a
+        # planner: the planner bounds the save's peak, it is not what resolves
+        # the stand-in, and a caller who already passed one is told to do again
+        # the thing that did not help.
+        raise RuntimeError(
+            "Gefen DCP stand-in cannot execute {}: it carries no data of its "
+            "own. It stands in for one slot's dense fp32 shard, which is "
+            "expanded only through torch.distributed.checkpoint's synchronous "
+            "save/load protocol, so an operator reaching here means a "
+            "GefenDCPState state_dict() is being used as a dict of ordinary "
+            "tensors. In particular, torch.distributed.checkpoint.async_save is "
+            "not supported with GefenDCPState -- its CPU staging copies the "
+            "whole state dict up front, which is the materialization the "
+            "stand-in exists to avoid -- so use the synchronous "
+            "torch.distributed.checkpoint.save instead. To hold real tensors "
+            "outside DCP, use the optimizer's own state_dict().".format(func)
+        )
+
+    def __repr__(self, *, tensor_contents=None):
+        # torch.Tensor.__repr__ formats by reading elements (aten.select), which
+        # __torch_dispatch__ refuses -- so printing a state dict, or logging one
+        # from an exception handler, raised a secondary error that buried the
+        # real one. Report the metadata the stand-in genuinely has instead; a
+        # repr must never raise. getattr defends the one path that builds this
+        # subclass without __new__ (DCP's _init_state_dict -> empty_like), where
+        # the attributes below are absent.
+        return (
+            "{}({} Gefen DCP stand-in for dense fp32 optimizer state, "
+            "shape={}, dtype={}, device={})".format(
+                type(self).__name__,
+                "materialized"
+                if getattr(self, "_gefen_cache", None) is not None
+                else "unmaterialized",
+                tuple(self.shape),
+                self.dtype,
+                self.device,
+            )
+        )
+
+    def __reduce_ex__(self, protocol):
+        # Pickle (torch.save, copy.copy) would otherwise fail inside pickle on
+        # the materialize closure -- "Can't get local object
+        # '_lazy_momentum.<locals>.materialize'" -- which names nothing the
+        # caller can act on. The real constraint is that this holds a reference
+        # to live optimizer state, not data, so it is not serializable at all
+        # outside DCP's protocol.
+        raise TypeError(
+            "Gefen DCP stand-in cannot be pickled: it carries no data of its "
+            "own and is resolved only through torch.distributed.checkpoint's "
+            "save/load protocol. Use torch.distributed.checkpoint.save with a "
+            "GefenDCPState to write it, or the optimizer's own state_dict() "
+            "for an ordinary serializable dict."
+        )
+
+    def _gefen_chunk(self):
+        """This shard's global offsets/sizes.
+
+        Taken from the *parameter*'s own chunk list rather than recomputed: the
+        eager path wrapped the dense tensor in a DTensor built from the
+        parameter's mesh/placements/shape, so the parameter's chunk geometry is
+        by construction the geometry the dense slot had, and reusing DTensor's
+        own helper keeps the two from drifting apart.
+        """
+        return self._gefen_parameter.__create_chunk_list__()[0]
+
+    def _gefen_resolve_uncached(self) -> torch.Tensor:
+        """Expand the dense shard without retaining it (the bounded save path)."""
+        return self._gefen_materialize()
+
+    def __create_write_items__(self, fqn, obj):
+        from torch.distributed.checkpoint.metadata import (
+            MetadataIndex,
+            TensorProperties,
+        )
+        from torch.distributed.checkpoint.planner import (
+            TensorWriteData,
+            WriteItem,
+            WriteItemType,
+        )
+
+        chunk = self._gefen_chunk()
+        return [
+            WriteItem(
+                index=MetadataIndex(fqn, chunk.offsets),
+                type=WriteItemType.SHARD,
+                tensor_data=TensorWriteData(
+                    chunk=chunk,
+                    # Reads dtype/layout/requires_grad/pin_memory -- none of which
+                    # depend on shape or storage -- off this stand-in, which
+                    # mirrors the dense tensor in all of them, so they match what
+                    # the eager DTensor's local shard reported.
+                    properties=TensorProperties.create_from_tensor(self),
+                    size=self._gefen_parameter.size(),
+                ),
+            )
+        ]
+
+    def __create_chunk_list__(self):
+        return [self._gefen_chunk()]
+
+    def __get_tensor_shard__(self, index):
+        # Retained on purpose -- see the class docstring: this is the load
+        # destination, and it must stay the same buffer across calls.
+        if self._gefen_cache is None:
+            self._gefen_cache = self._gefen_materialize()
+        return self._gefen_cache
+
+
+def _lazy_momentum(optimizer, parameter, state, initialized):
+    """Defer one slot's dense momentum expansion to write time."""
+
+    def materialize():
+        if initialized:
+            return _dense_momentum(optimizer, parameter, state)
+        return torch.zeros_like(_local(parameter), dtype=torch.float32)
+
+    return _LazyDenseShard(parameter, materialize)
+
+
+def _lazy_second_moment(parameter, state, initialized):
+    """Defer one slot's dense second-moment expansion to write time."""
+
+    def materialize():
+        if initialized:
+            return _dense_second_moment(parameter, state)
+        return torch.zeros_like(_local(parameter), dtype=torch.float32)
+
+    return _LazyDenseShard(parameter, materialize)
+
+
+def _dense_from_checkpoint(value) -> torch.Tensor:
+    """Read one dense slot out of a checkpoint value.
+
+    A DCP load fills the stand-ins returned by ``state_dict`` and hands the same
+    dict back, so the value here is the stand-in whose retained buffer DCP just
+    read the checkpoint into -- ``__get_tensor_shard__`` returns exactly that
+    buffer. A caller can also feed a ``state_dict()`` straight back into
+    ``load_state_dict`` with no save/load in between (an in-memory reset that
+    several tests exercise); then the buffer has not been filled and holds the
+    dense form of the optimizer's current state, which is what the eager save
+    produced there too. Both cases are one call.
+    """
+    if isinstance(value, _LazyDenseShard):
+        return value.__get_tensor_shard__(None)
+    return _local(value)
 
 
 def _choose_period(optimizer, name: str, parameter, second: torch.Tensor) -> int:
@@ -238,17 +518,27 @@ class GefenDCPState:
 
     Use this object as the optimizer value passed to
     :func:`torch.distributed.checkpoint.save` and ``load``. Save dequantizes the
-    quantized momentum against the learned per-rank codebook into dense
-    ``Shard(0)`` DTensors; load reshards those dense tensors and re-blocks them
-    back into Gefen's compact per-block state (re-running the period search,
-    relearning the codebook, and re-quantizing on each new local shard), so the
-    restored optimizer keeps its ~1 byte/param footprint. Because it goes through
+    quantized momentum against the learned per-rank codebook into dense fp32
+    ``Shard(0)`` shards -- expanded one slot at a time as the writer asks for
+    them (see :class:`_LazyDenseShard`) rather than handed to DCP as finished
+    tensors, which is what keeps the save's peak bounded; load reshards that
+    dense form and re-blocks it back into Gefen's compact per-block state
+    (re-running the period search, relearning the codebook, and re-quantizing on
+    each new local shard), so the restored optimizer keeps its ~1 byte/param
+    footprint. Because it goes through
     a dense reshard this path is for *changing* topology; same-topology resumes
     should use the native bit-exact ``state_dict`` path (left unchanged).
 
     The adapter is intentionally limited to plain :class:`gefen.Gefen` with
     ``factored_v_2d=False`` and ``capturable=False``, one-dimensional
     default-world DTensors, and one ``Shard(0)`` placement.
+
+    Save must be the *synchronous* :func:`torch.distributed.checkpoint.save`;
+    ``async_save`` is not supported and fails loudly. Its CPU staging copies the
+    whole state dict up front, which is exactly the all-slots-live
+    materialization this save path is built to avoid, so it is refused rather
+    than silently staging empty tensors. Pass :class:`GefenSavePlanner` to that
+    synchronous save to keep its peak bounded.
     """
 
     def __init__(self, optimizer):
@@ -638,22 +928,20 @@ class GefenDCPState:
                 else 0,
                 dtype=torch.int64,
             )
-            local = _local(slot.parameter)
-            momentum = (
-                _dense_momentum(self.optimizer, slot.parameter, state)
-                if initialized
-                else torch.zeros_like(local, dtype=torch.float32)
+            # Check the dense-expansion invariants now, while nothing has been
+            # written, rather than letting them fire from inside a write.
+            if initialized:
+                _validate_dense_geometry(self.optimizer, slot.parameter, state)
+            # Hand DCP stand-ins, not tensors: expanding every slot here held the
+            # dense momentum AND second moment for every parameter live at once
+            # (8 bytes/param, eight times the optimizer's resident state) for the
+            # whole write. The stand-ins carry the planning metadata and expand
+            # one at a time as the writer asks for them.
+            result[self._key(slot, "momentum")] = _lazy_momentum(
+                self.optimizer, slot.parameter, state, initialized
             )
-            second = (
-                _dense_second_moment(slot.parameter, state)
-                if initialized
-                else torch.zeros_like(local, dtype=torch.float32)
-            )
-            result[self._key(slot, "momentum")] = _dtensor_from_local(
-                momentum, slot.parameter
-            )
-            result[self._key(slot, "second_moment")] = _dtensor_from_local(
-                second, slot.parameter
+            result[self._key(slot, "second_moment")] = _lazy_second_moment(
+                slot.parameter, state, initialized
             )
         return result
 
@@ -750,8 +1038,16 @@ class GefenDCPState:
                 vmean_step = _counter(
                     state_dict[keys["vmean_step"]], "vmean_step"
                 )
-                momentum = _local(state_dict[keys["momentum"]]).detach().float()
-                second = _local(state_dict[keys["second_moment"]]).detach().float()
+                momentum = (
+                    _dense_from_checkpoint(state_dict[keys["momentum"]])
+                    .detach()
+                    .float()
+                )
+                second = (
+                    _dense_from_checkpoint(state_dict[keys["second_moment"]])
+                    .detach()
+                    .float()
+                )
                 local = _local(slot.parameter)
                 if momentum.shape != local.shape or second.shape != local.shape:
                     raise ValueError(
@@ -914,3 +1210,45 @@ class GefenDCPState:
         self.optimizer._sr_seed_by_device.clear()
         self.optimizer._reset_gefen_global_step_devices()
         self.optimizer._static_mark_sig = None
+
+
+class GefenSavePlanner(DefaultSavePlanner):
+    """``SavePlanner`` that keeps a :class:`GefenDCPState` save memory-bounded.
+
+    Pass this to ``torch.distributed.checkpoint.save`` whenever the state dict
+    contains a :class:`GefenDCPState`::
+
+        dcp.save(
+            {"model": model, "optimizer": GefenDCPState(optimizer)},
+            storage_writer=dcp.FileSystemWriter(path),
+            planner=GefenSavePlanner(),
+        )
+
+    Resharding forces the save to expand Gefen's ~1 byte/param block state into a
+    dense 4 byte/param momentum plus a dense 4 byte/param second moment (the
+    momentum codebook is learned per rank, so the indices mean nothing off their
+    owning rank). :class:`GefenDCPState` therefore hands DCP zero-storage
+    stand-ins instead of finished tensors, and this planner expands exactly one
+    of them at a time, at the moment the writer asks for that write item, without
+    keeping it afterwards. The writer drops its own reference once the shard is
+    copied to CPU and bounds how far it copies ahead, so the save peaks at the
+    optimizer's resident state plus a single slot's dense form rather than
+    holding 8 bytes/param for every parameter across the whole write.
+
+    Without this planner the save is still *correct* -- the stand-ins fall back to
+    allocating and retaining their dense form, which is what the load path needs
+    them to do anyway -- but it costs the same 8 bytes/param the eager
+    implementation did. Everything that is not a Gefen stand-in (the model, other
+    Stateful items) is handled entirely by ``DefaultSavePlanner``.
+    """
+
+    def resolve_data(self, write_item):
+        # Deliberately NOT via lookup_object(): that resolves through
+        # find_tensor_shard -> __get_tensor_shard__, which retains the buffer for
+        # the load path and would defeat the bound. Read the entry straight out
+        # of the (already flattened) state dict instead, and fall through to the
+        # default for anything that is not a Gefen stand-in.
+        entry = self.state_dict.get(write_item.index.fqn)
+        if isinstance(entry, _LazyDenseShard):
+            return entry._gefen_resolve_uncached()
+        return super().resolve_data(write_item)

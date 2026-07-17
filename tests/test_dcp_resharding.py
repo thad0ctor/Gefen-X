@@ -36,7 +36,7 @@ from torch.distributed.tensor import (
     init_device_mesh,
 )
 
-from gefen import Gefen, GefenDCPState
+from gefen import Gefen, GefenDCPState, GefenSavePlanner
 
 
 # A 2D weight large enough that the block-variance period search returns a real
@@ -1592,6 +1592,392 @@ def test_dense_momentum_transient_is_bounded():
     # form peaked at ~16. Anything at/above 8 means a full-size int64 index copy
     # (or a second full-size gather) is live again.
     assert peak_bytes_per_elem < 8.0, peak_bytes_per_elem
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available(),
+    reason="peak-allocation measurement requires CUDA",
+)
+def test_dense_second_moment_transient_is_bounded():
+    # Direct unit test (no distributed needed). The pre-fix form was
+    # expand(...).reshape(...).clone(): reshaping a stride-0 expand cannot return
+    # a view, so it already built a full 4-byte/param copy that the clone then
+    # copied a SECOND time -- 8 bytes/param live to produce a 4-byte/param
+    # result. Filling one preallocated buffer is single-copy.
+    import gefen.dcp as dcp_mod
+
+    numel = 1 << 24
+    period = 64
+    torch.manual_seed(0)
+    state = {
+        "vmean": torch.rand(numel // period, device="cuda"),
+        "automatic_period": period,
+    }
+    param = torch.empty(numel // 128, 128, device="cuda", dtype=torch.bfloat16)
+
+    torch.cuda.synchronize()
+    torch.cuda.reset_peak_memory_stats()
+    base = torch.cuda.memory_allocated()
+    dense = dcp_mod._dense_second_moment(param, state)
+    torch.cuda.synchronize()
+    peak_bytes_per_elem = (torch.cuda.max_memory_allocated() - base) / numel
+
+    assert dense.numel() == numel
+    # The 4-byte/param fp32 result is kept, so it is the floor; the pre-fix form
+    # peaked at exactly 8. Anything at/above 6 means a second full-size copy is
+    # live again.
+    assert peak_bytes_per_elem < 6.0, peak_bytes_per_elem
+
+
+def test_dense_second_moment_does_not_alias_live_vmean_at_period_one():
+    # At period 1 the expand is a no-op and the reshape returns a VIEW of the
+    # live vmean state -- the clone the pre-fix form ended with was what kept the
+    # dense save from aliasing (and a later in-place re-block from corrupting)
+    # the optimizer's own second moment. The preallocated fill must own its
+    # memory at every period, including this one.
+    import gefen.dcp as dcp_mod
+
+    original = torch.tensor([1.0, 2.0, 3.0, 4.0])
+    state = {"vmean": original.clone(), "automatic_period": 1}
+    param = torch.empty(4)
+
+    dense = dcp_mod._dense_second_moment(param, state)
+    assert torch.equal(dense, original)
+    dense.add_(1.0)
+    # Mutating the dense expansion must not touch the optimizer's live state.
+    assert torch.equal(state["vmean"], original), state["vmean"]
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or not dist.is_available() or not dist.is_gloo_available(),
+    reason="peak-allocation measurement requires CUDA and Gloo",
+)
+def test_dcp_save_peak_is_bounded_by_one_slot(tmp_path):
+    # The save must expand Gefen's ~1 byte/param block state to a dense 4
+    # byte/param momentum + 4 byte/param second moment, because the momentum
+    # codebook is learned per rank. The pre-fix state_dict() built that dense
+    # pair for EVERY slot up front and handed DCP a finished dict, so all of it
+    # -- 8 bytes/param, eight times the optimizer's resident state -- stayed live
+    # for the whole write, peaking higher than a training step.
+    #
+    # DCP resolves one write item at a time, so GefenSavePlanner caps the
+    # transient at a single slot's dense form (plus the dequantize's gather
+    # scratch, which is bounded by the gather chunk rather than by the total
+    # state, so it does not scale with the slot count). Sized so that a
+    # regression to all-slots-live is unambiguous: 8 equal slots means eager
+    # retention is ~8x this bound.
+    _single_rank_group(tmp_path / "save-peak-init")
+    try:
+        mesh = init_device_mesh("cuda", (1,), mesh_dim_names=("dp",))
+        slots = 8
+        shape = (2048, 1024)  # 2M params per slot; 16M total
+        named = []
+        for index in range(slots):
+            named.append(
+                ("w{}".format(index), _shaped_dparam(shape, mesh, device="cuda"))
+            )
+        optimizer = Gefen(
+            named, lr=1e-3, fused=False, factored_v_2d=False, deterministic=True
+        )
+        numel = sum(param.numel() for _, param in named)
+        for step in range(_SAVE_STEPS):
+            for _, param in named:
+                param.grad = distribute_tensor(
+                    _shaped_grad(shape, step).cuda(), mesh, [Shard(0)]
+                )
+            optimizer.step()
+        for _, param in named:
+            param.grad = None
+
+        # state_dict() itself must materialize nothing at all.
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()
+        torch.cuda.reset_peak_memory_stats()
+        base = torch.cuda.memory_allocated()
+        saved = GefenDCPState(optimizer).state_dict()
+        torch.cuda.synchronize()
+        held = (torch.cuda.memory_allocated() - base) / numel
+        assert held < 0.1, held
+        del saved
+
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()
+        torch.cuda.reset_peak_memory_stats()
+        base = torch.cuda.memory_allocated()
+        torch.distributed.checkpoint.save(
+            {"optimizer": GefenDCPState(optimizer)},
+            storage_writer=FileSystemWriter(str(tmp_path / "save-peak-ckpt")),
+            planner=GefenSavePlanner(),
+        )
+        torch.cuda.synchronize()
+        peak_bytes_per_elem = (torch.cuda.max_memory_allocated() - base) / numel
+
+        # Eager retention is >= 8 (dense momentum + dense second moment for every
+        # slot). One slot's dense pair is 8/slots = 1, and the gather scratch
+        # adds ~24 MiB (12 bytes per element of a 2M-element slot, under the 8M
+        # chunk) = 1.5 here; 4 separates the two regimes with room to spare on
+        # either side.
+        assert peak_bytes_per_elem < 4.0, peak_bytes_per_elem
+    finally:
+        dist.destroy_process_group()
+
+
+@pytest.mark.skipif(
+    not dist.is_available() or not dist.is_gloo_available(),
+    reason="DCP resharding coverage requires Gloo",
+)
+def test_dcp_save_without_planner_is_still_correct(tmp_path):
+    # GefenSavePlanner is what makes the save memory-BOUNDED, not what makes it
+    # correct. A caller who forgets it must still get a checkpoint that restores
+    # exactly what the planner-bounded save would have written -- the stand-ins
+    # fall back to expanding and retaining their dense form (the pre-fix memory
+    # profile). A silently wrong checkpoint would be far worse than a hungry one.
+    _single_rank_group(tmp_path / "no-planner-init")
+    try:
+        mesh = init_device_mesh("cpu", (1,), mesh_dim_names=("dp",))
+        planned_dir = str(tmp_path / "planned")
+        plain_dir = str(tmp_path / "plain")
+
+        param = _shaped_dparam(_SHAPE, mesh)
+        optimizer = Gefen(
+            [("weight", param)], lr=1e-3, fused=False, factored_v_2d=False
+        )
+        for step in range(_SAVE_STEPS):
+            param.grad = distribute_tensor(
+                _shaped_grad(_SHAPE, step), mesh, [Shard(0)]
+            )
+            optimizer.step()
+
+        torch.distributed.checkpoint.save(
+            {"optimizer": GefenDCPState(optimizer)},
+            storage_writer=FileSystemWriter(planned_dir),
+            planner=GefenSavePlanner(),
+        )
+        torch.distributed.checkpoint.save(
+            {"optimizer": GefenDCPState(optimizer)},
+            storage_writer=FileSystemWriter(plain_dir),
+        )
+
+        # Both checkpoints must restore byte-identical optimizer state.
+        signatures = []
+        for checkpoint_dir in (planned_dir, plain_dir):
+            target_param = _shaped_dparam(_SHAPE, mesh)
+            target = Gefen(
+                [("weight", target_param)], lr=1e-3, fused=False, factored_v_2d=False
+            )
+            wrapper = GefenDCPState(target)
+            state = wrapper.state_dict()
+            torch.distributed.checkpoint.load(
+                {"optimizer": wrapper},
+                storage_reader=FileSystemReader(checkpoint_dir),
+            )
+            del state
+            restored = target.state[target_param]
+            signatures.append(
+                (
+                    int(restored["automatic_period"]),
+                    int(restored["step"]),
+                    restored["m_codebook"].clone(),
+                    restored["m_magnitude"].clone(),
+                    restored["vmean"].clone(),
+                )
+            )
+
+        planned, plain = signatures
+        assert planned[:2] == plain[:2], (planned[:2], plain[:2])
+        for left, right in zip(planned[2:], plain[2:]):
+            assert torch.equal(left, right), (left - right).abs().max()
+    finally:
+        dist.destroy_process_group()
+
+
+def _has_checkpoint_bytes(checkpoint_dir):
+    # A DCP checkpoint is loadable only with its .metadata; .distcp files are the
+    # shard payloads. Either one means the save got past planning and put
+    # something on disk.
+    if not os.path.isdir(checkpoint_dir):
+        return False
+    names = os.listdir(checkpoint_dir)
+    return any(
+        name == ".metadata" or name.endswith(".distcp") for name in names
+    )
+
+
+@pytest.mark.skipif(
+    not dist.is_available() or not dist.is_gloo_available(),
+    reason="DCP resharding coverage requires Gloo",
+)
+def test_dcp_async_save_is_refused_and_writes_nothing(tmp_path):
+    # async_save is NOT supported with GefenDCPState: its CPU staging
+    # (_create_cpu_state_dict -> zeros_like over the whole state dict) is exactly
+    # the all-slots-live materialization the stand-ins exist to avoid. It must
+    # fail loudly and leave no checkpoint behind -- a half-written or
+    # empty-tensor checkpoint that only fails at restore time would be far worse.
+    # Pinned here because this is a deliberate scope limit, not an accident: the
+    # refusal is what a caller reaching for async_save has to be told.
+    _single_rank_group(tmp_path / "async-init")
+    try:
+        mesh = init_device_mesh("cpu", (1,), mesh_dim_names=("dp",))
+        param = _shaped_dparam(_SHAPE, mesh)
+        optimizer = Gefen(
+            [("weight", param)], lr=1e-3, fused=False, factored_v_2d=False
+        )
+        for step in range(_SAVE_STEPS):
+            param.grad = distribute_tensor(
+                _shaped_grad(_SHAPE, step), mesh, [Shard(0)]
+            )
+            optimizer.step()
+        param.grad = None
+
+        checkpoint_dir = str(tmp_path / "async-ckpt")
+        with pytest.raises(RuntimeError) as excinfo:
+            torch.distributed.checkpoint.async_save(
+                {"optimizer": GefenDCPState(optimizer)},
+                storage_writer=FileSystemWriter(checkpoint_dir),
+                planner=GefenSavePlanner(),
+            )
+
+        message = str(excinfo.value)
+        # The message must send the caller to the synchronous save...
+        assert "async_save" in message, message
+        assert "not supported" in message, message
+        assert "synchronous" in message, message
+        # ...and must NOT tell them to pass a planner. This call already passes
+        # one, so advice to pass it is advice to redo what just failed.
+        assert "GefenSavePlanner" not in message, message
+        assert not _has_checkpoint_bytes(checkpoint_dir), os.listdir(checkpoint_dir)
+    finally:
+        dist.destroy_process_group()
+
+
+@pytest.mark.skipif(
+    not dist.is_available() or not dist.is_gloo_available(),
+    reason="DCP resharding coverage requires Gloo",
+)
+def test_dcp_save_rejects_codebook_that_does_not_tile_the_shard(tmp_path):
+    # The block-count checks are not redundant with each other: shrinking
+    # m_magnitude and m_codebook together by one block keeps the ratio
+    # m_codebook == m_magnitude * period intact and leaves vmean alone, so both
+    # of the other invariants still hold -- but the blocks no longer tile the
+    # local shard, which is what _dense_momentum's final reshape requires. Since
+    # the dense expansion is deferred to write time, missing this check does not
+    # merely lose an error message: it turns a clean up-front rejection into a
+    # failure from inside the write.
+    _single_rank_group(tmp_path / "tile-init")
+    try:
+        mesh = init_device_mesh("cpu", (1,), mesh_dim_names=("dp",))
+        param = _shaped_dparam(_SHAPE, mesh)
+        optimizer = Gefen(
+            [("weight", param)], lr=1e-3, fused=False, factored_v_2d=False
+        )
+        for step in range(_SAVE_STEPS):
+            param.grad = distribute_tensor(
+                _shaped_grad(_SHAPE, step), mesh, [Shard(0)]
+            )
+            optimizer.step()
+        param.grad = None
+
+        state = optimizer.state[param]
+        period = int(state["automatic_period"])
+        blocks = state["m_magnitude"].reshape(-1).numel()
+        assert blocks > 1 and period > 1, (blocks, period)
+        state["m_magnitude"] = state["m_magnitude"].reshape(-1)[: blocks - 1].clone()
+        state["m_codebook"] = (
+            state["m_codebook"].reshape(-1)[: (blocks - 1) * period].clone()
+        )
+
+        with pytest.raises(ValueError, match="momentum block geometry is invalid"):
+            GefenDCPState(optimizer).state_dict()
+
+        # ...and the save that would have consumed it stops before writing a byte.
+        checkpoint_dir = str(tmp_path / "tile-ckpt")
+        with pytest.raises(ValueError, match="momentum block geometry is invalid"):
+            torch.distributed.checkpoint.save(
+                {"optimizer": GefenDCPState(optimizer)},
+                storage_writer=FileSystemWriter(checkpoint_dir),
+                planner=GefenSavePlanner(),
+            )
+        assert not _has_checkpoint_bytes(checkpoint_dir)
+    finally:
+        dist.destroy_process_group()
+
+
+@pytest.mark.skipif(
+    not dist.is_available() or not dist.is_gloo_available(),
+    reason="DCP resharding coverage requires Gloo",
+)
+def test_lazy_shard_repr_is_informative_and_never_dispatches(tmp_path):
+    # torch.Tensor.__repr__ formats by reading elements, which the stand-in
+    # refuses -- so before the __repr__ override, printing the state dict (or
+    # logging it from an exception handler) raised a SECONDARY error that buried
+    # whatever was actually being debugged. A repr must never raise.
+    _single_rank_group(tmp_path / "repr-init")
+    try:
+        mesh = init_device_mesh("cpu", (1,), mesh_dim_names=("dp",))
+        param = _shaped_dparam(_SHAPE, mesh)
+        optimizer = Gefen(
+            [("weight", param)], lr=1e-3, fused=False, factored_v_2d=False
+        )
+        for step in range(_SAVE_STEPS):
+            param.grad = distribute_tensor(
+                _shaped_grad(_SHAPE, step), mesh, [Shard(0)]
+            )
+            optimizer.step()
+        param.grad = None
+
+        state_dict = GefenDCPState(optimizer).state_dict()
+        standin = state_dict["slot_00000000.momentum"]
+
+        text = repr(standin)
+        assert "_LazyDenseShard" in text, text
+        assert "unmaterialized" in text, text
+        # The global shape, not the local shard's: that is what the stand-in
+        # reports to DCP, so a repr showing anything else would mislead.
+        assert str(tuple(param.shape)) in text, text
+        assert "torch.float32" in text, text
+        assert str(_local(param).device) in text, text
+        # str/format go through the same override, and a dict of them -- the way
+        # this is actually printed -- must format too.
+        assert str(standin) == text
+        assert "{}".format(standin) == text
+        assert "_LazyDenseShard" in repr(state_dict)
+    finally:
+        dist.destroy_process_group()
+
+
+@pytest.mark.skipif(
+    not dist.is_available() or not dist.is_gloo_available(),
+    reason="DCP resharding coverage requires Gloo",
+)
+def test_lazy_shard_pickle_names_the_real_constraint(tmp_path):
+    # torch.save of a GefenDCPState state_dict used to fail inside pickle with
+    # "Can't get local object '_lazy_momentum.<locals>.materialize'", which names
+    # an implementation detail instead of the constraint. The stand-in references
+    # live optimizer state rather than carrying data, so it is not serializable
+    # outside DCP at all; the error has to say so and point somewhere useful.
+    _single_rank_group(tmp_path / "pickle-init")
+    try:
+        mesh = init_device_mesh("cpu", (1,), mesh_dim_names=("dp",))
+        param = _shaped_dparam(_SHAPE, mesh)
+        optimizer = Gefen(
+            [("weight", param)], lr=1e-3, fused=False, factored_v_2d=False
+        )
+        for step in range(_SAVE_STEPS):
+            param.grad = distribute_tensor(
+                _shaped_grad(_SHAPE, step), mesh, [Shard(0)]
+            )
+            optimizer.step()
+        param.grad = None
+
+        state_dict = GefenDCPState(optimizer).state_dict()
+        with pytest.raises(TypeError, match="cannot be pickled"):
+            torch.save(state_dict, str(tmp_path / "standin.pt"))
+
+        # The optimizer's own state_dict stays the serializable path, and saying
+        # so is the point of the message.
+        torch.save(optimizer.state_dict(), str(tmp_path / "native.pt"))
+    finally:
+        dist.destroy_process_group()
 
 
 @pytest.mark.skipif(
