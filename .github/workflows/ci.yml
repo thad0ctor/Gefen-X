@@ -124,11 +124,12 @@ jobs:
         run: |
           python - <<'PY'
           import gefen
-          # Derive the public optimizers from __all__ so this adapts per branch
-          # (e.g. main has no GefenMuonHybrid). Skip non-class exports: "kernels"
-          # is a submodule and "__version__" is a string, neither has __name__.
-          names = [n for n in gefen.__all__ if n not in ("kernels", "__version__")]
-          loaded = {n: getattr(gefen, n).__name__ for n in names}
+          # Resolve every public export in __all__ so this adapts per branch and
+          # exercises the lazy __getattr__ hooks. Exports are a mix of classes,
+          # a submodule ("kernels"), the version string, and integer schema
+          # constants (e.g. CONTRACT_SCHEMA_VERSION), so report __name__ where it
+          # exists and fall back to repr for value exports.
+          loaded = {n: getattr(getattr(gefen, n), "__name__", repr(getattr(gefen, n))) for n in gefen.__all__}
           assert "Gefen" in loaded, "Gefen must always be importable"
           print("import OK ->", loaded)
           PY

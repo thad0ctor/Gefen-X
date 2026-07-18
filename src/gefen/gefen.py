@@ -10,20 +10,49 @@ contains the ``Gefen`` optimizer and the block-partitioning / quantization
 helpers it steps through; ``gefen_muon``/``hybrid`` build on it.
 """
 
+import hashlib
 import io
 import logging
 import math
 import os
 import re
 import warnings
-from collections import OrderedDict
+from collections import defaultdict, OrderedDict
 from itertools import chain
 from typing import Iterable, Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
 
+from gefen.canonical import (
+    CANONICAL_STATE_FORMAT_VERSION,
+    PreparedCanonicalStateImport,
+    canonical_value_supported,
+    canonical_values_equal,
+    clone_canonical_value,
+    make_prepared_canonical_state_import,
+)
+from gefen.codebook import CodebookProcessGroupBinding
+from gefen.contracts import (
+    LogicalSlice,
+    OptimizerContract,
+    ParameterIdentity,
+    ParameterLayout,
+    ParameterStateRole,
+    PlacementKind,
+    ProcessGroupIdentity,
+    ShardIdentity,
+    ShardPlacement,
+    ShardingManifest,
+    TopologyChange,
+    _gefen_contract,
+)
 from gefen.partitioning import find_period_by_block_variance
+from gefen.portable_identity import (
+    _parse_shard_identity,
+    _serialize_shard_identity,
+)
+from gefen.rebinding import LogicalSlotBinding, ParameterRebinding
 import gefen.quantization as quantization_module
 from gefen.kernels.automatic_vmean import (
     automatic_vmean_update_cuda as _automatic_vmean_update_cuda,
@@ -56,6 +85,38 @@ _RANK_LOCAL_PAYLOAD_KEY_PREFIX = "_gefen_rank_local_payload_"
 _RANK_LOCAL_MEMBER_KEY = "_gefen_rank_local_member"
 _RANK_LOCAL_FORMAT = "rank_local_dtensor_v2"
 _RANK_LOCAL_METADATA_VERSION = 3
+_CODEBOOK_SCOPE_FORMAT_VERSION = 1
+_SCOPED_NATIVE_METADATA_VERSION = 4
+_NATIVE_LOCAL_SHARDS_LEGACY_FORMAT_VERSION = 1
+_NATIVE_LOCAL_SHARDS_FORMAT_VERSION = 2
+_CANONICAL_PARAMETER_STATE_KEYS = frozenset(
+    {
+        "name",
+        "automatic_period",
+        "step",
+        "m_codebook",
+        "m_magnitude",
+        "vmean",
+        "vmean_step",
+        "v_row",
+        "v_col",
+        "factored_step",
+        "normuon_v",
+        "normuon_step",
+    }
+)
+_CANONICAL_DERIVED_PARAMETER_STATE_KEYS = frozenset(
+    {
+        "stepsize",
+        "_h_buf",
+        "_capt_scalars",
+        "_capt_consts",
+        "_capt_consts_key",
+        "_capt_stack",
+        "_capt_row",
+        "m_codebook_shape",
+    }
+)
 
 # Per-param optimizer-state tensors that the non-fused step migrates onto the
 # current compute device when a framework relocates a parameter between
@@ -79,6 +140,7 @@ _COLOCATABLE_STATE_KEYS = (
 
 def _rank_local_payload_key(global_rank: int) -> str:
     return "{}{}".format(_RANK_LOCAL_PAYLOAD_KEY_PREFIX, int(global_rank))
+
 
 # Optional explicit override for the period-search backend ("cuda_kernel" / "cpu"
 # / "gpu"). None (default) means resolve per call from each tensor's own device
@@ -414,24 +476,15 @@ def gefen_automatic_fused_update(
     )
 
 
-def learn_gefen_exact_codebook_from_grad_periods(
-    *,
-    grad_periods,
-    codebook_device: torch.device,
-    num_codebooks: int,
-    force_endpoints: bool,
-    verbose: bool,
-    compute_mse_logging: bool,
-    use_fused_histogram: bool = FUSE_HISTOGRAM_FOR_EXACT,
-) -> Optional[torch.Tensor]:
+def _gefen_exact_histogram_from_grad_periods(
+    *, grad_periods, num_codebooks: int, use_fused_histogram: bool
+) -> torch.Tensor:
     histogram_bins = num_codebooks * 16
     bin_width = 2.0 / float(histogram_bins)
     # Accumulate counts as int64 and cast to float32 once at assembly: repeated
     # fp32 adds round for bins past 2^24 counts, so chunked accumulation could
     # otherwise drift from the whole-tensor form's single cast.
     bin_counts_cpu = torch.zeros(histogram_bins, dtype=torch.int64, device="cpu")
-    total_numel = 0
-
     prev_mode = torch.get_deterministic_debug_mode()
     torch.set_deterministic_debug_mode(0)
     try:
@@ -450,7 +503,6 @@ def learn_gefen_exact_codebook_from_grad_periods(
                     )
                     gefen_exact_histogram_cuda(flat_float, period, local_counts_cuda)
                     bin_counts_cpu.add_(local_counts_cuda.cpu())
-                    total_numel += flat_float.numel()
                 else:
                     blocks = automatic_partition_view(flat_float, period)
                     absmax = blocks.abs().amax(dim=1, keepdim=True)
@@ -462,13 +514,35 @@ def learn_gefen_exact_codebook_from_grad_periods(
                         torch.long
                     )
                     bin_indices = bin_indices.clamp(0, histogram_bins - 1)
-                    local_counts = torch.bincount(
-                        bin_indices, minlength=histogram_bins
-                    )
+                    local_counts = torch.bincount(bin_indices, minlength=histogram_bins)
                     bin_counts_cpu.add_(local_counts.cpu())
-                    total_numel += normalized_flat.numel()
     finally:
         torch.set_deterministic_debug_mode(prev_mode)
+    return bin_counts_cpu
+
+
+def _learn_gefen_exact_codebook_from_histogram(
+    *,
+    bin_counts_cpu: torch.Tensor,
+    codebook_device: torch.device,
+    num_codebooks: int,
+    force_endpoints: bool,
+    verbose: bool,
+    compute_mse_logging: bool,
+) -> Optional[torch.Tensor]:
+    histogram_bins = num_codebooks * 16
+    if (
+        not torch.is_tensor(bin_counts_cpu)
+        or bin_counts_cpu.device.type != "cpu"
+        or bin_counts_cpu.dtype != torch.int64
+        or tuple(bin_counts_cpu.shape) != (histogram_bins,)
+    ):
+        raise ValueError(
+            "Gefen exact-codebook histogram must be a CPU int64 vector with {} bins".format(
+                histogram_bins
+            )
+        )
+    total_numel = int(bin_counts_cpu.sum().item())
 
     if total_numel == 0:
         return None
@@ -515,6 +589,33 @@ def learn_gefen_exact_codebook_from_grad_periods(
         print("  exact DP: MSE_normalized={:.6e}".format(mse_normalized))
 
     return codebook
+
+
+def learn_gefen_exact_codebook_from_grad_periods(
+    *,
+    grad_periods,
+    codebook_device: torch.device,
+    num_codebooks: int,
+    force_endpoints: bool,
+    verbose: bool,
+    compute_mse_logging: bool,
+    use_fused_histogram: bool = FUSE_HISTOGRAM_FOR_EXACT,
+) -> Optional[torch.Tensor]:
+    """Learn one exact-DP codebook from an unscoped local gradient stream."""
+
+    histogram = _gefen_exact_histogram_from_grad_periods(
+        grad_periods=grad_periods,
+        num_codebooks=num_codebooks,
+        use_fused_histogram=use_fused_histogram,
+    )
+    return _learn_gefen_exact_codebook_from_histogram(
+        bin_counts_cpu=histogram,
+        codebook_device=codebook_device,
+        num_codebooks=num_codebooks,
+        force_endpoints=force_endpoints,
+        verbose=verbose,
+        compute_mse_logging=compute_mse_logging,
+    )
 
 
 def _resolve_find_period_backend(grad: torch.Tensor) -> str:
@@ -735,8 +836,7 @@ def _amp_dtensor_protocol_preflight(optimizer) -> bool:
 
     params = [param for group in optimizer.param_groups for param in group["params"]]
     has_fp16_storage = any(
-        param.dtype == torch.float16
-        and not getattr(param, "_is_flat_param", False)
+        param.dtype == torch.float16 and not getattr(param, "_is_flat_param", False)
         for param in params
     )
     if not has_fp16_storage:
@@ -760,8 +860,7 @@ def _amp_dtensor_protocol_preflight(optimizer) -> bool:
                 str(mesh.device_type),
                 tuple(int(item) for item in mesh.shape),
                 tuple(
-                    int(item)
-                    for item in mesh.mesh.detach().cpu().reshape(-1).tolist()
+                    int(item) for item in mesh.mesh.detach().cpu().reshape(-1).tolist()
                 ),
                 tuple(str(group.group_name) for group in process_groups),
             )
@@ -776,9 +875,7 @@ def _amp_dtensor_protocol_preflight(optimizer) -> bool:
             name = (
                 names[index]
                 if isinstance(names, (list, tuple)) and index < len(names)
-                else getattr(optimizer, "_param_name", lambda _: "parameter")(
-                    param
-                )
+                else getattr(optimizer, "_param_name", lambda _: "parameter")(param)
             )
             entry["items"].append((str(name), param, param.grad is not None))
 
@@ -914,9 +1011,7 @@ def _assert_optimizer_gradients_structurally_valid(
                 else getattr(optimizer, "_param_name", lambda _: "parameter")(param)
             )
             if require_2d_params and param.ndim != 2:
-                error_factory = getattr(
-                    optimizer, "_step_non_2d_parameter_error", None
-                )
+                error_factory = getattr(optimizer, "_step_non_2d_parameter_error", None)
                 if callable(error_factory):
                     raise ValueError(error_factory(param))
                 raise ValueError(
@@ -933,19 +1028,17 @@ def _assert_optimizer_gradients_structurally_valid(
                 raise RuntimeError(
                     "Gefen does not support sparse gradients or other "
                     "non-strided layouts; parameter {!r} has gradient layout "
-                    "{}.".format(
-                        str(name), layout
-                    )
+                    "{}.".format(str(name), layout)
                 )
             if torch.is_complex(grad):
                 raise RuntimeError(
-                    "Gefen optimizers do not support complex gradients, but "
-                    "parameter {!r} has dtype {}.".format(str(name), grad.dtype)
+                    "Gefen optimizers do not support complex gradients, but parameter {!r} has dtype {}.".format(
+                        str(name), grad.dtype
+                    )
                 )
             if tuple(grad.shape) != tuple(param.shape):
                 raise RuntimeError(
-                    "Gefen gradient shape {} for parameter {!r} does not match "
-                    "parameter shape {}.".format(
+                    "Gefen gradient shape {} for parameter {!r} does not match parameter shape {}.".format(
                         tuple(grad.shape), str(name), tuple(param.shape)
                     )
                 )
@@ -1071,6 +1164,18 @@ class Gefen(torch.optim.Optimizer):
             learning and period prediction.
     """
 
+    # Pure rebuildable memoization for the layout-forensics guards. These live
+    # in ``__slots__`` rather than the instance ``__dict__`` so that staged
+    # ``__dict__`` copies, staged commits, and fail-before-mutation attribute
+    # snapshots treat them as what they are — caches, never optimizer state.
+    # Every accessor reads them through ``getattr`` with a cold default, so an
+    # object whose slots were never populated simply revalidates fully.
+    __slots__ = (
+        "_gefen_layout_version",
+        "_gefen_layout_forensics_verdict",
+        "_gefen_manifest_forensics_cache",
+    )
+
     def __init__(
         self,
         params: Iterable[Union[nn.Parameter, Tuple[str, nn.Parameter]]],
@@ -1101,8 +1206,7 @@ class Gefen(torch.optim.Optimizer):
             )
         if fused and not torch.cuda.is_available():
             warnings.warn(
-                "Gefen optimizer got fused=True, but CUDA is not available. "
-                "Changing fused to False.",
+                "Gefen optimizer got fused=True, but CUDA is not available. Changing fused to False.",
                 UserWarning,
                 stacklevel=2,
             )
@@ -1122,11 +1226,11 @@ class Gefen(torch.optim.Optimizer):
         # partitioning.memory_safe_fallback_period.
         self._force_1d_period_one = force_1d_period_one
         self._force_2d_period_one = force_2d_period_one
-        self._period_one_substrings = tuple(
-            s.lower() for s in period_one_substrings
-        )
+        self._period_one_substrings = tuple(s.lower() for s in period_one_substrings)
         self._factored_v_2d = factored_v_2d
         self._deterministic = deterministic
+        if type(codebook_refresh_every) is not int:
+            raise TypeError("codebook_refresh_every must be an integer")
         if codebook_refresh_every < 0:
             raise ValueError(
                 "codebook_refresh_every must be >= 0 but is: {}".format(
@@ -1178,6 +1282,12 @@ class Gefen(torch.optim.Optimizer):
         # cudagraph-trees recording rejects whenever the codebook input gets
         # copied into the graph pool). Cleared with _gefen_codebook_by_device.
         self._gefen_codebook_lut_by_device = {}
+        # An explicit learned-codebook scope is installed only as part of the
+        # same full post_sharding transaction that publishes canonical shard
+        # identities. It is live runtime configuration, never inferred from a
+        # default process group or from tensor storage.
+        self._gefen_codebook_process_group = None
+        self._gefen_codebook_scope_validated = False
         # Capturable stochastic rounding: ONE 0-dim int64 device tensor per
         # device holding the per-step rounding seed (a device-side mirror of
         # _gefen_global_step). Created lazily by _sr_seed_on and advanced on
@@ -1206,7 +1316,6 @@ class Gefen(torch.optim.Optimizer):
         # one device counter per parameter device and advance it in the captured
         # step tail; state_dict synchronizes the host mirror before serializing.
         self._gefen_global_step_by_device = {}
-
         defaults = dict(
             lr=lr,
             beta1=betas[0],
@@ -1215,6 +1324,28 @@ class Gefen(torch.optim.Optimizer):
             weight_decay=weight_decay,
         )
         self._param_names = {}
+        # Exact canonical identity remains separate from compatibility
+        # ``param_names``. A full post_sharding transaction publishes these
+        # registries only after validating every optimizer slot and manifest.
+        self._gefen_shard_bindings = {}
+        self._gefen_local_shard_bindings = ()
+        self._gefen_sharding_manifest = None
+        self._gefen_post_sharding_finalized = False
+        self._gefen_finalized_slots = ()
+        self._gefen_logical_slots = ()
+        # Layout-forensics fast path. After one full structural pass succeeds,
+        # the exact container identities it validated are remembered together
+        # with a version counter that every legitimate mutating API bumps
+        # (post_sharding and staged checkpoint load commits). Per-step guards
+        # accept only that unchanged token set; boundary operations (checkpoint
+        # prepare/commit, rebinding, collective codebook initialize/refresh,
+        # and contract readiness) always rerun the complete forensic rebuild.
+        self._gefen_layout_version = 0
+        self._gefen_layout_forensics_verdict = None
+        # (manifest, frozenset(manifest.shards), sha256 digest) computed once
+        # per finalized manifest object instead of rehashing every identity on
+        # every scoped step header.
+        self._gefen_manifest_forensics_cache = None
         # Provenance for those names: True where Gefen generated the positional
         # name itself, False where the caller supplied it. Only the generated ones
         # encode registration order rather than stable identity, and the spelling
@@ -1236,7 +1367,1617 @@ class Gefen(torch.optim.Optimizer):
         # FP32-master AMP. Native handling is needed for active local FP16
         # gradients, or statically for distributed optimizers that combine any
         # true-FP16 storage with DTensors after a collective presence preflight.
+        # An explicit codebook scope is also a topology property: whole owners
+        # and empty nonowners must enter the same GradScaler protocol before
+        # Gefen can compare found_inf/grad_scale collectively inside step().
+        if self._gefen_codebook_process_group is not None:
+            return True
         return _amp_native_scaling_required(self)
+
+    def optimizer_contract(self) -> OptimizerContract:
+        """Return the immutable state-layout and integration capability contract."""
+
+        identity_ready = self._canonical_identity_ready()
+        canonical_state_layouts = self._canonical_state_layouts()
+        try:
+            from gefen.portable_runtime import _portable_runtime_layouts
+
+            canonical_global_same_topology = _portable_runtime_layouts(self)
+        except Exception:
+            canonical_global_same_topology = frozenset()
+        has_factored_matrix = (
+            canonical_global_same_topology
+            and self._factored_v_2d
+            and any(
+                len(slot.shard.parameter.global_shape) == 2
+                for slot in self._gefen_logical_slots
+            )
+        )
+        if canonical_global_same_topology and not has_factored_matrix:
+            canonical_global_topology_changing = frozenset(
+                {
+                    ParameterLayout.REPLICATED,
+                    ParameterLayout.FLATTENED_ELEMENT_SHARD,
+                }
+            )
+            canonical_global_topology_change_kinds = frozenset(
+                {TopologyChange.PLACEMENT_RESHARD}
+            )
+        else:
+            canonical_global_topology_changing = frozenset()
+            canonical_global_topology_change_kinds = frozenset()
+        return _gefen_contract(
+            factored_v_2d=self._factored_v_2d,
+            canonical_parameter_fqns=identity_ready,
+            stable_shard_identity=identity_ready,
+            explicit_process_group_codebook_scope=True,
+            canonical_state_layouts=canonical_state_layouts,
+            canonical_global_same_topology=canonical_global_same_topology,
+            canonical_global_topology_changing=canonical_global_topology_changing,
+            canonical_global_topology_change_kinds=canonical_global_topology_change_kinds,
+            native_flattened_checkpoint=(
+                self._codebook_scope_ready()
+                and any(
+                    shard.layout is ParameterLayout.FLATTENED_ELEMENT_SHARD
+                    for _, shard in self._gefen_local_shard_bindings
+                )
+            ),
+        )
+
+    def _canonical_state_variant_layout(self):
+        return _gefen_contract(
+            factored_v_2d=self._factored_v_2d,
+        ).state_layout
+
+    def _canonical_state_layout_supported(self, layout) -> bool:
+        return layout in {
+            ParameterLayout.REPLICATED,
+            ParameterLayout.FLATTENED_ELEMENT_SHARD,
+        }
+
+    @staticmethod
+    def _canonical_group_options_value(group):
+        return {
+            key: value
+            for key, value in group.items()
+            if key
+            not in {
+                "params",
+                "param_names",
+                _SYNTHESIZED_PARAM_NAMES_KEY,
+                "name",
+                "_gefen_checkpoint_metadata",
+            }
+        }
+
+    def _canonical_state_layouts(self):
+        if not self._canonical_identity_ready():
+            return frozenset()
+        if self._stochastic_round:
+            return frozenset()
+        if any(
+            parameter is None
+            or not self._canonical_state_layout_supported(shard.layout)
+            for parameter, shard in self._gefen_local_shard_bindings
+        ):
+            return frozenset()
+        if any(
+            not canonical_value_supported(
+                self._canonical_group_options_value(group),
+                finite_tensors=True,
+            )
+            for group in self.param_groups
+        ):
+            return frozenset()
+        if not canonical_value_supported(
+            self._canonical_policy(),
+            finite_tensors=True,
+        ):
+            return frozenset()
+        if not canonical_value_supported(
+            self._gefen_codebook,
+            finite_tensors=True,
+        ):
+            return frozenset()
+        try:
+            global_step = self._canonical_common_global_step()
+            if type(global_step) is not int or global_step < 0:
+                return frozenset()
+            self._validate_loaded_native_state()
+        except Exception:
+            return frozenset()
+        state_layout = self._canonical_state_variant_layout()
+        for group in self.param_groups:
+            group_options = self._canonical_group_options_value(group)
+            for parameter in group["params"]:
+                state = self.state.get(parameter, {})
+                if any(
+                    key not in _CANONICAL_PARAMETER_STATE_KEYS
+                    and key not in _CANONICAL_DERIVED_PARAMETER_STATE_KEYS
+                    for key in state
+                ):
+                    return frozenset()
+                if any(
+                    not canonical_value_supported(
+                        value,
+                        finite_tensors=True,
+                    )
+                    for key, value in state.items()
+                    if key in _CANONICAL_PARAMETER_STATE_KEYS
+                ):
+                    return frozenset()
+                canonical_state = {
+                    key: value
+                    for key, value in state.items()
+                    if key in _CANONICAL_PARAMETER_STATE_KEYS and key != "name"
+                }
+                shard = self._gefen_shard_bindings[parameter]
+                try:
+                    self._validate_canonical_parameter_semantics(
+                        parameter,
+                        shard,
+                        group_options,
+                        canonical_state,
+                        state_layout,
+                        global_step,
+                    )
+                except (TypeError, ValueError, RuntimeError):
+                    return frozenset()
+        return frozenset(shard.layout for _, shard in self._gefen_local_shard_bindings)
+
+    def _codebook_scope_ready(self) -> bool:
+        return (
+            self._gefen_codebook_process_group is not None
+            and self._canonical_identity_ready()
+        )
+
+    def _canonical_identity_ready(self) -> bool:
+        if (
+            not self._gefen_post_sharding_finalized
+            or self._gefen_sharding_manifest is None
+        ):
+            return False
+        # Contract readiness is an honest external claim, so it never trusts
+        # the per-step fast-path verdict.
+        return self._finalized_binding_layout_matches(full=True)
+
+    def _invalidate_layout_forensics_caches(self) -> None:
+        self._gefen_layout_version = getattr(self, "_gefen_layout_version", 0) + 1
+        self._gefen_layout_forensics_verdict = None
+
+    @staticmethod
+    def _forensics_tokens_match(cached, live) -> bool:
+        # Containers, tensors, and strings compare by object identity — the
+        # cached tuple holds strong references, so an unchanged attribute is
+        # the same object. Plain ints (version counter, lengths) compare by
+        # value because CPython interns only small integers.
+        return len(cached) == len(live) and all(
+            cached_item is live_item
+            or (
+                type(cached_item) is int
+                and type(live_item) is int
+                and cached_item == live_item
+            )
+            for cached_item, live_item in zip(cached, live)
+        )
+
+    def _layout_forensics_fast_tokens(self):
+        # O(local params) identity snapshot of everything user code can reach
+        # between two guard calls: the finalized registries by object identity
+        # (they are replaced, never mutated, by legitimate APIs) plus every
+        # live group container, parameter, and compatibility name element, so
+        # in-place mutation of the public groups — e.g. a closure swapping one
+        # ``group["params"]`` slot — still falls back to the full forensic
+        # pass before any state mutation.
+        live = [
+            getattr(self, "_gefen_layout_version", 0),
+            self._gefen_post_sharding_finalized,
+            self._gefen_sharding_manifest,
+            self._gefen_logical_slots,
+            self._gefen_finalized_slots,
+            self._gefen_local_shard_bindings,
+            self._gefen_shard_bindings,
+            len(self._gefen_shard_bindings),
+            self._param_names,
+            len(self._param_names),
+            self.param_groups,
+            len(self.param_groups),
+            self.state,
+        ]
+        live.extend(self._param_names.keys())
+        live.extend(self._param_names.values())
+        for group in self.param_groups:
+            params = group.get("params") if type(group) is dict else None
+            names = group.get("param_names") if type(group) is dict else None
+            live.append(group)
+            live.append(params)
+            live.append(names)
+            if isinstance(params, (list, tuple)):
+                live.append(len(params))
+                live.extend(params)
+                for parameter in params:
+                    parameter_state = self.state.get(parameter)
+                    live.append(type(parameter_state))
+                    live.append(
+                        parameter_state.get("name")
+                        if type(parameter_state) is dict
+                        else None
+                    )
+            if isinstance(names, (list, tuple)):
+                live.append(len(names))
+                live.extend(names)
+        return tuple(live)
+
+    def _manifest_layout_forensics(self, *, refresh: bool = False):
+        """Return the cached ``(shard set, digest)`` for the live manifest.
+
+        Both values are pure functions of one immutable ``ShardingManifest``,
+        so they are computed once per manifest object (at post_sharding
+        finalization) instead of rehashing every ``ShardIdentity`` — including
+        its world-size ``ordered_members`` tuple — on every step. Full
+        forensic passes recompute with ``refresh=True`` so boundary checks
+        never trust a stale cache.
+        """
+
+        manifest = self._gefen_sharding_manifest
+        cache = getattr(self, "_gefen_manifest_forensics_cache", None)
+        if not refresh and cache is not None and cache[0] is manifest:
+            return cache[1], cache[2]
+        shards = frozenset(manifest.shards)
+        digest = self._compute_codebook_manifest_fingerprint(manifest)
+        self._gefen_manifest_forensics_cache = (manifest, shards, digest)
+        return shards, digest
+
+    def _finalized_binding_layout_matches(self, *, full: bool = False) -> bool:
+        try:
+            verdict = getattr(self, "_gefen_layout_forensics_verdict", None)
+            if not full and verdict is not None:
+                if self._forensics_tokens_match(
+                    verdict, self._layout_forensics_fast_tokens()
+                ):
+                    return True
+            self._gefen_layout_forensics_verdict = None
+            matches = self._finalized_binding_layout_matches_full()
+            if matches:
+                self._gefen_layout_forensics_verdict = (
+                    self._layout_forensics_fast_tokens()
+                )
+            return matches
+        except AttributeError:
+            return False
+
+    def _finalized_binding_layout_matches_full(self) -> bool:
+        try:
+            if (
+                type(self._gefen_logical_slots) is not tuple
+                or not self._gefen_logical_slots
+                or type(self._gefen_finalized_slots) is not tuple
+                or type(self._gefen_local_shard_bindings) is not tuple
+                or type(self._gefen_shard_bindings) is not dict
+                or type(self._param_names) is not dict
+                or not isinstance(self._gefen_sharding_manifest, ShardingManifest)
+                or len(self.param_groups) != len(self._gefen_finalized_slots)
+            ):
+                return False
+
+            logical_groups = [[] for _ in self.param_groups]
+            logical_fqns = set()
+            previous_position = None
+            for logical_slot in self._gefen_logical_slots:
+                if (
+                    type(logical_slot) is not LogicalSlotBinding
+                    or type(logical_slot.group_index) is not int
+                    or type(logical_slot.original_slot_index) is not int
+                    or type(logical_slot.compatibility_name) is not str
+                    or logical_slot.compatibility_name
+                    != logical_slot.compatibility_name.lower()
+                    or not isinstance(logical_slot.shard, ShardIdentity)
+                ):
+                    return False
+                position = (
+                    logical_slot.group_index,
+                    logical_slot.original_slot_index,
+                )
+                if (
+                    logical_slot.group_index < 0
+                    or logical_slot.group_index >= len(logical_groups)
+                    or logical_slot.original_slot_index
+                    != len(logical_groups[logical_slot.group_index])
+                ):
+                    return False
+                if previous_position is None:
+                    if position != (0, 0):
+                        return False
+                elif logical_slot.group_index == previous_position[0]:
+                    if logical_slot.original_slot_index != previous_position[1] + 1:
+                        return False
+                elif position != (previous_position[0] + 1, 0):
+                    return False
+                fqn = logical_slot.shard.parameter.fqn
+                if fqn in logical_fqns:
+                    return False
+                logical_fqns.add(fqn)
+                logical_groups[logical_slot.group_index].append(logical_slot)
+                previous_position = position
+
+            if any(not group for group in logical_groups):
+                return False
+
+            manifest_shards = self._manifest_layout_forensics(refresh=True)[0]
+            if {
+                shard.parameter.fqn for shard in manifest_shards
+            } != logical_fqns or any(
+                logical_slot.shard not in manifest_shards
+                for logical_slot in self._gefen_logical_slots
+            ):
+                return False
+
+            local_bindings = {}
+            previous_sort_key = None
+            for item in self._gefen_local_shard_bindings:
+                if type(item) is not tuple or len(item) != 2:
+                    return False
+                parameter, shard = item
+                if parameter is not None and not isinstance(parameter, torch.Tensor):
+                    return False
+                if not isinstance(shard, ShardIdentity):
+                    return False
+                if previous_sort_key is not None and shard.sort_key < previous_sort_key:
+                    return False
+                previous_sort_key = shard.sort_key
+                fqn = shard.parameter.fqn
+                if fqn in local_bindings:
+                    return False
+                local_bindings[fqn] = (parameter, shard)
+            if set(local_bindings) != logical_fqns:
+                return False
+
+            expected_live_groups = []
+            expected_name_groups = []
+            expected_live_bindings = []
+            for logical_group in logical_groups:
+                live_group = []
+                name_group = []
+                for logical_slot in logical_group:
+                    parameter, shard = local_bindings[logical_slot.shard.parameter.fqn]
+                    if shard != logical_slot.shard:
+                        return False
+                    pruned = (
+                        shard.layout is ParameterLayout.WHOLE_PARAMETER_OWNER
+                        and shard.local_member != shard.owner
+                    )
+                    if pruned:
+                        if parameter is not None:
+                            return False
+                        continue
+                    if parameter is None:
+                        return False
+                    live_group.append(parameter)
+                    name_group.append(logical_slot.compatibility_name)
+                    expected_live_bindings.append((parameter, shard))
+                expected_live_groups.append(tuple(live_group))
+                expected_name_groups.append(tuple(name_group))
+
+            if len(self._gefen_shard_bindings) != len(expected_live_bindings):
+                return False
+            expected_live_ids = {
+                id(parameter) for parameter, _ in expected_live_bindings
+            }
+            if len(expected_live_ids) != len(expected_live_bindings):
+                return False
+            if {
+                id(parameter) for parameter in self._gefen_shard_bindings
+            } != expected_live_ids:
+                return False
+            for parameter, shard in expected_live_bindings:
+                if self._gefen_shard_bindings.get(parameter) != shard:
+                    return False
+
+            if len(self._param_names) != len(expected_live_bindings):
+                return False
+            if {id(parameter) for parameter in self._param_names} != expected_live_ids:
+                return False
+            for group_index, (group, expected_params, expected_names) in enumerate(
+                zip(self.param_groups, expected_live_groups, expected_name_groups)
+            ):
+                params = group.get("params")
+                names = group.get("param_names")
+                finalized = self._gefen_finalized_slots[group_index]
+                if (
+                    not isinstance(params, (list, tuple))
+                    or not isinstance(names, (list, tuple))
+                    or type(finalized) is not tuple
+                    or len(params) != len(expected_params)
+                    or len(names) != len(expected_names)
+                    or len(finalized) != len(expected_params)
+                ):
+                    return False
+                if any(
+                    live is not expected
+                    for live, expected in zip(params, expected_params)
+                ) or any(
+                    bound is not expected
+                    for bound, expected in zip(finalized, expected_params)
+                ):
+                    return False
+                if tuple(names) != expected_names:
+                    return False
+                for parameter, expected_name in zip(expected_params, expected_names):
+                    if self._param_names.get(parameter) != expected_name:
+                        return False
+                    parameter_state = self.state.get(parameter)
+                    if (
+                        type(parameter_state) is not dict
+                        or parameter_state.get("name") != expected_name
+                    ):
+                        return False
+            return True
+        except (
+            AttributeError,
+            IndexError,
+            KeyError,
+            RuntimeError,
+            TypeError,
+            ValueError,
+        ):
+            return False
+
+    def _assert_finalized_binding_layout(self, *, full: bool = False) -> None:
+        if (
+            self._gefen_post_sharding_finalized
+            and not self._finalized_binding_layout_matches(full=full)
+        ):
+            raise RuntimeError(
+                "Gefen finalized parameter layout changed outside post_sharding"
+            )
+
+    def parameter_identity(self, parameter) -> ParameterIdentity:
+        """Return the exact canonical identity bound to one live parameter."""
+
+        return self.shard_identity(parameter).parameter
+
+    def shard_identity(self, parameter) -> ShardIdentity:
+        """Return the stable shard identity bound to one live parameter."""
+
+        self._assert_finalized_binding_layout()
+        try:
+            return self._gefen_shard_bindings[parameter]
+        except KeyError:
+            raise KeyError("parameter has no finalized Gefen shard identity") from None
+
+    def shard_bindings(self):
+        """Return local tensor/identity pairs in canonical structural order."""
+
+        self._assert_finalized_binding_layout()
+        return self._gefen_local_shard_bindings
+
+    def sharding_manifest(self):
+        """Return the finalized global identity manifest, or ``None``."""
+
+        self._assert_finalized_binding_layout()
+        return self._gefen_sharding_manifest
+
+    def codebook_process_group_binding(self):
+        """Return the finalized explicit learned-codebook binding, or ``None``."""
+
+        self._assert_finalized_binding_layout()
+        return self._gefen_codebook_process_group
+
+    def _serialized_codebook_scope(self):
+        binding = self._gefen_codebook_process_group
+        if binding is None:
+            return None
+        return {
+            "format_version": _CODEBOOK_SCOPE_FORMAT_VERSION,
+            "semantic_name": binding.identity.semantic_name,
+            "ordered_members": list(binding.identity.ordered_members),
+            "refresh_every": self._codebook_refresh_every,
+        }
+
+    @staticmethod
+    def _normalize_serialized_codebook_scope(value):
+        if value is None:
+            return None
+        if not isinstance(value, dict) or set(value) != {
+            "format_version",
+            "semantic_name",
+            "ordered_members",
+            "refresh_every",
+        }:
+            raise ValueError("Gefen checkpoint codebook scope has an invalid schema")
+        if (
+            type(value["format_version"]) is not int
+            or value["format_version"] != _CODEBOOK_SCOPE_FORMAT_VERSION
+        ):
+            raise ValueError(
+                "Gefen checkpoint codebook scope has an unsupported format version"
+            )
+        if not isinstance(value["ordered_members"], list):
+            raise ValueError(
+                "Gefen checkpoint codebook scope ordered_members must be a list"
+            )
+        from gefen.contracts import ProcessGroupIdentity
+
+        try:
+            identity = ProcessGroupIdentity(
+                value["semantic_name"], tuple(value["ordered_members"])
+            )
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                "Gefen checkpoint codebook scope identity is invalid"
+            ) from exc
+        refresh_every = value["refresh_every"]
+        if type(refresh_every) is not int or refresh_every < 0:
+            raise ValueError(
+                "Gefen checkpoint codebook scope refresh_every must be a nonnegative integer"
+            )
+        return {
+            "format_version": _CODEBOOK_SCOPE_FORMAT_VERSION,
+            "semantic_name": identity.semantic_name,
+            "ordered_members": list(identity.ordered_members),
+            "refresh_every": refresh_every,
+        }
+
+    @staticmethod
+    def _serialized_native_local_shard(shard):
+        return {
+            "fqn": shard.parameter.fqn,
+            "global_shape": list(shard.parameter.global_shape),
+            "layout": shard.layout.value,
+            "flat_offset": shard.logical_slice.flat_offset,
+            "length": shard.logical_slice.length,
+            "process_group": {
+                "semantic_name": shard.process_group.semantic_name,
+                "ordered_members": list(shard.process_group.ordered_members),
+            },
+            "local_member": shard.local_member,
+            "owner": shard.owner,
+            "placements": [
+                {
+                    "mesh_axis": placement.mesh_axis,
+                    "kind": placement.kind.value,
+                    "coordinate": placement.coordinate,
+                    "parts": placement.parts,
+                    "parameter_dimension": placement.parameter_dimension,
+                }
+                for placement in shard.placements
+            ],
+        }
+
+    @staticmethod
+    def _serialized_canonical_shard(shard):
+        process_group = None
+        if shard.process_group is not None:
+            process_group = {
+                "schema_version": shard.process_group.schema_version,
+                "semantic_name": shard.process_group.semantic_name,
+                "ordered_members": list(shard.process_group.ordered_members),
+            }
+        return {
+            "schema_version": shard.schema_version,
+            "parameter": {
+                "schema_version": shard.parameter.schema_version,
+                "fqn": shard.parameter.fqn,
+                "global_shape": list(shard.parameter.global_shape),
+            },
+            "layout": shard.layout.value,
+            "logical_slice": {
+                "flat_offset": shard.logical_slice.flat_offset,
+                "length": shard.logical_slice.length,
+            },
+            "process_group": process_group,
+            "local_member": shard.local_member,
+            "owner": shard.owner,
+            "placements": [
+                {
+                    "mesh_axis": placement.mesh_axis,
+                    "kind": placement.kind.value,
+                    "coordinate": placement.coordinate,
+                    "parts": placement.parts,
+                    "parameter_dimension": placement.parameter_dimension,
+                }
+                for placement in shard.placements
+            ],
+        }
+
+    @classmethod
+    def _normalize_serialized_canonical_shard(cls, record):
+        if not isinstance(record, dict) or set(record) != {
+            "schema_version",
+            "parameter",
+            "layout",
+            "logical_slice",
+            "process_group",
+            "local_member",
+            "owner",
+            "placements",
+        }:
+            raise ValueError("Gefen canonical shard has an invalid schema")
+        parameter_record = record["parameter"]
+        if not isinstance(parameter_record, dict) or set(parameter_record) != {
+            "schema_version",
+            "fqn",
+            "global_shape",
+        }:
+            raise ValueError("Gefen canonical parameter identity is invalid")
+        if not isinstance(parameter_record["global_shape"], list):
+            raise ValueError("Gefen canonical global_shape must be a list")
+        slice_record = record["logical_slice"]
+        if not isinstance(slice_record, dict) or set(slice_record) != {
+            "flat_offset",
+            "length",
+        }:
+            raise ValueError("Gefen canonical logical slice is invalid")
+        group_record = record["process_group"]
+        if group_record is not None and (
+            not isinstance(group_record, dict)
+            or set(group_record)
+            != {"schema_version", "semantic_name", "ordered_members"}
+            or not isinstance(group_record["ordered_members"], list)
+        ):
+            raise ValueError("Gefen canonical process-group identity is invalid")
+        if not isinstance(record["placements"], list):
+            raise ValueError("Gefen canonical placements must be a list")
+        try:
+            parameter = ParameterIdentity(
+                parameter_record["fqn"],
+                tuple(parameter_record["global_shape"]),
+                schema_version=parameter_record["schema_version"],
+            )
+            process_group = None
+            if group_record is not None:
+                process_group = ProcessGroupIdentity(
+                    group_record["semantic_name"],
+                    tuple(group_record["ordered_members"]),
+                    schema_version=group_record["schema_version"],
+                )
+            placements = []
+            for placement_record in record["placements"]:
+                if not isinstance(placement_record, dict) or set(placement_record) != {
+                    "mesh_axis",
+                    "kind",
+                    "coordinate",
+                    "parts",
+                    "parameter_dimension",
+                }:
+                    raise ValueError("invalid placement schema")
+                placements.append(
+                    ShardPlacement(
+                        placement_record["mesh_axis"],
+                        PlacementKind(placement_record["kind"]),
+                        placement_record["coordinate"],
+                        placement_record["parts"],
+                        placement_record["parameter_dimension"],
+                    )
+                )
+            shard = ShardIdentity(
+                parameter,
+                ParameterLayout(record["layout"]),
+                LogicalSlice(slice_record["flat_offset"], slice_record["length"]),
+                process_group=process_group,
+                local_member=record["local_member"],
+                owner=record["owner"],
+                placements=tuple(placements),
+                schema_version=record["schema_version"],
+            )
+        except (TypeError, ValueError) as exc:
+            raise ValueError("Gefen canonical shard identity is invalid") from exc
+        return cls._serialized_canonical_shard(shard)
+
+    def _serialized_native_local_shards_v1(self):
+        if self._gefen_codebook_process_group is None:
+            return None
+        if not any(
+            shard.layout is not ParameterLayout.REPLICATED
+            for _, shard in self._gefen_local_shard_bindings
+        ):
+            return None
+
+        # Native Optimizer.load_state_dict maps per-parameter state by
+        # parameter-group and slot position, not by canonical FQN. Bind every
+        # serialized live slot to its shard identity (including replicated
+        # slots in a mixed optimizer), and retain pruned whole-owner records
+        # separately. A canonical shard set alone would not distinguish A/B
+        # from B/A when equal-shaped parameters exchange positions.
+        param_groups = []
+        for group in self.param_groups:
+            param_groups.append(
+                [
+                    self._serialized_native_local_shard(
+                        self._gefen_shard_bindings[parameter]
+                    )
+                    for parameter in group["params"]
+                ]
+            )
+        pruned_shards = [
+            self._serialized_native_local_shard(shard)
+            for parameter, shard in self._gefen_local_shard_bindings
+            if parameter is None
+        ]
+        return {
+            "format_version": _NATIVE_LOCAL_SHARDS_LEGACY_FORMAT_VERSION,
+            "param_groups": param_groups,
+            "pruned_shards": pruned_shards,
+        }
+
+    def _serialized_native_local_shards(self):
+        if self._gefen_codebook_process_group is None:
+            return None
+        if not any(
+            shard.layout is not ParameterLayout.REPLICATED
+            for _, shard in self._gefen_local_shard_bindings
+        ):
+            return None
+        return {
+            "format_version": _NATIVE_LOCAL_SHARDS_FORMAT_VERSION,
+            "logical_slots": [
+                {
+                    "group_index": slot.group_index,
+                    "original_slot_index": slot.original_slot_index,
+                    "compatibility_name": slot.compatibility_name,
+                    "shard": _serialize_shard_identity(slot.shard),
+                }
+                for slot in self._gefen_logical_slots
+            ],
+        }
+
+    @classmethod
+    def _normalize_serialized_native_local_shard(cls, record):
+        expected = {
+            "fqn",
+            "global_shape",
+            "layout",
+            "flat_offset",
+            "length",
+            "process_group",
+            "local_member",
+            "owner",
+            "placements",
+        }
+        if not isinstance(record, dict) or set(record) != expected:
+            raise ValueError("Gefen native local-shard metadata has an invalid schema")
+        group_record = record["process_group"]
+        if not isinstance(group_record, dict) or set(group_record) != {
+            "semantic_name",
+            "ordered_members",
+        }:
+            raise ValueError(
+                "Gefen native local-shard process-group metadata is invalid"
+            )
+        if not isinstance(group_record["ordered_members"], list):
+            raise ValueError("Gefen native local-shard ordered_members must be a list")
+        if not isinstance(record["global_shape"], list) or not isinstance(
+            record["placements"], list
+        ):
+            raise ValueError(
+                "Gefen native local-shard shapes and placements must be lists"
+            )
+        try:
+            parameter = ParameterIdentity(record["fqn"], tuple(record["global_shape"]))
+            group = ProcessGroupIdentity(
+                group_record["semantic_name"],
+                tuple(group_record["ordered_members"]),
+            )
+            placements = []
+            for placement_record in record["placements"]:
+                if not isinstance(placement_record, dict) or set(placement_record) != {
+                    "mesh_axis",
+                    "kind",
+                    "coordinate",
+                    "parts",
+                    "parameter_dimension",
+                }:
+                    raise ValueError("invalid placement schema")
+                placements.append(
+                    ShardPlacement(
+                        placement_record["mesh_axis"],
+                        PlacementKind(placement_record["kind"]),
+                        placement_record["coordinate"],
+                        placement_record["parts"],
+                        placement_record["parameter_dimension"],
+                    )
+                )
+            shard = ShardIdentity(
+                parameter,
+                ParameterLayout(record["layout"]),
+                LogicalSlice(record["flat_offset"], record["length"]),
+                process_group=group,
+                local_member=record["local_member"],
+                owner=record["owner"],
+                placements=tuple(placements),
+            )
+        except (TypeError, ValueError) as exc:
+            raise ValueError("Gefen native local-shard metadata is invalid") from exc
+        if shard.layout not in {
+            ParameterLayout.REPLICATED,
+            ParameterLayout.FLATTENED_ELEMENT_SHARD,
+            ParameterLayout.WHOLE_PARAMETER_OWNER,
+        }:
+            raise ValueError(
+                "Gefen native local-shard metadata has an unsupported layout"
+            )
+        return cls._serialized_native_local_shard(shard)
+
+    @classmethod
+    def _normalize_serialized_native_local_shards_v1(cls, value):
+        if not isinstance(value, dict) or set(value) != {
+            "format_version",
+            "param_groups",
+            "pruned_shards",
+        }:
+            raise ValueError("Gefen native local-shard metadata has an invalid schema")
+        format_version = value["format_version"]
+        if (
+            type(format_version) is not int
+            or format_version != _NATIVE_LOCAL_SHARDS_LEGACY_FORMAT_VERSION
+        ):
+            raise ValueError(
+                "Unsupported Gefen native local-shard format_version: {}".format(
+                    format_version
+                )
+            )
+        param_groups = value["param_groups"]
+        pruned_shards = value["pruned_shards"]
+        if not isinstance(param_groups, list) or not isinstance(pruned_shards, list):
+            raise ValueError(
+                "Gefen native local-shard parameter groups and pruned shards must be lists"
+            )
+        normalized_groups = []
+        for group in param_groups:
+            if not isinstance(group, list):
+                raise ValueError(
+                    "Gefen native local-shard parameter groups must contain lists"
+                )
+            normalized_groups.append(
+                [
+                    cls._normalize_serialized_native_local_shard(record)
+                    for record in group
+                ]
+            )
+        normalized_pruned = [
+            cls._normalize_serialized_native_local_shard(record)
+            for record in pruned_shards
+        ]
+        if any(
+            record["layout"] != ParameterLayout.WHOLE_PARAMETER_OWNER.value
+            for record in normalized_pruned
+        ):
+            raise ValueError(
+                "Gefen native pruned-shard metadata must describe whole-parameter nonowners"
+            )
+        return {
+            "format_version": _NATIVE_LOCAL_SHARDS_LEGACY_FORMAT_VERSION,
+            "param_groups": normalized_groups,
+            "pruned_shards": normalized_pruned,
+        }
+
+    @classmethod
+    def _normalize_serialized_native_local_shards_v2(cls, value):
+        if type(value) is not dict or set(value) != {
+            "format_version",
+            "logical_slots",
+        }:
+            raise ValueError("Gefen native local-shard metadata has an invalid schema")
+        format_version = value["format_version"]
+        if (
+            type(format_version) is not int
+            or format_version != _NATIVE_LOCAL_SHARDS_FORMAT_VERSION
+        ):
+            raise ValueError(
+                "Unsupported Gefen native local-shard format_version: {}".format(
+                    format_version
+                )
+            )
+        records = value["logical_slots"]
+        if type(records) is not list or not records:
+            raise ValueError(
+                "Gefen native local-shard logical_slots must be a nonempty list"
+            )
+
+        normalized_records = []
+        seen_fqns = set()
+        previous_position = None
+        supported_layouts = {
+            ParameterLayout.REPLICATED,
+            ParameterLayout.FLATTENED_ELEMENT_SHARD,
+            ParameterLayout.WHOLE_PARAMETER_OWNER,
+        }
+        for record in records:
+            if type(record) is not dict or set(record) != {
+                "group_index",
+                "original_slot_index",
+                "compatibility_name",
+                "shard",
+            }:
+                raise ValueError(
+                    "Gefen native local-shard logical slot has an invalid schema"
+                )
+            if (
+                type(record["shard"]) is dict
+                and "process_group" in record["shard"]
+                and record["shard"]["process_group"] is None
+            ):
+                raise ValueError(
+                    "Gefen native local-shard metadata requires a process-group identity"
+                )
+            try:
+                shard = _parse_shard_identity(record["shard"])
+                slot = LogicalSlotBinding(
+                    record["group_index"],
+                    record["original_slot_index"],
+                    record["compatibility_name"],
+                    shard,
+                )
+            except (TypeError, ValueError) as exc:
+                raise ValueError(
+                    "Gefen native local-shard logical slot is invalid"
+                ) from exc
+            position = (slot.group_index, slot.original_slot_index)
+            if previous_position is None:
+                valid_position = position == (0, 0)
+            elif position[0] == previous_position[0]:
+                valid_position = position[1] == previous_position[1] + 1
+            else:
+                valid_position = position == (previous_position[0] + 1, 0)
+            if not valid_position:
+                raise ValueError(
+                    "Gefen native local-shard logical slot positions must be contiguous"
+                )
+            previous_position = position
+            if slot.shard.layout not in supported_layouts:
+                raise ValueError(
+                    "Gefen native local-shard metadata has an unsupported layout"
+                )
+            if slot.shard.process_group is None:
+                raise ValueError(
+                    "Gefen native local-shard metadata requires a process-group identity"
+                )
+            fqn = slot.shard.parameter.fqn
+            if fqn in seen_fqns:
+                raise ValueError(
+                    "Gefen native local-shard logical slot FQNs must be unique"
+                )
+            seen_fqns.add(fqn)
+            normalized_records.append(
+                {
+                    "group_index": slot.group_index,
+                    "original_slot_index": slot.original_slot_index,
+                    "compatibility_name": slot.compatibility_name,
+                    "shard": _serialize_shard_identity(slot.shard),
+                }
+            )
+        return {
+            "format_version": _NATIVE_LOCAL_SHARDS_FORMAT_VERSION,
+            "logical_slots": normalized_records,
+        }
+
+    @classmethod
+    def _normalize_serialized_native_local_shards(cls, value):
+        if value is None:
+            return None
+        if type(value) is not dict or "format_version" not in value:
+            raise ValueError("Gefen native local-shard metadata has an invalid schema")
+        format_version = value["format_version"]
+        if type(format_version) is not int:
+            raise ValueError(
+                "Unsupported Gefen native local-shard format_version: {}".format(
+                    format_version
+                )
+            )
+        if format_version == _NATIVE_LOCAL_SHARDS_LEGACY_FORMAT_VERSION:
+            return cls._normalize_serialized_native_local_shards_v1(value)
+        if format_version == _NATIVE_LOCAL_SHARDS_FORMAT_VERSION:
+            return cls._normalize_serialized_native_local_shards_v2(value)
+        raise ValueError(
+            "Unsupported Gefen native local-shard format_version: {}".format(
+                format_version
+            )
+        )
+
+    def _native_local_shards_matches_live(self, value):
+        if value is None:
+            return self._serialized_native_local_shards() is None
+        if value["format_version"] == _NATIVE_LOCAL_SHARDS_LEGACY_FORMAT_VERSION:
+            return value == self._serialized_native_local_shards_v1()
+        if value["format_version"] == _NATIVE_LOCAL_SHARDS_FORMAT_VERSION:
+            return value == self._serialized_native_local_shards()
+        return False
+
+    @staticmethod
+    def _parameter_in(parameters, candidate) -> bool:
+        return any(item is candidate for item in parameters)
+
+    @staticmethod
+    def _assert_rebound_storage_disjoint(parameters) -> None:
+        storage_ranges = []
+        for parameter in parameters:
+            if parameter.numel() == 0:
+                continue
+            storage = parameter.untyped_storage()
+            storage_id = (str(parameter.device), storage.data_ptr())
+            if not parameter.is_contiguous():
+                for other_id, _, _ in storage_ranges:
+                    if other_id == storage_id:
+                        raise ValueError(
+                            "rebound target tensors must not share noncontiguous storage"
+                        )
+                storage_ranges.append((storage_id, None, None))
+                continue
+            start = parameter.storage_offset() * parameter.element_size()
+            end = start + parameter.numel() * parameter.element_size()
+            for other_id, other_start, other_end in storage_ranges:
+                if other_id != storage_id:
+                    continue
+                if other_start is None or max(start, other_start) < min(end, other_end):
+                    raise ValueError(
+                        "rebound target tensor storage ranges must not overlap"
+                    )
+            storage_ranges.append((storage_id, start, end))
+
+    @staticmethod
+    def _target_may_have_internal_storage_overlap(parameter) -> bool:
+        """Conservatively prove disjoint positive-stride tensor elements."""
+
+        required_span = 1
+        dimensions = sorted(
+            (stride, size)
+            for size, stride in zip(parameter.shape, parameter.stride())
+            if size > 1
+        )
+        for stride, size in dimensions:
+            if stride < required_span:
+                return True
+            required_span += (size - 1) * stride
+        return False
+
+    def _assert_rebinding_pristine(self, rebindings) -> None:
+        if self._gefen_post_sharding_finalized:
+            raise RuntimeError("Gefen post-sharding identity is already finalized")
+        if (
+            self._gefen_shard_bindings
+            or self._gefen_local_shard_bindings
+            or self._gefen_sharding_manifest is not None
+            or self._gefen_finalized_slots
+            or self._gefen_logical_slots
+        ):
+            raise RuntimeError(
+                "Gefen parameter rebinding found an incomplete prior identity plan"
+            )
+        global_step = self._validate_rank_local_counter(
+            "gefen_global_step", self._gefen_global_step
+        )
+        if global_step != 0 or self._gefen_codebook is not None:
+            raise RuntimeError(
+                "Gefen parameter rebinding is allowed only before optimizer mutation"
+            )
+        if self._capt_stacks is not None:
+            raise RuntimeError(
+                "Gefen parameter rebinding cannot discard active capturable stacks"
+            )
+        if self._gefen_codebook_by_device or self._gefen_codebook_lut_by_device:
+            raise RuntimeError(
+                "Gefen parameter rebinding cannot discard initialized codebook caches"
+            )
+        for cache_name in (
+            "_gefen_global_step_by_device",
+            "_sr_seed_by_device",
+        ):
+            cache = getattr(self, cache_name)
+            for value in cache.values():
+                if (
+                    not torch.is_tensor(value)
+                    or value.numel() != 1
+                    or value.dtype == torch.bool
+                    or not bool(torch.isfinite(value.detach()).all())
+                    or float(value.detach().cpu().item()) != 0.0
+                ):
+                    raise RuntimeError(
+                        "Gefen parameter rebinding found non-pristine device counters"
+                    )
+
+        live = [param for group in self.param_groups for param in group["params"]]
+        sources = [item.old_parameter for item in rebindings]
+        allowed_state_keys = tuple(live) + tuple(sources)
+        for parameter in self._param_names:
+            if not self._parameter_in(allowed_state_keys, parameter):
+                raise RuntimeError(
+                    "Gefen parameter rebinding found orphan parameter-name state"
+                )
+            compatibility_name = self._param_names[parameter]
+            if (
+                not isinstance(compatibility_name, str)
+                or compatibility_name != compatibility_name.lower()
+            ):
+                raise RuntimeError(
+                    "Gefen parameter rebinding found an invalid compatibility name"
+                )
+        allowed_names = {"name", _RANK_LOCAL_MEMBER_KEY}
+        for parameter, pstate in self.state.items():
+            if not self._parameter_in(allowed_state_keys, parameter):
+                raise RuntimeError(
+                    "Gefen parameter rebinding found orphan optimizer state"
+                )
+            if not isinstance(pstate, dict):
+                raise RuntimeError(
+                    "Gefen parameter rebinding found invalid constructor state"
+                )
+            for key in pstate:
+                if key in allowed_names:
+                    continue
+                if isinstance(key, str) and key.startswith(
+                    _RANK_LOCAL_PAYLOAD_KEY_PREFIX
+                ):
+                    continue
+                raise RuntimeError(
+                    "Gefen parameter rebinding found initialized optimizer state"
+                )
+            state_name = pstate.get("name")
+            if state_name is not None and (
+                not isinstance(state_name, str) or state_name != state_name.lower()
+            ):
+                raise RuntimeError(
+                    "Gefen parameter rebinding found an invalid state name"
+                )
+
+    def _validate_rebinding_layout(self, rebinding: ParameterRebinding) -> None:
+        shard = rebinding.shard
+        target = rebinding.new_parameter
+        if shard.layout is ParameterLayout.REPLICATED:
+            if target is None or tuple(target.shape) != shard.parameter.global_shape:
+                raise ValueError(
+                    "replicated Gefen rebinding requires complete parameter storage"
+                )
+        elif shard.layout is ParameterLayout.FLATTENED_ELEMENT_SHARD:
+            if target is None or target.ndim != 1:
+                raise ValueError(
+                    "flattened Gefen rebinding requires a live 1-D tensor shard"
+                )
+            if not target.is_contiguous():
+                raise ValueError(
+                    "flattened Gefen rebinding requires contiguous physical storage"
+                )
+            if self._factored_v_2d and len(shard.parameter.global_shape) == 2:
+                raise ValueError(
+                    "flattened logical matrices require factored_v_2d=False until "
+                    "matrix-aware factored-state projection is implemented"
+                )
+        else:
+            raise ValueError(
+                "plain Gefen rebinding supports replicated or flattened element shards only"
+            )
+        if target.numel() != shard.logical_slice.length:
+            raise ValueError(
+                "Gefen rebound tensor numel does not match its logical slice"
+            )
+
+    @staticmethod
+    def _codebook_scope_backend_device_is_valid(backend: str, device) -> bool:
+        backend = str(backend).lower()
+        if "nccl" in backend:
+            return device.type == "cuda" and device.index is not None
+        if "gloo" in backend or "mpi" in backend:
+            return device.type == "cpu"
+        return device.type in {"cpu", "cuda"}
+
+    def _validate_codebook_process_group_binding(
+        self, binding, rebindings, manifest
+    ) -> None:
+        if not isinstance(binding, CodebookProcessGroupBinding):
+            raise TypeError(
+                "codebook_process_group must be a CodebookProcessGroupBinding"
+            )
+        identity = binding.identity
+        if any(shard.process_group != identity for shard in manifest.shards):
+            raise ValueError(
+                "every scoped manifest shard must use the codebook process-group identity"
+            )
+        for rebinding in rebindings:
+            shard = rebinding.shard
+            if shard.local_member != binding.local_member:
+                raise ValueError(
+                    "local shard members must match the codebook binding member"
+                )
+            if shard.layout not in {
+                ParameterLayout.REPLICATED,
+                ParameterLayout.FLATTENED_ELEMENT_SHARD,
+                ParameterLayout.WHOLE_PARAMETER_OWNER,
+            }:
+                raise ValueError(
+                    "explicit codebook scope supports replicated, flattened, or whole-parameter owner identities"
+                )
+
+        self._validate_codebook_runtime_binding(binding)
+
+    def _validate_codebook_runtime_binding(self, binding) -> None:
+        members = binding.identity.ordered_members
+        if len(members) == 1:
+            if binding.process_group is not None:
+                raise ValueError(
+                    "a one-member codebook scope must use process_group=None"
+                )
+            return
+
+        if self.capturable:
+            raise ValueError(
+                "capturable=True does not support a multi-member explicit codebook scope"
+            )
+
+        if binding.process_group is None:
+            raise ValueError(
+                "a multi-member codebook scope requires an explicit runtime process group"
+            )
+        if (
+            not torch.distributed.is_available()
+            or not torch.distributed.is_initialized()
+        ):
+            raise RuntimeError(
+                "a multi-member codebook scope requires initialized torch.distributed"
+            )
+        import torch.distributed as dist
+
+        try:
+            world = dist.get_world_size(binding.process_group)
+            group_rank = dist.get_group_rank(binding.process_group, dist.get_rank())
+            backend = dist.get_backend(binding.process_group)
+        except Exception as exc:
+            raise ValueError(
+                "the current rank must belong to the explicit codebook process group"
+            ) from exc
+        if world != len(members):
+            raise ValueError(
+                "codebook process-group world size does not match its stable identity"
+            )
+        if group_rank < 0 or members[group_rank] != binding.local_member:
+            raise ValueError(
+                "runtime codebook group order does not match ordered semantic members"
+            )
+        if not self._codebook_scope_backend_device_is_valid(
+            backend, binding.collective_device
+        ):
+            raise ValueError(
+                "codebook collective device is incompatible with the runtime backend"
+            )
+        if binding.collective_device.type == "cuda":
+            index = binding.collective_device.index
+            if (
+                not torch.cuda.is_available()
+                or index is None
+                or index < 0
+                or index >= torch.cuda.device_count()
+            ):
+                raise ValueError("codebook collective CUDA device is unavailable")
+
+    @torch._dynamo.disable
+    def _assert_runtime_codebook_process_group(self, *, full: bool = False) -> None:
+        binding = self._gefen_codebook_process_group
+        if binding is None:
+            return
+        self._assert_finalized_binding_layout(full=full)
+        self._validate_codebook_runtime_binding(binding)
+
+    def _capture_codebook_scope_binding_for_step(self):
+        """Return a usable failure-vote binding before inspecting live layout."""
+
+        binding = self._gefen_codebook_process_group
+        if binding is None:
+            return None
+        if not isinstance(binding, CodebookProcessGroupBinding):
+            raise TypeError("the runtime codebook process-group binding is invalid")
+        self._validate_codebook_runtime_binding(binding)
+        return binding
+
+    def _codebook_parameter_contributes(self, parameter) -> bool:
+        binding = self._gefen_codebook_process_group
+        if binding is None:
+            return True
+        shard = self._gefen_shard_bindings.get(parameter)
+        if shard is None:
+            raise RuntimeError(
+                "scoped codebook parameter has no finalized shard identity"
+            )
+        if shard.layout is ParameterLayout.REPLICATED:
+            return shard.local_member == binding.identity.ordered_members[0]
+        return True
+
+    def _stage_post_sharding(self, rebindings, manifest, codebook_process_group=None):
+        self._assert_rebinding_pristine(rebindings)
+        live_slots = []
+        for group_index, group in enumerate(self.param_groups):
+            params = list(group["params"])
+            names = list(group.get("param_names", ()))
+            if len(names) != len(params):
+                names = [self._param_name(param) for param in params]
+            for parameter_index, (parameter, name) in enumerate(zip(params, names)):
+                live_slots.append((group_index, parameter_index, parameter, str(name)))
+        if len(rebindings) != len(live_slots):
+            raise ValueError(
+                "post_sharding requires exactly one rebinding for every optimizer slot"
+            )
+
+        manifest_fqns = {shard.parameter.fqn for shard in manifest.shards}
+        local_fqns = [item.shard.parameter.fqn for item in rebindings]
+        if len(set(local_fqns)) != len(local_fqns):
+            raise ValueError("local canonical parameter FQNs must be unique")
+        if set(local_fqns) != manifest_fqns:
+            raise ValueError(
+                "post_sharding manifest FQNs must exactly match optimizer slots"
+            )
+
+        assigned_positions = {}
+        binding_names = {}
+        final_targets = []
+        seen_sources = []
+        local_member_by_group = {}
+        for binding_index, rebinding in enumerate(rebindings):
+            if not isinstance(rebinding.old_parameter, torch.Tensor):
+                raise TypeError("rebinding source must be a Tensor")
+            if self._parameter_in(seen_sources, rebinding.old_parameter):
+                raise ValueError("rebinding source tensors must be unique")
+            seen_sources.append(rebinding.old_parameter)
+            process_group = rebinding.shard.process_group
+            if process_group is not None:
+                previous_member = local_member_by_group.setdefault(
+                    process_group, rebinding.shard.local_member
+                )
+                if previous_member != rebinding.shard.local_member:
+                    raise ValueError(
+                        "local shard bindings must use one member per process group"
+                    )
+            target = rebinding.new_parameter
+            if target is not None:
+                if not isinstance(target, torch.Tensor):
+                    raise TypeError("rebinding target must be a Tensor or None")
+                if self._is_dtensor_parameter(target):
+                    raise ValueError(
+                        "stable DTensor rebinding requires the deferred logical-region identity schema"
+                    )
+                if torch.is_complex(target):
+                    raise ValueError(
+                        "Gefen does not support complex rebound parameters"
+                    )
+                if target.layout is not torch.strided or target.dtype not in (
+                    torch.float16,
+                    torch.bfloat16,
+                    torch.float32,
+                    torch.float64,
+                ):
+                    raise ValueError(
+                        "rebound parameters require strided floating-point storage"
+                    )
+                if target.is_meta:
+                    raise ValueError("rebound parameters require materialized storage")
+                if (
+                    rebinding.shard.layout is ParameterLayout.FLATTENED_ELEMENT_SHARD
+                    and not target.is_contiguous()
+                ):
+                    raise ValueError(
+                        "flattened Gefen rebinding requires contiguous physical storage"
+                    )
+                if self._target_may_have_internal_storage_overlap(target):
+                    raise ValueError(
+                        "rebound target storage must be provably free of internal storage overlap"
+                    )
+                if not target.is_leaf and not target.retains_grad:
+                    raise ValueError("can't optimize a non-leaf rebound Tensor")
+            if rebinding.old_parameter.grad is not None or (
+                target is not None and target.grad is not None
+            ):
+                raise RuntimeError(
+                    "post_sharding must run before source or target gradients exist"
+                )
+            if rebinding.shard not in manifest.shards:
+                raise ValueError("local shard identity is absent from the manifest")
+            whole_owner = (
+                rebinding.shard.layout is ParameterLayout.WHOLE_PARAMETER_OWNER
+            )
+            local_owns = rebinding.shard.local_member == rebinding.shard.owner
+            if whole_owner and local_owns != (target is not None):
+                raise ValueError(
+                    "whole-parameter owner bindings require storage only on the owner"
+                )
+            if not whole_owner and target is None:
+                raise ValueError("only a whole-parameter non-owner may bind None")
+
+            source_positions = [
+                index
+                for index, slot in enumerate(live_slots)
+                if slot[2] is rebinding.old_parameter
+            ]
+            target_positions = []
+            if target is not None:
+                target_positions = [
+                    index for index, slot in enumerate(live_slots) if slot[2] is target
+                ]
+            if len(source_positions) == 1:
+                position = source_positions[0]
+                if target_positions and target_positions != [position]:
+                    raise ValueError(
+                        "rebinding target already occupies another optimizer slot"
+                    )
+            elif len(source_positions) == 0 and len(target_positions) == 1:
+                position = target_positions[0]
+                source_known = (
+                    rebinding.old_parameter in self.state
+                    or rebinding.old_parameter in self._param_names
+                )
+                if not source_known:
+                    raise ValueError("rebinding source is not registered with Gefen")
+            else:
+                raise ValueError(
+                    "rebinding source must identify exactly one optimizer slot"
+                )
+            if position in assigned_positions:
+                raise ValueError("multiple rebindings target one optimizer slot")
+            assigned_positions[position] = binding_index
+            compatibility_name = self._param_names.get(rebinding.old_parameter)
+            source_state = self.state.get(rebinding.old_parameter)
+            if compatibility_name is None and isinstance(source_state, dict):
+                compatibility_name = source_state.get("name")
+            if compatibility_name is None:
+                compatibility_name = live_slots[position][3]
+            if (
+                not isinstance(compatibility_name, str)
+                or compatibility_name != compatibility_name.lower()
+            ):
+                raise ValueError(
+                    "rebinding source compatibility name must be a lowercase string"
+                )
+            binding_names[binding_index] = compatibility_name
+            if target is not None:
+                if self._parameter_in(final_targets, target):
+                    raise ValueError("rebound target tensors must be unique")
+                final_targets.append(target)
+            self._validate_rebinding_layout(rebinding)
+
+        if len(assigned_positions) != len(live_slots):
+            raise ValueError("post_sharding did not bind every optimizer slot")
+        self._assert_rebound_storage_disjoint(final_targets)
+        if codebook_process_group is not None:
+            self._validate_codebook_process_group_binding(
+                codebook_process_group, rebindings, manifest
+            )
+
+        staged = object.__new__(type(self))
+        staged.__dict__ = self.__dict__.copy()
+        staged.param_groups = []
+        staged.state = defaultdict(dict)
+        staged._param_names = {}
+        staged._synthesized_param_names = {}
+        staged._gefen_shard_bindings = {}
+        local_bindings = []
+        logical_slots = []
+        slot_cursor = 0
+        for group_index, group in enumerate(self.param_groups):
+            staged_group = dict(group)
+            staged_group.pop("_gefen_checkpoint_metadata", None)
+            staged_params = []
+            staged_names = []
+            staged_synthesized_names = []
+            names = list(group.get("param_names", ()))
+            if len(names) != len(group["params"]):
+                names = [self._param_name(param) for param in group["params"]]
+            for original_slot_index, _ in enumerate(names):
+                binding_index = assigned_positions[slot_cursor]
+                rebinding = rebindings[binding_index]
+                compatibility_name = binding_names[binding_index]
+                slot_cursor += 1
+                target = rebinding.new_parameter
+                local_bindings.append((target, rebinding.shard))
+                logical_slots.append(
+                    LogicalSlotBinding(
+                        group_index,
+                        original_slot_index,
+                        compatibility_name,
+                        rebinding.shard,
+                    )
+                )
+                if target is None:
+                    continue
+                staged_params.append(target)
+                staged_names.append(compatibility_name)
+                staged._param_names[target] = compatibility_name
+                synthesized_name = self._synthesized_param_names.get(
+                    rebinding.old_parameter, True
+                )
+                staged_synthesized_names.append(synthesized_name)
+                staged._synthesized_param_names[target] = synthesized_name
+                staged.state[target]["name"] = compatibility_name
+                staged._gefen_shard_bindings[target] = rebinding.shard
+            staged_group["params"] = staged_params
+            staged_group["param_names"] = staged_names
+            staged_group[_SYNTHESIZED_PARAM_NAMES_KEY] = staged_synthesized_names
+            staged.param_groups.append(staged_group)
+
+        staged._gefen_local_shard_bindings = tuple(
+            sorted(local_bindings, key=lambda item: item[1].sort_key)
+        )
+        staged._gefen_logical_slots = tuple(logical_slots)
+        staged._gefen_sharding_manifest = manifest
+        staged._gefen_post_sharding_finalized = True
+        staged._gefen_codebook_process_group = codebook_process_group
+        staged._gefen_codebook_scope_validated = False
+        staged._gefen_codebook_by_device = {}
+        staged._gefen_codebook_lut_by_device = {}
+        staged._sr_seed_by_device = {}
+        staged._gefen_global_step_by_device = {}
+        staged._capt_stacks = None
+        staged._static_mark_sig = None
+        staged._lr_scalar_cache = None
+        staged._ensure_gefen_global_step_devices()
+        staged._install_rank_local_checkpoint_schema()
+        staged._gefen_finalized_slots = tuple(
+            tuple(group["params"]) for group in staged.param_groups
+        )
+        return staged
+
+    def post_sharding(
+        self,
+        rebindings,
+        *,
+        manifest: ShardingManifest,
+        codebook_process_group=None,
+    ) -> None:
+        """Atomically finalize every local optimizer slot after sharding."""
+
+        if not isinstance(manifest, ShardingManifest):
+            raise TypeError("manifest must be a ShardingManifest")
+        if isinstance(rebindings, (str, bytes)):
+            raise TypeError("rebindings must be a sequence")
+        rebindings = tuple(rebindings)
+        if not rebindings or any(
+            not isinstance(item, ParameterRebinding) for item in rebindings
+        ):
+            raise TypeError(
+                "rebindings must contain one or more ParameterRebinding values"
+            )
+        sources = []
+        for rebinding in rebindings:
+            if self._parameter_in(sources, rebinding.old_parameter):
+                raise ValueError("rebinding source tensors must be unique")
+            sources.append(rebinding.old_parameter)
+        staged = self._stage_post_sharding(rebindings, manifest, codebook_process_group)
+        self.__dict__.update(staged.__dict__)
+        self._invalidate_layout_forensics_caches()
+        # Compute the manifest shard set and digest exactly once at
+        # finalization; every later step guard and scoped operation header
+        # reuses this cache instead of rehashing every shard identity.
+        self._manifest_layout_forensics(refresh=True)
+
+    def rebind_shard(
+        self,
+        old_parameter,
+        new_parameter,
+        *,
+        shard: ShardIdentity,
+        manifest: ShardingManifest,
+    ) -> None:
+        """Apply a complete one-slot shard plan through ``post_sharding``."""
+
+        self.post_sharding(
+            (ParameterRebinding(old_parameter, new_parameter, shard),),
+            manifest=manifest,
+        )
+
+    def rebind_parameter(
+        self,
+        old_parameter,
+        new_parameter,
+        *,
+        identity: ParameterIdentity,
+    ) -> None:
+        """Bind one complete replicated parameter with a canonical identity."""
+
+        shard = ShardIdentity(
+            identity,
+            ParameterLayout.REPLICATED,
+            LogicalSlice.full(identity),
+        )
+        self.rebind_shard(
+            old_parameter,
+            new_parameter,
+            shard=shard,
+            manifest=ShardingManifest((shard,)),
+        )
 
     @staticmethod
     def _normalize_param_groups(params):
@@ -1259,13 +3000,9 @@ class Gefen(torch.optim.Optimizer):
         if not 0.0 <= lr:
             raise ValueError("Invalid learning rate: {}".format(lr))
         elif not 0.0 <= betas[0] < 1.0:
-            raise ValueError(
-                "Invalid beta parameter at index 0: {}".format(betas[0])
-            )
+            raise ValueError("Invalid beta parameter at index 0: {}".format(betas[0]))
         elif not 0.0 <= betas[1] < 1.0:
-            raise ValueError(
-                "Invalid beta parameter at index 1: {}".format(betas[1])
-            )
+            raise ValueError("Invalid beta parameter at index 1: {}".format(betas[1]))
         elif not 0.0 <= weight_decay:
             raise ValueError("Invalid weight_decay value: {}".format(weight_decay))
         elif not math.isfinite(eps) or eps <= 0.0:
@@ -1291,8 +3028,9 @@ class Gefen(torch.optim.Optimizer):
                 )
             if torch.is_complex(param):
                 raise ValueError(
-                    "Gefen does not support complex parameters, but got a "
-                    "parameter with dtype {}".format(param.dtype)
+                    "Gefen does not support complex parameters, but got a parameter with dtype {}".format(
+                        param.dtype
+                    )
                 )
             yield param_name, param
 
@@ -1324,6 +3062,28 @@ class Gefen(torch.optim.Optimizer):
             else:
                 yield self._param_name(param), param
 
+    def _iter_codebook_params_with_names(self):
+        """Yield codebook inputs in canonical order when a scope is bound."""
+
+        if self._gefen_codebook_process_group is None:
+            for group in self.param_groups:
+                for name, parameter in self._iter_group_params_with_names(group):
+                    yield group, name, parameter
+            return
+        by_identity = {}
+        for group in self.param_groups:
+            for name, parameter in self._iter_group_params_with_names(group):
+                by_identity[id(parameter)] = (group, name, parameter)
+        for parameter, _ in self._gefen_local_shard_bindings:
+            if parameter is not None:
+                yield by_identity[id(parameter)]
+
+    def _has_local_codebook_gradients(self) -> bool:
+        return any(
+            parameter.grad is not None
+            for _, _, parameter in self._iter_codebook_params_with_names()
+        )
+
     @staticmethod
     def _unique_name(base: str, existing_names) -> str:
         name = str(base).lower()
@@ -1353,12 +3113,31 @@ class Gefen(torch.optim.Optimizer):
         previous_names = self._param_names
         previous_flags = self._synthesized_param_names
         self._param_names = {}
+        logical_groups = None
+        if self._gefen_post_sharding_finalized:
+            logical_groups = [[] for _ in self.param_groups]
+            for logical_slot in self._gefen_logical_slots:
+                if (
+                    logical_slot.shard.layout is ParameterLayout.WHOLE_PARAMETER_OWNER
+                    and logical_slot.shard.local_member != logical_slot.shard.owner
+                ):
+                    continue
+                logical_groups[logical_slot.group_index].append(
+                    logical_slot.compatibility_name
+                )
         synthesized_flags = {}
-        for group in self.param_groups:
+        for group_index, group in enumerate(self.param_groups):
             params = group["params"]
-            names = list(group.get("param_names", ()))
-            if len(names) != len(params):
-                names = [self._param_name(p) for p in params]
+            if logical_groups is None:
+                names = list(group.get("param_names", ()))
+                if len(names) != len(params):
+                    names = [self._param_name(p) for p in params]
+            else:
+                names = logical_groups[group_index]
+                if len(names) != len(params):
+                    raise RuntimeError(
+                        "Gefen finalized logical-slot registry does not match the loaded layout"
+                    )
             # A short/absent/malformed list is unusable rather than partially
             # trusted: provenance is positional against param_names, so a length
             # mismatch means we cannot say which flag describes which name.
@@ -1395,11 +3174,13 @@ class Gefen(torch.optim.Optimizer):
         stable lowercase name is stored in its per-param state and in the
         group's ``param_names`` list for introspection.
         """
+        if getattr(self, "_gefen_post_sharding_finalized", False):
+            raise RuntimeError(
+                "Gefen cannot add parameter groups after post_sharding finalization"
+            )
         if not isinstance(param_group, dict):
             raise TypeError(
-                "param_group must be a dict, got {}".format(
-                    type(param_group).__name__
-                )
+                "param_group must be a dict, got {}".format(type(param_group).__name__)
             )
         if "params" not in param_group:
             raise ValueError("Gefen parameter group is missing the 'params' key.")
@@ -1627,9 +3408,7 @@ class Gefen(torch.optim.Optimizer):
             )
         if capturing:
             devices = {
-                param.device
-                for group in self.param_groups
-                for param in group["params"]
+                param.device for group in self.param_groups for param in group["params"]
             }
             capture_device = torch.device("cuda", torch.cuda.current_device())
             if devices != {capture_device}:
@@ -1662,9 +3441,7 @@ class Gefen(torch.optim.Optimizer):
             acc += sum(map(id, params))
             acc ^= sum(id(p.grad) for p in params)
         state = self.state
-        acc += sum(
-            map(id, chain.from_iterable(map(dict.values, state.values())))
-        )
+        acc += sum(map(id, chain.from_iterable(map(dict.values, state.values()))))
         stacks = self._capt_stacks
         return (
             acc,
@@ -1717,9 +3494,7 @@ class Gefen(torch.optim.Optimizer):
             mark(self._gefen_codebook)
             lut = _codebook_search_lut(self._gefen_codebook)
             mark(lut)
-            self._gefen_codebook_lut_by_device[
-                self._gefen_codebook.device
-            ] = lut
+            self._gefen_codebook_lut_by_device[self._gefen_codebook.device] = lut
         for device, cached in self._gefen_codebook_by_device.items():
             mark(cached)
             lut = _codebook_search_lut(cached)
@@ -1792,8 +3567,10 @@ class Gefen(torch.optim.Optimizer):
                 else int(global_counter.item())
             )
             seed = torch.full(
-                (), initial_step,
-                dtype=torch.int64, device=device,
+                (),
+                initial_step,
+                dtype=torch.int64,
+                device=device,
             )
             self._sr_seed_by_device[device] = seed
         return seed
@@ -1818,8 +3595,9 @@ class Gefen(torch.optim.Optimizer):
         ]
         if any(step != steps[0] for step in steps[1:]):
             raise RuntimeError(
-                "Gefen capturable global-step counters disagree across devices: "
-                "{}".format(steps)
+                "Gefen capturable global-step counters disagree across devices: {}".format(
+                    steps
+                )
             )
         return steps[0]
 
@@ -1835,7 +3613,9 @@ class Gefen(torch.optim.Optimizer):
         ]
         if missing:
             device_step = self._device_gefen_global_step()
-            initial_step = self._gefen_global_step if device_step is None else device_step
+            initial_step = (
+                self._gefen_global_step if device_step is None else device_step
+            )
             self._gefen_global_step = initial_step
             for device in missing:
                 self._gefen_global_step_by_device[device] = torch.full(
@@ -1859,13 +3639,10 @@ class Gefen(torch.optim.Optimizer):
         if device_step is not None:
             self._gefen_global_step = device_step
         if self.capturable and self._stochastic_round:
-            seed_steps = [
-                int(seed.item()) for seed in self._sr_seed_by_device.values()
-            ]
+            seed_steps = [int(seed.item()) for seed in self._sr_seed_by_device.values()]
             if any(seed_step != self._gefen_global_step for seed_step in seed_steps):
                 raise RuntimeError(
-                    "Gefen capturable stochastic-round seeds disagree with the "
-                    "optimizer global step: {} != {}".format(
+                    "Gefen capturable stochastic-round seeds disagree with the optimizer global step: {} != {}".format(
                         seed_steps, self._gefen_global_step
                     )
                 )
@@ -2152,10 +3929,7 @@ class Gefen(torch.optim.Optimizer):
                 steps2d = torch.empty((2, n), dtype=torch.float32, device=device)
                 steps2d[0].copy_(
                     torch.stack(
-                        [
-                            self.state[p][key].detach()
-                            for p, key in zip(rows, d["keys"])
-                        ]
+                        [self.state[p][key].detach() for p, key in zip(rows, d["keys"])]
                     )
                 )
                 steps2d[1].copy_(
@@ -2281,9 +4055,7 @@ class Gefen(torch.optim.Optimizer):
         # per-row alias/routing guard, but validate group-owned hypers once per
         # contiguous device run instead of once per parameter. Heterogeneous
         # registries take the fully general path below.
-        if stacks and all(
-            len(device_stacks) == 1 for device_stacks in stacks.values()
-        ):
+        if stacks and all(len(device_stacks) == 1 for device_stacks in stacks.values()):
             if self._capt_single_cohort_ready(stacks):
                 return True
             if capturing:
@@ -2324,8 +4096,7 @@ class Gefen(torch.optim.Optimizer):
                     or state["step"] is not stack["step_views"][i]
                     or state.get(info[0]) is not stack["bc2_views"][i]
                     or state.get("_capt_scalars") is not stack["scalar_views"][i]
-                    or stack["betas"][i]
-                    != (group["beta1"], group["beta2"])
+                    or stack["betas"][i] != (group["beta1"], group["beta2"])
                     or group["weight_decay"] != stack["weight_decay0"]
                 ):
                     ok = False
@@ -2489,6 +4260,11 @@ class Gefen(torch.optim.Optimizer):
                 if p.grad is not None:
                     return p.grad.device
                 return p.device
+        # A whole-parameter non-owner deliberately has no local parameter
+        # storage but must still materialize the group-agreed codebook so its
+        # optimizer-common checkpoint state remains complete.
+        if self._gefen_codebook_process_group is not None:
+            return torch.device("cpu")
         raise ValueError(
             "Expected at least one parameter when choosing the Gefen codebook device."
         )
@@ -2509,9 +4285,7 @@ class Gefen(torch.optim.Optimizer):
             self._gefen_codebook_by_device[device] = cached
         return cached
 
-    def _gefen_codebook_lut_on(
-        self, device: torch.device
-    ) -> Optional[torch.Tensor]:
+    def _gefen_codebook_lut_on(self, device: torch.device) -> Optional[torch.Tensor]:
         # Resolve once per device and retain the tensor on the optimizer.  The
         # eager Muon momentum path calls this per matrix; returning a stable
         # cached tensor avoids rebuilding the data_ptr/version cache key in the
@@ -2566,15 +4340,19 @@ class Gefen(torch.optim.Optimizer):
         # Single decision point for a parameter's automatic period so the
         # codebook-learning pass and the step agree. force_1d_period_one short-
         # circuits 1D params to per-element (period==1) before the block search.
+        routing_name = param_name
+        shard = self._gefen_shard_bindings.get(param)
+        if shard is not None:
+            routing_name = shard.parameter.fqn
         if self._force_1d_period_one and param.ndim == 1:
             return 1
         if self._force_2d_period_one and param.ndim == 2:
             return 1
         if self._period_one_substrings:
-            lname = str(param_name).lower()
+            lname = str(routing_name).lower()
             if any(sub in lname for sub in self._period_one_substrings):
                 return 1
-        return self._predict_period_from_grad_sq(param_name, param, grad)
+        return self._predict_period_from_grad_sq(routing_name, param, grad)
 
     def _predict_period_from_grad_sq(
         self, param_name: str, param: torch.Tensor, grad: torch.Tensor
@@ -2636,9 +4414,7 @@ class Gefen(torch.optim.Optimizer):
                 )
 
         if backend == "cpu":
-            period_input = (
-                grad_work.detach().float().square().reshape(-1).cpu().numpy()
-            )
+            period_input = grad_work.detach().float().square().reshape(-1).cpu().numpy()
         elif backend == "gpu":
             if grad_work.device.type != "cuda":
                 raise ValueError("FIND_PERIOD_BACKEND='gpu' requires a CUDA tensor")
@@ -2685,104 +4461,546 @@ class Gefen(torch.optim.Optimizer):
                 )
             )
 
-    def _iter_gefen_grad_periods(self, reuse_existing_periods: bool = False):
+    def _iter_gefen_grad_periods(
+        self, reuse_existing_periods: bool = False, staged_periods=None
+    ):
+        for _, param_name, p in self._iter_codebook_params_with_names():
+            if p.grad is None:
+                continue
+            grad = p.grad
+            # Codebook learning runs before the step loop's own guard, so
+            # reject sparse grads here too with the same clear error.
+            if getattr(grad, "is_sparse", False):
+                raise RuntimeError("Gefen does not support sparse gradients")
+            if torch.is_complex(grad):
+                raise RuntimeError("Gefen does not support complex gradients")
+            if hasattr(grad, "to_local"):
+                grad = grad.to_local()
+            if hasattr(grad, "wait"):
+                grad = grad.wait()
+            grad = grad.detach()
+            flat = grad.reshape(-1)
+            if flat.numel() == 0:
+                continue
 
-        for group in self.param_groups:
-            for param_name, p in self._iter_group_params_with_names(group):
-                if p.grad is None:
-                    continue
-                grad = p.grad
-                # Codebook learning runs before the step loop's own guard, so
-                # reject sparse grads here too with the same clear error.
-                if getattr(grad, "is_sparse", False):
-                    raise RuntimeError("Gefen does not support sparse gradients")
-                if torch.is_complex(grad):
-                    raise RuntimeError("Gefen does not support complex gradients")
-                if hasattr(grad, "to_local"):
-                    grad = grad.to_local()
-                if hasattr(grad, "wait"):
-                    grad = grad.wait()
-                grad = grad.detach()
-                flat = grad.reshape(-1)
-                if flat.numel() == 0:
-                    continue
-
-                if reuse_existing_periods:
-                    state = self.state[p]
-                    if "automatic_period" not in state:
-                        raise ValueError(
-                            "Expected automatic_period to exist for {} before refreshing Gefen codebook at optimizer step {}".format(
-                                param_name,
-                                self._gefen_global_step,
-                            )
-                        )
-                    period = state["automatic_period"]
-                elif flat.numel() == 1:
-                    period = 1
-                else:
-                    period = self._resolve_automatic_period(param_name, p, grad)
-
-                self.state[p]["automatic_period"] = period
-
-                if flat.numel() % period != 0:
+            if reuse_existing_periods:
+                state = self.state[p]
+                if "automatic_period" not in state:
                     raise ValueError(
-                        "Automatic partition period {} does not divide parameter {} with numel {} while learning Gefen codebook".format(
-                            period,
+                        "Expected automatic_period to exist for {} before refreshing Gefen codebook at optimizer step {}".format(
                             param_name,
-                            flat.numel(),
+                            self._gefen_global_step,
                         )
                     )
+                period = state["automatic_period"]
+            elif flat.numel() == 1:
+                period = 1
+            else:
+                period = self._resolve_automatic_period(param_name, p, grad)
 
-                yield param_name, flat, period, grad
+            if flat.numel() % period != 0:
+                raise ValueError(
+                    "Automatic partition period {} does not divide parameter {} with numel {} while learning Gefen codebook".format(
+                        period,
+                        param_name,
+                        flat.numel(),
+                    )
+                )
+
+            if staged_periods is None:
+                self.state[p]["automatic_period"] = period
+            elif not reuse_existing_periods:
+                staged_periods.append((p, period))
+            if not self._codebook_parameter_contributes(p):
+                continue
+
+            yield param_name, flat, period, grad
+
+    @torch._dynamo.disable
+    def _synchronize_codebook_scope_failure(self, error, phase: str) -> None:
+        binding = self._gefen_codebook_process_group
+        if binding is None or len(binding.identity.ordered_members) == 1:
+            if error is not None:
+                raise error
+            return
+        self._assert_runtime_codebook_process_group()
+        self._synchronize_prevalidated_codebook_scope_failure(error, phase, binding)
+
+    @staticmethod
+    @torch._dynamo.disable
+    def _synchronize_prevalidated_codebook_scope_failure(
+        error, phase: str, binding
+    ) -> None:
+        """Synchronize through a binding validated before rank-local user code."""
+
+        if binding is None or len(binding.identity.ordered_members) == 1:
+            if error is not None:
+                raise error
+            return
+        failed = _synchronize_step_failure(
+            error is not None,
+            binding.process_group,
+            collective_device=binding.collective_device,
+        )
+        if not failed:
+            return
+        if error is not None:
+            raise RuntimeError(
+                "scoped Gefen codebook {} failed on local member {}: {}".format(
+                    phase, binding.local_member, error
+                )
+            ) from error
+        raise RuntimeError(
+            "scoped Gefen codebook {} failed on another process-group member".format(
+                phase
+            )
+        )
+
+    @torch._dynamo.disable
+    def _prepare_scoped_amp_optimizer_step(self) -> bool:
+        binding = self._gefen_codebook_process_group
+        if binding is None:
+            return _amp_prepare_optimizer_step(self)
+        found_inf = getattr(self, "found_inf", None)
+        local_present = hasattr(self, "found_inf") or hasattr(
+            self, "grad_scale"
+        )
+        try:
+            local_overflow, grad_scale, local_scale = (
+                _amp_optimizer_step_controls(self)
+            )
+            if (
+                found_inf is not None
+                and not torch.is_tensor(found_inf)
+                and len(binding.identity.ordered_members) > 1
+            ):
+                raise RuntimeError(
+                    "a multi-member scoped optimizer requires a group-aware "
+                    "gradient scaler to provide tensor found_inf on every member"
+                )
+            scale_present = grad_scale is not None
+            local_error = None
+        except Exception as exc:
+            local_overflow = False
+            scale_present = False
+            local_scale = 0.0
+            local_error = exc
+        self._synchronize_codebook_scope_failure(local_error, "AMP overflow preflight")
+        if len(binding.identity.ordered_members) > 1:
+            import torch.distributed as dist
+
+            amp_control = torch.tensor(
+                [
+                    int(local_present),
+                    int(local_overflow),
+                    int(scale_present),
+                    local_scale,
+                ],
+                dtype=torch.float64,
+                device=binding.collective_device,
+            )
+            controls = [
+                torch.empty_like(amp_control) for _ in binding.identity.ordered_members
+            ]
+            dist.all_gather(controls, amp_control, group=binding.process_group)
+            if any(not torch.equal(item, controls[0]) for item in controls[1:]):
+                raise RuntimeError(
+                    "scoped Gefen AMP requires identical protocol presence, "
+                    "found_inf, and grad_scale on every process-group member; "
+                    "use a group-aware gradient scaler"
+                )
+            if local_overflow:
+                return False
+        elif local_overflow:
+            return False
+        return _amp_prepare_optimizer_step(self)
+
+    def _reduce_codebook_scope_histogram(self, histogram: torch.Tensor) -> torch.Tensor:
+        binding = self._gefen_codebook_process_group
+        if binding is None or len(binding.identity.ordered_members) == 1:
+            return histogram
+        self._assert_runtime_codebook_process_group()
+        import torch.distributed as dist
+
+        reduced = histogram.to(binding.collective_device).clone()
+        dist.all_reduce(reduced, op=dist.ReduceOp.SUM, group=binding.process_group)
+        return reduced.cpu()
+
+    def _codebook_manifest_fingerprint(self):
+        return self._manifest_layout_forensics()[1]
+
+    def _compute_codebook_manifest_fingerprint(self, manifest):
+        # Scoped manifests always carry contiguous slices and one process-group
+        # identity, so their payload (and digest) is unchanged; the ungrouped
+        # and logical-region forms only appear for unscoped finalized layouts,
+        # whose digest is cached but never exchanged in a scope header.
+        payload = tuple(
+            (
+                shard.parameter.fqn,
+                shard.parameter.global_shape,
+                shard.layout.value,
+                shard.logical_slice.flat_offset
+                if isinstance(shard.logical_slice, LogicalSlice)
+                else tuple(shard.logical_slice.offsets),
+                shard.logical_slice.length
+                if isinstance(shard.logical_slice, LogicalSlice)
+                else tuple(shard.logical_slice.lengths),
+                None
+                if shard.process_group is None
+                else shard.process_group.semantic_name,
+                None
+                if shard.process_group is None
+                else shard.process_group.ordered_members,
+                shard.local_member,
+                shard.owner,
+                tuple(
+                    (
+                        placement.mesh_axis,
+                        placement.kind.value,
+                        placement.coordinate,
+                        placement.parts,
+                        placement.parameter_dimension,
+                    )
+                    for placement in shard.placements
+                ),
+            )
+            for shard in manifest.shards
+        )
+        return self._sha256_int64(repr(payload).encode("utf-8"))
+
+    @staticmethod
+    def _sha256_int64(payload):
+        digest = hashlib.sha256(payload).digest()
+        return tuple(
+            int.from_bytes(digest[index : index + 8], "big", signed=True)
+            for index in range(0, len(digest), 8)
+        )
+
+    def _codebook_scope_fingerprint(self):
+        return self._sha256_int64(
+            repr(self._serialized_codebook_scope()).encode("utf-8")
+        )
+
+    def _codebook_value_fingerprint(self):
+        if self._gefen_codebook is None:
+            return (0, 0, 0, 0)
+        raw = bytes(
+            self._gefen_codebook.detach().cpu().contiguous().view(torch.uint8).tolist()
+        )
+        return self._sha256_int64(raw)
+
+    def _validate_codebook_scope_operation_header(self, operation: str) -> None:
+        binding = self._gefen_codebook_process_group
+        if binding is None or len(binding.identity.ordered_members) == 1:
+            return
+        operation_codes = {
+            "initialize": 1,
+            "refresh": 2,
+            "periodic_step": 3,
+            "step": 4,
+        }
+        if operation not in operation_codes:
+            raise ValueError("unknown scoped codebook operation")
+        self._assert_runtime_codebook_process_group()
+        import torch.distributed as dist
+
+        header = torch.tensor(
+            [
+                operation_codes[operation],
+                int(self._gefen_global_step),
+                int(self._gefen_codebook is not None),
+                int(self._deterministic),
+                int(self._codebook_refresh_every),
+                int(self.capturable),
+                int(hasattr(self, "found_inf") or hasattr(self, "grad_scale")),
+                *self._codebook_scope_fingerprint(),
+                *self._codebook_manifest_fingerprint(),
+                *self._codebook_value_fingerprint(),
+                # Trailing decision bit, deliberately excluded from the equality
+                # check below: collective-free rank-local operations
+                # (post-sharding, staged/native checkpoint loads)
+                # legitimately reset _gefen_codebook_scope_validated on a subset
+                # of members without changing any fingerprinted value. The group
+                # resolves "does any member need re-validation" here so
+                # _ensure_codebook_scope_agreement re-validates on every member
+                # together instead of diverging in front of its collectives.
+                int(self._gefen_codebook_scope_validated),
+            ],
+            dtype=torch.int64,
+            device=binding.collective_device,
+        )
+        headers = [torch.empty_like(header) for _ in binding.identity.ordered_members]
+        dist.all_gather(headers, header, group=binding.process_group)
+        if any(not torch.equal(item[:-1], headers[0][:-1]) for item in headers[1:]):
+            raise RuntimeError(
+                "scoped Gefen codebook operation, step, scope, manifest, policy, "
+                "or old codebook differs across process-group members"
+            )
+        if any(int(item[-1].item()) == 0 for item in headers):
+            self._gefen_codebook_scope_validated = False
+        if operation != "step" and self._gefen_codebook is not None:
+            self._verify_codebook_scope_agreement(self._gefen_codebook)
+
+    def _validate_codebook_scope_contribution_controls(
+        self, staged_periods, *, reuse_existing_periods: bool
+    ) -> None:
+        binding = self._gefen_codebook_process_group
+        if binding is None or len(binding.identity.ordered_members) == 1:
+            return
+        self._assert_runtime_codebook_process_group()
+        import torch.distributed as dist
+
+        staged_by_parameter = {
+            id(parameter): int(period) for parameter, period in staged_periods
+        }
+        local_records = []
+        for parameter, shard in self._gefen_local_shard_bindings:
+            active = int(
+                parameter is not None
+                and parameter.grad is not None
+                and parameter.numel() > 0
+            )
+            period = -1
+            if active:
+                if reuse_existing_periods:
+                    period = int(self.state[parameter]["automatic_period"])
+                else:
+                    period = staged_by_parameter[id(parameter)]
+            layout_code = {
+                ParameterLayout.REPLICATED: 1,
+                ParameterLayout.FLATTENED_ELEMENT_SHARD: 2,
+                ParameterLayout.WHOLE_PARAMETER_OWNER: 3,
+            }[shard.layout]
+            local_records.append(
+                (layout_code, active, period, shard.logical_slice.length)
+            )
+
+        header = torch.tensor(
+            list(self._codebook_manifest_fingerprint()) + [len(local_records)],
+            dtype=torch.int64,
+            device=binding.collective_device,
+        )
+        headers = [torch.empty_like(header) for _ in binding.identity.ordered_members]
+        dist.all_gather(headers, header, group=binding.process_group)
+        if any(not torch.equal(item, headers[0]) for item in headers[1:]):
+            raise RuntimeError(
+                "scoped Gefen codebook manifests differ across process-group members"
+            )
+
+        flattened = []
+        for record in local_records:
+            flattened.extend(record)
+        local = torch.tensor(
+            flattened, dtype=torch.int64, device=binding.collective_device
+        )
+        gathered = [torch.empty_like(local) for _ in binding.identity.ordered_members]
+        dist.all_gather(gathered, local, group=binding.process_group)
+        for record_index, (layout_code, _, _, _) in enumerate(local_records):
+            offset = record_index * 4
+            if any(int(item[offset].item()) != layout_code for item in gathered):
+                raise RuntimeError(
+                    "scoped Gefen codebook local layouts differ across members"
+                )
+            if layout_code != 1:
+                if layout_code == 2:
+                    nonempty_activity = {
+                        int(item[offset + 1].item())
+                        for item in gathered
+                        if int(item[offset + 3].item()) > 0
+                    }
+                    if len(nonempty_activity) > 1:
+                        raise RuntimeError(
+                            "scoped flattened parameters require every nonempty shard to agree on gradient presence"
+                        )
+                continue
+            replicated_controls = {
+                (int(item[offset + 1].item()), int(item[offset + 2].item()))
+                for item in gathered
+            }
+            if len(replicated_controls) != 1:
+                raise RuntimeError(
+                    "scoped replicated parameters require identical gradient "
+                    "presence and automatic periods on every member"
+                )
+
+    def _verify_codebook_scope_agreement(self, codebook: torch.Tensor) -> None:
+        binding = self._gefen_codebook_process_group
+        if binding is None or len(binding.identity.ordered_members) == 1:
+            return
+        self._assert_runtime_codebook_process_group()
+        import torch.distributed as dist
+
+        local = (
+            codebook.detach()
+            .to(device=binding.collective_device, dtype=torch.float32)
+            .contiguous()
+        )
+        gathered = [torch.empty_like(local) for _ in binding.identity.ordered_members]
+        dist.all_gather(gathered, local, group=binding.process_group)
+        if any(not torch.equal(item, gathered[0]) for item in gathered[1:]):
+            raise RuntimeError(
+                "scoped Gefen codebook values differ across process-group members"
+            )
+
+    def _ensure_codebook_scope_agreement(self) -> None:
+        binding = self._gefen_codebook_process_group
+        if binding is None or self._gefen_codebook_scope_validated:
+            return
+        # Scope re-validation runs only after a mutating API reset the flag,
+        # so its collectives already amortize one full forensic rebuild.
+        self._assert_runtime_codebook_process_group(full=True)
+        if len(binding.identity.ordered_members) == 1:
+            self._gefen_codebook_scope_validated = self._gefen_codebook is not None
+            return
+        import torch.distributed as dist
+
+        control = torch.tensor(
+            [
+                int(self._gefen_global_step),
+                int(self._gefen_codebook is not None),
+                int(self._deterministic),
+                int(self._codebook_refresh_every),
+                int(hasattr(self, "found_inf") or hasattr(self, "grad_scale")),
+                int(self.capturable),
+                *self._codebook_scope_fingerprint(),
+                *self._codebook_manifest_fingerprint(),
+            ],
+            dtype=torch.int64,
+            device=binding.collective_device,
+        )
+        controls = [torch.empty_like(control) for _ in binding.identity.ordered_members]
+        dist.all_gather(controls, control, group=binding.process_group)
+        if any(not torch.equal(item, controls[0]) for item in controls[1:]):
+            raise RuntimeError(
+                "scoped Gefen codebook step, presence, policy, scope, manifest, "
+                "or AMP protocol differs across process-group members"
+            )
+        if self._gefen_codebook is not None:
+            self._verify_codebook_scope_agreement(self._gefen_codebook)
+            self._gefen_codebook_scope_validated = True
+
+    def _codebook_requires_2d_parameters(self) -> bool:
+        return False
+
+    def _assert_codebook_capture_ready(self) -> None:
+        if (
+            torch.cuda.is_available()
+            and torch.cuda.is_current_stream_capturing()
+            and self._gefen_codebook is None
+            and self._has_local_codebook_gradients()
+        ):
+            raise RuntimeError(
+                "Gefen codebook initialization is host-driven and must complete "
+                "during eager warmup before CUDA graph capture"
+            )
 
     def _learn_gefen_exact_codebook(
         self,
         reuse_existing_periods: bool = False,
         compute_mse_logging: bool = True,
-    ) -> Optional[torch.Tensor]:
+    ):
+        fused_build_ok = self._fused_build_ok
+        try:
+            return self._prepare_gefen_exact_codebook(
+                reuse_existing_periods=reuse_existing_periods,
+                compute_mse_logging=compute_mse_logging,
+            )
+        except Exception:
+            self._fused_build_ok = fused_build_ok
+            raise
+
+    def _prepare_gefen_exact_codebook(
+        self,
+        reuse_existing_periods: bool = False,
+        compute_mse_logging: bool = True,
+    ):
+        if torch.cuda.is_available() and torch.cuda.is_current_stream_capturing():
+            raise RuntimeError(
+                "Gefen codebook initialization is host-driven and cannot run "
+                "inside CUDA graph capture; initialize during eager warmup"
+            )
         # Fire the fused-toolchain probe ONCE here, at the first fused CUDA
         # extension boundary (step-1 codebook learning), so a broken toolchain
         # is discovered and downgraded before the histogram / period-finding /
         # update paths run. On a healthy box this just builds the extension a
         # little earlier; for fused=False the probe is a no-op (never builds).
-        if self.fused:
-            self._gefen_fused_toolchain_ok()
-        codebook = learn_gefen_exact_codebook_from_grad_periods(
-            grad_periods=self._iter_gefen_grad_periods(
-                reuse_existing_periods=reuse_existing_periods
-            ),
-            codebook_device=self._gefen_codebook_device(),
-            num_codebooks=256,
-            force_endpoints=True,
-            verbose=self.verbose,
-            compute_mse_logging=compute_mse_logging,
-            # ``fused=False`` promises a JIT-free pure-PyTorch path. Do not load
-            # the separate histogram extension in that mode (or after the fused
-            # toolchain probe failed). An explicit global period-backend choice
-            # remains independent of this histogram implementation decision.
-            use_fused_histogram=(
-                FUSE_HISTOGRAM_FOR_EXACT
-                and self.fused
-                and self._fused_build_ok is not False
-            ),
+        if not reuse_existing_periods:
+            self._validate_codebook_scope_operation_header("initialize")
+        staged_periods = []
+        try:
+            if self.fused:
+                self._gefen_fused_toolchain_ok()
+            histogram = _gefen_exact_histogram_from_grad_periods(
+                grad_periods=self._iter_gefen_grad_periods(
+                    reuse_existing_periods=reuse_existing_periods,
+                    staged_periods=staged_periods,
+                ),
+                num_codebooks=256,
+                # ``fused=False`` promises a JIT-free pure-PyTorch path. Do not
+                # load the separate histogram extension in that mode (or after
+                # the fused toolchain probe failed).
+                use_fused_histogram=(
+                    FUSE_HISTOGRAM_FOR_EXACT
+                    and self.fused
+                    and self._fused_build_ok is not False
+                ),
+            )
+            local_error = None
+        except Exception as exc:
+            histogram = None
+            local_error = exc
+        self._synchronize_codebook_scope_failure(
+            local_error, "local histogram preparation"
         )
-        if codebook is None:
-            return None
+        self._validate_codebook_scope_contribution_controls(
+            staged_periods,
+            reuse_existing_periods=reuse_existing_periods,
+        )
+        histogram = self._reduce_codebook_scope_histogram(histogram)
 
-        return codebook
+        try:
+            codebook = _learn_gefen_exact_codebook_from_histogram(
+                bin_counts_cpu=histogram,
+                codebook_device=self._gefen_codebook_device(),
+                num_codebooks=256,
+                force_endpoints=True,
+                verbose=self.verbose,
+                compute_mse_logging=compute_mse_logging,
+            )
+            local_error = None
+        except Exception as exc:
+            codebook = None
+            local_error = exc
+        self._synchronize_codebook_scope_failure(
+            local_error, "exact-DP solve and placement"
+        )
+        if codebook is not None:
+            self._verify_codebook_scope_agreement(codebook)
+        return codebook, staged_periods
 
     def _ensure_gefen_codebook(self, reuse_existing_periods: bool = False) -> None:
-        codebook = self._learn_gefen_exact_codebook(
+        codebook, staged_periods = self._learn_gefen_exact_codebook(
             reuse_existing_periods=reuse_existing_periods,
             compute_mse_logging=False,
         )
         if codebook is not None:
+            for parameter, period in staged_periods:
+                self.state[parameter]["automatic_period"] = period
             self._gefen_codebook = codebook
             self._gefen_codebook_by_device.clear()
             self._gefen_codebook_lut_by_device.clear()
+            self._gefen_codebook_scope_validated = (
+                self._gefen_codebook_process_group is not None
+            )
 
     def _step_automatic_factored(
-        self, group, param_name: str, p: torch.Tensor, grad: torch.Tensor
+        self,
+        group,
+        param_name: str,
+        p: torch.Tensor,
+        grad: torch.Tensor,
+        *,
+        state=None,
     ) -> None:
         # Adafactor-style factored second moment for a 2D param (opt-in via
         # factored_v_2d). The quantized-momentum machinery is byte-identical to
@@ -2797,7 +5015,7 @@ class Gefen(torch.optim.Optimizer):
             grad = grad.to_local()
         if hasattr(grad, "wait"):
             grad = grad.wait()
-        state = self.state[p]
+        state = self.state[p] if state is None else state
         beta1 = group["beta1"]
         beta2 = group["beta2"]
         lr = group["lr"]
@@ -2813,9 +5031,7 @@ class Gefen(torch.optim.Optimizer):
             elif flat_grad.numel() == 1:
                 automatic_period = 1
             else:
-                automatic_period = self._resolve_automatic_period(
-                    param_name, p, grad
-                )
+                automatic_period = self._resolve_automatic_period(param_name, p, grad)
             if flat_grad.numel() % automatic_period != 0:
                 raise ValueError(
                     "Automatic partition period {} does not divide parameter {} with numel {}".format(
@@ -2878,8 +5094,7 @@ class Gefen(torch.optim.Optimizer):
             codebook = self._gefen_codebook_on(p.device)
             if codebook is None:
                 raise ValueError(
-                    "Expected Gefen codebook to be initialized before the "
-                    "factored update."
+                    "Expected Gefen codebook to be initialized before the factored update."
                 )
             # The raw kernel flat-indexes a contiguous matrix.  A strided leaf
             # Parameter is uncommon but valid (and can arise from model surgery
@@ -3025,17 +5240,32 @@ class Gefen(torch.optim.Optimizer):
         # the codebook that WROTE them, so the momentum survives the swap with
         # only nearest-codeword rounding error; m_magnitude is unchanged
         # (coefficients stay normalized to [-1, 1]).
+        if self.capturable:
+            raise RuntimeError(
+                "capturable=True does not support replacing the learned codebook"
+            )
+        self._validate_codebook_scope_operation_header("refresh")
         old_codebook = self._gefen_codebook
         if old_codebook is None:
             return
-        new_codebook = self._learn_gefen_exact_codebook(
+        new_codebook, staged_periods = self._learn_gefen_exact_codebook(
             reuse_existing_periods=True, compute_mse_logging=False
         )
+        if staged_periods:
+            raise RuntimeError(
+                "codebook refresh unexpectedly attempted to replace block periods"
+            )
         if new_codebook is None:
             return
         staged_indices = []
-        for pgroup in self.param_groups:
-            for p in pgroup["params"]:
+        if self._gefen_codebook_process_group is None:
+            parameters = [p for pgroup in self.param_groups for p in pgroup["params"]]
+        else:
+            parameters = [
+                p for p, _ in self._gefen_local_shard_bindings if p is not None
+            ]
+        try:
+            for p in parameters:
                 pstate = self.state.get(p)
                 if not pstate or "m_codebook" not in pstate:
                     continue
@@ -3050,8 +5280,14 @@ class Gefen(torch.optim.Optimizer):
                 )
                 indices = gefen_nearest_codebook_indices(new_codebook_local, coeffs)
                 staged_indices.append((pstate["m_codebook"], indices))
+            local_error = None
+        except Exception as exc:
+            local_error = exc
+        self._synchronize_codebook_scope_failure(
+            local_error, "momentum requantization staging"
+        )
 
-        # Commit only after every allocation/dequantization/search succeeded.
+        # Commit only after every member prepared every local replacement.
         # The staged tensors already have the destination shape/device, so this
         # tail is a deterministic sequence of infallible in-place copies.
         for stored_indices, indices in staged_indices:
@@ -3069,6 +5305,28 @@ class Gefen(torch.optim.Optimizer):
             for p in group["params"]
         )
 
+    def _scope_agreed_resuming_from_checkpoint(self) -> bool:
+        # Per-parameter state presence is legitimately rank-asymmetric under an
+        # explicit scope (empty non-owner slots and zero-length shards never
+        # create state), so the rank-local _resuming_from_checkpoint() predicate
+        # must not gate collectives directly: resolve one group-wide decision
+        # before any member branches on it. Any member that restored periods
+        # makes the whole scope reuse them.
+        resuming = self._resuming_from_checkpoint()
+        binding = self._gefen_codebook_process_group
+        if binding is None or len(binding.identity.ordered_members) == 1:
+            return resuming
+        self._assert_runtime_codebook_process_group()
+        import torch.distributed as dist
+
+        control = torch.tensor(
+            int(resuming),
+            dtype=torch.int32,
+            device=binding.collective_device,
+        )
+        dist.all_reduce(control, op=dist.ReduceOp.MAX, group=binding.process_group)
+        return bool(int(control.item()))
+
     def _maybe_refresh_gefen_codebook(self) -> None:
         if self._gefen_codebook is not None:
             # A codebook restored from a checkpoint may land on CPU (depending on
@@ -3080,6 +5338,17 @@ class Gefen(torch.optim.Optimizer):
                 self._gefen_codebook_lut_by_device.clear()
             return
 
+        binding = self._gefen_codebook_process_group
+        if (
+            binding is None or len(binding.identity.ordered_members) == 1
+        ) and not self._has_local_codebook_gradients():
+            # No local histogram exists, so learning would return None. This
+            # fast no-op is also what keeps a no-gradient capturable step free
+            # of the host-driven exact-DP preparation path. Multi-member scopes
+            # still enter collectively because another member (for example a
+            # whole-parameter owner) may hold the only active gradient.
+            return
+
         # No codebook yet. On a fresh run this learns it and predicts periods.
         # On resume the persisted codebook is normally restored in
         # load_state_dict, but FSDP optim-state consolidation strips custom
@@ -3089,8 +5358,84 @@ class Gefen(torch.optim.Optimizer):
         # the refreshed periods desync from the restored vmean/m_codebook block
         # geometry and the vmean kernel aborts on a block-count mismatch.
         self._ensure_gefen_codebook(
-            reuse_existing_periods=self._resuming_from_checkpoint()
+            reuse_existing_periods=self._scope_agreed_resuming_from_checkpoint()
         )
+
+    @torch.no_grad()
+    def initialize_codebook(self) -> bool:
+        """Collectively initialize the learned codebook without taking a step."""
+
+        # Capture a usable failure-vote binding before inspecting live layout so
+        # a one-sided preamble failure -- for example capture-readiness raising
+        # only on the gradient-owning member while non-owners proceed -- is
+        # reported through the scope instead of stranding peers inside the
+        # scoped operation-header collective below.
+        scope_binding = self._capture_codebook_scope_binding_for_step()
+        try:
+            self._assert_finalized_binding_layout(full=True)
+            self._assert_runtime_codebook_process_group()
+            self._assert_codebook_capture_ready()
+            local_preamble_error = None
+        except Exception as exc:
+            local_preamble_error = exc
+        if scope_binding is not None:
+            self._synchronize_prevalidated_codebook_scope_failure(
+                local_preamble_error, "initialize preamble", scope_binding
+            )
+        elif local_preamble_error is not None:
+            raise local_preamble_error
+        self._validate_codebook_scope_operation_header("initialize")
+        try:
+            _assert_optimizer_gradients_structurally_valid(
+                self, require_2d_params=self._codebook_requires_2d_parameters()
+            )
+            local_error = None
+        except Exception as exc:
+            local_error = exc
+        if self._gefen_codebook_process_group is not None:
+            self._synchronize_codebook_scope_failure(local_error, "gradient preflight")
+        elif local_error is not None:
+            raise local_error
+        self._ensure_codebook_scope_agreement()
+        if self._gefen_codebook is not None:
+            return False
+        self._ensure_gefen_codebook(
+            reuse_existing_periods=self._scope_agreed_resuming_from_checkpoint()
+        )
+        return self._gefen_codebook is not None
+
+    @torch.no_grad()
+    def refresh_codebook(self) -> bool:
+        """Collectively relearn and atomically requantize the current codebook."""
+
+        self._assert_finalized_binding_layout(full=True)
+        self._assert_runtime_codebook_process_group()
+        if torch.cuda.is_available() and torch.cuda.is_current_stream_capturing():
+            raise RuntimeError(
+                "capturable=True does not support replacing the learned codebook"
+            )
+        self._validate_codebook_scope_operation_header("refresh")
+        if self.capturable:
+            raise RuntimeError(
+                "capturable=True does not support replacing the learned codebook"
+            )
+        if self._gefen_codebook is None:
+            raise RuntimeError("Gefen codebook must be initialized before refresh")
+        try:
+            _assert_optimizer_gradients_structurally_valid(
+                self, require_2d_params=self._codebook_requires_2d_parameters()
+            )
+            local_error = None
+        except Exception as exc:
+            local_error = exc
+        if self._gefen_codebook_process_group is not None:
+            self._synchronize_codebook_scope_failure(local_error, "gradient preflight")
+        elif local_error is not None:
+            raise local_error
+        self._ensure_codebook_scope_agreement()
+        before = self._gefen_codebook
+        self._refresh_codebook_with_requant()
+        return self._gefen_codebook is not before
 
     def _maybe_save_gefen_grad_histogram(self) -> None:
         if not hasattr(quantization_module, "LIST_STEPS_SAVE_HIST_GRAD"):
@@ -3400,9 +5745,7 @@ class Gefen(torch.optim.Optimizer):
                 * m_magnitude[r0:r1]
             )
             # lerp() needs matching dtypes, so promote the (bf16) grad rows to fp32.
-            updated_m = current_m.lerp(
-                grad_view[r0:r1].to(current_m.dtype), 1 - beta1
-            )
+            updated_m = current_m.lerp(grad_view[r0:r1].to(current_m.dtype), 1 - beta1)
 
             # New per-block magnitude = max |updated_m| over each row, written back
             # into the persistent fp32 m_magnitude state in place.
@@ -3486,7 +5829,13 @@ class Gefen(torch.optim.Optimizer):
         return quantized_m * state["m_magnitude"]
 
     def _step_automatic(
-        self, group, param_name: str, p: torch.Tensor, grad: torch.Tensor
+        self,
+        group,
+        param_name: str,
+        p: torch.Tensor,
+        grad: torch.Tensor,
+        *,
+        state=None,
     ) -> None:
         # Unwrap the gradient to its local shard for both the fused and
         # non-fused paths. Under FSDP2 the gradient arrives as a sharded DTensor;
@@ -3498,7 +5847,7 @@ class Gefen(torch.optim.Optimizer):
         if hasattr(grad, "wait"):
             grad = grad.wait()
 
-        state = self.state[p]
+        state = self.state[p] if state is None else state
         beta1 = group["beta1"]
         beta2 = group["beta2"]
         lr = group["lr"]
@@ -3529,9 +5878,7 @@ class Gefen(torch.optim.Optimizer):
             elif local_numel == 1:
                 automatic_period = 1
             elif local_numel > 1:
-                automatic_period = self._resolve_automatic_period(
-                    param_name, p, grad
-                )
+                automatic_period = self._resolve_automatic_period(param_name, p, grad)
             else:
                 raise ValueError(
                     "Automatic partition received an empty parameter {}".format(
@@ -3581,9 +5928,7 @@ class Gefen(torch.optim.Optimizer):
             # A capturable (tensor) step must be CLONED -- assigning the same
             # 0-dim tensor would alias the two counters and double-increment.
             step = state["step"]
-            state["vmean_step"] = (
-                step.clone() if torch.is_tensor(step) else step
-            )
+            state["vmean_step"] = step.clone() if torch.is_tensor(step) else step
 
         # If a framework relocated this parameter since its last step (CPU
         # offload paging the shard), the state tensors are stranded on the old
@@ -3618,8 +5963,12 @@ class Gefen(torch.optim.Optimizer):
         # Deterministic mode keeps the fused update and selects v1-full, whose
         # fixed thread tree produces bit-identical vmean/parameter writes for
         # identical inputs on a homogeneous architecture.
-        route_v2 = False if self._deterministic else _should_use_v2_full(
-            grad_view.shape[0], automatic_period, grad_view.device
+        route_v2 = (
+            False
+            if self._deterministic
+            else _should_use_v2_full(
+                grad_view.shape[0], automatic_period, grad_view.device
+            )
         )
         if (
             route_v2
@@ -3651,9 +6000,7 @@ class Gefen(torch.optim.Optimizer):
         # local shard's storage. DTensor.to_local() returns a view of that
         # storage, so in-place ops propagate back to the param.
         p_local = (
-            p.to_local()
-            if (hasattr(p, "to_local") and hasattr(p, "placements"))
-            else p
+            p.to_local() if (hasattr(p, "to_local") and hasattr(p, "placements")) else p
         )
 
         if self.capturable and (use_full_fused or use_v2_full):
@@ -3697,8 +6044,7 @@ class Gefen(torch.optim.Optimizer):
             # contiguous; a non-contiguous shard is updated on a contiguous
             # copy that is copied back to preserve the in-place semantics.
             weight_decay_factor = (
-                1.0 if step_scalars is not None
-                else 1.0 - lr * group["weight_decay"]
+                1.0 if step_scalars is not None else 1.0 - lr * group["weight_decay"]
             )
             if p_local.is_contiguous():
                 self._automatic_gefen_fused_full_update(
@@ -3738,8 +6084,7 @@ class Gefen(torch.optim.Optimizer):
             # (see _automatic_gefen_fused_update_v2_full). Same contiguity
             # handling as the v1-full branch.
             weight_decay_factor = (
-                1.0 if step_scalars is not None
-                else 1.0 - lr * group["weight_decay"]
+                1.0 if step_scalars is not None else 1.0 - lr * group["weight_decay"]
             )
             if p_local.is_contiguous():
                 self._automatic_gefen_fused_update_v2_full(
@@ -3983,7 +6328,7 @@ class Gefen(torch.optim.Optimizer):
         if weight_decay > 0.0:
             torch._foreach_mul_(params, 1 - lr * weight_decay)
 
-        bias_correction_1 = 1 - beta1 ** step_count
+        bias_correction_1 = 1 - beta1**step_count
         bias_correction_2 = 1 - beta2 ** first_state["vmean_step"]
         h = (merged_vmean.sqrt() / math.sqrt(bias_correction_2)).add_(eps)
         stepsize = (1 / bias_correction_1) / h
@@ -4006,17 +6351,662 @@ class Gefen(torch.optim.Optimizer):
         update_views = update.reshape(k, nblocks, period)
         param_updates = [update_views[i].reshape(params[i].shape) for i in range(k)]
         torch._foreach_add_(params, param_updates, alpha=-1.0)
-        torch._foreach_copy_(vmeans, list(merged_vmean.reshape(k, nblocks, 1).unbind(0)))
+        torch._foreach_copy_(
+            vmeans, list(merged_vmean.reshape(k, nblocks, 1).unbind(0))
+        )
         torch._foreach_copy_(mags, list(merged_mag.reshape(k, nblocks, 1).unbind(0)))
         torch._foreach_copy_(
             codebooks, list(merged_codebook.reshape(k, nblocks, period).unbind(0))
         )
 
+    def _canonical_policy(self):
+        return {
+            "factored_v_2d": self._factored_v_2d,
+            "force_1d_period_one": self._force_1d_period_one,
+            "force_2d_period_one": self._force_2d_period_one,
+            "period_one_substrings": list(self._period_one_substrings),
+            "stochastic_round": self._stochastic_round,
+            "codebook_refresh_every": self._codebook_refresh_every,
+        }
+
+    def _canonical_common_global_step(self) -> int:
+        device_step = self._device_gefen_global_step()
+        step = self._gefen_global_step if device_step is None else device_step
+        if self.capturable and self._stochastic_round:
+            seed_steps = [int(seed.item()) for seed in self._sr_seed_by_device.values()]
+            if any(seed_step != step for seed_step in seed_steps):
+                raise RuntimeError(
+                    "Gefen capturable stochastic-round seeds disagree with the canonical optimizer global step"
+                )
+        return step
+
+    def _serialized_sharding_manifest(self):
+        return [
+            self._serialized_canonical_shard(shard)
+            for shard in self._gefen_sharding_manifest.shards
+        ]
+
+    def _canonical_live_entries(self):
+        entries = {}
+        for group in self.param_groups:
+            options = clone_canonical_value(
+                self._canonical_group_options_value(group),
+                path="parameter group options",
+            )
+            for compatibility_name, parameter in self._iter_group_params_with_names(
+                group
+            ):
+                shard = self._gefen_shard_bindings[parameter]
+                entries[shard.parameter.fqn] = (
+                    parameter,
+                    shard,
+                    str(compatibility_name),
+                    options,
+                )
+        return entries
+
+    @staticmethod
+    def _canonical_value_token(value):
+        if torch.is_tensor(value):
+            raw = (
+                value.detach()
+                .to(device="cpu")
+                .resolve_conj()
+                .resolve_neg()
+                .contiguous()
+                .reshape(-1)
+                .view(torch.uint8)
+                .numpy()
+                .tobytes()
+            )
+            try:
+                version = value._version
+            except RuntimeError:
+                version = None
+            return (
+                "tensor",
+                id(value),
+                version,
+                hashlib.sha256(raw).digest(),
+                str(value.device),
+                str(value.dtype),
+                tuple(value.shape),
+            )
+        if type(value) is dict:
+            return (
+                "dict",
+                tuple(
+                    (key, Gefen._canonical_value_token(value[key]))
+                    for key in sorted(value, key=repr)
+                ),
+            )
+        if type(value) in {list, tuple}:
+            return (
+                type(value).__name__,
+                tuple(Gefen._canonical_value_token(item) for item in value),
+            )
+        try:
+            hash(value)
+            token = value
+        except TypeError:
+            token = (id(value), repr(value))
+        return (type(value).__name__, token)
+
+    def _canonical_import_live_token(self):
+        from gefen.portable_runtime import _parameter_storage_token
+
+        groups = tuple(
+            (
+                id(group),
+                tuple(id(parameter) for parameter in group["params"]),
+                tuple(
+                    str(name) for name, _ in self._iter_group_params_with_names(group)
+                ),
+                self._canonical_value_token(self._canonical_group_options_value(group)),
+            )
+            for group in self.param_groups
+        )
+        states = tuple(
+            (
+                id(parameter),
+                id(self.state.get(parameter)),
+                self._canonical_value_token(self.state.get(parameter, {})),
+            )
+            for group in self.param_groups
+            for parameter in group["params"]
+        )
+        return (
+            id(self.param_groups),
+            id(self.state),
+            id(self.defaults),
+            self._canonical_value_token(self.defaults),
+            groups,
+            states,
+            self._gefen_global_step,
+            self._device_gefen_global_step(),
+            self._canonical_value_token(self._gefen_codebook),
+            self._canonical_value_token(self._gefen_global_step_by_device),
+            self._canonical_value_token(self._sr_seed_by_device),
+            self._canonical_value_token(self._canonical_policy()),
+            self._deterministic,
+            self.capturable,
+            self.fused,
+            self.verbose,
+            self._fused_build_ok,
+            id(self._gefen_codebook_process_group),
+            self._canonical_value_token(self._serialized_codebook_scope()),
+            id(self._gefen_sharding_manifest),
+            id(self._gefen_logical_slots),
+            tuple(
+                (
+                    id(logical_slot),
+                    logical_slot.group_index,
+                    logical_slot.original_slot_index,
+                    logical_slot.compatibility_name,
+                    self._canonical_value_token(
+                        self._serialized_canonical_shard(logical_slot.shard)
+                    ),
+                )
+                for logical_slot in self._gefen_logical_slots
+            ),
+            tuple(
+                (
+                    id(parameter),
+                    shard.sort_key,
+                    # Mirror the portable live token: a prepared import must go
+                    # stale when a locally bound parameter's storage is
+                    # retargeted or mutated between prepare and commit.
+                    None
+                    if parameter is None
+                    else _parameter_storage_token(parameter),
+                )
+                for parameter, shard in self._gefen_local_shard_bindings
+            ),
+        )
+
+    def _canonical_parameter_state_matches_variant(
+        self, shard, group_options, parameter_state, state_layout
+    ) -> bool:
+        carries_momentum = any(
+            key in parameter_state for key in ("m_codebook", "m_magnitude")
+        )
+        carries_normuon = any(
+            key in parameter_state for key in ("normuon_v", "normuon_step")
+        )
+        if bool(group_options.get("normuon", False)):
+            if carries_momentum and not carries_normuon:
+                return False
+        elif carries_normuon:
+            return False
+        fields = frozenset({"name", *parameter_state})
+        parameter_rank = len(shard.parameter.global_shape)
+        sharded_mode = group_options.get("sharded_mode")
+        for variant in state_layout.parameter_variants:
+            if frozenset(variant.fields) != fields:
+                continue
+            if shard.layout not in variant.layouts:
+                continue
+            if variant.role is not ParameterStateRole.ANY:
+                continue
+            if variant.sharded_mode != sharded_mode:
+                continue
+            if (
+                variant.parameter_ranks is not None
+                and parameter_rank not in variant.parameter_ranks
+            ):
+                continue
+            if parameter_rank in variant.excluded_parameter_ranks:
+                continue
+            return True
+        return False
+
+    def _canonical_period_must_be_one(self, parameter, shard) -> bool:
+        if self._force_1d_period_one and parameter.ndim == 1:
+            return True
+        if self._force_2d_period_one and parameter.ndim == 2:
+            return True
+        fqn = shard.parameter.fqn.lower()
+        return any(substring in fqn for substring in self._period_one_substrings)
+
+    def _validate_canonical_parameter_semantics(
+        self,
+        parameter,
+        shard,
+        group_options,
+        parameter_state,
+        state_layout,
+        global_step,
+    ) -> None:
+        carries_momentum = any(
+            key in parameter_state for key in ("m_codebook", "m_magnitude")
+        )
+        carries_normuon = any(
+            key in parameter_state for key in ("normuon_v", "normuon_step")
+        )
+        counters = {}
+        for counter_key in (
+            "step",
+            "vmean_step",
+            "factored_step",
+            "normuon_step",
+        ):
+            if counter_key not in parameter_state:
+                continue
+            counter = self._validate_rank_local_counter(
+                counter_key, parameter_state[counter_key]
+            )
+            counters[counter_key] = counter
+            if counter > global_step:
+                raise ValueError(
+                    "Gefen canonical parameter counter {} exceeds the optimizer global step".format(
+                        counter_key
+                    )
+                )
+        if "step" in counters and any(
+            counters[counter_key] > counters["step"]
+            for counter_key in (
+                "vmean_step",
+                "factored_step",
+                "normuon_step",
+            )
+            if counter_key in counters
+        ):
+            raise ValueError(
+                "Gefen canonical secondary counter exceeds the parameter step"
+            )
+        period = parameter_state.get("automatic_period")
+        if (
+            period is not None
+            and self._canonical_period_must_be_one(parameter, shard)
+            and (type(period) is not int or period != 1)
+        ):
+            raise ValueError(
+                "Gefen canonical automatic period violates period-one policy"
+            )
+        if bool(group_options.get("normuon", False)):
+            if carries_momentum and not carries_normuon:
+                raise ValueError(
+                    "Gefen canonical initialized NorMuon state is incomplete"
+                )
+        elif carries_normuon:
+            raise ValueError(
+                "Gefen canonical NorMuon state is invalid for the target policy"
+            )
+        if not self._canonical_parameter_state_matches_variant(
+            shard, group_options, parameter_state, state_layout
+        ):
+            raise ValueError(
+                "Gefen canonical parameter state does not match a declared state variant"
+            )
+
+    @staticmethod
+    def _assert_canonical_state_outside_cuda_capture(operation) -> None:
+        if torch.cuda.is_available() and torch.cuda.is_current_stream_capturing():
+            raise RuntimeError(
+                "canonical state {} cannot run during CUDA capture".format(operation)
+            )
+
+    def _assert_canonical_import_target_safe(self) -> None:
+        if not self.capturable:
+            return
+        device_step = self._device_gefen_global_step()
+        initialized_state = any(
+            any(key != "name" for key in self.state.get(parameter, {}))
+            for group in self.param_groups
+            for parameter in group["params"]
+        )
+        if (
+            self._capt_stacks is not None
+            or self._gefen_codebook is not None
+            or self._gefen_global_step != 0
+            or (device_step is not None and device_step != 0)
+            or initialized_state
+        ):
+            raise RuntimeError(
+                "canonical import into a capturable optimizer requires a fresh "
+                "target before device state or CUDA graphs are initialized"
+            )
+
+    def export_canonical_state(self):
+        """Export an exact-binding, device-neutral local state fragment."""
+
+        self._assert_finalized_binding_layout(full=True)
+        self._assert_canonical_state_outside_cuda_capture("export")
+        if not self._canonical_state_layouts():
+            raise RuntimeError(
+                "canonical state export requires a supported finalized identity layout and primitive algorithm policy"
+            )
+        entries = self._canonical_live_entries()
+        parameters = {}
+        for fqn in sorted(entries):
+            parameter, shard, compatibility_name, options = entries[fqn]
+            state = {}
+            for key, value in self.state.get(parameter, {}).items():
+                if key in _CANONICAL_DERIVED_PARAMETER_STATE_KEYS:
+                    continue
+                if key == "name":
+                    continue
+                if key not in _CANONICAL_PARAMETER_STATE_KEYS:
+                    raise RuntimeError(
+                        "canonical state export found undeclared parameter state key {!r}".format(
+                            key
+                        )
+                    )
+                state[key] = clone_canonical_value(
+                    value, path="parameters.{}.state.{}".format(fqn, key)
+                )
+            parameters[fqn] = {
+                "compatibility_name": compatibility_name,
+                "shard": self._serialized_canonical_shard(shard),
+                "group_options": clone_canonical_value(
+                    options, path="parameters.{}.group_options".format(fqn)
+                ),
+                "state": state,
+            }
+        return {
+            "format": "gefen.bound_state",
+            "format_version": CANONICAL_STATE_FORMAT_VERSION,
+            "coverage": "local_optimizer_fragment",
+            "implementation": self.optimizer_contract().implementation,
+            "policy": clone_canonical_value(self._canonical_policy(), path="policy"),
+            "common": {
+                "gefen_global_step": self._canonical_common_global_step(),
+                "gefen_codebook": clone_canonical_value(
+                    self._gefen_codebook, path="common.gefen_codebook"
+                ),
+                "gefen_deterministic": self._deterministic,
+                "gefen_codebook_scope": clone_canonical_value(
+                    self._serialized_codebook_scope(),
+                    path="common.gefen_codebook_scope",
+                ),
+            },
+            "manifest": clone_canonical_value(
+                self._serialized_sharding_manifest(), path="manifest"
+            ),
+            "parameters": parameters,
+        }
+
+    def _normalize_canonical_state_import(self, state):
+        state = clone_canonical_value(state, path="canonical state")
+        expected_top = {
+            "format",
+            "format_version",
+            "coverage",
+            "implementation",
+            "policy",
+            "common",
+            "manifest",
+            "parameters",
+        }
+        if type(state) is not dict or set(state) != expected_top:
+            raise ValueError("Gefen canonical state has an invalid top-level schema")
+        if state["format"] != "gefen.bound_state":
+            raise ValueError("Unsupported Gefen canonical state format")
+        if (
+            type(state["format_version"]) is not int
+            or state["format_version"] != CANONICAL_STATE_FORMAT_VERSION
+        ):
+            raise ValueError(
+                "Unsupported Gefen canonical state format_version: {}".format(
+                    state["format_version"]
+                )
+            )
+        if state["coverage"] != "local_optimizer_fragment":
+            raise ValueError("Unsupported Gefen canonical state coverage")
+        implementation = self.optimizer_contract().implementation
+        if state["implementation"] != implementation:
+            raise ValueError(
+                "Gefen canonical state implementation does not match the target"
+            )
+        live_policy = clone_canonical_value(
+            self._canonical_policy(), path="live policy"
+        )
+        if not canonical_values_equal(state["policy"], live_policy):
+            raise ValueError(
+                "Gefen canonical state algorithm policy does not match the target"
+            )
+
+        common = state["common"]
+        if type(common) is not dict or set(common) != {
+            "gefen_global_step",
+            "gefen_codebook",
+            "gefen_deterministic",
+            "gefen_codebook_scope",
+        }:
+            raise ValueError("Gefen canonical common state has an invalid schema")
+        if (
+            type(common["gefen_global_step"]) is not int
+            or common["gefen_global_step"] < 0
+        ):
+            raise ValueError(
+                "Gefen canonical global step must be a nonnegative integer"
+            )
+        if type(common["gefen_deterministic"]) is not bool:
+            raise ValueError("Gefen canonical deterministic policy must be a bool")
+        normalized_scope = self._normalize_serialized_codebook_scope(
+            common["gefen_codebook_scope"]
+        )
+        if normalized_scope != self._serialized_codebook_scope():
+            raise ValueError(
+                "Gefen canonical codebook scope does not match the live binding"
+            )
+        common["gefen_codebook_scope"] = normalized_scope
+
+        manifest = state["manifest"]
+        if type(manifest) is not list:
+            raise ValueError("Gefen canonical manifest must be a list")
+        normalized_manifest = [
+            self._normalize_serialized_canonical_shard(record) for record in manifest
+        ]
+        if normalized_manifest != self._serialized_sharding_manifest():
+            raise ValueError(
+                "Gefen canonical manifest does not match the finalized target"
+            )
+        state["manifest"] = normalized_manifest
+
+        parameters = state["parameters"]
+        if type(parameters) is not dict:
+            raise ValueError("Gefen canonical parameters must be an FQN mapping")
+        live_entries = self._canonical_live_entries()
+        state_layout = self._canonical_state_variant_layout()
+        if set(parameters) != set(live_entries):
+            raise ValueError(
+                "Gefen canonical parameter FQNs do not match the finalized target"
+            )
+        for fqn, record in parameters.items():
+            if type(record) is not dict or set(record) != {
+                "compatibility_name",
+                "shard",
+                "group_options",
+                "state",
+            }:
+                raise ValueError(
+                    "Gefen canonical parameter {!r} has an invalid schema".format(fqn)
+                )
+            if type(record["compatibility_name"]) is not str:
+                raise ValueError("Gefen canonical compatibility names must be strings")
+            parameter, shard, _, live_options = live_entries[fqn]
+            normalized_shard = self._normalize_serialized_canonical_shard(
+                record["shard"]
+            )
+            if normalized_shard != self._serialized_canonical_shard(shard):
+                raise ValueError(
+                    "Gefen canonical parameter shard does not match the live binding"
+                )
+            record["shard"] = normalized_shard
+            if not canonical_values_equal(record["group_options"], live_options):
+                raise ValueError(
+                    "Gefen canonical parameter-group options do not match the target"
+                )
+            parameter_state = record["state"]
+            if type(parameter_state) is not dict or any(
+                key == "name" or key not in _CANONICAL_PARAMETER_STATE_KEYS
+                for key in parameter_state
+            ):
+                raise ValueError(
+                    "Gefen canonical parameter state has undeclared fields"
+                )
+            self._validate_canonical_parameter_semantics(
+                parameter,
+                shard,
+                live_options,
+                parameter_state,
+                state_layout,
+                common["gefen_global_step"],
+            )
+            record["state"] = clone_canonical_value(
+                parameter_state, path="parameters.{}.state".format(fqn)
+            )
+            del parameter
+        return state
+
+    def _canonical_native_state_dict(self, canonical_state):
+        native = self._base_state_dict_without_hooks()
+        native["state"] = {}
+        live_entries = self._canonical_live_entries()
+        for saved_group, live_group in zip(native["param_groups"], self.param_groups):
+            for parameter_id, parameter in zip(
+                saved_group["params"], live_group["params"]
+            ):
+                shard = self._gefen_shard_bindings[parameter]
+                record = canonical_state["parameters"][shard.parameter.fqn]
+                parameter_state = {
+                    "name": self._param_name(parameter),
+                    **clone_canonical_value(
+                        record["state"],
+                        path="parameters.{}.state".format(shard.parameter.fqn),
+                    ),
+                }
+                native["state"][parameter_id] = parameter_state
+
+        common = canonical_state["common"]
+        native["gefen_global_step"] = common["gefen_global_step"]
+        native["gefen_codebook"] = common["gefen_codebook"]
+        native["gefen_deterministic"] = common["gefen_deterministic"]
+        scope = common["gefen_codebook_scope"]
+        if scope is not None:
+            native["gefen_codebook_scope"] = scope
+        else:
+            native.pop("gefen_codebook_scope", None)
+        local_shards = self._serialized_native_local_shards()
+        if local_shards is not None:
+            native["gefen_native_local_shards"] = local_shards
+        else:
+            native.pop("gefen_native_local_shards", None)
+        metadata = {
+            "format_version": (
+                _SCOPED_NATIVE_METADATA_VERSION if scope is not None else 1
+            ),
+            "global_step": common["gefen_global_step"],
+            "codebook": common["gefen_codebook"],
+            "deterministic": common["gefen_deterministic"],
+            "device_anchor": self._checkpoint_device_anchor(),
+        }
+        if scope is not None:
+            metadata["codebook_scope"] = scope
+        if local_shards is not None:
+            metadata["native_local_shards"] = local_shards
+        for group in native["param_groups"]:
+            group["_gefen_checkpoint_metadata"] = metadata
+        del live_entries
+        return native
+
+    def _preserve_canonical_target_configuration(self, staged) -> None:
+        staged.defaults = self.defaults.copy()
+        staged.param_groups = self.param_groups
+
+    def prepare_canonical_state_import(self, state):
+        """Validate and stage a canonical local import without live mutation."""
+
+        self._assert_finalized_binding_layout(full=True)
+        self._assert_canonical_state_outside_cuda_capture("import preparation")
+        self._assert_canonical_import_target_safe()
+        if not self._canonical_state_layouts():
+            raise RuntimeError(
+                "canonical state import requires a supported finalized identity layout"
+            )
+        normalized = self._normalize_canonical_state_import(state)
+        live_token = self._canonical_import_live_token()
+        staged = self._stage_load_state_dict(
+            self._canonical_native_state_dict(normalized)
+        )
+        self._preserve_canonical_target_configuration(staged)
+        return make_prepared_canonical_state_import(self, live_token, staged)
+
+    def commit_canonical_state_import(self, prepared) -> None:
+        """Commit one still-current prepared canonical import exactly once."""
+
+        if not isinstance(prepared, PreparedCanonicalStateImport):
+            raise TypeError(
+                "prepared must be a PreparedCanonicalStateImport from this optimizer"
+            )
+        if prepared._optimizer is not self:
+            raise ValueError("prepared canonical state belongs to another optimizer")
+        if prepared._consumed:
+            raise RuntimeError("prepared canonical state import was already consumed")
+        self._assert_finalized_binding_layout(full=True)
+        self._assert_canonical_state_outside_cuda_capture("import commit")
+        self._assert_canonical_import_target_safe()
+        if prepared._live_token != self._canonical_import_live_token():
+            raise RuntimeError(
+                "live optimizer state changed after canonical import preparation"
+            )
+        prepared._consumed = True
+        self._commit_staged_load_state_dict(prepared._staged)
+
+    def import_canonical_state(self, state) -> None:
+        """Atomically prepare and commit an exact-binding canonical fragment."""
+
+        self.commit_canonical_state_import(self.prepare_canonical_state_import(state))
+
+    def export_portable_state(
+        self,
+        *,
+        checkpoint_process_group,
+        transaction_id,
+        limits,
+    ):
+        """Collectively export exact period-one state by logical identity."""
+
+        from gefen.portable_runtime import _export_portable_state
+
+        return _export_portable_state(
+            self,
+            checkpoint_process_group=checkpoint_process_group,
+            transaction_id=transaction_id,
+            limits=limits,
+        )
+
+    def import_portable_state(
+        self,
+        state,
+        *,
+        checkpoint_process_group,
+        transaction_id,
+        limits,
+    ) -> None:
+        """Collectively stage and atomically publish exact portable state."""
+
+        from gefen.portable_runtime import _import_portable_state
+
+        _import_portable_state(
+            self,
+            state,
+            checkpoint_process_group=checkpoint_process_group,
+            transaction_id=transaction_id,
+            limits=limits,
+        )
+
+    canonical_state_dict = export_canonical_state
+    load_canonical_state_dict = import_canonical_state
+
     def state_dict(self):
         """Run optimizer state-dict hooks around Gefen's complete schema."""
 
+        self._assert_finalized_binding_layout(full=True)
         for pre_hook in self._optimizer_state_dict_pre_hooks.values():
             pre_hook(self)
+        self._assert_finalized_binding_layout(full=True)
         state_dict = self._state_dict_impl()
         for post_hook in self._optimizer_state_dict_post_hooks.values():
             hook_result = post_hook(self, state_dict)
@@ -4105,10 +7095,12 @@ class Gefen(torch.optim.Optimizer):
                 raise RuntimeError(message)
             return None
 
-        if not torch.distributed.is_available() or not torch.distributed.is_initialized():
+        if (
+            not torch.distributed.is_available()
+            or not torch.distributed.is_initialized()
+        ):
             return reject(
-                "Gefen rank-local DTensor checkpointing requires an initialized "
-                "default distributed process group"
+                "Gefen rank-local DTensor checkpointing requires an initialized default distributed process group"
             )
 
         import torch.distributed as dist
@@ -4265,9 +7257,7 @@ class Gefen(torch.optim.Optimizer):
                             for item in p.placements
                         ],
                         "mesh": self._device_mesh_checkpoint_signature(mesh),
-                        "coordinate": None
-                        if coordinate is None
-                        else list(coordinate),
+                        "coordinate": None if coordinate is None else list(coordinate),
                         "sharded_mode": group.get("sharded_mode"),
                     }
                 )
@@ -4359,13 +7349,15 @@ class Gefen(torch.optim.Optimizer):
     def _serialize_rank_local_payload(payload) -> torch.Tensor:
         buffer = io.BytesIO()
         torch.save(payload, buffer)
-        return torch.frombuffer(
-            bytearray(buffer.getvalue()), dtype=torch.uint8
-        ).clone()
+        return torch.frombuffer(bytearray(buffer.getvalue()), dtype=torch.uint8).clone()
 
     @staticmethod
     def _deserialize_rank_local_payload(payload: torch.Tensor):
-        if not torch.is_tensor(payload) or payload.dtype != torch.uint8 or payload.dim() != 1:
+        if (
+            not torch.is_tensor(payload)
+            or payload.dtype != torch.uint8
+            or payload.dim() != 1
+        ):
             raise ValueError(
                 "Gefen rank-local checkpoint payload must be a 1-D uint8 tensor"
             )
@@ -4447,24 +7439,27 @@ class Gefen(torch.optim.Optimizer):
             )
         if any(control["manifest"] != local_manifest for control in controls):
             raise RuntimeError(
-                "Gefen DTensor checkpoint parameter identifiers, names, dtypes, "
-                "or global shapes differ across ranks"
+                "Gefen DTensor checkpoint parameter identifiers, names, dtypes, or global shapes differ across ranks"
             )
         global_steps = [control["global_step"] for control in controls]
-        if any(type(step) is not int for step in global_steps) or len(
-            set(global_steps)
-        ) != 1:
+        if (
+            any(type(step) is not int for step in global_steps)
+            or len(set(global_steps)) != 1
+        ):
             raise RuntimeError(
-                "Gefen rank-local checkpoint global_step differs across ranks: "
-                "{}".format(global_steps)
+                "Gefen rank-local checkpoint global_step differs across ranks: {}".format(
+                    global_steps
+                )
             )
         deterministic_values = [control["deterministic"] for control in controls]
-        if any(type(value) is not bool for value in deterministic_values) or len(
-            set(deterministic_values)
-        ) != 1:
+        if (
+            any(type(value) is not bool for value in deterministic_values)
+            or len(set(deterministic_values)) != 1
+        ):
             raise RuntimeError(
-                "Gefen rank-local checkpoint deterministic policy differs across "
-                "ranks: {}".format(deterministic_values)
+                "Gefen rank-local checkpoint deterministic policy differs across ranks: {}".format(
+                    deterministic_values
+                )
             )
 
         signatures = {
@@ -4504,8 +7499,9 @@ class Gefen(torch.optim.Optimizer):
         dist.all_gather_object(serialization_statuses, serialization_status)
         if any(not item.get("ok", False) for item in serialization_statuses):
             raise RuntimeError(
-                "Gefen rank-local checkpoint payload serialization failed across "
-                "ranks: {}".format(serialization_statuses)
+                "Gefen rank-local checkpoint payload serialization failed across ranks: {}".format(
+                    serialization_statuses
+                )
             )
         serialized_payloads = {
             str(src): self._broadcast_checkpoint_payload(
@@ -4584,9 +7580,7 @@ class Gefen(torch.optim.Optimizer):
         # membership matches the id()-keyed param_mappings the base class
         # builds. The no-orphan path (every non-wrapped run) takes the plain
         # super() call, bit-for-bit unchanged.
-        reachable = {
-            param for group in self.param_groups for param in group["params"]
-        }
+        reachable = {param for group in self.param_groups for param in group["params"]}
         orphaned = [param for param in self.state if param not in reachable]
         if orphaned:
             original_order = list(self.state)
@@ -4635,8 +7629,7 @@ class Gefen(torch.optim.Optimizer):
 
         def _is_scratch_key(key):
             return key in scratch_keys or (
-                isinstance(key, str)
-                and key.startswith(_RANK_LOCAL_PAYLOAD_KEY_PREFIX)
+                isinstance(key, str) and key.startswith(_RANK_LOCAL_PAYLOAD_KEY_PREFIX)
             )
 
         def _compact(value):
@@ -4657,11 +7650,7 @@ class Gefen(torch.optim.Optimizer):
 
         state_dict["state"] = {
             pid: (
-                {
-                    k: _compact(v)
-                    for k, v in pstate.items()
-                    if not _is_scratch_key(k)
-                }
+                {k: _compact(v) for k, v in pstate.items() if not _is_scratch_key(k)}
                 if isinstance(pstate, dict)
                 else pstate
             )
@@ -4669,6 +7658,12 @@ class Gefen(torch.optim.Optimizer):
         }
         state_dict["gefen_global_step"] = self._gefen_global_step
         state_dict["gefen_deterministic"] = self._deterministic
+        codebook_scope = self._serialized_codebook_scope()
+        if codebook_scope is not None:
+            state_dict["gefen_codebook_scope"] = codebook_scope
+        native_local_shards = self._serialized_native_local_shards()
+        if native_local_shards is not None:
+            state_dict["gefen_native_local_shards"] = native_local_shards
         # The exact-DP codebook is learned once on the first step and then frozen
         # for the rest of the run. It is not per-param state, so persist it
         # explicitly; without it resume would reinterpret the restored uint8
@@ -4686,7 +7681,9 @@ class Gefen(torch.optim.Optimizer):
         # learned one. The loader removes this private transport metadata before
         # handing groups to torch, so it never leaks into live scheduler groups.
         checkpoint_metadata = {
-            "format_version": 1,
+            "format_version": (
+                _SCOPED_NATIVE_METADATA_VERSION if codebook_scope is not None else 1
+            ),
             "global_step": self._gefen_global_step,
             "codebook": self._gefen_codebook,
             "deterministic": self._deterministic,
@@ -4698,10 +7695,12 @@ class Gefen(torch.optim.Optimizer):
             # of the private group metadata during load.
             "device_anchor": self._checkpoint_device_anchor(),
         }
+        if codebook_scope is not None:
+            checkpoint_metadata["codebook_scope"] = self._serialized_codebook_scope()
+        if native_local_shards is not None:
+            checkpoint_metadata["native_local_shards"] = native_local_shards
         if consolidate_rank_local:
-            self._consolidate_rank_local_sharded_state(
-                state_dict, checkpoint_metadata
-            )
+            self._consolidate_rank_local_sharded_state(state_dict, checkpoint_metadata)
         for group in state_dict["param_groups"]:
             group["_gefen_checkpoint_metadata"] = checkpoint_metadata
         return state_dict
@@ -4789,11 +7788,13 @@ class Gefen(torch.optim.Optimizer):
         ``_publish_load_state_dict`` for the standalone atomic load.
         """
 
+        self._assert_finalized_binding_layout(full=True)
         state_dict = state_dict.copy()
         for pre_hook in self._optimizer_load_state_dict_pre_hooks.values():
             hook_result = pre_hook(self, state_dict)
             if hook_result is not None:
                 state_dict = hook_result
+        self._assert_finalized_binding_layout(full=True)
         return self._stage_load_state_dict(state_dict)
 
     def _publish_load_state_dict(self, staged):
@@ -4851,16 +7852,15 @@ class Gefen(torch.optim.Optimizer):
         # preserve that public object identity while publishing the staged
         # value. Both mappings are ordinary built-in dicts created by Optimizer.
         live_defaults = self.defaults
-        live_defaults.update(staged.defaults)
+        dict.update(live_defaults, staged.defaults)
         staged.defaults = live_defaults
-        self.__dict__.update(staged.__dict__)
+        dict.update(self.__dict__, staged.__dict__)
+        self._invalidate_layout_forensics_caches()
 
     def _validate_loaded_native_state(self) -> None:
         """Validate the complete prepared native state before publication."""
 
-        self._validate_rank_local_counter(
-            "gefen_global_step", self._gefen_global_step
-        )
+        self._validate_rank_local_counter("gefen_global_step", self._gefen_global_step)
         signature = self._rank_local_sharded_signature(context={})
         states = [
             self.state[param]
@@ -4872,6 +7872,9 @@ class Gefen(torch.optim.Optimizer):
             signature,
             self._gefen_codebook,
             allow_legacy_vmean_counter=True,
+            allow_preinitialized_periods=(
+                self._gefen_global_step == 0 and self._gefen_codebook is not None
+            ),
         )
         for group in self.param_groups:
             self._validate_group_options(
@@ -4956,6 +7959,7 @@ class Gefen(torch.optim.Optimizer):
         codebook,
         *,
         allow_legacy_vmean_counter: bool = False,
+        allow_preinitialized_periods: bool = False,
     ) -> None:
         if not isinstance(states, list) or len(states) != len(signature):
             raise ValueError(
@@ -4971,17 +7975,14 @@ class Gefen(torch.optim.Optimizer):
             expected_name = param_signature["name"]
             if pstate.get("name") != expected_name:
                 raise ValueError(
-                    "Gefen rank-local checkpoint state name/order differs: "
-                    "checkpoint={!r} expected={!r}".format(
+                    "Gefen rank-local checkpoint state name/order differs: checkpoint={!r} expected={!r}".format(
                         pstate.get("name"), expected_name
                     )
                 )
             counters = {}
             for key in counter_keys:
                 if key in pstate:
-                    counters[key] = self._validate_rank_local_counter(
-                        key, pstate[key]
-                    )
+                    counters[key] = self._validate_rank_local_counter(key, pstate[key])
 
             local_shape = param_signature["local_shape"]
             state_shape = (
@@ -4998,8 +7999,7 @@ class Gefen(torch.optim.Optimizer):
                     )
                 if state_numel == 0 or state_numel % period != 0:
                     raise ValueError(
-                        "Gefen rank-local checkpoint automatic_period does not divide "
-                        "the parameter state geometry"
+                        "Gefen rank-local checkpoint automatic_period does not divide the parameter state geometry"
                     )
 
             momentum_keys = ("m_codebook", "m_magnitude")
@@ -5016,8 +8016,7 @@ class Gefen(torch.optim.Optimizer):
             )
             if any(key in pstate for key in initialized_keys) and not carries_momentum:
                 raise ValueError(
-                    "Gefen rank-local checkpoint initialized state is missing "
-                    "quantized momentum"
+                    "Gefen rank-local checkpoint initialized state is missing quantized momentum"
                 )
             if (
                 period is not None
@@ -5026,10 +8025,13 @@ class Gefen(torch.optim.Optimizer):
                     param_signature.get("sharded")
                     and param_signature.get("sharded_mode") == "distributed"
                 )
+                and not (
+                    allow_preinitialized_periods
+                    and not any(key in pstate for key in initialized_keys)
+                )
             ):
                 raise ValueError(
-                    "Gefen rank-local checkpoint automatic_period is invalid without "
-                    "initialized momentum"
+                    "Gefen rank-local checkpoint automatic_period is invalid without initialized momentum"
                 )
             if carries_momentum:
                 has_quantized_momentum = True
@@ -5064,8 +8066,7 @@ class Gefen(torch.optim.Optimizer):
                     or not bool((magnitude >= 0).all())
                 ):
                     raise ValueError(
-                        "Gefen rank-local checkpoint m_magnitude geometry/dtype/values "
-                        "are invalid"
+                        "Gefen rank-local checkpoint m_magnitude geometry/dtype/values are invalid"
                     )
                 vmean = pstate.get("vmean")
                 if vmean is not None and (
@@ -5076,8 +8077,7 @@ class Gefen(torch.optim.Optimizer):
                     or not bool((vmean >= 0).all())
                 ):
                     raise ValueError(
-                        "Gefen rank-local checkpoint vmean geometry/dtype/values "
-                        "are invalid"
+                        "Gefen rank-local checkpoint vmean geometry/dtype/values are invalid"
                     )
 
                 has_vmean = "vmean" in pstate
@@ -5086,14 +8086,9 @@ class Gefen(torch.optim.Optimizer):
                     raise ValueError(
                         "Gefen rank-local checkpoint block second moment is incomplete"
                     )
-                if (
-                    has_vmean
-                    and not has_vmean_step
-                    and not allow_legacy_vmean_counter
-                ):
+                if has_vmean and not has_vmean_step and not allow_legacy_vmean_counter:
                     raise ValueError(
-                        "Gefen rank-local checkpoint block second moment is missing "
-                        "vmean_step"
+                        "Gefen rank-local checkpoint block second moment is missing vmean_step"
                     )
 
                 # GefenMuon groups carry a sharded_mode and intentionally use
@@ -5104,26 +8099,19 @@ class Gefen(torch.optim.Optimizer):
                     if carries_factored:
                         if "factored_step" not in pstate:
                             raise ValueError(
-                                "Gefen rank-local checkpoint factored state is missing "
-                                "factored_step"
+                                "Gefen rank-local checkpoint factored state is missing factored_step"
                             )
                         if counters["factored_step"] < 1:
                             raise ValueError(
-                                "Gefen rank-local checkpoint initialized factored "
-                                "state requires factored_step >= 1"
+                                "Gefen rank-local checkpoint initialized factored state requires factored_step >= 1"
                             )
                     elif "vmean" not in pstate:
                         raise ValueError(
-                            "Gefen rank-local checkpoint plain momentum is missing a "
-                            "second moment"
+                            "Gefen rank-local checkpoint plain momentum is missing a second moment"
                         )
-                    elif (
-                        "vmean_step" in counters
-                        and counters["vmean_step"] < 1
-                    ):
+                    elif "vmean_step" in counters and counters["vmean_step"] < 1:
                         raise ValueError(
-                            "Gefen rank-local checkpoint initialized vmean requires "
-                            "vmean_step >= 1"
+                            "Gefen rank-local checkpoint initialized vmean requires vmean_step >= 1"
                         )
 
             factored = (pstate.get("v_row"), pstate.get("v_col"))
@@ -5154,8 +8142,9 @@ class Gefen(torch.optim.Optimizer):
                         or not bool((tensor >= 0).all())
                     ):
                         raise ValueError(
-                            "Gefen rank-local checkpoint {} geometry/dtype/values "
-                            "are invalid".format(key)
+                            "Gefen rank-local checkpoint {} geometry/dtype/values are invalid".format(
+                                key
+                            )
                         )
 
             has_normuon_v = "normuon_v" in pstate
@@ -5167,18 +8156,15 @@ class Gefen(torch.optim.Optimizer):
             if has_normuon_v:
                 if param_signature.get("sharded_mode") is None:
                     raise ValueError(
-                        "Gefen rank-local checkpoint NorMuon state is invalid for "
-                        "a plain Gefen parameter"
+                        "Gefen rank-local checkpoint NorMuon state is invalid for a plain Gefen parameter"
                     )
                 if not carries_momentum:
                     raise ValueError(
-                        "Gefen rank-local checkpoint NorMuon state is missing "
-                        "initialized momentum"
+                        "Gefen rank-local checkpoint NorMuon state is missing initialized momentum"
                     )
                 if len(state_shape) != 2:
                     raise ValueError(
-                        "Gefen rank-local checkpoint NorMuon state requires a 2-D "
-                        "parameter"
+                        "Gefen rank-local checkpoint NorMuon state requires a 2-D parameter"
                     )
                 normuon_v = pstate["normuon_v"]
                 if (
@@ -5189,18 +8175,14 @@ class Gefen(torch.optim.Optimizer):
                     or not bool((normuon_v >= 0).all())
                 ):
                     raise ValueError(
-                        "Gefen rank-local checkpoint normuon_v geometry/dtype/values "
-                        "are invalid"
+                        "Gefen rank-local checkpoint normuon_v geometry/dtype/values are invalid"
                     )
                 if counters["normuon_step"] < 1:
                     raise ValueError(
-                        "Gefen rank-local checkpoint initialized NorMuon state "
-                        "requires normuon_step >= 1"
+                        "Gefen rank-local checkpoint initialized NorMuon state requires normuon_step >= 1"
                     )
 
-        self._validate_rank_local_codebook(
-            codebook, required=has_quantized_momentum
-        )
+        self._validate_rank_local_codebook(codebook, required=has_quantized_momentum)
 
     def _unwrap_rank_local_sharded_checkpoint(self, state_dict) -> None:
         groups = state_dict.get("param_groups", ())
@@ -5232,8 +8214,7 @@ class Gefen(torch.optim.Optimizer):
         if not markers:
             if wrapped_state:
                 raise ValueError(
-                    "Gefen checkpoint carries rank-local DTensor payloads but "
-                    "is missing their topology metadata"
+                    "Gefen checkpoint carries rank-local DTensor payloads but is missing their topology metadata"
                 )
             has_quantized_momentum = any(
                 isinstance(pstate, dict) and "m_codebook" in pstate
@@ -5245,15 +8226,12 @@ class Gefen(torch.optim.Optimizer):
                     "rank-local DTensor optimizer state. Older generic FSDP/DCP "
                     "full optimizer checkpoints kept rank 0's codebook and block "
                     "state for every rank. Re-save from the original run with a "
-                    "Gefen version that writes {} payloads.".format(
-                        _RANK_LOCAL_FORMAT
-                    )
+                    "Gefen version that writes {} payloads.".format(_RANK_LOCAL_FORMAT)
                 )
             return
         if len(markers) != len(groups) or any(item is None for item in metadata):
             raise ValueError(
-                "Gefen rank-local DTensor checkpoint metadata is present on only "
-                "some parameter groups"
+                "Gefen rank-local DTensor checkpoint metadata is present on only some parameter groups"
             )
         marker = markers[0]
         if not isinstance(marker, dict):
@@ -5270,8 +8248,7 @@ class Gefen(torch.optim.Optimizer):
             )
         if not self._uses_rank_local_sharded_state():
             raise ValueError(
-                "A rank-local DTensor Gefen checkpoint can only load into the "
-                "same sharded optimizer topology"
+                "A rank-local DTensor Gefen checkpoint can only load into the same sharded optimizer topology"
             )
         try:
             context = self._rank_local_checkpoint_context()
@@ -5281,8 +8258,7 @@ class Gefen(torch.optim.Optimizer):
         rank = context["global_rank"]
         if marker.get("world_size") != world:
             raise ValueError(
-                "Gefen rank-local DTensor checkpoints require the same world "
-                "size; checkpoint={} current={}".format(
+                "Gefen rank-local DTensor checkpoints require the same world size; checkpoint={} current={}".format(
                     marker.get("world_size"), world
                 )
             )
@@ -5299,8 +8275,7 @@ class Gefen(torch.optim.Optimizer):
         current_signature = self._rank_local_sharded_signature(context)
         if signatures[str(rank)] != current_signature:
             raise ValueError(
-                "Gefen rank-local DTensor checkpoint topology differs on rank {}: "
-                "checkpoint={!r} current={!r}".format(
+                "Gefen rank-local DTensor checkpoint topology differs on rank {}: checkpoint={!r} current={!r}".format(
                     rank, signatures[str(rank)], current_signature
                 )
             )
@@ -5348,14 +8323,19 @@ class Gefen(torch.optim.Optimizer):
                 if isinstance(key, str)
                 and key.startswith(_RANK_LOCAL_PAYLOAD_KEY_PREFIX)
             }
-            extras = set(pstate) - carrier_keys - {
-                _RANK_LOCAL_MEMBER_KEY,
-                "name",
-            }
+            extras = (
+                set(pstate)
+                - carrier_keys
+                - {
+                    _RANK_LOCAL_MEMBER_KEY,
+                    "name",
+                }
+            )
             if extras:
                 raise ValueError(
-                    "Gefen rank-local checkpoint parameter state has an invalid "
-                    "schema: {!r}".format(pstate)
+                    "Gefen rank-local checkpoint parameter state has an invalid schema: {!r}".format(
+                        pstate
+                    )
                 )
             if pstate.get("name") != 0:
                 raise ValueError(
@@ -5370,17 +8350,14 @@ class Gefen(torch.optim.Optimizer):
             if has_carrier:
                 if carrier_keys != expected_carrier_keys:
                     raise ValueError(
-                        "Gefen rank-local checkpoint carrier has missing or "
-                        "unexpected per-rank payload keys"
+                        "Gefen rank-local checkpoint carrier has missing or unexpected per-rank payload keys"
                     )
                 if serialized_payloads is not None:
                     raise ValueError(
                         "Gefen rank-local checkpoint repeats its payload transport"
                     )
                 serialized_payloads = {
-                    str(global_rank): pstate[
-                        _rank_local_payload_key(global_rank)
-                    ]
+                    str(global_rank): pstate[_rank_local_payload_key(global_rank)]
                     for global_rank in context["world_ranks"]
                 }
             elif pstate.get(_RANK_LOCAL_MEMBER_KEY) is not True:
@@ -5410,8 +8387,13 @@ class Gefen(torch.optim.Optimizer):
             "states",
             "codebook",
         }
-        if not isinstance(selected_payload, dict) or set(selected_payload) != expected_payload_keys:
-            raise ValueError("Gefen rank-local checkpoint payload has an invalid schema")
+        if (
+            not isinstance(selected_payload, dict)
+            or set(selected_payload) != expected_payload_keys
+        ):
+            raise ValueError(
+                "Gefen rank-local checkpoint payload has an invalid schema"
+            )
         payload_identity = (
             selected_payload["format"] == _RANK_LOCAL_FORMAT
             and selected_payload["global_rank"] == rank
@@ -5486,12 +8468,25 @@ class Gefen(torch.optim.Optimizer):
 
         gefen_global_step = state_dict.pop("gefen_global_step", None)
         gefen_codebook = state_dict.pop("gefen_codebook", None)
+        has_top_level_codebook_scope = "gefen_codebook_scope" in state_dict
+        gefen_codebook_scope = state_dict.pop("gefen_codebook_scope", None)
+        if has_top_level_codebook_scope:
+            gefen_codebook_scope = self._normalize_serialized_codebook_scope(
+                gefen_codebook_scope
+            )
+        has_top_level_native_local_shards = "gefen_native_local_shards" in state_dict
+        native_local_shards = state_dict.pop("gefen_native_local_shards", None)
+        if has_top_level_native_local_shards:
+            native_local_shards = self._normalize_serialized_native_local_shards(
+                native_local_shards
+            )
         has_top_level_deterministic = "gefen_deterministic" in state_dict
         gefen_deterministic = state_dict.pop("gefen_deterministic", None)
         if has_top_level_deterministic and type(gefen_deterministic) is not bool:
             raise ValueError(
-                "Gefen checkpoint top-level deterministic policy must be a bool, "
-                "got {!r}".format(gefen_deterministic)
+                "Gefen checkpoint top-level deterministic policy must be a bool, got {!r}".format(
+                    gefen_deterministic
+                )
             )
         if group_metadata:
             if len(group_metadata) != len(state_dict["param_groups"]):
@@ -5499,50 +8494,84 @@ class Gefen(torch.optim.Optimizer):
                     "Gefen checkpoint metadata is present on only some parameter groups"
                 )
             first_metadata = group_metadata[0]
-            if first_metadata.get("format_version") not in (
-                1,
-                2,
-                _RANK_LOCAL_METADATA_VERSION,
-            ):
-                raise ValueError(
-                    "Unsupported Gefen checkpoint metadata format_version: {}".format(
-                        first_metadata.get("format_version")
-                    )
-                )
+            normalized_metadata_native_local_shards = []
             for metadata in group_metadata:
+                metadata_version = metadata.get("format_version")
+                if metadata_version not in (
+                    1,
+                    2,
+                    _RANK_LOCAL_METADATA_VERSION,
+                    _SCOPED_NATIVE_METADATA_VERSION,
+                ):
+                    raise ValueError(
+                        "Unsupported Gefen checkpoint metadata format_version: {}".format(
+                            metadata_version
+                        )
+                    )
+                if ("codebook_scope" in metadata) != (
+                    metadata_version == _SCOPED_NATIVE_METADATA_VERSION
+                ):
+                    raise ValueError(
+                        "Gefen scoped checkpoint metadata must use format_version {}".format(
+                            _SCOPED_NATIVE_METADATA_VERSION
+                        )
+                    )
                 if (
                     "deterministic" in metadata
                     and type(metadata["deterministic"]) is not bool
                 ):
                     raise ValueError(
-                        "Gefen checkpoint parameter-group deterministic policy "
-                        "must be a bool, got {!r}".format(metadata["deterministic"])
+                        "Gefen checkpoint parameter-group deterministic policy must be a bool, got {!r}".format(
+                            metadata["deterministic"]
+                        )
                     )
-            for metadata in group_metadata[1:]:
+                normalized_metadata_native_local_shards.append(
+                    self._normalize_serialized_native_local_shards(
+                        metadata.get("native_local_shards")
+                    )
+                )
+            for metadata_index, metadata in enumerate(group_metadata[1:], start=1):
+                same_version = metadata.get("format_version") == first_metadata.get(
+                    "format_version"
+                )
                 same_step = metadata.get("global_step") == first_metadata.get(
                     "global_step"
                 )
                 left_codebook = metadata.get("codebook")
                 right_codebook = first_metadata.get("codebook")
-                same_codebook = (
-                    left_codebook is right_codebook
-                    or (
-                        torch.is_tensor(left_codebook)
-                        and torch.is_tensor(right_codebook)
-                        and torch.equal(left_codebook, right_codebook)
-                    )
+                same_codebook = left_codebook is right_codebook or (
+                    torch.is_tensor(left_codebook)
+                    and torch.is_tensor(right_codebook)
+                    and torch.equal(left_codebook, right_codebook)
                 )
                 same_deterministic = metadata.get(
                     "deterministic"
                 ) == first_metadata.get("deterministic")
-                if not same_step or not same_codebook or not same_deterministic:
+                same_codebook_scope = metadata.get(
+                    "codebook_scope"
+                ) == first_metadata.get("codebook_scope")
+                same_native_local_shards = (
+                    normalized_metadata_native_local_shards[metadata_index]
+                    == normalized_metadata_native_local_shards[0]
+                )
+                if (
+                    not same_version
+                    or not same_step
+                    or not same_codebook
+                    or not same_deterministic
+                    or not same_codebook_scope
+                    or not same_native_local_shards
+                ):
                     raise ValueError(
-                        "Gefen checkpoint parameter groups carry inconsistent "
-                        "optimizer metadata"
+                        "Gefen checkpoint parameter groups carry inconsistent optimizer metadata"
                     )
             metadata_step = first_metadata.get("global_step", 0)
             metadata_codebook = first_metadata.get("codebook")
             metadata_deterministic = first_metadata.get("deterministic")
+            metadata_codebook_scope = self._normalize_serialized_codebook_scope(
+                first_metadata.get("codebook_scope")
+            )
+            metadata_native_local_shards = normalized_metadata_native_local_shards[0]
             if gefen_global_step is None:
                 gefen_global_step = metadata_step
             elif gefen_global_step != metadata_step:
@@ -5569,14 +8598,35 @@ class Gefen(torch.optim.Optimizer):
                 and gefen_deterministic != metadata_deterministic
             ):
                 raise ValueError(
-                    "Gefen checkpoint top-level and parameter-group deterministic "
-                    "policies disagree"
+                    "Gefen checkpoint top-level and parameter-group deterministic policies disagree"
                 )
+            if not has_top_level_codebook_scope:
+                gefen_codebook_scope = metadata_codebook_scope
+            elif gefen_codebook_scope != metadata_codebook_scope:
+                raise ValueError(
+                    "Gefen checkpoint top-level and parameter-group codebook scopes disagree"
+                )
+            if not has_top_level_native_local_shards:
+                native_local_shards = metadata_native_local_shards
+            elif native_local_shards != metadata_native_local_shards:
+                raise ValueError(
+                    "Gefen checkpoint top-level and parameter-group local shards disagree"
+                )
+        live_codebook_scope = self._serialized_codebook_scope()
+        if gefen_codebook_scope != live_codebook_scope:
+            raise ValueError(
+                "Gefen checkpoint codebook scope does not match the live explicit binding"
+            )
+        if not self._native_local_shards_matches_live(native_local_shards):
+            raise ValueError(
+                "Gefen checkpoint native local-shard identity does not match the live binding"
+            )
         if gefen_deterministic is not None:
             if type(gefen_deterministic) is not bool:
                 raise ValueError(
-                    "Gefen checkpoint deterministic policy must be a bool, got "
-                    "{!r}".format(gefen_deterministic)
+                    "Gefen checkpoint deterministic policy must be a bool, got {!r}".format(
+                        gefen_deterministic
+                    )
                 )
             if gefen_deterministic != self._deterministic:
                 raise ValueError(
@@ -5640,6 +8690,7 @@ class Gefen(torch.optim.Optimizer):
         self._gefen_codebook = gefen_codebook
         self._gefen_codebook_by_device.clear()
         self._gefen_codebook_lut_by_device.clear()
+        self._gefen_codebook_scope_validated = False
         # The identity fingerprint would catch the wholesale state swap anyway;
         # reset it explicitly so the first post-load capturable step re-marks.
         self._static_mark_sig = None
@@ -5665,7 +8716,10 @@ class Gefen(torch.optim.Optimizer):
                 if not torch.is_tensor(saved_value):
                     continue
                 live_value = live_state.get(key)
-                if torch.is_tensor(live_value) and live_value.dtype == saved_value.dtype:
+                if (
+                    torch.is_tensor(live_value)
+                    and live_value.dtype == saved_value.dtype
+                ):
                     continue
                 device = (
                     live_value.device if torch.is_tensor(live_value) else param.device
@@ -5718,23 +8772,83 @@ class Gefen(torch.optim.Optimizer):
                 closure feed the first step's codebook learning correctly. The
                 returned loss is passed through.
         """
-        self._assert_capturable_if_capturing()
+        # Capture and validate the control scope independently of public
+        # parameter containers. A rank-local mutation made between steps can
+        # then be reported through the last known-good binding instead of
+        # stranding peers after a one-sided entry-guard failure.
+        scope_binding = self._capture_codebook_scope_binding_for_step()
 
         loss = None
-        if closure is not None:
-            with torch.enable_grad():
-                loss = closure()
+        try:
+            self._assert_finalized_binding_layout()
+            self._assert_runtime_codebook_process_group()
+            self._assert_capturable_if_capturing()
+            self._assert_codebook_capture_ready()
+            if closure is not None:
+                with torch.enable_grad():
+                    loss = closure()
+            local_preamble_error = None
+        except Exception as exc:
+            loss = None
+            local_preamble_error = exc
+        if scope_binding is not None:
+            self._synchronize_prevalidated_codebook_scope_failure(
+                local_preamble_error, "step preamble", scope_binding
+            )
+        elif local_preamble_error is not None:
+            raise local_preamble_error
 
-        _assert_optimizer_gradients_structurally_valid(self)
+        # The closure can replace a finalized parameter or otherwise invalidate
+        # the runtime binding. It can also rebind (or clear) the runtime
+        # process-group between capture and the operation header; a rank that
+        # silently swapped to None or a different binding would enter a
+        # different header collective than its peers and deadlock. Recheck
+        # against the captured binding and synchronize structural failures
+        # before any peer enters a scoped codebook collective.
+        try:
+            if self._gefen_codebook_process_group is not scope_binding:
+                raise RuntimeError(
+                    "Gefen codebook process-group binding changed during the step preamble"
+                )
+            self._assert_finalized_binding_layout()
+            self._assert_runtime_codebook_process_group()
+            _assert_optimizer_gradients_structurally_valid(self)
+            local_preflight_error = None
+        except Exception as exc:
+            local_preflight_error = exc
+        if scope_binding is not None:
+            self._synchronize_prevalidated_codebook_scope_failure(
+                local_preflight_error, "gradient preflight", scope_binding
+            )
+        elif local_preflight_error is not None:
+            raise local_preflight_error
+        self._validate_codebook_scope_operation_header("step")
+        self._ensure_codebook_scope_agreement()
 
         # GradScaler invokes native-AMP optimizers even on overflow. Decide
         # before codebook learning, periodic refresh, capturable counters, or
-        # parameter/state mutation. The attribute gate compiles away on the
+        # parameter/state mutation. A multi-member codebook scope must run the
+        # AMP protocol agreement on EVERY member -- including one with no local
+        # GradScaler attributes -- otherwise the presence gather inside
+        # _prepare_scoped_amp_optimizer_step is entered by only some members and
+        # deadlocks (mirrors the unconditional Muon/Hybrid AMP preflight). Off a
+        # multi-member scope the attribute gate still compiles away on the
         # ordinary BF16/FP32 path where GradScaler attaches nothing.
-        if (
-            hasattr(self, "found_inf") or hasattr(self, "grad_scale")
-        ) and not _amp_prepare_optimizer_step(self):
+        scope = self._gefen_codebook_process_group
+        if scope is not None and len(scope.identity.ordered_members) > 1:
+            should_step = self._prepare_scoped_amp_optimizer_step()
+        elif hasattr(self, "found_inf") or hasattr(self, "grad_scale"):
+            should_step = self._prepare_scoped_amp_optimizer_step()
+        else:
+            should_step = True
+        if not should_step:
             return loss
+
+        if (
+            self._gefen_codebook_process_group is not None
+            and self._codebook_refresh_every
+        ):
+            self._validate_codebook_scope_operation_header("periodic_step")
 
         self._maybe_refresh_gefen_codebook()
         self._maybe_save_gefen_grad_histogram()
@@ -5799,11 +8913,7 @@ class Gefen(torch.optim.Optimizer):
                 # path) instead of any vmean path. Sharded (DTensor) params
                 # fall through to the standard path: local-shard row/col
                 # statistics would be wrong under sharding.
-                if (
-                    self._factored_v_2d
-                    and p.ndim == 2
-                    and not hasattr(p, "placements")
-                ):
+                if self._factored_v_2d and p.ndim == 2 and not hasattr(p, "placements"):
                     self._step_automatic_factored(group, name, p, grad)
                     continue
                 if (
