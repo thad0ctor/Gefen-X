@@ -5,7 +5,7 @@ name: Release
 #   git tag v0.2.1.dev1 && git push origin v0.2.1.dev1   -> build + TestPyPI only
 #   git tag v0.2.1       && git push origin v0.2.1        -> build + TestPyPI + PyPI
 #
-# `ci.yml` intentionally runs on branch pushes and pull requests, not tag pushes.
+# `ci.yml` intentionally runs on pull requests and pushes to main, not tag pushes.
 # This workflow therefore carries installed-wheel CPU and Transformers Trainer
 # gates. Every gate tests the artifact built in `build`, and every publish job
 # downloads that same artifact.

@@ -22,6 +22,7 @@
  - **≈2× faster `opt.step()`** via fused CUDA kernels with validated numerical parity.
  - **Whole-model Muon option** (`GefenMuonHybrid`) with a selectable AdamW quality backup or ~1 B/param Gefen low-memory backup, plus task-specific [SFT and pretraining recipes](#which-muon-recipe-should-i-use).
  - **Reliable native checkpoint save/resume and FSDP2 training support** — broken or absent in the shipped release; see [Distributed Training](#distributed-training) for the checkpoint compatibility table.
+ - **CPU-offloaded training and reshardable checkpoints** — plain Gefen trains with parameters, gradients, and optimizer state on CPU (DeepSpeed ZeRO, FSDP2 `CPUOffloadPolicy`), and its FSDP2 optimizer state reshards N ranks → M via `GefenDCPState` with a memory-bounded save.
  - **Hardened against crashes** (device/dtype guards, bounds checks, race fixes).
 
 <details>
@@ -36,9 +37,10 @@
 >| **Optimizer-step speed** | baseline | ≈2× faster `opt.step()` with fused kernels |
 >| **Peak memory**| large transient spikes | much lower peak — room for bigger models / batches |
 >| **Sharded multi-GPU training (FSDP2)** | breaks with the fast path | works — for plain Gefen *and* Muon |
+>| **CPU-offloaded training** | not supported (GPU-resident) | parameters, gradients & optimizer state can live on CPU — validated for plain Gefen under DeepSpeed ZeRO CPU-offload (optimizer at ZeRO-2/3, parameters at ZeRO-3) and FSDP2 `CPUOffloadPolicy` (single & multi-GPU) — [details](https://github.com/thad0ctor/Gefen-X/blob/main/COMPATIBILITY.md#fsdp2-cpu-offload) |
 >| **Whole-model Muon** | 2D weight matrices only | `GefenMuonHybrid` trains the entire model |
 >| **Muon step efficiency** | generic momentum hack + redundant dequant gather | single-pass bit-exact momentum kernel |
->| **Save / resume checkpoints** | can corrupt state or lose tuning on resume | native optimizer checkpoints save and resume correctly; distributed checkpoint formats have documented limits |
+>| **Save / resume checkpoints** | can corrupt state or lose tuning on resume | native optimizer checkpoints save and resume correctly; FSDP2 optimizer state reshards N ranks → M via `GefenDCPState` with a memory-bounded save |
 >| **Crash safety** | missing device / edge-case guards | guarded against wrong-device, empty-tensor, and race bugs |
 >| **Correctness** | no fused-kernel tests | kernel parity and distributed tests |
 >| **Documentation** | no Axolotl / fork-install guidance | Axolotl how-to + fair loss/speed/memory benchmarks |
@@ -119,17 +121,68 @@ Gefen drops into standard distributed training like any other PyTorch optimizer,
 | System | Works with |
 |---|---|
 | DDP | All optimizers |
-| FSDP2 | All optimizers |
-| FSDP2 checkpoints | Plain Gefen and Muon `approx`; resume needs the same GPU count — scope note below |
+| FSDP2 | All optimizers; training-time CPU offload (`CPUOffloadPolicy`) validated for plain Gefen, single and multi-GPU |
+| FSDP2 checkpoints | Plain Gefen can use `GefenDCPState` + `GefenSavePlanner` to reshard N ranks to M; same-topology resumes use the bit-exact native full-state path (Muon `approx` too) |
 | Muon `distributed` checkpoints | Resume on any GPU count, even a single GPU — [details](#experimental-lever-sharded-newton-schulz-under-fsdp2-sharded_mode) |
-| DeepSpeed ZeRO 1-3 | Plain Gefen; use FSDP2 or DDP for the Muon family — config note below |
+| DeepSpeed ZeRO 1-3 | Plain Gefen (client optimizer); optimizer CPU-offload verified at ZeRO-2/3, parameter offload at ZeRO-3 (full fine-tune and LoRA); use FSDP2 or DDP for the Muon family — config note below |
 | Megatron-LM | All optimizers, including checkpoint resume — [scope](https://github.com/thad0ctor/Gefen-X/blob/main/COMPATIBILITY.md#megatron-lm-integration-scope) |
 
-> **FSDP2 checkpoint scope.** Plain Gefen and Muon `approx` save and resume exactly through PyTorch's standard full-state checkpoint calls, as long as the GPU count and sharding layout are unchanged and every GPU joins the save. Anything outside that scope refuses to load instead of corrupting state — [full details](https://github.com/thad0ctor/Gefen-X/blob/main/COMPATIBILITY.md#optimizer-checkpoint-scope).
+### Resharding an FSDP2 checkpoint (N ranks → M)
+
+Opt in by wrapping plain Gefen in `GefenDCPState`. Save on 2 ranks, load on 4 — or on 1.
+
+Works on the declared torch **2.5+** floor. `fully_shard`'s public import below is torch 2.6+; on 2.5 it lives at `torch.distributed._composable.fsdp`, so import it with a fallback there.
+
+```python
+from gefen import Gefen, GefenDCPState, GefenFileSystemWriter, GefenSavePlanner
+try:
+    from torch.distributed.fsdp import fully_shard          # torch 2.6+
+except ImportError:
+    from torch.distributed._composable.fsdp import fully_shard  # torch 2.5
+import torch.distributed.checkpoint as dcp
+
+fully_shard(model)                            # params must be Shard(0) DTensors
+optimizer = Gefen(model.named_parameters(), lr=3e-5, factored_v_2d=False)
+state = {"model": model, "optimizer": GefenDCPState(optimizer)}
+
+dcp.save(
+    state,
+    storage_writer=dcp.FileSystemWriter(path),
+    planner=GefenSavePlanner(),   # optional — see below. Drop it and the save
+)                                 # still writes the same checkpoint, using more memory
+
+dcp.load(state, storage_reader=dcp.FileSystemReader(path))   # never needs a planner
+```
+
+Requires `factored_v_2d=False` and `capturable=False`.
+
+**`dcp.async_save` needs `GefenFileSystemWriter`.** Async save returns as soon as the state is staged and writes from a background thread, so it has to snapshot the state dict to CPU first. `GefenFileSystemWriter` is what stages Gefen's slots — expanding each one's dense form, copying it to CPU, and releasing it before the next — so training can resume immediately and the checkpoint still reflects the moment of the call.
+
+```python
+response = dcp.async_save(
+    state,
+    storage_writer=GefenFileSystemWriter(path),
+    planner=GefenSavePlanner(),
+)
+
+# ... keep training; the checkpoint holds the state as of the call above ...
+
+# torch 2.5 returns a bare Future; newer torch wraps it in an AsyncSaveResponse.
+# Waiting is what surfaces a background write failure.
+getattr(response, "upload_completion", response).result()
+```
+
+**`GefenSavePlanner` is optional and recommended.** Resharding has to expand Gefen's compact state to dense fp32 to be portable across world sizes. Without the planner, every parameter's dense form is held for the whole write; with it, one is expanded at a time. On a 32-tensor model that is the difference between **8.25 and 0.50 bytes/param** of peak memory over the optimizer's resident state — enough that a model which trains fine could otherwise OOM while saving.
+
+> **Scope.** For *changing* topology only: resume is a correct continuation, not a bit-exact restore. Same-topology resumes should use the native full-state path (Muon `approx` too), which is bit-exact — [full details](https://github.com/thad0ctor/Gefen-X/blob/main/COMPATIBILITY.md#optimizer-checkpoint-scope).
+>
+> **This is a library-level API — you call `dcp.save` yourself.** There is no config key for it in Axolotl: Axolotl and Accelerate do their own checkpointing and pass DCP's default planner, so `GefenDCPState` never enters that path.
+>
+> **FSDP2 CPU offload.** Training-time CPU offload via `CPUOffloadPolicy` (`fully_shard(module, offload_policy=CPUOffloadPolicy())`) is validated for plain Gefen on single and multiple GPUs: each rank steps its CPU-resident local shard directly (the codebook is learned rank-locally, with no cross-rank codebook collective), and the multi-GPU run completes on an NCCL-only process group.
 
 Mixed precision works out of the box: BF16 and standard AMP behave exactly as with any PyTorch optimizer, and true-FP16 `GradScaler` training is handled safely — an overflow step changes nothing. FSDP1 FP16 needs `torch.distributed.fsdp.ShardedGradScaler`.
 
-> **DeepSpeed ZeRO config.** Set `"zero_allow_untested_optimizer": true` and leave the config's `optimizer` section unset. With optimizer CPU-offload, also set `"zero_force_ds_cpu_optimizer": false` — otherwise raw DeepSpeed refuses to initialize, and accelerate-based launchers (axolotl) silently swap in DeepSpeed's own CPU Adam.
+> **DeepSpeed ZeRO config.** Set `"zero_allow_untested_optimizer": true` and leave the config's `optimizer` section unset. With optimizer or parameter CPU-offload, also set `"zero_force_ds_cpu_optimizer": false` — otherwise raw DeepSpeed refuses to initialize, and accelerate-based launchers (axolotl) silently swap in DeepSpeed's own CPU Adam. With those two flags, plain Gefen (`optimizer: gefenx`) steps the CPU-resident fp32 partitions directly and trains normally under ZeRO-2 and ZeRO-3 offload, for both full fine-tuning and LoRA. Activation offloading (`activation_offloading: true`) is optimizer-agnostic and composes with `gefenx`, including alongside ZeRO CPU-offload.
 
 Platform adapters can query the immutable [`optimizer_contract()` capability and state-layout descriptors](https://github.com/thad0ctor/Gefen-X/blob/main/docs/optimizer_contracts.md) instead of depending on Gefen's private optimizer attributes.
 
@@ -637,7 +690,7 @@ Finalized exact period-one plain Gefen, distributed-owner GefenMuon, and Gefen-b
 ## Known limitations
 
 - **Hybrid checkpoint schema.** `GefenMuonHybrid`'s ordinary `state_dict()` uses its own nested `{"muon": ..., "backup": ..., "backup_optimizer": "gefen" | "adamw"}` layout. Resume from a checkpoint the hybrid itself saved—not one consolidated or converted to the flat torch `{state, param_groups}` layout. Cross-backend loads are rejected before either child is mutated; legacy untagged hybrid checkpoints are interpreted as Gefen-backed. The separate topology-neutral DCP path above supports only a finalized Gefen-backed Hybrid; AdamW-backed Hybrid remains same-topology through its ordinary nested checkpoint.
-- **FSDP2 optimizer checkpoints don't reshard.** Plain Gefen and Muon `approx` resume only on the same GPU count and layout; changing either refuses to load. Model weights are unaffected — [details](https://github.com/thad0ctor/Gefen-X/blob/main/COMPATIBILITY.md#optimizer-checkpoint-scope).
+- **FSDP2 optimizer resharding is explicit and approximate.** Resharding plain Gefen across world sizes needs `GefenDCPState` + `GefenSavePlanner` ([usage](#resharding-an-fsdp2-checkpoint-n-ranks--m)), and resume is a correct continuation rather than a bit-exact restore. Muon, Hybrid, and other placements fail closed; `dcp.async_save` needs `GefenFileSystemWriter` — [details](https://github.com/thad0ctor/Gefen-X/blob/main/COMPATIBILITY.md#optimizer-checkpoint-scope).
 - **True-FP16 overflow skips are invisible to Accelerate's `step_was_skipped` flag.** BF16 and standard AMP are unaffected and are the recommended modes in Trainer/Accelerate.
 
 ## Troubleshooting

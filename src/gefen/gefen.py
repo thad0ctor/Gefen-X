@@ -15,6 +15,7 @@ import io
 import logging
 import math
 import os
+import re
 import warnings
 from collections import defaultdict, OrderedDict
 from itertools import chain
@@ -116,6 +117,27 @@ _CANONICAL_DERIVED_PARAMETER_STATE_KEYS = frozenset(
         "m_codebook_shape",
     }
 )
+
+# Per-param optimizer-state tensors that the non-fused step migrates onto the
+# current compute device when a framework relocates a parameter between
+# iterations (CPU-offload paging). Covers quantized momentum (m_codebook /
+# m_magnitude), the block second moment (vmean), the factored second moment
+# (v_row / v_col), the tensor step counters, and the reused scratch buffers.
+# See Gefen._colocate_param_state_.
+_COLOCATABLE_STATE_KEYS = (
+    "m_codebook",
+    "m_magnitude",
+    "vmean",
+    "vmean_step",
+    "v_row",
+    "v_col",
+    "factored_step",
+    "step",
+    "stepsize",
+    "_h_buf",
+)
+
+
 def _rank_local_payload_key(global_rank: int) -> str:
     return "{}{}".format(_RANK_LOCAL_PAYLOAD_KEY_PREFIX, int(global_rank))
 
@@ -244,6 +266,20 @@ def automatic_vmean_update(
 # chunk size; it is not the step bottleneck (Newton-Schulz dominates), and the
 # bounded scratch is what turns the full-FT OOM into a fit.
 GEFEN_CODEBOOK_SEARCH_CHUNK = 1 << 23
+
+
+# Shape of the names Gefen synthesizes positionally for an unnamed parameter.
+# The spelling decides nothing on its own -- a caller may declare a real
+# parameter called "param_0", and a collision-suffixed "weight_1" is positional
+# without matching -- so this is only a last-resort guess for a parameter with no
+# registration record; see _param_name_is_synthesized.
+_SYNTHESIZED_PARAM_NAME_RE = re.compile(r"^(group_\d+_param_\d+|param_\d+)$")
+
+# Serialized mirror of the registration-time provenance flags, parallel to a
+# group's "param_names". Provenance cannot be recovered from a name's spelling,
+# so it travels WITH the name through a checkpoint. Additive: a checkpoint
+# written before this key existed lacks it, and load treats that as unknowable.
+_SYNTHESIZED_PARAM_NAMES_KEY = "param_names_synthesized"
 
 
 # Dequantize the stored uint8 indices into codebook coefficients in element
@@ -1006,6 +1042,36 @@ def _assert_optimizer_gradients_structurally_valid(
                         tuple(grad.shape), str(name), tuple(param.shape)
                     )
                 )
+            # The update is applied in place into the parameter while all of the
+            # update math runs on the gradient's device; the parameter, its
+            # gradient, and its optimizer state must therefore be co-located (the
+            # CPU-offload contract). A genuine param/grad device split cannot
+            # produce a correct in-place write and otherwise fails opaquely deep
+            # in an add_/kernel. Reject it here in the pre-mutation preflight --
+            # before shared-codebook learning/refresh and the per-parameter loop
+            # -- so a mismatch fails atomically without leaving a codebook or
+            # per-param state learned from the rejected gradient. Normal autograd
+            # produces the gradient on the parameter's own device, so this never
+            # fires for a same-device run. DTensor / async gradients are sharded
+            # wrappers whose local-shard device is resolved by the
+            # .to_local()/.wait() unwrap downstream and can legitimately differ
+            # from the wrapper's reported device, so skip the check for them and
+            # only enforce co-location for plain tensors (the CPU-offload case).
+            if (
+                not hasattr(grad, "to_local")
+                and not hasattr(grad, "wait")
+                and not hasattr(param, "placements")
+                and grad.device != param.device
+            ):
+                raise RuntimeError(
+                    "Gefen requires each parameter and its gradient to live on "
+                    "the same device (param {!r} is on {} but its gradient is on "
+                    "{}). For CPU-offloaded training keep the parameter, its "
+                    "gradient, and its optimizer state co-located on the same "
+                    "device for the step.".format(
+                        str(name), param.device, grad.device
+                    )
+                )
 
 
 class Gefen(torch.optim.Optimizer):
@@ -1280,6 +1346,12 @@ class Gefen(torch.optim.Optimizer):
         # per finalized manifest object instead of rehashing every identity on
         # every scoped step header.
         self._gefen_manifest_forensics_cache = None
+        # Provenance for those names: True where Gefen generated the positional
+        # name itself, False where the caller supplied it. Only the generated ones
+        # encode registration order rather than stable identity, and the spelling
+        # cannot tell them apart. Consumers needing caller-stable identity
+        # (GefenDCPState) ask _param_name_is_synthesized.
+        self._synthesized_param_names = {}
         # ``set_optimizer_state_dict(flatten_optimizer_state_dict=True)`` uses
         # the *live* optimizer state/group keys as its unflattening schema before
         # it calls our loader. Publish the private rank-local transport keys only
@@ -2959,6 +3031,20 @@ class Gefen(torch.optim.Optimizer):
             return state["name"]
         return self._param_names.get(param, "none")
 
+    def _param_name_is_synthesized(self, param) -> bool:
+        """True when Gefen generated this parameter's name positionally.
+
+        Recorded at registration (``add_param_group``), where the distinction is
+        known for certain, rather than inferred from spelling: the synthesized
+        forms are ordinary identifiers a caller may legitimately use. A native load
+        re-establishes the flag from the checkpoint's own provenance, so a rename
+        cannot launder a positional name into a caller-provided one. The spelling
+        fallback covers only a parameter with no registration record at all.
+        """
+        if param in self._synthesized_param_names:
+            return self._synthesized_param_names[param]
+        return bool(_SYNTHESIZED_PARAM_NAME_RE.match(str(self._param_name(param))))
+
     def _iter_group_params_with_names(self, group):
         names = group.get("param_names")
         for idx, param in enumerate(group["params"]):
@@ -3000,6 +3086,23 @@ class Gefen(torch.optim.Optimizer):
         return "{}_{}".format(name, suffix)
 
     def _sync_param_names_to_state(self) -> None:
+        """Re-derive per-parameter names and their provenance after a native load.
+
+        Provenance decides whether GefenDCPState will reshard against the name, so
+        a load that CHANGES a name must re-establish it rather than inherit the
+        live optimizer's stale flag: keep the registration-time flag for an
+        unchanged name, take the checkpoint's for a changed one, and fail closed
+        (mark it synthesized) when a legacy checkpoint carried none.
+
+        That last case must NOT fall back to spelling. Two unnamed groups both
+        named "weight" produce the positional pair "weight"/"weight_1", which no
+        regex separates from a caller's legitimate "layer_1" -- so a spelling
+        check accepts it and lets DCP reshard against a registration-order
+        identity, cross-assigning momentum. Refusing a renamed legacy checkpoint
+        until it is re-saved is recoverable; cross-assigned momentum is not.
+        """
+        previous_names = self._param_names
+        previous_flags = self._synthesized_param_names
         self._param_names = {}
         logical_groups = None
         if self._gefen_post_sharding_finalized:
@@ -3013,6 +3116,7 @@ class Gefen(torch.optim.Optimizer):
                 logical_groups[logical_slot.group_index].append(
                     logical_slot.compatibility_name
                 )
+        synthesized_flags = {}
         for group_index, group in enumerate(self.param_groups):
             params = group["params"]
             if logical_groups is None:
@@ -3025,13 +3129,31 @@ class Gefen(torch.optim.Optimizer):
                     raise RuntimeError(
                         "Gefen finalized logical-slot registry does not match the loaded layout"
                     )
+            # A short/absent/malformed list is unusable rather than partially
+            # trusted: provenance is positional against param_names, so a length
+            # mismatch means we cannot say which flag describes which name.
+            checkpoint_flags = group.get(_SYNTHESIZED_PARAM_NAMES_KEY)
+            if not isinstance(checkpoint_flags, (list, tuple)) or len(
+                checkpoint_flags
+            ) != len(params):
+                checkpoint_flags = None
             normalized_names = []
-            for param, name in zip(params, names):
+            for index, (param, name) in enumerate(zip(params, names)):
                 name = str(name).lower()
                 normalized_names.append(name)
                 self._param_names[param] = name
+                if param in previous_flags and previous_names.get(param) == name:
+                    synthesized_flags[param] = previous_flags[param]
+                elif checkpoint_flags is not None:
+                    synthesized_flags[param] = bool(checkpoint_flags[index])
+                else:
+                    synthesized_flags[param] = True
                 self.state[param]["name"] = name
             group["param_names"] = normalized_names
+            group[_SYNTHESIZED_PARAM_NAMES_KEY] = [
+                synthesized_flags[param] for param in params
+            ]
+        self._synthesized_param_names = synthesized_flags
 
     def add_param_group(self, param_group):
         """Add a param group while preserving the caller-visible group boundary.
@@ -3083,6 +3205,7 @@ class Gefen(torch.optim.Optimizer):
             "eps",
             "weight_decay",
             "param_names",
+            _SYNTHESIZED_PARAM_NAMES_KEY,
             "_gefen_implicit_group",
         )
         extra = {k: v for k, v in param_group.items() if k not in consumed}
@@ -3101,6 +3224,10 @@ class Gefen(torch.optim.Optimizer):
         implicit_group = bool(param_group.get("_gefen_implicit_group", False))
         params = []
         param_names = []
+        # Parallel to param_names: True where Gefen generated the name below
+        # because the caller supplied none. Recorded here, the only place the
+        # distinction is knowable.
+        synthesized_flags = []
         for param_index, (param_name, param) in enumerate(named_params):
             # Reject duplicates before registering any group, so the base class's
             # own (post-registration) duplicate check can't leave us partial.
@@ -3110,23 +3237,36 @@ class Gefen(torch.optim.Optimizer):
                 )
             batch_params.add(param)
             params.append(param)
+            synthesized = False
             if param_name is None:
                 if group_name is not None and len(named_params) == 1:
-                    param_name = group_name
-                    param_name = self._unique_name(param_name, existing_names)
+                    # The caller named the group, and that name identifies the
+                    # single parameter it holds: caller-provided, not positional.
+                    base_name = str(group_name).lower()
+                    param_name = self._unique_name(base_name, existing_names)
+                    if param_name != base_name:
+                        # ...unless a collision forced a suffix, which
+                        # registration order alone decides -- build the same groups
+                        # in a different order and the names swap. Marking it
+                        # synthesized keeps DCP from resharding against an
+                        # identity it cannot rely on.
+                        synthesized = True
                 elif implicit_group:
                     param_name = self._unique_name(
                         "param_{}".format(len(self._param_names) + param_index),
                         existing_names,
                     )
+                    synthesized = True
                 else:
                     param_name = self._unique_name(
                         "group_{}_param_{}".format(group_index, param_index),
                         existing_names,
                     )
+                    synthesized = True
             else:
                 param_name = str(param_name).lower()
             param_names.append(param_name)
+            synthesized_flags.append(synthesized)
             existing_names.add(param_name)
 
         new_group = dict(extra)
@@ -3138,6 +3278,9 @@ class Gefen(torch.optim.Optimizer):
             {
                 "params": params,
                 "param_names": param_names,
+                # Mirrored into the public group (like param_names) so
+                # Optimizer.state_dict carries provenance to the checkpoint.
+                _SYNTHESIZED_PARAM_NAMES_KEY: synthesized_flags,
                 "lr": group_lr,
                 "beta1": group_betas[0],
                 "beta2": group_betas[1],
@@ -3146,8 +3289,11 @@ class Gefen(torch.optim.Optimizer):
             }
         )
         super().add_param_group(new_group)
-        for param, param_name in zip(params, param_names):
+        for param, param_name, synthesized in zip(
+            params, param_names, synthesized_flags
+        ):
             self._param_names[param] = param_name
+            self._synthesized_param_names[param] = synthesized
             self.state[param]["name"] = param_name
         self._ensure_gefen_global_step_devices()
         if getattr(self, "_gefen_checkpoint_schema_ready", False):
@@ -3515,6 +3661,38 @@ class Gefen(torch.optim.Optimizer):
         if self.capturable:
             return torch.zeros((), dtype=torch.float32, device=device)
         return 0
+
+    def _colocate_param_state_(self, state, device: torch.device) -> None:
+        # CPU-offload / device-mobility support. The per-param state tensors
+        # (quantized momentum, block/factored second moments, tensor step
+        # counters, reused scratch) are allocated once on the first step's
+        # device and then reused in place. When a framework relocates a
+        # parameter between iterations -- e.g. CPU offload paging a shard
+        # CPU->CUDA->CPU -- the state is left stranded on the previous device
+        # and the next non-fused update trips the codebook/state device-equality
+        # guards. Migrate the stranded tensors onto the current compute device
+        # (grad_view.device) so the whole update stays co-located.
+        #
+        # Cheap gate: one device compare on a sentinel (m_codebook, always
+        # created by _init_gefen_state on both the block and factored paths). On
+        # the common same-device step -- every CUDA-resident run -- this returns
+        # immediately with no allocation and no .to(), so the update is
+        # byte-for-byte unchanged. Capturable stepping pins static state
+        # addresses for CUDA-graph replay, so reassigning a state tensor would
+        # break capture; capture is CUDA-graph only (not a CPU-offload path), so
+        # this is an unconditional no-op there.
+        if self.capturable:
+            return
+        sentinel = state.get("m_codebook")
+        if sentinel is None or sentinel.device == device:
+            return
+        for key in _COLOCATABLE_STATE_KEYS:
+            value = state.get(key)
+            if torch.is_tensor(value) and value.device != device:
+                # .to() on the uint8 index / fp32 magnitude / fp32 second-moment
+                # tensors is a pure device copy (no dtype change), so a
+                # round-trip preserves momentum indices and magnitudes exactly.
+                state[key] = value.to(device)
 
     def _refresh_capturable_step_scalars(
         self, state, group, bc2_step_key: str, sqrt_bc2: bool
@@ -4880,6 +5058,11 @@ class Gefen(torch.optim.Optimizer):
             )
             state["factored_step"] = self._new_step_counter(p.device)
 
+        # Migrate any state stranded on a previous device (CPU-offload paging)
+        # onto the current compute device before the counter bump and second-
+        # moment reads below. No-op on the common same-device step.
+        self._colocate_param_state_(state, grad_view.device)
+
         rows, cols = p.shape
         # Rows registered with the batched capturable prologue had BOTH
         # counters advanced by its single stacked add_ already this step.
@@ -5028,6 +5211,13 @@ class Gefen(torch.optim.Optimizer):
         # path; returns the reconstructed fp32 momentum (codebook * magnitude).
         shared_m = self._automatic_momentum_update_merged(state, grad_view, beta1)
 
+        # The weight-decay and update multiplies below run on the compute
+        # device; a tensor lr stranded on another device (a CUDA lr after the
+        # parameter was paged to CPU) would break them. Scalarize when not
+        # capturable -- bit-identical to the 0-dim tensor (value == lr.item()).
+        # Capturable keeps the on-device tensor lr for its device-tensor math.
+        if torch.is_tensor(lr) and not self.capturable:
+            lr = self._lr_scalar(group)
         if group["weight_decay"] > 0.0:
             p.mul_(1 - lr * group["weight_decay"])
         update = shared_m.view(p.shape).mul_(stepsize).mul_(lr)
@@ -5731,6 +5921,13 @@ class Gefen(torch.optim.Optimizer):
             step = state["step"]
             state["vmean_step"] = step.clone() if torch.is_tensor(step) else step
 
+        # If a framework relocated this parameter since its last step (CPU
+        # offload paging the shard), the state tensors are stranded on the old
+        # device. Migrate them onto the current compute device before any state
+        # read below. No-op (single device compare) on the common same-device
+        # step, so the CUDA path is unchanged.
+        self._colocate_param_state_(state, grad_view.device)
+
         # Tier-1 uses a separately calibrated predicate for the current full
         # v1/v2 kernels. Both fold the vmean EMA, per-block stepsize math, and
         # weight decay into the update path; v1 is one kernel while v2 splits
@@ -5817,10 +6014,16 @@ class Gefen(torch.optim.Optimizer):
             # only when vmean was lazily recreated after a factored->legacy
             # toggle.
             bias_correction_2 = 1 - beta2 ** state["vmean_step"]
-            if torch.is_tensor(lr) and (use_full_fused or use_v2_full):
-                # The fused kernel bindings take lr / wd_factor as host
-                # doubles; scalarize a tensor lr through the cached no-sync
-                # .item() hoist (_lr_scalar) instead of passing the tensor.
+            if torch.is_tensor(lr) and not self.capturable:
+                # The fused kernel bindings take lr / wd_factor as host doubles,
+                # and the non-fused decomposed path multiplies the update by lr
+                # on the compute device -- a tensor lr stranded on another device
+                # (e.g. a CUDA lr after the parameter was paged to CPU) would
+                # break that in-place math. Scalarize through the cached no-sync
+                # .item() hoist (_lr_scalar); the value equals lr.item(), so this
+                # is bit-identical to passing the 0-dim tensor. Capturable keeps
+                # the on-device tensor lr for CUDA-graph replay (never a
+                # CPU-offload path).
                 lr = self._lr_scalar(group)
 
         if use_full_fused:
@@ -5973,6 +6176,16 @@ class Gefen(torch.optim.Optimizer):
         if not grad.is_cuda:
             return False
         if not p.is_contiguous():
+            return False
+        # A parameter just paged onto this device (CPU-offload) may still carry
+        # optimizer state stranded on its previous device; the merged path
+        # stacks that state against the gradient and cannot bridge devices.
+        # Route it to the per-param path, which re-colocates the state before
+        # stepping. Steady-state runs keep their state co-located, so this never
+        # rejects a normal CUDA-resident param.
+        state = self.state.get(p)
+        sentinel = None if state is None else state.get("m_codebook")
+        if sentinel is not None and sentinel.device != grad.device:
             return False
         # Large params (those that would actually stream in the per-param momentum
         # update) stay per-param so they get the transient-VRAM win; only the
@@ -7511,7 +7724,11 @@ class Gefen(torch.optim.Optimizer):
 
         packed_groups = []
         cursor = 0
-        ignored = {"params", "name", "param_names"}
+        # Provenance is dropped with the names it describes: packing rewrites the
+        # names positionally, so a flag saved against the OLD one-param-per-group
+        # layout does not describe the packed name. Absent means unknowable, which
+        # _sync_param_names_to_state fails closed on.
+        ignored = {"params", "name", "param_names", _SYNTHESIZED_PARAM_NAMES_KEY}
         for live_group, size in zip(self.param_groups, live_sizes):
             chunk = saved_groups[cursor : cursor + size]
             cursor += size
@@ -8677,6 +8894,10 @@ class Gefen(torch.optim.Optimizer):
                     raise RuntimeError("Gefen does not support sparse gradients")
                 if torch.is_complex(grad):
                     raise RuntimeError("Gefen does not support complex gradients")
+                # Parameter / gradient device co-location is enforced up front in
+                # _assert_optimizer_gradients_structurally_valid (before any
+                # codebook or per-param state mutation), so by here a plain
+                # tensor's grad and param share a device.
                 # Factored-v routing (opt-in): plain 2D params keep their
                 # quantized momentum but step through the factored-second-
                 # moment path (in-kernel elementwise stepsize on the fused

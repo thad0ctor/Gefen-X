@@ -54,6 +54,9 @@ __all__ = [
     "portable_state_digest",
     "load_portable_dcp",
     "save_portable_dcp",
+    "GefenDCPState",
+    "GefenSavePlanner",
+    "GefenFileSystemWriter",
     "split_params_for_muon",
     "validate_split",
     "kernels",
@@ -74,6 +77,18 @@ def __getattr__(name):
         from .hybrid import GefenMuonHybrid
 
         return GefenMuonHybrid
+    if name == "GefenDCPState":
+        from .dcp import GefenDCPState
+
+        return GefenDCPState
+    if name == "GefenSavePlanner":
+        from .dcp import GefenSavePlanner
+
+        return GefenSavePlanner
+    if name == "GefenFileSystemWriter":
+        from .dcp import GefenFileSystemWriter
+
+        return GefenFileSystemWriter
     if name in ("split_params_for_muon", "validate_split"):
         from . import params
 
