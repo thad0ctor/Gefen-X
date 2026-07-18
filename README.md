@@ -22,6 +22,7 @@
  - **≈2× faster `opt.step()`** via fused CUDA kernels with validated numerical parity.
  - **Whole-model Muon option** (`GefenMuonHybrid`) with a selectable AdamW quality backup or ~1 B/param Gefen low-memory backup, plus task-specific [SFT and pretraining recipes](#which-muon-recipe-should-i-use).
  - **Reliable native checkpoint save/resume and FSDP2 training support** — broken or absent in the shipped release; see [Distributed Training](#distributed-training) for the checkpoint compatibility table.
+ - **CPU-offloaded training and reshardable checkpoints** — plain Gefen trains with parameters, gradients, and optimizer state on CPU (DeepSpeed ZeRO, FSDP2 `CPUOffloadPolicy`), and its FSDP2 optimizer state reshards N ranks → M via `GefenDCPState` with a memory-bounded save.
  - **Hardened against crashes** (device/dtype guards, bounds checks, race fixes).
 
 <details>
@@ -39,7 +40,7 @@
 >| **CPU-offloaded training** | not supported (GPU-resident) | parameters, gradients & optimizer state can live on CPU — validated for plain Gefen under DeepSpeed ZeRO CPU-offload (optimizer at ZeRO-2/3, parameters at ZeRO-3) and FSDP2 `CPUOffloadPolicy` (single & multi-GPU) — [details](https://github.com/thad0ctor/Gefen-X/blob/main/COMPATIBILITY.md#fsdp2-cpu-offload) |
 >| **Whole-model Muon** | 2D weight matrices only | `GefenMuonHybrid` trains the entire model |
 >| **Muon step efficiency** | generic momentum hack + redundant dequant gather | single-pass bit-exact momentum kernel |
->| **Save / resume checkpoints** | can corrupt state or lose tuning on resume | native optimizer checkpoints save and resume correctly; distributed checkpoint formats have documented limits |
+>| **Save / resume checkpoints** | can corrupt state or lose tuning on resume | native optimizer checkpoints save and resume correctly; FSDP2 optimizer state reshards N ranks → M via `GefenDCPState` with a memory-bounded save |
 >| **Crash safety** | missing device / edge-case guards | guarded against wrong-device, empty-tensor, and race bugs |
 >| **Correctness** | no fused-kernel tests | kernel parity and distributed tests |
 >| **Documentation** | no Axolotl / fork-install guidance | Axolotl how-to + fair loss/speed/memory benchmarks |
