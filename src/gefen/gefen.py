@@ -1444,6 +1444,7 @@ class Gefen(torch.optim.Optimizer):
             not in {
                 "params",
                 "param_names",
+                _SYNTHESIZED_PARAM_NAMES_KEY,
                 "name",
                 "_gefen_checkpoint_metadata",
             }
@@ -2841,6 +2842,7 @@ class Gefen(torch.optim.Optimizer):
         staged.param_groups = []
         staged.state = defaultdict(dict)
         staged._param_names = {}
+        staged._synthesized_param_names = {}
         staged._gefen_shard_bindings = {}
         local_bindings = []
         logical_slots = []
@@ -2850,6 +2852,7 @@ class Gefen(torch.optim.Optimizer):
             staged_group.pop("_gefen_checkpoint_metadata", None)
             staged_params = []
             staged_names = []
+            staged_synthesized_names = []
             names = list(group.get("param_names", ()))
             if len(names) != len(group["params"]):
                 names = [self._param_name(param) for param in group["params"]]
@@ -2873,10 +2876,16 @@ class Gefen(torch.optim.Optimizer):
                 staged_params.append(target)
                 staged_names.append(compatibility_name)
                 staged._param_names[target] = compatibility_name
+                synthesized_name = self._synthesized_param_names.get(
+                    rebinding.old_parameter, True
+                )
+                staged_synthesized_names.append(synthesized_name)
+                staged._synthesized_param_names[target] = synthesized_name
                 staged.state[target]["name"] = compatibility_name
                 staged._gefen_shard_bindings[target] = rebinding.shard
             staged_group["params"] = staged_params
             staged_group["param_names"] = staged_names
+            staged_group[_SYNTHESIZED_PARAM_NAMES_KEY] = staged_synthesized_names
             staged.param_groups.append(staged_group)
 
         staged._gefen_local_shard_bindings = tuple(

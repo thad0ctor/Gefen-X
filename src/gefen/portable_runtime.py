@@ -71,7 +71,7 @@ _STATUS_FALLBACK_LIMITS = PortableStateLimits(
 )._wire_limits()
 
 _PLAIN_GROUP_REQUIRED = frozenset({"params", "param_names", "lr", "beta1", "beta2", "eps", "weight_decay"})
-_PLAIN_GROUP_ALLOWED = _PLAIN_GROUP_REQUIRED | {"name"}
+_PLAIN_GROUP_ALLOWED = _PLAIN_GROUP_REQUIRED | {"name", "param_names_synthesized"}
 _MUON_GROUP_REQUIRED = _PLAIN_GROUP_REQUIRED | frozenset(
     {
         "momentum",
@@ -90,7 +90,11 @@ _MUON_GROUP_REQUIRED = _PLAIN_GROUP_REQUIRED | frozenset(
         "cautious",
     }
 )
-_MUON_GROUP_ALLOWED = _MUON_GROUP_REQUIRED | {"name", "ns_schedule"}
+_MUON_GROUP_ALLOWED = _MUON_GROUP_REQUIRED | {
+    "name",
+    "ns_schedule",
+    "param_names_synthesized",
+}
 
 _AUTHORITATIVE_STATE_KEYS = frozenset(
     {
